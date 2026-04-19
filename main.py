@@ -31,7 +31,7 @@ class Bot(commands.Bot):
 
         owner_ids = parse_owner_ids()
         super().__init__(
-            command_prefix="!",
+            command_prefix="/",
             intents=intents,
             owner_ids=owner_ids or None,
         )
@@ -46,6 +46,9 @@ class Bot(commands.Bot):
                 logger.info("Loaded extension: %s", ext)
             except Exception as e:
                 logger.error("Failed to load extension %s: %s", ext, e)
+
+        await self.tree.sync()
+        logger.info("Slash commands synced globally")
 
     async def on_ready(self):
         logger.info("Logged in as %s (ID: %s)", self.user, self.user.id)

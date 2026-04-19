@@ -3,9 +3,16 @@ import sys
 import logging
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 logger = logging.getLogger("bot.admin")
+
+
+def is_owner():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        return await interaction.client.is_owner(interaction.user)
+    return app_commands.check(predicate)
 
 
 class Admin(commands.Cog):
@@ -14,31 +21,32 @@ class Admin(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @commands.command(name="restart", aliases=["re"])
-    @commands.is_owner()
-    async def restart(self, ctx: commands.Context):
-        """BOTを再起動します (オーナー限定)"""
-        embed = discord.Embed(
-            title="再起動中...",
-            description=":arrows_counterclockwise: BOTを再起動しています。少々お待ちください。",
-            color=discord.Color.orange(),
+    @app_commands.command(name="restart", description="BOTを再起動します (オーナー限定)")
+    @is_owner()
+    async def restart(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="再起動中...",
+                description=":arrows_counterclockwise: BOTを再起動しています。少々お待ちください。",
+                color=discord.Color.orange(),
+            )
         )
-        await ctx.send(embed=embed)
-        logger.info("Restart requested by %s (ID: %s)", ctx.author, ctx.author.id)
+        logger.info("Restart requested by %s (ID: %s)", interaction.user, interaction.user.id)
 
         await self.bot.close()
-        # 現在のPythonインタープリタで同じスクリプトを再実行する
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
     @restart.error
-    async def restart_error(self, ctx: commands.Context, error: commands.CommandError):
-        if isinstance(error, commands.NotOwner):
-            embed = discord.Embed(
-                title="権限エラー",
-                description=":no_entry: このコマンドはBOTオーナーのみ使用できます。",
-                color=discord.Color.red(),
+    async def restart_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.CheckFailure):
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="権限エラー",
+                    description=":no_entry: このコマンドはBOTオーナーのみ使用できます。",
+                    color=discord.Color.red(),
+                ),
+                ephemeral=True,
             )
-            await ctx.send(embed=embed)
         else:
             logger.error("Unexpected error in restart command: %s", error)
             raise error
