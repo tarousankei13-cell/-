@@ -27,8 +27,11 @@ def load_allowed_users() -> set:
 
 
 def save_allowed_users(users: set):
-    with open(ALLOWED_USERS_FILE, "w") as f:
-        json.dump(list(users), f)
+    try:
+        with open(ALLOWED_USERS_FILE, "w") as f:
+            json.dump(list(users), f)
+    except Exception as e:
+        print(f"allowed_users.json の保存に失敗しました: {e}")
 
 
 def format_uptime(seconds: float) -> str:
@@ -105,7 +108,7 @@ class RemoveUserModal(discord.ui.Modal, title="ユーザーを削除"):
             await interaction.response.send_message("そのユーザーは許可リストにいません。", ephemeral=True)
 
 
-# ── ユーザー管理パネル（永続View） ────────────────────────────
+# ── ユーザー管理パネル（永続View・オーナー専用） ──────────────
 
 class ManagementPanel(discord.ui.View):
     def __init__(self):
@@ -139,7 +142,7 @@ class ManagementPanel(discord.ui.View):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# ── サーバーリスト＋退出ボタン（ページネーション対応） ─────────
+# ── サーバーリスト（ページネーション） ───────────────────────
 
 SERVERS_PER_PAGE = 20
 
@@ -157,7 +160,7 @@ def build_serverlist_embed(guilds: list[discord.Guild], page: int) -> discord.Em
         description="\n".join(lines) if lines else "サーバーがありません。",
         color=discord.Color.green()
     )
-    embed.set_footer(text=f"合計: {len(guilds)}サーバー | ページ {page + 1}/{total_pages} | 🚪ボタンで退出できます")
+    embed.set_footer(text=f"合計: {len(guilds)}サーバー | ページ {page + 1}/{total_pages}")
     return embed
 
 
@@ -168,16 +171,12 @@ class ServerListView(discord.ui.View):
         self.page = page
         self.total_pages = max(1, -(-len(guilds) // SERVERS_PER_PAGE))
 
-        start = page * SERVERS_PER_PAGE
-        for guild in guilds[start:start + SERVERS_PER_PAGE]:
-            self.add_item(LeaveButton(guild))
-
-        prev_btn = discord.ui.Button(label="◀ 前へ", style=discord.ButtonStyle.secondary, disabled=(page == 0), row=4)
+        prev_btn = discord.ui.Button(label="◀ 前へ", style=discord.ButtonStyle.secondary, disabled=(page == 0))
         prev_btn.callback = self.prev_page
 
-        page_btn = discord.ui.Button(label=f"{page + 1} / {self.total_pages}", style=discord.ButtonStyle.secondary, disabled=True, row=4)
+        page_btn = discord.ui.Button(label=f"{page + 1} / {self.total_pages}", style=discord.ButtonStyle.secondary, disabled=True)
 
-        next_btn = discord.ui.Button(label="次へ ▶", style=discord.ButtonStyle.secondary, disabled=(page >= self.total_pages - 1), row=4)
+        next_btn = discord.ui.Button(label="次へ ▶", style=discord.ButtonStyle.secondary, disabled=(page >= self.total_pages - 1))
         next_btn.callback = self.next_page
 
         self.add_item(prev_btn)
@@ -185,58 +184,32 @@ class ServerListView(discord.ui.View):
         self.add_item(next_btn)
 
     async def prev_page(self, interaction: discord.Interaction):
-        if interaction.user.id != OWNER_ID:
-            await interaction.response.send_message("オーナーのみ操作できます。", ephemeral=True)
+        if not is_allowed(interaction):
+            await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
             return
-        await interaction.response.edit_message(embed=build_serverlist_embed(self.guilds, self.page - 1), view=ServerListView(self.guilds, self.page - 1))
+        await interaction.response.edit_message(
+            embed=build_serverlist_embed(self.guilds, self.page - 1),
+            view=ServerListView(self.guilds, self.page - 1)
+        )
 
     async def next_page(self, interaction: discord.Interaction):
-        if interaction.user.id != OWNER_ID:
-            await interaction.response.send_message("オーナーのみ操作できます。", ephemeral=True)
+        if not is_allowed(interaction):
+            await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
             return
-        await interaction.response.edit_message(embed=build_serverlist_embed(self.guilds, self.page + 1), view=ServerListView(self.guilds, self.page + 1))
+        await interaction.response.edit_message(
+            embed=build_serverlist_embed(self.guilds, self.page + 1),
+            view=ServerListView(self.guilds, self.page + 1)
+        )
 
 
-class LeaveButton(discord.ui.Button):
-    def __init__(self, guild: discord.Guild):
-        label = guild.name[:30] + "…" if len(guild.name) > 30 else guild.name
-        super().__init__(label=label, style=discord.ButtonStyle.danger, emoji="🚪")
-        self.guild_id = guild.id
-        self.guild_name = guild.name
+# ── オートコンプリート ─────────────────────────────────────────
 
-    async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != OWNER_ID:
-            await interaction.response.send_message("オーナーのみ操作できます。", ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            guild = client.get_guild(self.guild_id)
-            if guild is None:
-                await interaction.followup.send("すでに退出済みのサーバーです。", ephemeral=True)
-                return
-
-            name = guild.name
-            await guild.leave()
-
-            updated_guilds = list(client.guilds)
-            if updated_guilds:
-                new_page = min(self.view.page, max(0, -(-len(updated_guilds) // SERVERS_PER_PAGE) - 1))
-                try:
-                    await interaction.edit_original_response(
-                        embed=build_serverlist_embed(updated_guilds, new_page),
-                        view=ServerListView(updated_guilds, new_page)
-                    )
-                except Exception:
-                    pass
-            await interaction.followup.send(f"**{name}** から退出しました。", ephemeral=True)
-
-        except Exception as e:
-            try:
-                await interaction.followup.send(f"エラーが発生しました: {e}", ephemeral=True)
-            except Exception:
-                pass
+async def server_autocomplete(interaction: discord.Interaction, current: str):
+    return [
+        app_commands.Choice(name=f"{g.name}", value=str(g.id))
+        for g in client.guilds
+        if current.lower() in g.name.lower()
+    ][:25]
 
 
 # ── コマンド ──────────────────────────────────────────────────
@@ -254,16 +227,49 @@ async def panel(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=ManagementPanel(), ephemeral=True)
 
 
-@tree.command(name="serverlist", description="Botが導入されているサーバー一覧と退出ボタンを表示します（オーナー専用）")
+@tree.command(name="serverlist", description="Botが導入されているサーバー一覧を表示します（許可ユーザー専用）")
 async def serverlist(interaction: discord.Interaction):
-    if interaction.user.id != OWNER_ID:
+    if not is_allowed(interaction):
         await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
         return
     guilds = list(client.guilds)
     if not guilds:
         await interaction.response.send_message("導入済みサーバーがありません。", ephemeral=True)
         return
-    await interaction.response.send_message(embed=build_serverlist_embed(guilds, 0), view=ServerListView(guilds, 0), ephemeral=True)
+    await interaction.response.send_message(
+        embed=build_serverlist_embed(guilds, 0),
+        view=ServerListView(guilds, 0),
+        ephemeral=True
+    )
+
+
+@tree.command(name="kick", description="指定したサーバーからBotを退出させます（許可ユーザー専用）")
+@app_commands.describe(server_id="退出するサーバー名を入力または選択")
+@app_commands.autocomplete(server_id=server_autocomplete)
+async def kick(interaction: discord.Interaction, server_id: str):
+    if not is_allowed(interaction):
+        await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        gid = int(server_id)
+    except ValueError:
+        await interaction.followup.send("無効なサーバーIDです。", ephemeral=True)
+        return
+
+    guild = client.get_guild(gid)
+    if guild is None:
+        await interaction.followup.send("指定されたサーバーが見つかりません。", ephemeral=True)
+        return
+
+    name = guild.name
+    try:
+        await guild.leave()
+        await interaction.followup.send(f"**{name}** から退出しました。", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"退出に失敗しました: {e}", ephemeral=True)
 
 
 @tree.command(name="restart", description="Botを再起動します（許可ユーザー専用）")
