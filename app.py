@@ -205,15 +205,32 @@ class LeaveButton(discord.ui.Button):
         if interaction.user.id != OWNER_ID:
             await interaction.response.send_message("オーナーのみ操作できます。", ephemeral=True)
             return
+
+        await interaction.response.defer(ephemeral=True)
+
         guild = client.get_guild(self.guild_id)
         if guild is None:
-            await interaction.response.send_message("すでに退出済みのサーバーです。", ephemeral=True)
+            try:
+                guild = await client.fetch_guild(self.guild_id)
+            except Exception:
+                await interaction.followup.send("すでに退出済みのサーバーです。", ephemeral=True)
+                return
+
+        name = guild.name
+        try:
+            await guild.leave()
+        except Exception as e:
+            await interaction.followup.send(f"退出に失敗しました: {e}", ephemeral=True)
             return
-        await guild.leave()
+
         self.disabled = True
-        self.label = f"✓ {self.guild_name[:27]}…" if len(self.guild_name) > 27 else f"✓ {self.guild_name}"
+        self.label = f"✓ {name[:27]}…" if len(name) > 27 else f"✓ {name}"
         self.style = discord.ButtonStyle.secondary
-        await interaction.response.edit_message(view=self.view)
+        try:
+            await interaction.edit_original_response(view=self.view)
+        except Exception:
+            pass
+        await interaction.followup.send(f"**{name}** から退出しました。", ephemeral=True)
 
 
 # ── コマンド ──────────────────────────────────────────────────
