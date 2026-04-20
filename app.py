@@ -211,36 +211,32 @@ class LeaveButton(discord.ui.Button):
 
         await interaction.response.defer(ephemeral=True)
 
-        guild = client.get_guild(self.guild_id)
-        if guild is None:
-            try:
-                guild = await client.fetch_guild(self.guild_id)
-            except Exception:
+        try:
+            guild = client.get_guild(self.guild_id)
+            if guild is None:
                 await interaction.followup.send("すでに退出済みのサーバーです。", ephemeral=True)
                 return
 
-        name = guild.name
-        try:
+            name = guild.name
             await guild.leave()
-        except Exception as e:
-            await interaction.followup.send(f"退出に失敗しました: {e}", ephemeral=True)
-            return
 
-        # 退出後にリストを最新状態で更新
-        updated_guilds = list(client.guilds)
-        new_page = min(self.view.page, max(0, -(-len(updated_guilds) // SERVERS_PER_PAGE) - 1)) if updated_guilds else 0
-        try:
+            updated_guilds = list(client.guilds)
             if updated_guilds:
-                await interaction.edit_original_response(
-                    embed=build_serverlist_embed(updated_guilds, new_page),
-                    view=ServerListView(updated_guilds, new_page)
-                )
-            else:
-                await interaction.edit_original_response(content="全サーバーから退出しました。", embed=None, view=None)
-        except Exception:
-            pass
+                new_page = min(self.view.page, max(0, -(-len(updated_guilds) // SERVERS_PER_PAGE) - 1))
+                try:
+                    await interaction.edit_original_response(
+                        embed=build_serverlist_embed(updated_guilds, new_page),
+                        view=ServerListView(updated_guilds, new_page)
+                    )
+                except Exception:
+                    pass
+            await interaction.followup.send(f"**{name}** から退出しました。", ephemeral=True)
 
-        await interaction.followup.send(f"**{name}** から退出しました。", ephemeral=True)
+        except Exception as e:
+            try:
+                await interaction.followup.send(f"エラーが発生しました: {e}", ephemeral=True)
+            except Exception:
+                pass
 
 
 # ── コマンド ──────────────────────────────────────────────────
