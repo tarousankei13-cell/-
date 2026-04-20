@@ -17,9 +17,12 @@ start_time = time.time()
 
 
 def load_allowed_users() -> set:
-    if os.path.exists(ALLOWED_USERS_FILE):
-        with open(ALLOWED_USERS_FILE, "r") as f:
-            return set(json.load(f))
+    try:
+        if os.path.exists(ALLOWED_USERS_FILE):
+            with open(ALLOWED_USERS_FILE, "r") as f:
+                return set(json.load(f))
+    except Exception as e:
+        print(f"allowed_users.json の読み込みに失敗しました: {e}")
     return set()
 
 
@@ -151,7 +154,7 @@ def build_serverlist_embed(guilds: list[discord.Guild], page: int) -> discord.Em
     ]
     embed = discord.Embed(
         title="導入済みサーバー一覧",
-        description="\n".join(lines),
+        description="\n".join(lines) if lines else "サーバーがありません。",
         color=discord.Color.green()
     )
     embed.set_footer(text=f"合計: {len(guilds)}サーバー | ページ {page + 1}/{total_pages} | 🚪ボタンで退出できます")
@@ -223,13 +226,20 @@ class LeaveButton(discord.ui.Button):
             await interaction.followup.send(f"退出に失敗しました: {e}", ephemeral=True)
             return
 
-        self.disabled = True
-        self.label = f"✓ {name[:27]}…" if len(name) > 27 else f"✓ {name}"
-        self.style = discord.ButtonStyle.secondary
+        # 退出後にリストを最新状態で更新
+        updated_guilds = list(client.guilds)
+        new_page = min(self.view.page, max(0, -(-len(updated_guilds) // SERVERS_PER_PAGE) - 1)) if updated_guilds else 0
         try:
-            await interaction.edit_original_response(view=self.view)
+            if updated_guilds:
+                await interaction.edit_original_response(
+                    embed=build_serverlist_embed(updated_guilds, new_page),
+                    view=ServerListView(updated_guilds, new_page)
+                )
+            else:
+                await interaction.edit_original_response(content="全サーバーから退出しました。", embed=None, view=None)
         except Exception:
             pass
+
         await interaction.followup.send(f"**{name}** から退出しました。", ephemeral=True)
 
 
@@ -253,7 +263,7 @@ async def serverlist(interaction: discord.Interaction):
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
         return
-    guilds = client.guilds
+    guilds = list(client.guilds)
     if not guilds:
         await interaction.response.send_message("導入済みサーバーがありません。", ephemeral=True)
         return
