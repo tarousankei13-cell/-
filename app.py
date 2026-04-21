@@ -1399,8 +1399,8 @@ class JissekiModal(discord.ui.Modal, title="実績を報告する"):
     )
     quantity = discord.ui.TextInput(
         label="📦 個数",
-        placeholder="例: 1個",
-        default="1個",
+        placeholder="数字のみ入力してください（例: 1）",
+        default="1",
         required=False
     )
 
@@ -1413,6 +1413,14 @@ class JissekiModal(discord.ui.Modal, title="実績を報告する"):
                 raise ValueError
         except ValueError:
             await interaction.followup.send("評価は1〜5の数字で入力してください。", ephemeral=True)
+            return
+
+        try:
+            quantity_num = int(self.quantity.value.strip())
+            if quantity_num < 1:
+                raise ValueError
+        except ValueError:
+            await interaction.followup.send("個数は1以上の数字で入力してください。", ephemeral=True)
             return
 
         guild_key = str(interaction.guild_id)
@@ -1434,7 +1442,7 @@ class JissekiModal(discord.ui.Modal, title="実績を報告する"):
         embed.add_field(name="🛍️ 商品名", value=self.product.value, inline=False)
         embed.add_field(name="⭐ 評価", value=f"{stars} ({rating_num})", inline=False)
         embed.add_field(name="📋 コメント", value=self.comment.value or "なし", inline=False)
-        embed.add_field(name="📦 個数", value=self.quantity.value or "1個", inline=False)
+        embed.add_field(name="📦 個数", value=f"{quantity_num}個", inline=False)
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.set_footer(text=client.user.name, icon_url=client.user.display_avatar.url)
 
