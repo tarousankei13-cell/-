@@ -47,7 +47,6 @@ def load_paypay_channels() -> dict:
         if os.path.exists(PAYPAY_CHANNEL_FILE):
             with open(PAYPAY_CHANNEL_FILE, "r") as f:
                 data = json.load(f)
-                # 旧フォーマット（int）を新フォーマットに変換
                 for k, v in data.items():
                     if isinstance(v, int):
                         data[k] = {"channel_id": v, "role_id": None}
@@ -149,10 +148,9 @@ async def on_message(message: discord.Message):
 
     timestamp = datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
     role_id = setting.get("role_id")
-    mention_text = f"<@&{role_id}>" if role_id else ""
+    mention_text = f"<@&{role_id}>" if role_id else None
 
     for link in links:
-        # 通知Embed
         embed = discord.Embed(
             title="💰 PayPayリンクを検知しました",
             color=discord.Color.red(),
@@ -164,9 +162,8 @@ async def on_message(message: discord.Message):
         embed.add_field(name="メッセージへ移動", value=f"[クリックしてジャンプ]({message.jump_url})", inline=False)
         embed.set_footer(text=f"検知時刻: {timestamp} (JST)")
 
-        await notify_channel.send(content=mention_text if mention_text else None, embed=embed)
+        await notify_channel.send(content=mention_text, embed=embed)
 
-        # ログに保存
         entry = {
             "user_id": message.author.id,
             "user_name": str(message.author),
@@ -249,6 +246,172 @@ class ManagementPanel(discord.ui.View):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+# ── PayPayパネル ──────────────────────────────────────────────
+
+class ChannelSelectMenu(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="📢 通知チャンネルを選択...",
+            channel_types=[discord.ChannelType.text],
+            row=0
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+            return
+        channel = self.values[0]
+        guild_key = str(interaction.guild_id)
+        existing = paypay_channels.get(guild_key, {})
+        paypay_channels[guild_key] = {
+            "channel_id": channel.id,
+            "role_id": existing.get("role_id")
+        }
+        save_paypay_channels(paypay_channels)
+        await interaction.response.send_message(f"✅ 通知チャンネルを {channel.mention} に設定しました。", ephemeral=True)
+
+
+class RoleSelectMenu(discord.ui.RoleSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="🔔 メンションロールを選択（省略可）...",
+            min_values=0,
+            max_values=1,
+            row=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+            return
+        guild_key = str(interaction.guild_id)
+        existing = paypay_channels.get(guild_key, {})
+        if not existing.get("channel_id"):
+            await interaction.response.send_message("先に通知チャンネルを設定してください。", ephemeral=True)
+            return
+        role_id = self.values[0].id if self.values else None
+        paypay_channels[guild_key]["role_id"] = role_id
+        save_paypay_channels(paypay_channels)
+        if role_id:
+            await interaction.response.send_message(f"✅ メンションロールを <@&{role_id}> に設定しました。", ephemeral=True)
+        else:
+            await interaction.response.send_message("✅ メンションロールを解除しました。", ephemeral=True)
+
+
+class PayPayPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.add_item(ChannelSelectMenu())
+        self.add_item(RoleSelectMenu())
+
+    @discord.ui.button(label="検知をオフ", style=discord.ButtonStyle.danger, emoji="🔕", row=2)
+    async def turn_off(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+            return
+        key = str(interaction.guild_id)
+        if key in paypay_channels:
+            del paypay_channels[key]
+            save_paypay_channels(paypay_channels)
+            await interaction.response.send_message("🔕 PayPayリンク検知をオフにしました。", ephemeral=True)
+        else:
+            await interaction.response.send_message("このサーバーでは検知が設定されていません。", ephemeral=True)
+
+    @discord.ui.button(label="ログを表示", style=discord.ButtonStyle.primary, emoji="📋", row=2)
+    async def show_log(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+            return
+        guild_key = str(interaction.guild_id)
+        entries = paypay_log.get(guild_key, [])
+        if not entries:
+            await interaction.response.send_message("まだログがありません。", ephemeral=True)
+            return
+        reversed_entries = list(reversed(entries))
+        await interaction.response.send_message(
+            embed=build_log_embed(reversed_entries, 0, interaction.guild.name),
+            view=LogView(reversed_entries, 0, interaction.guild.name),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="現在の設定", style=discord.ButtonStyle.secondary, emoji="ℹ️", row=2)
+    async def show_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+            return
+        guild_key = str(interaction.guild_id)
+        setting = paypay_channels.get(guild_key)
+        embed = discord.Embed(title="⚙️ PayPay検知 現在の設定", color=discord.Color.blurple())
+        if setting and setting.get("channel_id"):
+            channel = interaction.guild.get_channel(setting["channel_id"])
+            role_id = setting.get("role_id")
+            embed.add_field(name="状態", value="🟢 オン", inline=False)
+            embed.add_field(name="通知チャンネル", value=channel.mention if channel else "不明", inline=False)
+            embed.add_field(name="メンションロール", value=f"<@&{role_id}>" if role_id else "なし", inline=False)
+            log_count = len(paypay_log.get(guild_key, []))
+            embed.add_field(name="検知ログ件数", value=f"{log_count}件", inline=False)
+        else:
+            embed.add_field(name="状態", value="🔴 オフ", inline=False)
+            embed.add_field(name="設定方法", value="上のプルダウンでチャンネルを選択してください", inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ── ログページネーション ──────────────────────────────────────
+
+LOG_PER_PAGE = 5
+
+
+def build_log_embed(entries: list, page: int, guild_name: str) -> discord.Embed:
+    total_pages = max(1, -(-len(entries) // LOG_PER_PAGE))
+    start = page * LOG_PER_PAGE
+    page_entries = entries[start:start + LOG_PER_PAGE]
+    embed = discord.Embed(title="📋 PayPayリンク検知ログ", color=discord.Color.orange())
+    for i, e in enumerate(page_entries):
+        embed.add_field(
+            name=f"#{len(entries) - start - i}  {e['timestamp']}",
+            value=(
+                f"送信者: <@{e['user_id']}> (`{e['user_name']}`)\n"
+                f"チャンネル: #{e['channel_name']}\n"
+                f"リンク: {e['link']}\n"
+                f"[メッセージへ移動]({e['message_url']})"
+            ),
+            inline=False
+        )
+    embed.set_footer(text=f"{guild_name} | 合計: {len(entries)}件 | ページ {page + 1}/{total_pages}")
+    return embed
+
+
+class LogView(discord.ui.View):
+    def __init__(self, entries: list, page: int, guild_name: str):
+        super().__init__(timeout=120)
+        self.entries = entries
+        self.page = page
+        self.guild_name = guild_name
+        self.total_pages = max(1, -(-len(entries) // LOG_PER_PAGE))
+
+        prev_btn = discord.ui.Button(label="◀ 前へ", style=discord.ButtonStyle.secondary, disabled=(page == 0))
+        prev_btn.callback = self.prev_page
+        page_btn = discord.ui.Button(label=f"{page + 1} / {self.total_pages}", style=discord.ButtonStyle.secondary, disabled=True)
+        next_btn = discord.ui.Button(label="次へ ▶", style=discord.ButtonStyle.secondary, disabled=(page >= self.total_pages - 1))
+        next_btn.callback = self.next_page
+
+        self.add_item(prev_btn)
+        self.add_item(page_btn)
+        self.add_item(next_btn)
+
+    async def prev_page(self, interaction: discord.Interaction):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+            return
+        await interaction.response.edit_message(embed=build_log_embed(self.entries, self.page - 1, self.guild_name), view=LogView(self.entries, self.page - 1, self.guild_name))
+
+    async def next_page(self, interaction: discord.Interaction):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+            return
+        await interaction.response.edit_message(embed=build_log_embed(self.entries, self.page + 1, self.guild_name), view=LogView(self.entries, self.page + 1, self.guild_name))
+
+
 # ── サーバーリスト（ページネーション） ───────────────────────
 
 SERVERS_PER_PAGE = 20
@@ -301,65 +464,6 @@ class ServerListView(discord.ui.View):
         await interaction.response.edit_message(embed=build_serverlist_embed(self.guilds, self.page + 1), view=ServerListView(self.guilds, self.page + 1))
 
 
-# ── ログページネーション ──────────────────────────────────────
-
-LOG_PER_PAGE = 5
-
-
-def build_log_embed(entries: list, page: int, guild_name: str) -> discord.Embed:
-    total_pages = max(1, -(-len(entries) // LOG_PER_PAGE))
-    start = page * LOG_PER_PAGE
-    page_entries = entries[start:start + LOG_PER_PAGE]
-    embed = discord.Embed(
-        title="📋 PayPayリンク検知ログ",
-        color=discord.Color.orange()
-    )
-    for i, e in enumerate(page_entries):
-        embed.add_field(
-            name=f"#{len(entries) - start - i}  {e['timestamp']}",
-            value=(
-                f"送信者: <@{e['user_id']}> (`{e['user_name']}`)\n"
-                f"チャンネル: #{e['channel_name']}\n"
-                f"リンク: {e['link']}\n"
-                f"[メッセージへ移動]({e['message_url']})"
-            ),
-            inline=False
-        )
-    embed.set_footer(text=f"{guild_name} | 合計: {len(entries)}件 | ページ {page + 1}/{total_pages}")
-    return embed
-
-
-class LogView(discord.ui.View):
-    def __init__(self, entries: list, page: int, guild_name: str):
-        super().__init__(timeout=120)
-        self.entries = entries
-        self.page = page
-        self.guild_name = guild_name
-        self.total_pages = max(1, -(-len(entries) // LOG_PER_PAGE))
-
-        prev_btn = discord.ui.Button(label="◀ 前へ", style=discord.ButtonStyle.secondary, disabled=(page == 0))
-        prev_btn.callback = self.prev_page
-        page_btn = discord.ui.Button(label=f"{page + 1} / {self.total_pages}", style=discord.ButtonStyle.secondary, disabled=True)
-        next_btn = discord.ui.Button(label="次へ ▶", style=discord.ButtonStyle.secondary, disabled=(page >= self.total_pages - 1))
-        next_btn.callback = self.next_page
-
-        self.add_item(prev_btn)
-        self.add_item(page_btn)
-        self.add_item(next_btn)
-
-    async def prev_page(self, interaction: discord.Interaction):
-        if not is_allowed(interaction):
-            await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
-            return
-        await interaction.response.edit_message(embed=build_log_embed(self.entries, self.page - 1, self.guild_name), view=LogView(self.entries, self.page - 1, self.guild_name))
-
-    async def next_page(self, interaction: discord.Interaction):
-        if not is_allowed(interaction):
-            await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
-            return
-        await interaction.response.edit_message(embed=build_log_embed(self.entries, self.page + 1, self.guild_name), view=LogView(self.entries, self.page + 1, self.guild_name))
-
-
 # ── オートコンプリート ─────────────────────────────────────────
 
 async def server_autocomplete(interaction: discord.Interaction, current: str):
@@ -381,55 +485,29 @@ async def panel(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=ManagementPanel(), ephemeral=True)
 
 
-@tree.command(name="setpaypay", description="PayPayリンク検知の通知チャンネルを設定します（許可ユーザー専用）")
-@app_commands.describe(channel="PayPayリンクを検知したときに通知するチャンネル", role="検知時にメンションするロール（省略可）")
-async def setpaypay(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role = None):
-    if not is_allowed(interaction):
-        await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
-        return
-    paypay_channels[str(interaction.guild_id)] = {
-        "channel_id": channel.id,
-        "role_id": role.id if role else None
-    }
-    save_paypay_channels(paypay_channels)
-    desc = f"通知チャンネル: {channel.mention}"
-    if role:
-        desc += f"\nメンションロール: {role.mention}"
-    embed = discord.Embed(title="✅ PayPay通知を設定しました", description=desc, color=discord.Color.green())
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@tree.command(name="paypayoff", description="PayPayリンク検知をオフにします（許可ユーザー専用）")
-async def paypayoff(interaction: discord.Interaction):
-    if not is_allowed(interaction):
-        await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
-        return
-    key = str(interaction.guild_id)
-    if key in paypay_channels:
-        del paypay_channels[key]
-        save_paypay_channels(paypay_channels)
-        await interaction.response.send_message("PayPayリンク検知をオフにしました。", ephemeral=True)
-    else:
-        await interaction.response.send_message("このサーバーでは検知が設定されていません。", ephemeral=True)
-
-
-@tree.command(name="paypaylog", description="このサーバーのPayPayリンク検知ログを表示します（許可ユーザー専用）")
-async def paypaylog(interaction: discord.Interaction):
+@tree.command(name="paypay", description="PayPayリンク検知パネルを表示します（許可ユーザー専用）")
+async def paypay(interaction: discord.Interaction):
     if not is_allowed(interaction):
         await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
         return
     guild_key = str(interaction.guild_id)
-    entries = paypay_log.get(guild_key, [])
-    if not entries:
-        await interaction.response.send_message("まだログがありません。", ephemeral=True)
-        return
-    # 新しい順に並び替えて表示
-    reversed_entries = list(reversed(entries))
-    await interaction.response.send_message(
-        embed=build_log_embed(reversed_entries, 0, interaction.guild.name),
-        view=LogView(reversed_entries, 0, interaction.guild.name),
-        ephemeral=True
+    setting = paypay_channels.get(guild_key)
+    if setting and setting.get("channel_id"):
+        channel = interaction.guild.get_channel(setting["channel_id"])
+        role_id = setting.get("role_id")
+        status = (
+            f"状態: 🟢 オン\n"
+            f"通知チャンネル: {channel.mention if channel else '不明'}\n"
+            f"メンションロール: {'<@&' + str(role_id) + '>' if role_id else 'なし'}"
+        )
+    else:
+        status = "状態: 🔴 オフ"
+    embed = discord.Embed(
+        title="💰 PayPay検知パネル",
+        description=f"{status}\n\nプルダウンでチャンネル・ロールを設定できます。",
+        color=discord.Color.red()
     )
+    await interaction.response.send_message(embed=embed, view=PayPayPanel(), ephemeral=True)
 
 
 @tree.command(name="serverlist", description="Botが導入されているサーバー一覧を表示します（許可ユーザー専用）")
