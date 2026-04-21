@@ -1819,7 +1819,7 @@ def _get_active_lotteries(guild_id: str) -> list[tuple[str, dict]]:
     ]
 
 
-class LotteryDrawSelect(discord.ui.StringSelect):
+class LotteryDrawSelect(discord.ui.Select):
     def __init__(self, lotteries: list[tuple]):
         options = [
             discord.SelectOption(
@@ -1842,7 +1842,7 @@ class LotteryDrawSelect(discord.ui.StringSelect):
         await interaction.followup.send("✅ 抽選を実行しました！", ephemeral=True)
 
 
-class LotteryCancelSelect(discord.ui.StringSelect):
+class LotteryCancelSelect(discord.ui.Select):
     def __init__(self, lotteries: list[tuple]):
         options = [
             discord.SelectOption(
