@@ -1427,18 +1427,6 @@ class JissekiModal(discord.ui.Modal, title="実績を報告する"):
             await interaction.followup.send("個数は1以上の数字で入力してください。", ephemeral=True)
             return
 
-        guild_key = str(interaction.guild_id)
-        cfg = jisseki_config.get(guild_key, {})
-        output_channel_id = cfg.get("output_channel_id")
-        if not output_channel_id:
-            await interaction.followup.send("送信先チャンネルが設定されていません。管理者に連絡してください。", ephemeral=True)
-            return
-
-        output_channel = interaction.guild.get_channel(output_channel_id)
-        if not output_channel:
-            await interaction.followup.send("送信先チャンネルが見つかりません。", ephemeral=True)
-            return
-
         output_channel = await _send_jisseki_embed(
             interaction.guild, interaction.user,
             self.product.value, rating_num, quantity_num, self.comment.value
