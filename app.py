@@ -1471,7 +1471,7 @@ async def _send_jisseki_embed(
     return output_channel
 
 
-@tree.command(name="jisseki", description="代理で実績を送信します（許可ユーザー専用）")
+@tree.command(name="trackrecord-v2", description="代理で実績を送信します（許可ユーザー専用）")
 @app_commands.describe(
     user="実績を送信するユーザー",
     product="商品名",
