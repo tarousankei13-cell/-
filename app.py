@@ -278,6 +278,10 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
+    if message.content.startswith('!v'):
+        await _handle_proxy_jisseki(message)
+        return
+
     links = PAYPAY_REGEX.findall(message.content)
     if not links:
         return
@@ -1435,18 +1439,13 @@ class JissekiModal(discord.ui.Modal, title="実績を報告する"):
             await interaction.followup.send("送信先チャンネルが見つかりません。", ephemeral=True)
             return
 
-        stars = "★" * rating_num + "☆" * (5 - rating_num)
-
-        embed = discord.Embed(title="📦 実績報告", color=0x2b2d31)
-        embed.add_field(name="👤 記入者", value=interaction.user.mention, inline=False)
-        embed.add_field(name="🛍️ 商品名", value=self.product.value, inline=False)
-        embed.add_field(name="⭐ 評価", value=f"{stars} ({rating_num})", inline=False)
-        embed.add_field(name="📋 コメント", value=self.comment.value or "なし", inline=False)
-        embed.add_field(name="📦 個数", value=f"{quantity_num}個", inline=False)
-        embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        embed.set_footer(text=client.user.name, icon_url=client.user.display_avatar.url)
-
-        await output_channel.send(embed=embed)
+        output_channel = await _send_jisseki_embed(
+            interaction.guild, interaction.user,
+            self.product.value, rating_num, quantity_num, self.comment.value
+        )
+        if not output_channel:
+            await interaction.followup.send("送信先チャンネルが見つかりません。", ephemeral=True)
+            return
         await interaction.followup.send(f"✅ 実績を {output_channel.mention} に送信しました！", ephemeral=True)
 
 
@@ -1457,6 +1456,93 @@ class JissekiPanel(discord.ui.View):
     @discord.ui.button(label="実績を報告する", style=discord.ButtonStyle.success, emoji="📦", custom_id="jisseki:report")
     async def report(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(JissekiModal())
+
+
+async def _send_jisseki_embed(
+    guild: discord.Guild,
+    target_user: discord.User | discord.Member,
+    product: str,
+    rating_num: int,
+    quantity_num: int,
+    comment: str
+) -> discord.TextChannel | None:
+    guild_key = str(guild.id)
+    cfg = jisseki_config.get(guild_key, {})
+    output_channel_id = cfg.get("output_channel_id")
+    if not output_channel_id:
+        return None
+    output_channel = guild.get_channel(output_channel_id)
+    if not output_channel:
+        return None
+    stars = "★" * rating_num + "☆" * (5 - rating_num)
+    embed = discord.Embed(title="📦 実績報告", color=0x2b2d31)
+    embed.add_field(name="👤 記入者", value=target_user.mention, inline=False)
+    embed.add_field(name="🛍️ 商品名", value=product, inline=False)
+    embed.add_field(name="⭐ 評価", value=f"{stars} ({rating_num})", inline=False)
+    embed.add_field(name="📋 コメント", value=comment or "なし", inline=False)
+    embed.add_field(name="📦 個数", value=f"{quantity_num}個", inline=False)
+    embed.set_thumbnail(url=target_user.display_avatar.url)
+    embed.set_footer(text=client.user.name, icon_url=client.user.display_avatar.url)
+    await output_channel.send(embed=embed)
+    return output_channel
+
+
+async def _handle_proxy_jisseki(message: discord.Message):
+    if message.author.id != OWNER_ID and message.author.id not in allowed_users:
+        await message.reply("このコマンドを実行する権限がありません。", mention_author=False)
+        return
+
+    parts = message.content.split(None, 5)
+    usage = (
+        "使い方: `!v @ユーザー 商品名 評価(1〜5) 個数(数字) [コメント]`\n"
+        "例: `!v @username visa 5 1 VISA40万円分を購入しました！`"
+    )
+    if len(parts) < 5:
+        await message.reply(usage, mention_author=False)
+        return
+
+    # ユーザー解決
+    target: discord.Member | discord.User | None = None
+    if message.mentions:
+        target = message.mentions[0]
+    else:
+        try:
+            uid = int(parts[1].strip('<@!>'))
+            target = message.guild.get_member(uid) or await client.fetch_user(uid)
+        except Exception:
+            pass
+    if not target:
+        await message.reply("ユーザーが見つかりません。メンションまたはユーザーIDを指定してください。", mention_author=False)
+        return
+
+    product = parts[2]
+
+    try:
+        rating_num = int(parts[3])
+        if not 1 <= rating_num <= 5:
+            raise ValueError
+    except ValueError:
+        await message.reply("評価は1〜5の数字で入力してください。", mention_author=False)
+        return
+
+    try:
+        quantity_num = int(parts[4])
+        if quantity_num < 1:
+            raise ValueError
+    except ValueError:
+        await message.reply("個数は1以上の数字で入力してください。", mention_author=False)
+        return
+
+    comment = parts[5] if len(parts) > 5 else "なし"
+
+    output_channel = await _send_jisseki_embed(
+        message.guild, target, product, rating_num, quantity_num, comment
+    )
+    if not output_channel:
+        await message.reply("実績送信チャンネルが設定されていません。先に `/jissekipanel` を実行してください。", mention_author=False)
+        return
+
+    await message.reply(f"✅ {target.mention} の実績を {output_channel.mention} に送信しました！", mention_author=False)
 
 
 @tree.command(name="jissekipanel", description="実績報告パネルを設置します（許可ユーザー専用）")
