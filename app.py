@@ -20,6 +20,7 @@ TICKET_CONFIG_FILE = "ticket_config.json"
 TICKET_DATA_FILE = "ticket_data.json"
 BAN_CONFIG_FILE = "ban_config.json"
 TEMP_BANS_FILE = "temp_bans.json"
+JISSEKI_CONFIG_FILE = "jisseki_config.json"
 
 PAYPAY_REGEX = re.compile(r'https?://pay\.paypay\.ne\.jp/\S+')
 
@@ -159,6 +160,24 @@ def save_temp_bans(data: dict):
         print(f"temp_bans.json の保存に失敗: {e}")
 
 
+def load_jisseki_config() -> dict:
+    try:
+        if os.path.exists(JISSEKI_CONFIG_FILE):
+            with open(JISSEKI_CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"jisseki_config.json の読み込みに失敗: {e}")
+    return {}
+
+
+def save_jisseki_config(data: dict):
+    try:
+        with open(JISSEKI_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"jisseki_config.json の保存に失敗: {e}")
+
+
 def parse_duration(duration_str: str) -> timedelta | None:
     matches = re.findall(r'(\d+)([smhdw])', duration_str.lower())
     if not matches:
@@ -190,6 +209,7 @@ ticket_config = load_ticket_config()
 ticket_data = load_ticket_data()
 ban_config = load_ban_config()
 temp_bans = load_temp_bans()
+jisseki_config = load_jisseki_config()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -1359,6 +1379,110 @@ class BanPanel(discord.ui.View):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+# ── 実績パネル ───────────────────────────────────────────────
+
+class JissekiModal(discord.ui.Modal, title="実績を報告する"):
+    product = discord.ui.TextInput(
+        label="🛍️ 商品名",
+        placeholder="商品名を入力してください"
+    )
+    rating = discord.ui.TextInput(
+        label="⭐ 評価 (1〜5)",
+        placeholder="1〜5の数字で入力してください",
+        max_length=1
+    )
+    comment = discord.ui.TextInput(
+        label="📋 コメント",
+        style=discord.TextStyle.paragraph,
+        placeholder="コメントを入力してください",
+        required=False
+    )
+    quantity = discord.ui.TextInput(
+        label="📦 個数",
+        placeholder="例: 1個",
+        default="1個",
+        required=False
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            rating_num = int(self.rating.value.strip())
+            if not 1 <= rating_num <= 5:
+                raise ValueError
+        except ValueError:
+            await interaction.followup.send("評価は1〜5の数字で入力してください。", ephemeral=True)
+            return
+
+        guild_key = str(interaction.guild_id)
+        cfg = jisseki_config.get(guild_key, {})
+        output_channel_id = cfg.get("output_channel_id")
+        if not output_channel_id:
+            await interaction.followup.send("送信先チャンネルが設定されていません。管理者に連絡してください。", ephemeral=True)
+            return
+
+        output_channel = interaction.guild.get_channel(output_channel_id)
+        if not output_channel:
+            await interaction.followup.send("送信先チャンネルが見つかりません。", ephemeral=True)
+            return
+
+        stars = "★" * rating_num + "☆" * (5 - rating_num)
+
+        embed = discord.Embed(title="📦 実績報告", color=0x2b2d31)
+        embed.add_field(name="👤 記入者", value=interaction.user.mention, inline=False)
+        embed.add_field(name="🛍️ 商品名", value=self.product.value, inline=False)
+        embed.add_field(name="⭐ 評価", value=f"{stars} ({rating_num})", inline=False)
+        embed.add_field(name="📋 コメント", value=self.comment.value or "なし", inline=False)
+        embed.add_field(name="📦 個数", value=self.quantity.value or "1個", inline=False)
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.set_footer(text=client.user.name, icon_url=client.user.display_avatar.url)
+
+        await output_channel.send(embed=embed)
+        await interaction.followup.send(f"✅ 実績を {output_channel.mention} に送信しました！", ephemeral=True)
+
+
+class JissekiPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="実績を報告する", style=discord.ButtonStyle.success, emoji="📦", custom_id="jisseki:report")
+    async def report(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(JissekiModal())
+
+
+@tree.command(name="jissekipanel", description="実績報告パネルを設置します（許可ユーザー専用）")
+@app_commands.describe(
+    channel="実績を送信するチャンネル",
+    title="パネルのタイトル",
+    description="パネルの説明文"
+)
+async def jissekipanel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    title: str = "実績報告パネル",
+    description: str = "ボタンを押して実績を報告してください。"
+):
+    if not is_allowed(interaction):
+        await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+        return
+
+    guild_key = str(interaction.guild_id)
+    if guild_key not in jisseki_config:
+        jisseki_config[guild_key] = {}
+    jisseki_config[guild_key]["output_channel_id"] = channel.id
+    save_jisseki_config(jisseki_config)
+
+    embed = discord.Embed(
+        title=f"📦 {title}",
+        description=description,
+        color=0x2b2d31
+    )
+    embed.set_footer(text="ボタンを押して実績を報告してください")
+    await interaction.response.send_message(f"✅ パネルを設置しました。実績は {channel.mention} に送信されます。", ephemeral=True)
+    await interaction.channel.send(embed=embed, view=JissekiPanel())
+
+
 @tree.command(name="ban", description="BAN管理パネルを表示します（許可ユーザー専用）")
 async def ban_cmd(interaction: discord.Interaction):
     if not is_allowed(interaction):
@@ -1384,6 +1508,7 @@ async def on_ready():
     client.add_view(ManagementPanel())
     client.add_view(TicketPanel())
     client.add_view(TicketControlView())
+    client.add_view(JissekiPanel())
     if not update_status.is_running():
         update_status.start()
     if not check_temp_bans.is_running():
