@@ -1962,6 +1962,281 @@ async def lottery_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=LotteryManageView(), ephemeral=True)
 
 
+# ── Embed送信システム ─────────────────────────────────────────
+
+_embed_builder: dict = {}
+
+def _get_embed_state(guild_id: int, user_id: int) -> dict:
+    key = f"{guild_id}_{user_id}"
+    if key not in _embed_builder:
+        _embed_builder[key] = {
+            "title": None, "description": None, "color": 0x5865F2,
+            "footer": None, "author": None, "thumbnail_url": None,
+            "image_url": None, "fields": [], "target_channel_id": None,
+        }
+    return _embed_builder[key]
+
+def _reset_embed_state(guild_id: int, user_id: int):
+    _embed_builder.pop(f"{guild_id}_{user_id}", None)
+
+def _parse_embed_color(s: str) -> int:
+    s = s.strip().lstrip("#")
+    try:
+        val = int(s, 16)
+        if 0 <= val <= 0xFFFFFF:
+            return val
+    except ValueError:
+        pass
+    named = {
+        "red": 0xED4245, "blue": 0x3498DB, "green": 0x57F287,
+        "yellow": 0xFEE75C, "purple": 0x9B59B6, "orange": 0xE67E22,
+        "pink": 0xFF69B4, "white": 0xFFFFFF, "black": 0x000001,
+        "blurple": 0x5865F2, "gold": 0xFFD700, "teal": 0x1ABC9C,
+        "fuchsia": 0xEB459E, "gray": 0x95A5A6, "cyan": 0x00BCD4,
+    }
+    return named.get(s.lower(), 0x5865F2)
+
+def _build_embed_from_state(state: dict) -> discord.Embed:
+    embed = discord.Embed(
+        title=state.get("title") or None,
+        description=state.get("description") or None,
+        color=state.get("color", 0x5865F2)
+    )
+    if state.get("author"):
+        embed.set_author(name=state["author"])
+    if state.get("footer"):
+        embed.set_footer(text=state["footer"])
+    if state.get("thumbnail_url"):
+        embed.set_thumbnail(url=state["thumbnail_url"])
+    if state.get("image_url"):
+        embed.set_image(url=state["image_url"])
+    for field in state.get("fields", []):
+        embed.add_field(name=field["name"], value=field["value"], inline=field["inline"])
+    return embed
+
+class _EmbedChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(
+            placeholder="📢 送信先チャンネルを選択...",
+            channel_types=[discord.ChannelType.text], row=0
+        )
+        self.guild_id = guild_id
+        self.user_id = user_id
+
+    async def callback(self, interaction: discord.Interaction):
+        state = _get_embed_state(self.guild_id, self.user_id)
+        state["target_channel_id"] = self.values[0].id
+        await interaction.response.send_message(f"✅ 送信先を {self.values[0].mention} に設定しました。", ephemeral=True)
+
+class EmbedMainModal(discord.ui.Modal, title="Embed 基本設定"):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+        self.user_id = user_id
+        state = _get_embed_state(guild_id, user_id)
+        self.e_title = discord.ui.TextInput(label="タイトル", placeholder="タイトルを入力（省略可）", default=state.get("title") or "", required=False)
+        self.e_description = discord.ui.TextInput(label="説明文", style=discord.TextStyle.paragraph, placeholder="説明文を入力（省略可）", default=state.get("description") or "", required=False)
+        self.e_color = discord.ui.TextInput(label="カラー (#hex / 色名)", placeholder="例: #FF0000 / red / gold / blurple", default=f"#{state.get('color', 0x5865F2):06X}", required=False)
+        self.e_author = discord.ui.TextInput(label="作者名", placeholder="作者名を入力（省略可）", default=state.get("author") or "", required=False)
+        self.e_footer = discord.ui.TextInput(label="フッター", placeholder="フッターテキスト（省略可）", default=state.get("footer") or "", required=False)
+        self.add_item(self.e_title)
+        self.add_item(self.e_description)
+        self.add_item(self.e_color)
+        self.add_item(self.e_author)
+        self.add_item(self.e_footer)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        state = _get_embed_state(self.guild_id, self.user_id)
+        state["title"] = self.e_title.value.strip() or None
+        state["description"] = self.e_description.value.strip() or None
+        state["color"] = _parse_embed_color(self.e_color.value) if self.e_color.value.strip() else 0x5865F2
+        state["author"] = self.e_author.value.strip() or None
+        state["footer"] = self.e_footer.value.strip() or None
+        await interaction.response.send_message("✅ 基本設定を保存しました。プレビューで確認できます。", ephemeral=True)
+
+class EmbedFieldModal(discord.ui.Modal, title="フィールドを追加"):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.f_name = discord.ui.TextInput(label="フィールド名", placeholder="フィールド名を入力")
+        self.f_value = discord.ui.TextInput(label="フィールド内容", style=discord.TextStyle.paragraph, placeholder="フィールドの内容を入力")
+        self.f_inline = discord.ui.TextInput(label="横並び表示 (yes / no)", placeholder="yes または no", default="no", max_length=3)
+        self.add_item(self.f_name)
+        self.add_item(self.f_value)
+        self.add_item(self.f_inline)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        state = _get_embed_state(self.guild_id, self.user_id)
+        if len(state["fields"]) >= 25:
+            await interaction.response.send_message("フィールドは最大25個までです。", ephemeral=True)
+            return
+        inline = self.f_inline.value.strip().lower() in ("yes", "y", "true", "1")
+        state["fields"].append({"name": self.f_name.value, "value": self.f_value.value, "inline": inline})
+        await interaction.response.send_message(f"✅ フィールド「{self.f_name.value}」を追加しました。（合計: {len(state['fields'])}個）", ephemeral=True)
+
+class EmbedImageModal(discord.ui.Modal, title="画像設定"):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+        self.user_id = user_id
+        state = _get_embed_state(guild_id, user_id)
+        self.thumbnail = discord.ui.TextInput(label="サムネイルURL", placeholder="https://...", default=state.get("thumbnail_url") or "", required=False)
+        self.image = discord.ui.TextInput(label="メイン画像URL", placeholder="https://...", default=state.get("image_url") or "", required=False)
+        self.add_item(self.thumbnail)
+        self.add_item(self.image)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        state = _get_embed_state(self.guild_id, self.user_id)
+        state["thumbnail_url"] = self.thumbnail.value.strip() or None
+        state["image_url"] = self.image.value.strip() or None
+        await interaction.response.send_message("✅ 画像設定を保存しました。", ephemeral=True)
+
+class EmbedEditLoadModal(discord.ui.Modal, title="既存Embedを読み込む"):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.message_id = discord.ui.TextInput(label="メッセージID", placeholder="編集するBotのメッセージIDを入力")
+        self.channel_id_input = discord.ui.TextInput(label="チャンネルID（省略で現在のチャンネル）", placeholder="省略可能", required=False)
+        self.add_item(self.message_id)
+        self.add_item(self.channel_id_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        ch_val = self.channel_id_input.value.strip()
+        ch_id = int(ch_val) if ch_val else interaction.channel_id
+        channel = interaction.guild.get_channel(ch_id)
+        if not channel:
+            await interaction.followup.send("チャンネルが見つかりません。", ephemeral=True)
+            return
+        try:
+            msg = await channel.fetch_message(int(self.message_id.value.strip()))
+        except Exception:
+            await interaction.followup.send("メッセージが見つかりません。", ephemeral=True)
+            return
+        if not msg.embeds:
+            await interaction.followup.send("そのメッセージにEmbedはありません。", ephemeral=True)
+            return
+        emb = msg.embeds[0]
+        state = _get_embed_state(self.guild_id, self.user_id)
+        state["title"] = emb.title
+        state["description"] = emb.description
+        state["color"] = emb.color.value if emb.color else 0x5865F2
+        state["footer"] = emb.footer.text if emb.footer else None
+        state["author"] = emb.author.name if emb.author else None
+        state["thumbnail_url"] = emb.thumbnail.url if emb.thumbnail else None
+        state["image_url"] = emb.image.url if emb.image else None
+        state["fields"] = [{"name": f.name, "value": f.value, "inline": f.inline} for f in emb.fields]
+        state["_edit_message_id"] = str(msg.id)
+        state["_edit_channel_id"] = str(channel.id)
+        await interaction.followup.send("✅ Embedを読み込みました。編集して「🚀 送信」で上書き更新されます。", ephemeral=True)
+
+class EmbedPanel(discord.ui.View):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.add_item(_EmbedChannelSelect(guild_id, user_id))
+
+    @discord.ui.button(label="📝 基本設定", style=discord.ButtonStyle.primary, row=1)
+    async def set_main(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EmbedMainModal(self.guild_id, self.user_id))
+
+    @discord.ui.button(label="📋 フィールド追加", style=discord.ButtonStyle.secondary, row=1)
+    async def add_field(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EmbedFieldModal(self.guild_id, self.user_id))
+
+    @discord.ui.button(label="🖼️ 画像設定", style=discord.ButtonStyle.secondary, row=1)
+    async def set_image(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EmbedImageModal(self.guild_id, self.user_id))
+
+    @discord.ui.button(label="✏️ 既存を編集", style=discord.ButtonStyle.secondary, row=1)
+    async def load_edit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EmbedEditLoadModal(self.guild_id, self.user_id))
+
+    @discord.ui.button(label="👁️ プレビュー", style=discord.ButtonStyle.secondary, row=2)
+    async def preview(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = _get_embed_state(self.guild_id, self.user_id)
+        try:
+            embed = _build_embed_from_state(state)
+        except Exception as e:
+            await interaction.response.send_message(f"プレビュー生成に失敗: {e}", ephemeral=True)
+            return
+        target_ch = state.get("target_channel_id")
+        edit_mode = "✏️ 編集モード" if state.get("_edit_message_id") else ""
+        info = f"送信先: {'<#' + str(target_ch) + '>' if target_ch else '未設定'} | フィールド: {len(state['fields'])}個 {edit_mode}"
+        await interaction.response.send_message(content=f"**👁️ プレビュー** | {info}", embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="🚀 送信", style=discord.ButtonStyle.success, row=2)
+    async def send_embed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = _get_embed_state(self.guild_id, self.user_id)
+        if state.get("_edit_message_id"):
+            channel = interaction.guild.get_channel(int(state["_edit_channel_id"]))
+            if not channel:
+                await interaction.response.send_message("編集対象チャンネルが見つかりません。", ephemeral=True)
+                return
+            try:
+                msg = await channel.fetch_message(int(state["_edit_message_id"]))
+                await msg.edit(embed=_build_embed_from_state(state))
+                _reset_embed_state(self.guild_id, self.user_id)
+                await interaction.response.send_message(f"✅ Embedを更新しました！ [ジャンプ]({msg.jump_url})", ephemeral=True)
+            except Exception as e:
+                await interaction.response.send_message(f"編集に失敗しました: {e}", ephemeral=True)
+            return
+        target_ch_id = state.get("target_channel_id")
+        if not target_ch_id:
+            await interaction.response.send_message("先に送信先チャンネルを選択してください。", ephemeral=True)
+            return
+        channel = interaction.guild.get_channel(target_ch_id)
+        if not channel:
+            await interaction.response.send_message("チャンネルが見つかりません。", ephemeral=True)
+            return
+        try:
+            await channel.send(embed=_build_embed_from_state(state))
+            _reset_embed_state(self.guild_id, self.user_id)
+            await interaction.response.send_message(f"✅ Embedを {channel.mention} に送信しました！", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"送信に失敗しました: {e}", ephemeral=True)
+
+    @discord.ui.button(label="🗑️ フィールド削除", style=discord.ButtonStyle.danger, row=2)
+    async def remove_field(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = _get_embed_state(self.guild_id, self.user_id)
+        if not state["fields"]:
+            await interaction.response.send_message("フィールドがありません。", ephemeral=True)
+            return
+        removed = state["fields"].pop()
+        await interaction.response.send_message(f"🗑️ 最後のフィールド「{removed['name']}」を削除しました。（残り: {len(state['fields'])}個）", ephemeral=True)
+
+    @discord.ui.button(label="♻️ リセット", style=discord.ButtonStyle.danger, row=2)
+    async def reset_embed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        _reset_embed_state(self.guild_id, self.user_id)
+        await interaction.response.send_message("♻️ Embedをリセットしました。", ephemeral=True)
+
+@tree.command(name="embed", description="カスタムEmbedを作成・送信します（許可ユーザー専用）")
+async def embed_cmd(interaction: discord.Interaction):
+    if not is_allowed(interaction):
+        await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+        return
+    state = _get_embed_state(interaction.guild_id, interaction.user.id)
+    target_ch = state.get("target_channel_id")
+    embed = discord.Embed(
+        title="🎨 Embedビルダー",
+        description=(
+            "下のボタンで各項目を設定し、最後に **🚀 送信** を押してください。\n"
+            "パネルを閉じても状態は保持されます（5分間）。"
+        ),
+        color=discord.Color.blurple()
+    )
+    embed.add_field(name="送信先", value=f"<#{target_ch}>" if target_ch else "未設定", inline=True)
+    embed.add_field(name="タイトル", value=state.get("title") or "未設定", inline=True)
+    embed.add_field(name="フィールド数", value=f"{len(state.get('fields', []))}個", inline=True)
+    if state.get("_edit_message_id"):
+        embed.add_field(name="モード", value="✏️ 既存Embed編集モード", inline=False)
+    embed.set_footer(text="📝 基本設定 → 📋 フィールド追加 → 👁️ プレビュー → 🚀 送信")
+    await interaction.response.send_message(embed=embed, view=EmbedPanel(interaction.guild_id, interaction.user.id), ephemeral=True)
+
+
 @client.event
 async def on_ready():
     await tree.sync()
