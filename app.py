@@ -774,7 +774,7 @@ class TicketCloseConfirmView(discord.ui.View):
             user = interaction.guild.get_member(int(data["user_id"]))
             if user:
                 await interaction.channel.set_permissions(user, view_channel=False)
-            await interaction.channel.edit(name=f"closed-{data['ticket_number']:04d}")
+            await interaction.channel.edit(name=f"🔒・closed-{data['ticket_number']:04d}")
             close_embed = discord.Embed(
                 title="🔒 チケットをクローズしました",
                 description=f"{interaction.user.mention} がチケットをクローズしました。\n10秒後にチャンネルを削除します。",
@@ -867,7 +867,7 @@ class TicketPanel(discord.ui.View):
         save_ticket_config(ticket_config)
 
         safe_name = re.sub(r'[^a-z0-9-]', '', interaction.user.name.lower())[:20] or "user"
-        channel_name = f"ticket-{ticket_num:04d}-{safe_name}"
+        channel_name = f"🎫・ticket-{ticket_num:04d}-{safe_name}"
 
         staff_role_id = cfg.get("staff_role_id")
         overwrites = {
