@@ -278,10 +278,6 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    if message.content.startswith('!v'):
-        await _handle_proxy_jisseki(message)
-        return
-
     links = PAYPAY_REGEX.findall(message.content)
     if not links:
         return
@@ -1475,62 +1471,33 @@ async def _send_jisseki_embed(
     return output_channel
 
 
-async def _handle_proxy_jisseki(message: discord.Message):
-    if message.author.id != OWNER_ID and message.author.id not in allowed_users:
-        await message.reply("このコマンドを実行する権限がありません。", mention_author=False)
+@tree.command(name="jisseki", description="代理で実績を送信します（許可ユーザー専用）")
+@app_commands.describe(
+    user="実績を送信するユーザー",
+    product="商品名",
+    rating="評価 (1〜5)",
+    quantity="個数",
+    comment="コメント（省略可）"
+)
+async def jisseki_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    product: str,
+    rating: app_commands.Range[int, 1, 5],
+    quantity: app_commands.Range[int, 1, None],
+    comment: str = "なし"
+):
+    if not is_allowed(interaction):
+        await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
         return
-
-    parts = message.content.split(None, 5)
-    usage = (
-        "使い方: `!v @ユーザー 商品名 評価(1〜5) 個数(数字) [コメント]`\n"
-        "例: `!v @username visa 5 1 VISA40万円分を購入しました！`"
-    )
-    if len(parts) < 5:
-        await message.reply(usage, mention_author=False)
-        return
-
-    # ユーザー解決
-    target: discord.Member | discord.User | None = None
-    if message.mentions:
-        target = message.mentions[0]
-    else:
-        try:
-            uid = int(parts[1].strip('<@!>'))
-            target = message.guild.get_member(uid) or await client.fetch_user(uid)
-        except Exception:
-            pass
-    if not target:
-        await message.reply("ユーザーが見つかりません。メンションまたはユーザーIDを指定してください。", mention_author=False)
-        return
-
-    product = parts[2]
-
-    try:
-        rating_num = int(parts[3])
-        if not 1 <= rating_num <= 5:
-            raise ValueError
-    except ValueError:
-        await message.reply("評価は1〜5の数字で入力してください。", mention_author=False)
-        return
-
-    try:
-        quantity_num = int(parts[4])
-        if quantity_num < 1:
-            raise ValueError
-    except ValueError:
-        await message.reply("個数は1以上の数字で入力してください。", mention_author=False)
-        return
-
-    comment = parts[5] if len(parts) > 5 else "なし"
-
+    await interaction.response.defer(ephemeral=True)
     output_channel = await _send_jisseki_embed(
-        message.guild, target, product, rating_num, quantity_num, comment
+        interaction.guild, user, product, rating, quantity, comment
     )
     if not output_channel:
-        await message.reply("実績送信チャンネルが設定されていません。先に `/jissekipanel` を実行してください。", mention_author=False)
+        await interaction.followup.send("実績送信チャンネルが設定されていません。先に `/jissekipanel` を実行してください。", ephemeral=True)
         return
-
-    await message.reply(f"✅ {target.mention} の実績を {output_channel.mention} に送信しました！", mention_author=False)
+    await interaction.followup.send(f"✅ {user.mention} の実績を {output_channel.mention} に送信しました！", ephemeral=True)
 
 
 @tree.command(name="jissekipanel", description="実績報告パネルを設置します（許可ユーザー専用）")
