@@ -1812,41 +1812,54 @@ class LotteryCreateModal(discord.ui.Modal, title="抽選を作成"):
         await interaction.followup.send("✅ 抽選を作成しました！", ephemeral=True)
 
 
-class LotteryDrawNowModal(discord.ui.Modal, title="今すぐ抽選を実行"):
-    message_id = discord.ui.TextInput(
-        label="抽選メッセージID",
-        placeholder="抽選パネルのメッセージIDを貼り付けてください"
-    )
+def _get_active_lotteries(guild_id: str) -> list[tuple[str, dict]]:
+    return [
+        (lid, d) for lid, d in lottery_data.items()
+        if d.get("guild_id") == guild_id and d["status"] == "active"
+    ]
 
-    async def on_submit(self, interaction: discord.Interaction):
+
+class LotteryDrawSelect(discord.ui.StringSelect):
+    def __init__(self, lotteries: list[tuple]):
+        options = [
+            discord.SelectOption(
+                label=d["title"][:100],
+                value=lid,
+                description=f"参加者: {len(d['participants'])}人 | 終了: {datetime.fromtimestamp(d['ends_at'], JST).strftime('%m/%d %H:%M')}"
+            )
+            for lid, d in lotteries[:25]
+        ]
+        super().__init__(placeholder="今すぐ抽選する抽選を選択...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        lottery_id = self.message_id.value.strip()
+        lottery_id = self.values[0]
         data = lottery_data.get(lottery_id)
-        if not data or data.get("guild_id") != str(interaction.guild_id):
-            await interaction.followup.send("抽選が見つかりません。メッセージIDを確認してください。", ephemeral=True)
-            return
-        if data["status"] != "active":
-            await interaction.followup.send("この抽選はすでに終了またはキャンセルされています。", ephemeral=True)
+        if not data or data["status"] != "active":
+            await interaction.followup.send("この抽選はすでに終了しています。", ephemeral=True)
             return
         await _do_draw(lottery_id)
         await interaction.followup.send("✅ 抽選を実行しました！", ephemeral=True)
 
 
-class LotteryCancelModal(discord.ui.Modal, title="抽選をキャンセル"):
-    message_id = discord.ui.TextInput(
-        label="抽選メッセージID",
-        placeholder="抽選パネルのメッセージIDを貼り付けてください"
-    )
+class LotteryCancelSelect(discord.ui.StringSelect):
+    def __init__(self, lotteries: list[tuple]):
+        options = [
+            discord.SelectOption(
+                label=d["title"][:100],
+                value=lid,
+                description=f"参加者: {len(d['participants'])}人 | 終了: {datetime.fromtimestamp(d['ends_at'], JST).strftime('%m/%d %H:%M')}"
+            )
+            for lid, d in lotteries[:25]
+        ]
+        super().__init__(placeholder="キャンセルする抽選を選択...", options=options)
 
-    async def on_submit(self, interaction: discord.Interaction):
+    async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        lottery_id = self.message_id.value.strip()
+        lottery_id = self.values[0]
         data = lottery_data.get(lottery_id)
-        if not data or data.get("guild_id") != str(interaction.guild_id):
-            await interaction.followup.send("抽選が見つかりません。メッセージIDを確認してください。", ephemeral=True)
-            return
-        if data["status"] != "active":
-            await interaction.followup.send("この抽選はすでに終了またはキャンセルされています。", ephemeral=True)
+        if not data or data["status"] != "active":
+            await interaction.followup.send("この抽選はすでに終了しています。", ephemeral=True)
             return
         data["status"] = "cancelled"
         lottery_data[lottery_id] = data
@@ -1858,7 +1871,13 @@ class LotteryCancelModal(discord.ui.Modal, title="抽選をキャンセル"):
                 await msg.edit(embed=build_lottery_embed(data), view=None)
             except Exception:
                 pass
-        await interaction.followup.send("✅ 抽選をキャンセルしました。", ephemeral=True)
+        await interaction.followup.send(f"✅ **{data['title']}** をキャンセルしました。", ephemeral=True)
+
+
+class LotterySelectView(discord.ui.View):
+    def __init__(self, select: discord.ui.Select):
+        super().__init__(timeout=60)
+        self.add_item(select)
 
 
 class LotteryManageView(discord.ui.View):
@@ -1877,14 +1896,30 @@ class LotteryManageView(discord.ui.View):
         if not is_allowed(interaction):
             await interaction.response.send_message("権限がありません。", ephemeral=True)
             return
-        await interaction.response.send_modal(LotteryDrawNowModal())
+        lotteries = _get_active_lotteries(str(interaction.guild_id))
+        if not lotteries:
+            await interaction.response.send_message("現在アクティブな抽選はありません。", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "抽選を選択してください：",
+            view=LotterySelectView(LotteryDrawSelect(lotteries)),
+            ephemeral=True
+        )
 
     @discord.ui.button(label="抽選をキャンセル", style=discord.ButtonStyle.danger, emoji="❌", row=0)
     async def cancel_lottery(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_allowed(interaction):
             await interaction.response.send_message("権限がありません。", ephemeral=True)
             return
-        await interaction.response.send_modal(LotteryCancelModal())
+        lotteries = _get_active_lotteries(str(interaction.guild_id))
+        if not lotteries:
+            await interaction.response.send_message("現在アクティブな抽選はありません。", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "キャンセルする抽選を選択してください：",
+            view=LotterySelectView(LotteryCancelSelect(lotteries)),
+            ephemeral=True
+        )
 
     @discord.ui.button(label="抽選一覧", style=discord.ButtonStyle.secondary, emoji="📋", row=1)
     async def list_lotteries(self, interaction: discord.Interaction, button: discord.ui.Button):
