@@ -8,6 +8,7 @@ import asyncio
 import time
 import re
 import io
+import random
 from datetime import timedelta, timezone, datetime
 
 
@@ -21,6 +22,7 @@ TICKET_DATA_FILE = "ticket_data.json"
 BAN_CONFIG_FILE = "ban_config.json"
 TEMP_BANS_FILE = "temp_bans.json"
 JISSEKI_CONFIG_FILE = "jisseki_config.json"
+LOTTERY_DATA_FILE = "lottery_data.json"
 
 PAYPAY_REGEX = re.compile(r'https?://pay\.paypay\.ne\.jp/\S+')
 
@@ -178,6 +180,24 @@ def save_jisseki_config(data: dict):
         print(f"jisseki_config.json の保存に失敗: {e}")
 
 
+def load_lottery_data() -> dict:
+    try:
+        if os.path.exists(LOTTERY_DATA_FILE):
+            with open(LOTTERY_DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"lottery_data.json の読み込みに失敗: {e}")
+    return {}
+
+
+def save_lottery_data(data: dict):
+    try:
+        with open(LOTTERY_DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"lottery_data.json の保存に失敗: {e}")
+
+
 def parse_duration(duration_str: str) -> timedelta | None:
     matches = re.findall(r'(\d+)([smhdw])', duration_str.lower())
     if not matches:
@@ -210,6 +230,7 @@ ticket_data = load_ticket_data()
 ban_config = load_ban_config()
 temp_bans = load_temp_bans()
 jisseki_config = load_jisseki_config()
+lottery_data = load_lottery_data()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -1551,6 +1572,361 @@ async def ban_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=BanPanel(), ephemeral=True)
 
 
+# ── 抽選システム ─────────────────────────────────────────────
+
+def build_lottery_embed(data: dict) -> discord.Embed:
+    status = data["status"]
+    if status == "active":
+        color = discord.Color.blurple()
+        title_prefix = "🎉"
+    elif status == "ended":
+        color = discord.Color.gold()
+        title_prefix = "🔒"
+    else:
+        color = discord.Color.dark_gray()
+        title_prefix = "❌"
+
+    embed = discord.Embed(
+        title=f"{title_prefix} {data['title']}",
+        description=data.get("description") or None,
+        color=color
+    )
+    embed.add_field(name="🎁 賞品", value=data["prize"], inline=True)
+    embed.add_field(name="🏆 当選人数", value=f"{data['winner_count']}人", inline=True)
+    embed.add_field(name="👥 参加者数", value=f"{len(data['participants'])}人", inline=True)
+
+    if status == "active":
+        embed.add_field(name="⏰ 終了", value=f"<t:{int(data['ends_at'])}:R>", inline=False)
+    elif status == "ended" and data.get("winners"):
+        winner_mentions = " ".join(f"<@{w}>" for w in data["winners"])
+        embed.add_field(name="🏆 当選者", value=winner_mentions, inline=False)
+    elif status == "cancelled":
+        embed.add_field(name="状態", value="❌ キャンセル済み", inline=False)
+
+    embed.add_field(name="🎙️ 主催", value=f"<@{data['host_id']}>", inline=False)
+    if status == "active":
+        embed.set_footer(text="🎉 ボタンを押して応募 | 再度押すと取り消し")
+    else:
+        embed.set_footer(text="抽選終了")
+    return embed
+
+
+class LotteryEntryView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🎉 応募する", style=discord.ButtonStyle.success, custom_id="lottery:enter")
+    async def enter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        lottery_id = str(interaction.message.id)
+        data = lottery_data.get(lottery_id)
+        if not data:
+            await interaction.response.send_message("この抽選は見つかりません。", ephemeral=True)
+            return
+        if data["status"] != "active":
+            await interaction.response.send_message("この抽選はすでに終了しています。", ephemeral=True)
+            return
+        if datetime.now(timezone.utc).timestamp() > data["ends_at"]:
+            await interaction.response.send_message("この抽選の応募期間は終了しています。", ephemeral=True)
+            return
+
+        user_id = str(interaction.user.id)
+        if user_id in data["participants"]:
+            data["participants"].remove(user_id)
+            lottery_data[lottery_id] = data
+            save_lottery_data(lottery_data)
+            await interaction.response.edit_message(embed=build_lottery_embed(data))
+            await interaction.followup.send("🚫 抽選への応募を取り消しました。", ephemeral=True)
+        else:
+            data["participants"].append(user_id)
+            lottery_data[lottery_id] = data
+            save_lottery_data(lottery_data)
+            await interaction.response.edit_message(embed=build_lottery_embed(data))
+            await interaction.followup.send("✅ 抽選に応募しました！\n再度ボタンを押すと取り消せます。", ephemeral=True)
+
+
+class LotteryResultView(discord.ui.View):
+    def __init__(self, lottery_id: str):
+        super().__init__(timeout=None)
+        self.lottery_id = lottery_id
+
+    @discord.ui.button(label="🔄 再抽選", style=discord.ButtonStyle.primary)
+    async def reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("権限がありません。", ephemeral=True)
+            return
+        data = lottery_data.get(self.lottery_id)
+        if not data:
+            await interaction.response.send_message("抽選データが見つかりません。", ephemeral=True)
+            return
+        participants = data["participants"]
+        if not participants:
+            await interaction.response.send_message("参加者がいません。", ephemeral=True)
+            return
+        winner_count = min(data["winner_count"], len(participants))
+        new_winners = random.sample(participants, winner_count)
+        data["winners"] = new_winners
+        lottery_data[self.lottery_id] = data
+        save_lottery_data(lottery_data)
+        winner_mentions = " ".join(f"<@{w}>" for w in new_winners)
+        embed = discord.Embed(
+            title="🔄 再抽選結果",
+            color=discord.Color.gold(),
+            timestamp=datetime.now(JST)
+        )
+        embed.add_field(name="📌 抽選", value=data["title"], inline=False)
+        embed.add_field(name="🎁 賞品", value=data["prize"], inline=False)
+        embed.add_field(name="🏆 新当選者", value=winner_mentions, inline=False)
+        await interaction.response.send_message(content=winner_mentions, embed=embed)
+
+    @discord.ui.button(label="👥 参加者一覧", style=discord.ButtonStyle.secondary)
+    async def participants_list(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("権限がありません。", ephemeral=True)
+            return
+        data = lottery_data.get(self.lottery_id)
+        if not data:
+            await interaction.response.send_message("抽選データが見つかりません。", ephemeral=True)
+            return
+        participants = data["participants"]
+        if not participants:
+            await interaction.response.send_message("参加者がいません。", ephemeral=True)
+            return
+        lines = [f"{i + 1}. <@{uid}>" for i, uid in enumerate(participants)]
+        text = "\n".join(lines)
+        if len(text) > 3900:
+            text = text[:3900] + "\n..."
+        embed = discord.Embed(title="👥 参加者一覧", description=text, color=discord.Color.blurple())
+        embed.set_footer(text=f"合計: {len(participants)}人")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+async def _do_draw(lottery_id: str):
+    data = lottery_data.get(lottery_id)
+    if not data or data["status"] != "active":
+        return
+
+    participants = data["participants"]
+    winner_count = min(data["winner_count"], len(participants))
+    winners = random.sample(participants, winner_count) if participants else []
+
+    data["winners"] = winners
+    data["status"] = "ended"
+    lottery_data[lottery_id] = data
+    save_lottery_data(lottery_data)
+
+    guild = client.get_guild(int(data["guild_id"]))
+    if not guild:
+        return
+    channel = guild.get_channel(int(data["channel_id"]))
+    if not channel:
+        return
+
+    try:
+        message = await channel.fetch_message(int(data["message_id"]))
+        await message.edit(embed=build_lottery_embed(data), view=None)
+    except Exception:
+        pass
+
+    if winners:
+        winner_mentions = " ".join(f"<@{w}>" for w in winners)
+        result_embed = discord.Embed(
+            title="🎉 抽選結果発表！",
+            color=discord.Color.gold(),
+            timestamp=datetime.now(JST)
+        )
+        result_embed.add_field(name="📌 抽選タイトル", value=data["title"], inline=False)
+        result_embed.add_field(name="🎁 賞品", value=data["prize"], inline=False)
+        result_embed.add_field(name="🏆 当選者", value=winner_mentions, inline=False)
+        result_embed.add_field(name="👥 参加者数", value=f"{len(participants)}人", inline=True)
+        result_embed.set_footer(text="おめでとうございます！")
+        await channel.send(content=winner_mentions, embed=result_embed, view=LotteryResultView(lottery_id))
+    else:
+        result_embed = discord.Embed(
+            title="抽選終了",
+            description=f"**{data['title']}** が終了しましたが、参加者がいませんでした。",
+            color=discord.Color.gray()
+        )
+        await channel.send(embed=result_embed)
+
+
+@tasks.loop(seconds=30)
+async def check_lotteries():
+    now = datetime.now(timezone.utc).timestamp()
+    to_draw = [
+        lid for lid, d in list(lottery_data.items())
+        if d["status"] == "active" and d["ends_at"] <= now
+    ]
+    for lottery_id in to_draw:
+        await _do_draw(lottery_id)
+
+@check_lotteries.before_loop
+async def before_check_lotteries():
+    await client.wait_until_ready()
+
+
+class LotteryCreateModal(discord.ui.Modal, title="抽選を作成"):
+    lot_title = discord.ui.TextInput(label="🎉 抽選タイトル", placeholder="例: Nitroプレゼント抽選")
+    description = discord.ui.TextInput(
+        label="📝 説明",
+        style=discord.TextStyle.paragraph,
+        placeholder="抽選の詳細を入力（省略可）",
+        required=False
+    )
+    prize = discord.ui.TextInput(label="🎁 賞品", placeholder="例: Discord Nitro 1ヶ月")
+    winner_count = discord.ui.TextInput(label="🏆 当選人数 (1〜20)", placeholder="例: 1", default="1", max_length=2)
+    duration = discord.ui.TextInput(label="⏰ 開催時間", placeholder="例: 30m / 1h / 1d / 7d")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            wcount = int(self.winner_count.value.strip())
+            if not 1 <= wcount <= 20:
+                raise ValueError
+        except ValueError:
+            await interaction.followup.send("当選人数は1〜20の整数で入力してください。", ephemeral=True)
+            return
+        dur = parse_duration(self.duration.value.strip())
+        if dur is None:
+            await interaction.followup.send("無効な時間指定です。例: `30m` `1h` `1d`", ephemeral=True)
+            return
+        ends_at = (datetime.now(timezone.utc) + dur).timestamp()
+        data_obj = {
+            "guild_id": str(interaction.guild_id),
+            "channel_id": str(interaction.channel_id),
+            "message_id": None,
+            "title": self.lot_title.value,
+            "description": self.description.value or "",
+            "prize": self.prize.value,
+            "winner_count": wcount,
+            "ends_at": ends_at,
+            "host_id": str(interaction.user.id),
+            "participants": [],
+            "winners": [],
+            "status": "active",
+            "created_at": datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
+        }
+        msg = await interaction.channel.send(embed=build_lottery_embed(data_obj), view=LotteryEntryView())
+        data_obj["message_id"] = str(msg.id)
+        lottery_data[str(msg.id)] = data_obj
+        save_lottery_data(lottery_data)
+        await interaction.followup.send("✅ 抽選を作成しました！", ephemeral=True)
+
+
+class LotteryDrawNowModal(discord.ui.Modal, title="今すぐ抽選を実行"):
+    message_id = discord.ui.TextInput(
+        label="抽選メッセージID",
+        placeholder="抽選パネルのメッセージIDを貼り付けてください"
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        lottery_id = self.message_id.value.strip()
+        data = lottery_data.get(lottery_id)
+        if not data or data.get("guild_id") != str(interaction.guild_id):
+            await interaction.followup.send("抽選が見つかりません。メッセージIDを確認してください。", ephemeral=True)
+            return
+        if data["status"] != "active":
+            await interaction.followup.send("この抽選はすでに終了またはキャンセルされています。", ephemeral=True)
+            return
+        await _do_draw(lottery_id)
+        await interaction.followup.send("✅ 抽選を実行しました！", ephemeral=True)
+
+
+class LotteryCancelModal(discord.ui.Modal, title="抽選をキャンセル"):
+    message_id = discord.ui.TextInput(
+        label="抽選メッセージID",
+        placeholder="抽選パネルのメッセージIDを貼り付けてください"
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        lottery_id = self.message_id.value.strip()
+        data = lottery_data.get(lottery_id)
+        if not data or data.get("guild_id") != str(interaction.guild_id):
+            await interaction.followup.send("抽選が見つかりません。メッセージIDを確認してください。", ephemeral=True)
+            return
+        if data["status"] != "active":
+            await interaction.followup.send("この抽選はすでに終了またはキャンセルされています。", ephemeral=True)
+            return
+        data["status"] = "cancelled"
+        lottery_data[lottery_id] = data
+        save_lottery_data(lottery_data)
+        channel = interaction.guild.get_channel(int(data["channel_id"]))
+        if channel:
+            try:
+                msg = await channel.fetch_message(int(data["message_id"]))
+                await msg.edit(embed=build_lottery_embed(data), view=None)
+            except Exception:
+                pass
+        await interaction.followup.send("✅ 抽選をキャンセルしました。", ephemeral=True)
+
+
+class LotteryManageView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="抽選を作成", style=discord.ButtonStyle.success, emoji="🎉", row=0)
+    async def create(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("権限がありません。", ephemeral=True)
+            return
+        await interaction.response.send_modal(LotteryCreateModal())
+
+    @discord.ui.button(label="今すぐ抽選", style=discord.ButtonStyle.primary, emoji="🎲", row=0)
+    async def draw_now(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("権限がありません。", ephemeral=True)
+            return
+        await interaction.response.send_modal(LotteryDrawNowModal())
+
+    @discord.ui.button(label="抽選をキャンセル", style=discord.ButtonStyle.danger, emoji="❌", row=0)
+    async def cancel_lottery(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("権限がありません。", ephemeral=True)
+            return
+        await interaction.response.send_modal(LotteryCancelModal())
+
+    @discord.ui.button(label="抽選一覧", style=discord.ButtonStyle.secondary, emoji="📋", row=1)
+    async def list_lotteries(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("権限がありません。", ephemeral=True)
+            return
+        guild_key = str(interaction.guild_id)
+        active = [d for d in lottery_data.values() if d.get("guild_id") == guild_key and d["status"] == "active"]
+        if not active:
+            await interaction.response.send_message("現在アクティブな抽選はありません。", ephemeral=True)
+            return
+        embed = discord.Embed(title="📋 アクティブな抽選一覧", color=discord.Color.blurple())
+        for d in active[:10]:
+            embed.add_field(
+                name=f"🎉 {d['title']}",
+                value=(
+                    f"賞品: {d['prize']}\n"
+                    f"当選人数: {d['winner_count']}人 | 参加者: {len(d['participants'])}人\n"
+                    f"終了: <t:{int(d['ends_at'])}:R>\n"
+                    f"[メッセージへ移動](https://discord.com/channels/{d['guild_id']}/{d['channel_id']}/{d['message_id']})"
+                ),
+                inline=False
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="lottery", description="抽選管理パネルを表示します（許可ユーザー専用）")
+async def lottery_cmd(interaction: discord.Interaction):
+    if not is_allowed(interaction):
+        await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+        return
+    guild_key = str(interaction.guild_id)
+    active_count = sum(1 for d in lottery_data.values() if d.get("guild_id") == guild_key and d["status"] == "active")
+    embed = discord.Embed(
+        title="🎉 抽選管理パネル",
+        description="ボタンを押して抽選を作成・管理できます。",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(name="アクティブな抽選", value=f"{active_count}件", inline=True)
+    await interaction.response.send_message(embed=embed, view=LotteryManageView(), ephemeral=True)
+
+
 @client.event
 async def on_ready():
     await tree.sync()
@@ -1558,10 +1934,13 @@ async def on_ready():
     client.add_view(TicketPanel())
     client.add_view(TicketControlView())
     client.add_view(JissekiPanel())
+    client.add_view(LotteryEntryView())
     if not update_status.is_running():
         update_status.start()
     if not check_temp_bans.is_running():
         check_temp_bans.start()
+    if not check_lotteries.is_running():
+        check_lotteries.start()
     print(f"ログイン成功: {client.user} (ID: {client.user.id})")
     print("スラッシュコマンドを同期しました")
 
