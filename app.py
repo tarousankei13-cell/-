@@ -18,6 +18,8 @@ PAYPAY_CHANNEL_FILE = "paypay_channel.json"
 PAYPAY_LOG_FILE = "paypay_log.json"
 TICKET_CONFIG_FILE = "ticket_config.json"
 TICKET_DATA_FILE = "ticket_data.json"
+BAN_CONFIG_FILE = "ban_config.json"
+TEMP_BANS_FILE = "temp_bans.json"
 
 PAYPAY_REGEX = re.compile(r'https?://pay\.paypay\.ne\.jp/\S+')
 
@@ -121,6 +123,53 @@ def save_ticket_data(data: dict):
         print(f"ticket_data.json の保存に失敗: {e}")
 
 
+def load_ban_config() -> dict:
+    try:
+        if os.path.exists(BAN_CONFIG_FILE):
+            with open(BAN_CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"ban_config.json の読み込みに失敗: {e}")
+    return {}
+
+
+def save_ban_config(data: dict):
+    try:
+        with open(BAN_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"ban_config.json の保存に失敗: {e}")
+
+
+def load_temp_bans() -> dict:
+    try:
+        if os.path.exists(TEMP_BANS_FILE):
+            with open(TEMP_BANS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"temp_bans.json の読み込みに失敗: {e}")
+    return {}
+
+
+def save_temp_bans(data: dict):
+    try:
+        with open(TEMP_BANS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"temp_bans.json の保存に失敗: {e}")
+
+
+def parse_duration(duration_str: str) -> timedelta | None:
+    matches = re.findall(r'(\d+)([smhdw])', duration_str.lower())
+    if not matches:
+        return None
+    unit_map = {'s': 'seconds', 'm': 'minutes', 'h': 'hours', 'd': 'days', 'w': 'weeks'}
+    total = timedelta()
+    for amount, unit in matches:
+        total += timedelta(**{unit_map[unit]: int(amount)})
+    return total if total.total_seconds() > 0 else None
+
+
 def format_uptime(seconds: float) -> str:
     td = timedelta(seconds=int(seconds))
     days = td.days
@@ -139,6 +188,8 @@ paypay_channels = load_paypay_channels()
 paypay_log = load_paypay_log()
 ticket_config = load_ticket_config()
 ticket_data = load_ticket_data()
+ban_config = load_ban_config()
+temp_bans = load_temp_bans()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -164,6 +215,39 @@ async def update_status():
 
 @update_status.before_loop
 async def before_update_status():
+    await client.wait_until_ready()
+
+
+@tasks.loop(seconds=30)
+async def check_temp_bans():
+    now = datetime.now(timezone.utc).timestamp()
+    expired = [(k, v) for k, v in temp_bans.items() if v["expires_at"] <= now]
+    for key, data in expired:
+        guild = client.get_guild(int(data["guild_id"]))
+        if guild:
+            try:
+                user = await client.fetch_user(int(data["user_id"]))
+                await guild.unban(user, reason="一時BANの期限切れ・自動解除")
+                cfg = ban_config.get(data["guild_id"], {})
+                log_ch = guild.get_channel(cfg.get("log_channel_id", 0))
+                if log_ch:
+                    embed = discord.Embed(
+                        title="🔓 一時BAN 自動解除",
+                        color=discord.Color.green(),
+                        timestamp=datetime.now(JST)
+                    )
+                    embed.add_field(name="ユーザー", value=f"{user} (`{user.id}`)", inline=False)
+                    embed.add_field(name="BAN理由", value=data.get("reason", "理由なし"), inline=False)
+                    embed.set_thumbnail(url=user.display_avatar.url)
+                    await log_ch.send(embed=embed)
+            except Exception as e:
+                print(f"一時BAN自動解除に失敗: {e}")
+        temp_bans.pop(key, None)
+    if expired:
+        save_temp_bans(temp_bans)
+
+@check_temp_bans.before_loop
+async def before_check_temp_bans():
     await client.wait_until_ready()
 
 
@@ -970,6 +1054,330 @@ async def ticketpanel(
     await interaction.channel.send(embed=embed, view=TicketPanel())
 
 
+# ── BAN システム ─────────────────────────────────────────────
+
+BANS_PER_PAGE = 10
+
+
+def build_banlist_embed(bans: list, page: int, guild_name: str, guild_id_str: str) -> discord.Embed:
+    total_pages = max(1, -(-len(bans) // BANS_PER_PAGE))
+    start = page * BANS_PER_PAGE
+    page_bans = bans[start:start + BANS_PER_PAGE]
+    embed = discord.Embed(title="🔨 BANリスト", color=discord.Color.red())
+    for i, entry in enumerate(page_bans):
+        user = entry.user
+        reason = entry.reason or "理由なし"
+        ban_key = f"{guild_id_str}_{user.id}"
+        tdata = temp_bans.get(ban_key)
+        if tdata:
+            expires = datetime.fromtimestamp(tdata["expires_at"], JST).strftime("%Y/%m/%d %H:%M")
+            ban_type = f"⏰ 一時BAN（解除: {expires} JST）"
+        else:
+            ban_type = "🔨 永久BAN"
+        embed.add_field(
+            name=f"{start + i + 1}. {user}",
+            value=f"ID: `{user.id}` | {ban_type}\n理由: {reason}",
+            inline=False
+        )
+    embed.set_footer(text=f"{guild_name} | 合計: {len(bans)}人 | ページ {page + 1}/{total_pages}")
+    return embed
+
+
+class BanListView(discord.ui.View):
+    def __init__(self, bans: list, page: int, guild_name: str, guild_id_str: str):
+        super().__init__(timeout=120)
+        self.bans = bans
+        self.page = page
+        self.guild_name = guild_name
+        self.guild_id_str = guild_id_str
+        self.total_pages = max(1, -(-len(bans) // BANS_PER_PAGE))
+
+        prev_btn = discord.ui.Button(label="◀ 前へ", style=discord.ButtonStyle.secondary, disabled=(page == 0))
+        prev_btn.callback = self.prev_page
+        page_btn = discord.ui.Button(label=f"{page + 1} / {self.total_pages}", style=discord.ButtonStyle.secondary, disabled=True)
+        next_btn = discord.ui.Button(label="次へ ▶", style=discord.ButtonStyle.secondary, disabled=(page >= self.total_pages - 1))
+        next_btn.callback = self.next_page
+        self.add_item(prev_btn)
+        self.add_item(page_btn)
+        self.add_item(next_btn)
+
+    async def prev_page(self, interaction: discord.Interaction):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("権限がありません。", ephemeral=True)
+            return
+        await interaction.response.edit_message(
+            embed=build_banlist_embed(self.bans, self.page - 1, self.guild_name, self.guild_id_str),
+            view=BanListView(self.bans, self.page - 1, self.guild_name, self.guild_id_str)
+        )
+
+    async def next_page(self, interaction: discord.Interaction):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("権限がありません。", ephemeral=True)
+            return
+        await interaction.response.edit_message(
+            embed=build_banlist_embed(self.bans, self.page + 1, self.guild_name, self.guild_id_str),
+            view=BanListView(self.bans, self.page + 1, self.guild_name, self.guild_id_str)
+        )
+
+
+async def _execute_ban(interaction: discord.Interaction, uid: int, reason: str, del_days: int, duration_str: str):
+    if uid == interaction.user.id:
+        await interaction.followup.send("自分自身をBANすることはできません。", ephemeral=True)
+        return
+    if uid == OWNER_ID:
+        await interaction.followup.send("このユーザーをBANすることはできません。", ephemeral=True)
+        return
+
+    temp_duration = None
+    expires_at = None
+    if duration_str:
+        temp_duration = parse_duration(duration_str)
+        if temp_duration is None:
+            await interaction.followup.send("無効な期間指定です。例: `30m` `2h` `7d` `1w`", ephemeral=True)
+            return
+        expires_at = (datetime.now(timezone.utc) + temp_duration).timestamp()
+
+    ban_type = f"一時BAN ({duration_str})" if temp_duration else "永久BAN"
+
+    try:
+        user = await client.fetch_user(uid)
+    except Exception:
+        await interaction.followup.send("ユーザーが見つかりません。", ephemeral=True)
+        return
+
+    try:
+        dm_embed = discord.Embed(
+            title=f"🔨 {interaction.guild.name} からBANされました",
+            color=discord.Color.red(),
+            timestamp=datetime.now(JST)
+        )
+        dm_embed.add_field(name="種別", value=ban_type, inline=True)
+        dm_embed.add_field(name="理由", value=reason, inline=False)
+        if expires_at:
+            unban_time = datetime.fromtimestamp(expires_at, JST).strftime("%Y/%m/%d %H:%M:%S")
+            dm_embed.add_field(name="解除予定", value=f"{unban_time} (JST)", inline=False)
+        await user.send(embed=dm_embed)
+        dm_sent = True
+    except Exception:
+        dm_sent = False
+
+    try:
+        await interaction.guild.ban(user, reason=f"{reason} (実行者: {interaction.user})", delete_message_days=del_days)
+    except discord.Forbidden:
+        await interaction.followup.send("BANの実行権限がありません。", ephemeral=True)
+        return
+    except Exception as e:
+        await interaction.followup.send(f"BANに失敗しました: {e}", ephemeral=True)
+        return
+
+    if temp_duration and expires_at:
+        ban_key = f"{interaction.guild_id}_{uid}"
+        temp_bans[ban_key] = {
+            "guild_id": str(interaction.guild_id),
+            "user_id": str(uid),
+            "reason": reason,
+            "expires_at": expires_at,
+            "banned_by": str(interaction.user.id)
+        }
+        save_temp_bans(temp_bans)
+
+    guild_key = str(interaction.guild_id)
+    cfg = ban_config.get(guild_key, {})
+    log_ch = interaction.guild.get_channel(cfg.get("log_channel_id", 0))
+    if log_ch:
+        log_embed = discord.Embed(title="🔨 ユーザーをBANしました", color=discord.Color.red(), timestamp=datetime.now(JST))
+        log_embed.add_field(name="対象ユーザー", value=f"{user.mention} (`{user.id}`)", inline=False)
+        log_embed.add_field(name="実行者", value=interaction.user.mention, inline=True)
+        log_embed.add_field(name="種別", value=ban_type, inline=True)
+        log_embed.add_field(name="理由", value=reason, inline=False)
+        log_embed.add_field(name="メッセージ削除", value=f"{del_days}日分", inline=True)
+        log_embed.add_field(name="DM通知", value="✅ 送信済み" if dm_sent else "❌ 送信失敗", inline=True)
+        if expires_at:
+            unban_time = datetime.fromtimestamp(expires_at, JST).strftime("%Y/%m/%d %H:%M:%S")
+            log_embed.add_field(name="解除予定", value=f"{unban_time} (JST)", inline=False)
+        log_embed.set_thumbnail(url=user.display_avatar.url)
+        await log_ch.send(embed=log_embed)
+
+    result = discord.Embed(title="✅ BANしました", color=discord.Color.green())
+    result.add_field(name="ユーザー", value=f"{user} (`{user.id}`)", inline=False)
+    result.add_field(name="種別", value=ban_type, inline=True)
+    result.add_field(name="理由", value=reason, inline=True)
+    result.add_field(name="DM通知", value="✅ 送信済み" if dm_sent else "❌ 送信失敗（DM無効）", inline=False)
+    await interaction.followup.send(embed=result, ephemeral=True)
+
+
+async def _execute_unban(interaction: discord.Interaction, uid: int, reason: str):
+    try:
+        user = await client.fetch_user(uid)
+    except Exception:
+        await interaction.followup.send("ユーザーが見つかりません。", ephemeral=True)
+        return
+
+    try:
+        await interaction.guild.unban(user, reason=f"{reason} (実行者: {interaction.user})")
+    except discord.NotFound:
+        await interaction.followup.send("そのユーザーはBANされていません。", ephemeral=True)
+        return
+    except discord.Forbidden:
+        await interaction.followup.send("BAN解除の実行権限がありません。", ephemeral=True)
+        return
+    except Exception as e:
+        await interaction.followup.send(f"BAN解除に失敗しました: {e}", ephemeral=True)
+        return
+
+    ban_key = f"{interaction.guild_id}_{uid}"
+    if ban_key in temp_bans:
+        del temp_bans[ban_key]
+        save_temp_bans(temp_bans)
+
+    guild_key = str(interaction.guild_id)
+    cfg = ban_config.get(guild_key, {})
+    log_ch = interaction.guild.get_channel(cfg.get("log_channel_id", 0))
+    if log_ch:
+        log_embed = discord.Embed(title="🔓 BANを解除しました", color=discord.Color.green(), timestamp=datetime.now(JST))
+        log_embed.add_field(name="対象ユーザー", value=f"{user.mention} (`{user.id}`)", inline=False)
+        log_embed.add_field(name="実行者", value=interaction.user.mention, inline=True)
+        log_embed.add_field(name="理由", value=reason, inline=False)
+        log_embed.set_thumbnail(url=user.display_avatar.url)
+        await log_ch.send(embed=log_embed)
+
+    result = discord.Embed(title="✅ BAN解除しました", color=discord.Color.green())
+    result.add_field(name="ユーザー", value=f"{user} (`{user.id}`)", inline=False)
+    result.add_field(name="理由", value=reason, inline=False)
+    await interaction.followup.send(embed=result, ephemeral=True)
+
+
+class BanModal(discord.ui.Modal, title="ユーザーをBAN"):
+    user_id = discord.ui.TextInput(label="ユーザーID", placeholder="例: 123456789012345678")
+    reason = discord.ui.TextInput(label="理由", default="理由なし", required=False)
+    duration = discord.ui.TextInput(label="一時BAN期間（省略で永久）", placeholder="例: 30m / 2h / 7d / 1w", required=False)
+    delete_days = discord.ui.TextInput(label="メッセージ削除日数 (0〜7)", default="0", required=False)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            uid = int(self.user_id.value.strip())
+        except ValueError:
+            await interaction.followup.send("無効なユーザーIDです。数字で入力してください。", ephemeral=True)
+            return
+        try:
+            del_days = max(0, min(7, int(self.delete_days.value.strip() or "0")))
+        except ValueError:
+            del_days = 0
+        reason = self.reason.value.strip() or "理由なし"
+        duration_str = self.duration.value.strip()
+        await _execute_ban(interaction, uid, reason, del_days, duration_str)
+
+
+class UnbanModal(discord.ui.Modal, title="BANを解除"):
+    user_id = discord.ui.TextInput(label="ユーザーID", placeholder="例: 123456789012345678")
+    reason = discord.ui.TextInput(label="解除理由", default="理由なし", required=False)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            uid = int(self.user_id.value.strip())
+        except ValueError:
+            await interaction.followup.send("無効なユーザーIDです。数字で入力してください。", ephemeral=True)
+            return
+        reason = self.reason.value.strip() or "理由なし"
+        await _execute_unban(interaction, uid, reason)
+
+
+class BanLogChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="📋 BANログチャンネルを選択...",
+            channel_types=[discord.ChannelType.text],
+            row=0
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("権限がありません。", ephemeral=True)
+            return
+        guild_key = str(interaction.guild_id)
+        if guild_key not in ban_config:
+            ban_config[guild_key] = {}
+        ban_config[guild_key]["log_channel_id"] = self.values[0].id
+        save_ban_config(ban_config)
+        await interaction.response.send_message(f"✅ BANログチャンネルを {self.values[0].mention} に設定しました。", ephemeral=True)
+
+
+class BanPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.add_item(BanLogChannelSelect())
+
+    @discord.ui.button(label="BANする", style=discord.ButtonStyle.danger, emoji="🔨", row=1)
+    async def do_ban(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("権限がありません。", ephemeral=True)
+            return
+        await interaction.response.send_modal(BanModal())
+
+    @discord.ui.button(label="BAN解除", style=discord.ButtonStyle.success, emoji="🔓", row=1)
+    async def do_unban(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("権限がありません。", ephemeral=True)
+            return
+        await interaction.response.send_modal(UnbanModal())
+
+    @discord.ui.button(label="BANリスト", style=discord.ButtonStyle.primary, emoji="📋", row=1)
+    async def show_banlist(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("権限がありません。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            bans = [entry async for entry in interaction.guild.bans()]
+        except discord.Forbidden:
+            await interaction.followup.send("BANリストの取得権限がありません。", ephemeral=True)
+            return
+        if not bans:
+            await interaction.followup.send("BANされているユーザーはいません。", ephemeral=True)
+            return
+        guild_id_str = str(interaction.guild_id)
+        await interaction.followup.send(
+            embed=build_banlist_embed(bans, 0, interaction.guild.name, guild_id_str),
+            view=BanListView(bans, 0, interaction.guild.name, guild_id_str),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="現在の設定", style=discord.ButtonStyle.secondary, emoji="ℹ️", row=1)
+    async def show_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("権限がありません。", ephemeral=True)
+            return
+        guild_key = str(interaction.guild_id)
+        cfg = ban_config.get(guild_key, {})
+        log_ch = interaction.guild.get_channel(cfg.get("log_channel_id", 0))
+        temp_count = sum(1 for v in temp_bans.values() if v.get("guild_id") == guild_key)
+        embed = discord.Embed(title="🔨 BAN設定", color=discord.Color.red())
+        embed.add_field(name="ログチャンネル", value=log_ch.mention if log_ch else "未設定", inline=False)
+        embed.add_field(name="一時BAN中のユーザー", value=f"{temp_count}人", inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="ban", description="BAN管理パネルを表示します（許可ユーザー専用）")
+async def ban_cmd(interaction: discord.Interaction):
+    if not is_allowed(interaction):
+        await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+        return
+    guild_key = str(interaction.guild_id)
+    cfg = ban_config.get(guild_key, {})
+    log_ch = interaction.guild.get_channel(cfg.get("log_channel_id", 0))
+    temp_count = sum(1 for v in temp_bans.values() if v.get("guild_id") == guild_key)
+    embed = discord.Embed(
+        title="🔨 BAN管理パネル",
+        description="ログチャンネルをプルダウンで設定し、ボタンで操作してください。",
+        color=discord.Color.red()
+    )
+    embed.add_field(name="ログチャンネル", value=log_ch.mention if log_ch else "未設定", inline=True)
+    embed.add_field(name="一時BAN中", value=f"{temp_count}人", inline=True)
+    await interaction.response.send_message(embed=embed, view=BanPanel(), ephemeral=True)
+
+
 @client.event
 async def on_ready():
     await tree.sync()
@@ -978,6 +1386,8 @@ async def on_ready():
     client.add_view(TicketControlView())
     if not update_status.is_running():
         update_status.start()
+    if not check_temp_bans.is_running():
+        check_temp_bans.start()
     print(f"ログイン成功: {client.user} (ID: {client.user.id})")
     print("スラッシュコマンドを同期しました")
 
