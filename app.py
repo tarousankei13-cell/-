@@ -1489,16 +1489,20 @@ async def _send_jisseki_embed(
     product: str,
     rating_num: int,
     quantity_num: int,
-    comment: str
+    comment: str,
+    override_channel: discord.TextChannel | None = None
 ) -> discord.TextChannel | None:
-    guild_key = str(guild.id)
-    cfg = jisseki_config.get(guild_key, {})
-    output_channel_id = cfg.get("output_channel_id")
-    if not output_channel_id:
-        return None
-    output_channel = guild.get_channel(output_channel_id)
-    if not output_channel:
-        return None
+    if override_channel:
+        output_channel = override_channel
+    else:
+        guild_key = str(guild.id)
+        cfg = jisseki_config.get(guild_key, {})
+        output_channel_id = cfg.get("output_channel_id")
+        if not output_channel_id:
+            return None
+        output_channel = guild.get_channel(output_channel_id)
+        if not output_channel:
+            return None
     stars = "★" * rating_num + "☆" * (5 - rating_num)
     embed = discord.Embed(title="📦 実績報告", color=0x2b2d31)
     embed.add_field(name="👤 記入者", value=target_user.mention, inline=False)
@@ -1518,7 +1522,8 @@ async def _send_jisseki_embed(
     product="商品名",
     rating="評価 (1〜5)",
     quantity="個数",
-    comment="コメント（省略可）"
+    comment="コメント（省略可）",
+    channel="送信先チャンネル（省略時はデフォルトチャンネル）"
 )
 async def jisseki_cmd(
     interaction: discord.Interaction,
@@ -1526,17 +1531,18 @@ async def jisseki_cmd(
     product: str,
     rating: app_commands.Range[int, 1, 5],
     quantity: app_commands.Range[int, 1, None],
-    comment: str = "なし"
+    comment: str = "なし",
+    channel: discord.TextChannel = None
 ):
     if not is_allowed(interaction):
         await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     output_channel = await _send_jisseki_embed(
-        interaction.guild, user, product, rating, quantity, comment
+        interaction.guild, user, product, rating, quantity, comment, channel
     )
     if not output_channel:
-        await interaction.followup.send("実績送信チャンネルが設定されていません。先に `/jissekipanel` を実行してください。", ephemeral=True)
+        await interaction.followup.send("実績送信チャンネルが設定されていません。先に `/jissekipanel` を実行するか、`channel` を指定してください。", ephemeral=True)
         return
     await interaction.followup.send(f"✅ {user.mention} の実績を {output_channel.mention} に送信しました！", ephemeral=True)
 
