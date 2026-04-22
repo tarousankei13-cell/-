@@ -23,6 +23,7 @@ BAN_CONFIG_FILE = "ban_config.json"
 TEMP_BANS_FILE = "temp_bans.json"
 JISSEKI_CONFIG_FILE = "jisseki_config.json"
 LOTTERY_DATA_FILE = "lottery_data.json"
+AUTH_CONFIG_FILE = "auth_config.json"
 
 PAYPAY_REGEX = re.compile(r'https?://pay\.paypay\.ne\.jp/\S+')
 
@@ -198,6 +199,24 @@ def save_lottery_data(data: dict):
         print(f"lottery_data.json の保存に失敗: {e}")
 
 
+def load_auth_config() -> dict:
+    try:
+        if os.path.exists(AUTH_CONFIG_FILE):
+            with open(AUTH_CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"auth_config.json の読み込みに失敗: {e}")
+    return {}
+
+
+def save_auth_config(data: dict):
+    try:
+        with open(AUTH_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"auth_config.json の保存に失敗: {e}")
+
+
 def parse_duration(duration_str: str) -> timedelta | None:
     matches = re.findall(r'(\d+)([smhdw])', duration_str.lower())
     if not matches:
@@ -231,6 +250,7 @@ ban_config = load_ban_config()
 temp_bans = load_temp_bans()
 jisseki_config = load_jisseki_config()
 lottery_data = load_lottery_data()
+auth_config = load_auth_config()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -2237,6 +2257,263 @@ async def embed_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=EmbedPanel(interaction.guild_id, interaction.user.id), ephemeral=True)
 
 
+# ── 認証システム ─────────────────────────────────────────────
+
+class AuthCaptchaModal(discord.ui.Modal, title="認証 - 計算問題に答えてください"):
+    def __init__(self, guild_id: int, answer: int, question: str):
+        super().__init__()
+        self.guild_id = guild_id
+        self.answer = answer
+        self.user_answer = discord.ui.TextInput(
+            label=f"問題: {question} = ?",
+            placeholder="数字で答えを入力してください",
+            max_length=6
+        )
+        self.add_item(self.user_answer)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        guild_key = str(self.guild_id)
+        cfg = auth_config.get(guild_key, {})
+
+        try:
+            user_ans = int(self.user_answer.value.strip())
+        except ValueError:
+            await interaction.followup.send("❌ 数字で答えてください。もう一度「認証する」ボタンを押してください。", ephemeral=True)
+            return
+
+        if user_ans != self.answer:
+            await interaction.followup.send("❌ 答えが違います。もう一度「認証する」ボタンを押してください。", ephemeral=True)
+            return
+
+        verified_role_id = cfg.get("verified_role_id")
+        if not verified_role_id:
+            await interaction.followup.send("❌ 認証ロールが設定されていません。管理者に連絡してください。", ephemeral=True)
+            return
+
+        role = interaction.guild.get_role(verified_role_id)
+        if not role:
+            await interaction.followup.send("❌ 認証ロールが見つかりません。管理者に連絡してください。", ephemeral=True)
+            return
+
+        if role in interaction.user.roles:
+            await interaction.followup.send("✅ すでに認証済みです！", ephemeral=True)
+            return
+
+        try:
+            await interaction.user.add_roles(role, reason="認証パネルによる認証完了")
+        except discord.Forbidden:
+            await interaction.followup.send("❌ ロールの付与に失敗しました。Botの権限を確認してください。", ephemeral=True)
+            return
+
+        await interaction.followup.send("✅ 認証が完了しました！サーバーへようこそ！🎉", ephemeral=True)
+
+        log_channel_id = cfg.get("log_channel_id")
+        if log_channel_id:
+            log_ch = interaction.guild.get_channel(log_channel_id)
+            if log_ch:
+                embed = discord.Embed(title="✅ 認証完了", color=discord.Color.green(), timestamp=datetime.now(JST))
+                embed.add_field(name="ユーザー", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
+                embed.add_field(name="認証タイプ", value="🔢 計算認証", inline=True)
+                embed.add_field(name="付与ロール", value=role.mention, inline=True)
+                embed.set_thumbnail(url=interaction.user.display_avatar.url)
+                await log_ch.send(embed=embed)
+
+
+class AuthPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="認証する", style=discord.ButtonStyle.success, emoji="✅", custom_id="auth:verify")
+    async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_key = str(interaction.guild_id)
+        cfg = auth_config.get(guild_key, {})
+
+        if not cfg.get("verified_role_id"):
+            await interaction.response.send_message("❌ 認証が設定されていません。管理者に連絡してください。", ephemeral=True)
+            return
+
+        role = interaction.guild.get_role(cfg["verified_role_id"])
+        if role and role in interaction.user.roles:
+            await interaction.response.send_message("✅ すでに認証済みです！", ephemeral=True)
+            return
+
+        auth_type = cfg.get("auth_type", "button")
+
+        if auth_type == "captcha":
+            a = random.randint(10, 30)
+            b = random.randint(1, 20)
+            if random.choice([True, False]) and a >= b:
+                question = f"{a} - {b}"
+                answer = a - b
+            else:
+                question = f"{a} + {b}"
+                answer = a + b
+            await interaction.response.send_modal(AuthCaptchaModal(interaction.guild_id, answer, question))
+        else:
+            await interaction.response.defer(ephemeral=True)
+            verified_role_id = cfg.get("verified_role_id")
+            role = interaction.guild.get_role(verified_role_id)
+            if not role:
+                await interaction.followup.send("❌ 認証ロールが見つかりません。", ephemeral=True)
+                return
+            try:
+                await interaction.user.add_roles(role, reason="認証パネルによる認証完了")
+            except discord.Forbidden:
+                await interaction.followup.send("❌ ロールの付与に失敗しました。Botの権限を確認してください。", ephemeral=True)
+                return
+            await interaction.followup.send("✅ 認証が完了しました！サーバーへようこそ！🎉", ephemeral=True)
+
+            log_channel_id = cfg.get("log_channel_id")
+            if log_channel_id:
+                log_ch = interaction.guild.get_channel(log_channel_id)
+                if log_ch:
+                    embed = discord.Embed(title="✅ 認証完了", color=discord.Color.green(), timestamp=datetime.now(JST))
+                    embed.add_field(name="ユーザー", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
+                    embed.add_field(name="認証タイプ", value="🖱️ ボタン認証", inline=True)
+                    embed.add_field(name="付与ロール", value=role.mention, inline=True)
+                    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+                    await log_ch.send(embed=embed)
+
+
+class AuthVerifiedRoleSelect(discord.ui.RoleSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="✅ 認証後に付与するロールを選択...",
+            min_values=1,
+            max_values=1,
+            row=0
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("権限がありません。", ephemeral=True)
+            return
+        guild_key = str(interaction.guild_id)
+        if guild_key not in auth_config:
+            auth_config[guild_key] = {}
+        auth_config[guild_key]["verified_role_id"] = self.values[0].id
+        save_auth_config(auth_config)
+        await interaction.response.send_message(f"✅ 認証ロールを {self.values[0].mention} に設定しました。", ephemeral=True)
+
+
+class AuthLogChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="📋 認証ログチャンネルを選択...",
+            channel_types=[discord.ChannelType.text],
+            row=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("権限がありません。", ephemeral=True)
+            return
+        guild_key = str(interaction.guild_id)
+        if guild_key not in auth_config:
+            auth_config[guild_key] = {}
+        auth_config[guild_key]["log_channel_id"] = self.values[0].id
+        save_auth_config(auth_config)
+        await interaction.response.send_message(f"✅ 認証ログチャンネルを {self.values[0].mention} に設定しました。", ephemeral=True)
+
+
+class AuthSetupPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(AuthVerifiedRoleSelect())
+        self.add_item(AuthLogChannelSelect())
+
+    @discord.ui.button(label="ボタン認証", style=discord.ButtonStyle.success, emoji="🖱️", row=2)
+    async def set_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("権限がありません。", ephemeral=True)
+            return
+        guild_key = str(interaction.guild_id)
+        if guild_key not in auth_config:
+            auth_config[guild_key] = {}
+        auth_config[guild_key]["auth_type"] = "button"
+        save_auth_config(auth_config)
+        await interaction.response.send_message("✅ 認証タイプを **ボタン認証**（ボタンを押すだけ）に設定しました。", ephemeral=True)
+
+    @discord.ui.button(label="計算認証", style=discord.ButtonStyle.primary, emoji="🔢", row=2)
+    async def set_captcha(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("権限がありません。", ephemeral=True)
+            return
+        guild_key = str(interaction.guild_id)
+        if guild_key not in auth_config:
+            auth_config[guild_key] = {}
+        auth_config[guild_key]["auth_type"] = "captcha"
+        save_auth_config(auth_config)
+        await interaction.response.send_message("✅ 認証タイプを **計算認証**（簡単な計算問題）に設定しました。", ephemeral=True)
+
+    @discord.ui.button(label="現在の設定", style=discord.ButtonStyle.secondary, emoji="ℹ️", row=2)
+    async def show_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_allowed(interaction):
+            await interaction.response.send_message("権限がありません。", ephemeral=True)
+            return
+        guild_key = str(interaction.guild_id)
+        cfg = auth_config.get(guild_key, {})
+        role = interaction.guild.get_role(cfg.get("verified_role_id", 0))
+        log_ch = interaction.guild.get_channel(cfg.get("log_channel_id", 0))
+        auth_type = cfg.get("auth_type", "button")
+        type_label = "🖱️ ボタン認証" if auth_type == "button" else "🔢 計算認証"
+        embed = discord.Embed(title="🔐 認証設定", color=discord.Color.blurple())
+        embed.add_field(name="認証ロール", value=role.mention if role else "未設定", inline=False)
+        embed.add_field(name="ログチャンネル", value=log_ch.mention if log_ch else "未設定", inline=False)
+        embed.add_field(name="認証タイプ", value=type_label, inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="authsetup", description="認証システムを設定します（許可ユーザー専用）")
+async def authsetup(interaction: discord.Interaction):
+    if not is_allowed(interaction):
+        await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+        return
+    guild_key = str(interaction.guild_id)
+    cfg = auth_config.get(guild_key, {})
+    role = interaction.guild.get_role(cfg.get("verified_role_id", 0))
+    log_ch = interaction.guild.get_channel(cfg.get("log_channel_id", 0))
+    auth_type = cfg.get("auth_type", "button")
+    type_label = "🖱️ ボタン認証" if auth_type == "button" else "🔢 計算認証"
+    embed = discord.Embed(
+        title="🔐 認証システム設定",
+        description="プルダウンでロール・ログチャンネルを設定し、認証タイプを選択してください。",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(name="認証ロール", value=role.mention if role else "未設定", inline=False)
+    embed.add_field(name="ログチャンネル", value=log_ch.mention if log_ch else "未設定", inline=False)
+    embed.add_field(name="認証タイプ", value=type_label, inline=False)
+    await interaction.response.send_message(embed=embed, view=AuthSetupPanel(), ephemeral=True)
+
+
+@tree.command(name="authpanel", description="認証パネルを設置します（許可ユーザー専用）")
+@app_commands.describe(title="パネルのタイトル", description="パネルの説明文")
+async def authpanel(
+    interaction: discord.Interaction,
+    title: str = "認証",
+    description: str = "ボタンを押して認証してください。"
+):
+    if not is_allowed(interaction):
+        await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+        return
+    guild_key = str(interaction.guild_id)
+    cfg = auth_config.get(guild_key, {})
+    if not cfg.get("verified_role_id"):
+        await interaction.response.send_message("先に `/authsetup` で認証ロールを設定してください。", ephemeral=True)
+        return
+    auth_type = cfg.get("auth_type", "button")
+    type_label = "🖱️ ボタンをクリックするだけ" if auth_type == "button" else "🔢 簡単な計算問題に答える"
+    embed = discord.Embed(
+        title=f"🔐 {title}",
+        description=f"{description}\n\n**認証方法:** {type_label}",
+        color=discord.Color.blurple()
+    )
+    embed.set_footer(text="認証するには下のボタンを押してください")
+    await interaction.response.send_message("✅ 認証パネルを設置しました。", ephemeral=True)
+    await interaction.channel.send(embed=embed, view=AuthPanel())
+
+
 @client.event
 async def on_ready():
     await tree.sync()
@@ -2245,6 +2522,7 @@ async def on_ready():
     client.add_view(TicketControlView())
     client.add_view(JissekiPanel())
     client.add_view(LotteryEntryView())
+    client.add_view(AuthPanel())
     if not update_status.is_running():
         update_status.start()
     if not check_temp_bans.is_running():
