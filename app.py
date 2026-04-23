@@ -9,12 +9,23 @@ import time
 import re
 import io
 import random
+import traceback
 from datetime import timedelta, timezone, datetime
+
+try:
+    from PayPaython_mobile import PayPay as _PayPay
+    PAYPAY_AVAILABLE = True
+except ImportError:
+    PAYPAY_AVAILABLE = False
+    print("PayPayython_mobile が見つかりません。PayPay関連コマンドは無効です。")
 
 
 TOKEN = "ここに新しいトークンを貼り付け"
 OWNER_ID = 1324938326741876758
 ALLOWED_USERS_FILE = "allowed_users.json"
+SESSION_DIR = "sessions"
+VENDING_DATA_FILE = f"{SESSION_DIR}/vending_data.json"
+os.makedirs(SESSION_DIR, exist_ok=True)
 PAYPAY_CHANNEL_FILE = "paypay_channel.json"
 PAYPAY_LOG_FILE = "paypay_log.json"
 TICKET_CONFIG_FILE = "ticket_config.json"
@@ -217,6 +228,24 @@ def save_auth_config(data: dict):
         print(f"auth_config.json の保存に失敗: {e}")
 
 
+def load_vending_data() -> dict:
+    try:
+        if os.path.exists(VENDING_DATA_FILE):
+            with open(VENDING_DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"vending_data.json の読み込みに失敗: {e}")
+    return {"items": {}, "next_id": 1, "admin_ids": [], "sales_log": [], "receiver_id": None}
+
+
+def save_vending_data(data: dict):
+    try:
+        with open(VENDING_DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"vending_data.json の保存に失敗: {e}")
+
+
 def parse_duration(duration_str: str) -> timedelta | None:
     matches = re.findall(r'(\d+)([smhdw])', duration_str.lower())
     if not matches:
@@ -251,6 +280,7 @@ temp_bans = load_temp_bans()
 jisseki_config = load_jisseki_config()
 lottery_data = load_lottery_data()
 auth_config = load_auth_config()
+vending_data = load_vending_data()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -260,6 +290,136 @@ tree = app_commands.CommandTree(client)
 
 def is_allowed(interaction: discord.Interaction) -> bool:
     return interaction.user.id == OWNER_ID or interaction.user.id in allowed_users
+
+
+def is_vending_admin(user_id: int) -> bool:
+    return user_id in vending_data.get("admin_ids", [])
+
+
+# ── PayPay セッション管理 ─────────────────────────────────────
+
+class PayPaySessionManager:
+    def __init__(self):
+        self.sessions: dict = {}
+        self._load()
+
+    def _load(self):
+        path = f"{SESSION_DIR}/pp_sessions.json"
+        try:
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    self.sessions = json.load(f)
+        except Exception as e:
+            print(f"PayPayセッション読み込み失敗: {e}")
+
+    def _save(self):
+        path = f"{SESSION_DIR}/pp_sessions.json"
+        try:
+            with open(path, "w") as f:
+                json.dump(self.sessions, f)
+        except Exception as e:
+            print(f"PayPayセッション保存失敗: {e}")
+
+    def get(self, user_id: int) -> dict | None:
+        return self.sessions.get(str(user_id))
+
+    def save_user(self, user_id, phone, password, access_token=None, refresh_token=None, device_uuid=None):
+        self.sessions[str(user_id)] = {
+            "phone": phone, "password": password,
+            "access_token": access_token, "refresh_token": refresh_token,
+            "device_uuid": device_uuid, "last_updated": time.time()
+        }
+        self._save()
+
+    def update_tokens(self, user_id, access_token, refresh_token=None, device_uuid=None):
+        uid = str(user_id)
+        if uid in self.sessions:
+            self.sessions[uid]["access_token"] = access_token
+            if refresh_token:
+                self.sessions[uid]["refresh_token"] = refresh_token
+            if device_uuid:
+                self.sessions[uid]["device_uuid"] = device_uuid
+            self.sessions[uid]["last_updated"] = time.time()
+            self._save()
+
+
+class PayPayClientManager:
+    def __init__(self, session_mgr: PayPaySessionManager):
+        self.session_mgr = session_mgr
+        self._clients: dict = {}
+        self._pending: set = set()
+
+    async def get_client(self, user_id):
+        if not PAYPAY_AVAILABLE:
+            return None
+        uid = str(user_id)
+        if uid in self._clients:
+            return self._clients[uid]
+        session = self.session_mgr.get(user_id)
+        if not session:
+            return None
+        try:
+            if session.get("access_token"):
+                c = _PayPay(access_token=session["access_token"])
+            else:
+                c = _PayPay(session["phone"], session["password"], device_uuid=session.get("device_uuid"))
+                self.session_mgr.update_tokens(uid, c.access_token, c.refresh_token, c.device_uuid)
+            self._clients[uid] = c
+            return c
+        except Exception as e:
+            print(f"PayPayクライアント取得失敗: {e}")
+            return None
+
+    def any_client(self):
+        for c in self._clients.values():
+            if c:
+                return c
+        if not PAYPAY_AVAILABLE:
+            return None
+        for uid, s in self.session_mgr.sessions.items():
+            if s.get("access_token"):
+                try:
+                    c = _PayPay(access_token=s["access_token"])
+                    self._clients[uid] = c
+                    return c
+                except:
+                    continue
+        return None
+
+    async def authenticate(self, user_id, phone, password):
+        if not PAYPAY_AVAILABLE:
+            return False, "PayPayython_mobile がインストールされていません。"
+        uid = str(user_id)
+        phone_clean = phone.replace("-", "").replace(" ", "")
+        if not re.match(r'^0[5-9]0\d{8}$', phone_clean):
+            return False, "電話番号の形式が違います（例: 090-1234-5678）"
+        try:
+            c = _PayPay(phone_clean, password)
+            self._clients[uid] = c
+            self._pending.add(uid)
+            self.session_mgr.save_user(uid, phone_clean, password)
+            return True, "SMSにOTPが届きます。`/pp_otp コード` で入力してください。"
+        except Exception as e:
+            return False, f"認証エラー: {e}"
+
+    async def verify_otp(self, user_id, otp):
+        uid = str(user_id)
+        c = self._clients.get(uid)
+        if not c:
+            return False, "先に `/pp_login` で認証を開始してください。"
+        if uid not in self._pending:
+            return False, "認証セッションが見つかりません。もう一度 `/pp_login` からやり直してください。"
+        try:
+            c.login(otp)
+            self.session_mgr.update_tokens(uid, c.access_token, c.refresh_token, c.device_uuid)
+            self._pending.discard(uid)
+            return True, "✅ PayPayへのログインが完了しました！"
+        except Exception as e:
+            return False, f"OTP認証エラー: {e}"
+
+
+pp_session_mgr = PayPaySessionManager()
+pp_client_mgr = PayPayClientManager(pp_session_mgr)
 
 
 # ── ステータス自動更新 ─────────────────────────────────────────
@@ -2518,6 +2678,457 @@ async def authpanel(
     embed.set_footer(text="認証するには下のボタンを押してください")
     await interaction.response.send_message("✅ 認証パネルを設置しました。", ephemeral=True)
     await interaction.channel.send(embed=embed, view=AuthPanel())
+
+
+# ── 自販機 UI ────────────────────────────────────────────────
+
+def _build_vending_embed(items: list) -> discord.Embed:
+    embed = discord.Embed(
+        title="🏪 PayPay 自販機",
+        description="購入したい商品をプルダウンから選んでください。",
+        color=0x00b900
+    )
+    if not items:
+        embed.description = "現在販売中の商品はありません。"
+    else:
+        for item in items[:10]:
+            embed.add_field(
+                name=f"ID: {item['id']}  ¥{item['price']}  {item['name']}",
+                value=f"{item['description']}\n在庫: {len(item['stock'])}個",
+                inline=False
+            )
+    embed.set_footer(text="プルダウンで商品を選択すると購入手順が表示されます")
+    return embed
+
+
+def _available_items() -> list:
+    return [
+        item for item in vending_data["items"].values()
+        if item.get("enabled") and len(item.get("stock", [])) > 0
+    ]
+
+
+class VendingItemSelect(discord.ui.Select):
+    def __init__(self, items: list):
+        options = [
+            discord.SelectOption(
+                label=f"¥{item['price']} | {item['name']}"[:100],
+                value=item["id"],
+                description=f"{item['description']} (在庫: {len(item['stock'])}個)"[:100]
+            )
+            for item in items[:25]
+        ]
+        super().__init__(placeholder="🛒 商品を選択...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        item = vending_data["items"].get(self.values[0])
+        if not item:
+            await interaction.response.send_message("商品が見つかりません。", ephemeral=True)
+            return
+        embed = discord.Embed(title=f"🛒 {item['name']}", description=item["description"], color=0x00b900)
+        embed.add_field(name="💴 価格", value=f"¥{item['price']}", inline=True)
+        embed.add_field(name="📦 在庫", value=f"{len(item['stock'])}個", inline=True)
+        embed.add_field(
+            name="📋 購入手順",
+            value=(
+                f"1. PayPayアプリで **¥{item['price']}** の送金リンクを作成\n"
+                "2. 以下のコマンドを実行（DM推奨）:\n"
+                f"```/vending_buy {item['id']} [作成したリンクURL]```"
+            ),
+            inline=False
+        )
+        embed.set_footer(text=f"商品ID: {item['id']}")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class VendingListView(discord.ui.View):
+    def __init__(self, items: list):
+        super().__init__(timeout=180)
+        if items:
+            self.add_item(VendingItemSelect(items))
+
+    @discord.ui.button(label="🔄 更新", style=discord.ButtonStyle.secondary, row=1)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        items = _available_items()
+        await interaction.response.edit_message(embed=_build_vending_embed(items), view=VendingListView(items))
+
+
+class VendingAddModal(discord.ui.Modal, title="商品を追加"):
+    item_name = discord.ui.TextInput(label="商品名", placeholder="例: Netflixアカウント")
+    item_description = discord.ui.TextInput(label="説明（省略可）", placeholder="商品の説明", required=False)
+    item_price = discord.ui.TextInput(label="価格（円）", placeholder="例: 500")
+    item_contents = discord.ui.TextInput(
+        label="商品内容（1行1個）",
+        style=discord.TextStyle.paragraph,
+        placeholder="例:\nmail@example.com:password123\nmail2@example.com:password456"
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            price = int(self.item_price.value.strip())
+            if price <= 0:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message("価格は正の整数で入力してください。", ephemeral=True)
+            return
+
+        contents = [c.strip() for c in self.item_contents.value.strip().split("\n") if c.strip()]
+        if not contents:
+            await interaction.response.send_message("商品内容を1つ以上入力してください。", ephemeral=True)
+            return
+
+        item_id = str(vending_data["next_id"])
+        vending_data["next_id"] += 1
+        vending_data["items"][item_id] = {
+            "id": item_id,
+            "name": self.item_name.value.strip(),
+            "description": self.item_description.value.strip() or "説明なし",
+            "price": price,
+            "stock": contents,
+            "total_sold": 0,
+            "enabled": True
+        }
+        save_vending_data(vending_data)
+        await interaction.response.send_message(
+            f"✅ 商品を追加しました\n**{self.item_name.value}** | ¥{price} | 在庫: {len(contents)}個\n商品ID: `{item_id}`",
+            ephemeral=True
+        )
+
+
+class VendingStockModal(discord.ui.Modal, title="在庫を追加"):
+    item_id_input = discord.ui.TextInput(label="商品ID", placeholder="例: 1")
+    item_contents = discord.ui.TextInput(
+        label="追加する商品内容（1行1個）",
+        style=discord.TextStyle.paragraph,
+        placeholder="例:\nmail@example.com:password123"
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        item_id = self.item_id_input.value.strip()
+        item = vending_data["items"].get(item_id)
+        if not item:
+            await interaction.response.send_message(f"商品ID `{item_id}` が見つかりません。", ephemeral=True)
+            return
+        contents = [c.strip() for c in self.item_contents.value.strip().split("\n") if c.strip()]
+        if not contents:
+            await interaction.response.send_message("内容を1つ以上入力してください。", ephemeral=True)
+            return
+        item["stock"].extend(contents)
+        save_vending_data(vending_data)
+        await interaction.response.send_message(
+            f"✅ **{item['name']}** に {len(contents)}個の在庫を追加しました。現在の在庫: {len(item['stock'])}個",
+            ephemeral=True
+        )
+
+
+# ── PayPay 認証コマンド ───────────────────────────────────────
+
+@tree.command(name="pp_login", description="PayPayアカウントで認証を開始します（DMのみ）")
+@app_commands.describe(phone="電話番号（例: 090-1234-5678）", password="PayPayのパスワード")
+async def pp_login_cmd(interaction: discord.Interaction, phone: str, password: str):
+    if not isinstance(interaction.channel, discord.DMChannel):
+        await interaction.response.send_message("このコマンドはDMのみで使用できます。", ephemeral=True)
+        return
+    await interaction.response.defer()
+    success, msg = await pp_client_mgr.authenticate(interaction.user.id, phone, password)
+    await interaction.followup.send(msg)
+
+
+@tree.command(name="pp_otp", description="SMSで受け取ったOTPコードを入力します（DMのみ）")
+@app_commands.describe(code="SMSで受け取ったOTPコード")
+async def pp_otp_cmd(interaction: discord.Interaction, code: str):
+    if not isinstance(interaction.channel, discord.DMChannel):
+        await interaction.response.send_message("このコマンドはDMのみで使用できます。", ephemeral=True)
+        return
+    await interaction.response.defer()
+    success, msg = await pp_client_mgr.verify_otp(interaction.user.id, code)
+    await interaction.followup.send(msg)
+
+
+@tree.command(name="pp_balance", description="PayPay残高を確認します（DMのみ）")
+async def pp_balance_cmd(interaction: discord.Interaction):
+    if not isinstance(interaction.channel, discord.DMChannel):
+        await interaction.response.send_message("このコマンドはDMのみで使用できます。", ephemeral=True)
+        return
+    await interaction.response.defer()
+    c = await pp_client_mgr.get_client(interaction.user.id)
+    if not c:
+        await interaction.followup.send("先に `/pp_login` でログインしてください。")
+        return
+    try:
+        b = c.get_balance()
+        embed = discord.Embed(title="💴 PayPay残高", color=0x00b900)
+        embed.add_field(name="総残高", value=f"{getattr(b,'all_balance',0)}円", inline=True)
+        embed.add_field(name="利用可能残高", value=f"{getattr(b,'useable_balance',0)}円", inline=True)
+        embed.add_field(name="マネー", value=f"{getattr(b,'money',0)}円", inline=True)
+        embed.add_field(name="マネーライト", value=f"{getattr(b,'money_light',0)}円", inline=True)
+        embed.add_field(name="ポイント", value=f"{getattr(b,'points',0)}円", inline=True)
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"残高確認エラー: {e}")
+
+
+@tree.command(name="pp_send_link", description="指定金額の送金リンクを作成します")
+@app_commands.describe(amount="送金する金額（円）")
+async def pp_send_link_cmd(interaction: discord.Interaction, amount: int):
+    await interaction.response.defer(ephemeral=True)
+    c = await pp_client_mgr.get_client(interaction.user.id)
+    if not c:
+        await interaction.followup.send("先に `/pp_login` でログインしてください。")
+        return
+    try:
+        link = c.create_link(amount)
+        await interaction.followup.send(f"✅ 送金リンクを作成しました:\n{link}")
+    except Exception as e:
+        await interaction.followup.send(f"送金リンク作成エラー: {e}")
+
+
+@tree.command(name="pp_check_link", description="PayPay送金リンクの金額を確認します")
+@app_commands.describe(link="確認するPayPayリンク")
+async def pp_check_link_cmd(interaction: discord.Interaction, link: str):
+    await interaction.response.defer(ephemeral=True)
+    c = pp_client_mgr.any_client()
+    if not c:
+        await interaction.followup.send("PayPayにログインしているユーザーがいません。")
+        return
+    try:
+        info = c.link_check(link)
+        total = getattr(info, 'money', 0) + getattr(info, 'money_light', 0)
+        has_pw = getattr(info, 'has_password', False)
+        embed = discord.Embed(title="🔗 リンク情報", color=0x00b900)
+        embed.add_field(name="金額", value=f"¥{total}", inline=True)
+        embed.add_field(name="パスワード", value="あり" if has_pw else "なし", inline=True)
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"リンク確認エラー: {e}")
+
+
+# ── 自販機コマンド（管理者） ──────────────────────────────────
+
+@tree.command(name="vending_setup", description="自販機の管理者登録・初回セットアップ（許可ユーザー専用）")
+@app_commands.describe(receiver_id="PayPay受け取りに使うDiscord UserID（省略で自分）")
+async def vending_setup_cmd(interaction: discord.Interaction, receiver_id: str = None):
+    if not is_allowed(interaction):
+        await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    uid = interaction.user.id
+    if uid not in vending_data["admin_ids"]:
+        vending_data["admin_ids"].append(uid)
+
+    if receiver_id:
+        try:
+            vending_data["receiver_id"] = int(receiver_id)
+        except ValueError:
+            await interaction.followup.send("receiver_id は数字のDiscord IDで入力してください。")
+            return
+    else:
+        vending_data["receiver_id"] = uid
+
+    save_vending_data(vending_data)
+    rid = vending_data["receiver_id"]
+    embed = discord.Embed(title="✅ 自販機セットアップ完了", color=discord.Color.green())
+    embed.add_field(name="管理者", value=f"<@{uid}>", inline=True)
+    embed.add_field(name="受け取りアカウント", value=f"<@{rid}> のセッション", inline=True)
+    embed.add_field(
+        name="次のステップ",
+        value=(
+            "1. 受け取り用アカウントで `/pp_login` でログイン\n"
+            "2. `/vending_add` で商品を追加\n"
+            "3. `/vending_list` で自販機を公開"
+        ),
+        inline=False
+    )
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="vending_add", description="自販機に商品を追加します（管理者専用）")
+async def vending_add_cmd(interaction: discord.Interaction):
+    if not is_vending_admin(interaction.user.id) and not is_allowed(interaction):
+        await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
+        return
+    await interaction.response.send_modal(VendingAddModal())
+
+
+@tree.command(name="vending_stock", description="既存商品に在庫を追加します（管理者専用）")
+async def vending_stock_cmd(interaction: discord.Interaction):
+    if not is_vending_admin(interaction.user.id) and not is_allowed(interaction):
+        await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
+        return
+    await interaction.response.send_modal(VendingStockModal())
+
+
+@tree.command(name="vending_remove", description="商品を削除します（管理者専用）")
+@app_commands.describe(item_id="削除する商品ID")
+async def vending_remove_cmd(interaction: discord.Interaction, item_id: str):
+    if not is_vending_admin(interaction.user.id) and not is_allowed(interaction):
+        await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    item = vending_data["items"].get(item_id)
+    if not item:
+        await interaction.followup.send(f"商品ID `{item_id}` が見つかりません。")
+        return
+    del vending_data["items"][item_id]
+    save_vending_data(vending_data)
+    await interaction.followup.send(f"✅ **{item['name']}**（ID: {item_id}）を削除しました。")
+
+
+@tree.command(name="vending_toggle", description="商品の販売を停止/再開します（管理者専用）")
+@app_commands.describe(item_id="対象の商品ID")
+async def vending_toggle_cmd(interaction: discord.Interaction, item_id: str):
+    if not is_vending_admin(interaction.user.id) and not is_allowed(interaction):
+        await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    item = vending_data["items"].get(item_id)
+    if not item:
+        await interaction.followup.send(f"商品ID `{item_id}` が見つかりません。")
+        return
+    item["enabled"] = not item.get("enabled", True)
+    save_vending_data(vending_data)
+    status = "✅ 販売再開" if item["enabled"] else "⏸️ 販売停止"
+    await interaction.followup.send(f"**{item['name']}** を {status} しました。")
+
+
+@tree.command(name="vending_items", description="全商品一覧を表示します（管理者専用）")
+async def vending_items_cmd(interaction: discord.Interaction):
+    if not is_vending_admin(interaction.user.id) and not is_allowed(interaction):
+        await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    items = list(vending_data["items"].values())
+    if not items:
+        await interaction.followup.send("商品が登録されていません。")
+        return
+    embed = discord.Embed(title="📦 全商品一覧（管理者）", color=discord.Color.blurple())
+    for item in items:
+        status = "✅ 販売中" if item.get("enabled") else "⏸️ 停止中"
+        embed.add_field(
+            name=f"ID: {item['id']} | {item['name']}",
+            value=f"価格: ¥{item['price']} | 在庫: {len(item['stock'])}個 | 販売済: {item['total_sold']}個 | {status}",
+            inline=False
+        )
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="vending_sales", description="販売履歴を表示します（管理者専用）")
+async def vending_sales_cmd(interaction: discord.Interaction):
+    if not is_vending_admin(interaction.user.id) and not is_allowed(interaction):
+        await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    logs = vending_data.get("sales_log", [])
+    if not logs:
+        await interaction.followup.send("まだ販売履歴がありません。")
+        return
+    total_revenue = sum(e.get("price", 0) for e in logs)
+    embed = discord.Embed(title="📊 販売履歴（直近10件）", color=discord.Color.gold())
+    embed.add_field(name="総売上", value=f"¥{total_revenue}", inline=True)
+    embed.add_field(name="総販売数", value=f"{len(logs)}件", inline=True)
+    for entry in list(reversed(logs))[:10]:
+        ts = datetime.fromtimestamp(entry.get("timestamp", 0), JST).strftime("%m/%d %H:%M")
+        embed.add_field(
+            name=f"{ts} | {entry.get('item_name', '不明')}",
+            value=f"購入者: <@{entry.get('buyer_id', '?')}> | ¥{entry.get('price', '?')}",
+            inline=False
+        )
+    await interaction.followup.send(embed=embed)
+
+
+# ── 自販機コマンド（ユーザー） ────────────────────────────────
+
+@tree.command(name="vending_list", description="販売中の商品一覧を表示します")
+async def vending_list_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    items = _available_items()
+    await interaction.followup.send(embed=_build_vending_embed(items), view=VendingListView(items))
+
+
+@tree.command(name="vending_buy", description="商品を購入します（PayPay送金リンクが必要）")
+@app_commands.describe(
+    item_id="購入する商品ID（/vending_list で確認）",
+    link="自分が作成したPayPay送金リンク（価格ぴったりで作成してください）"
+)
+async def vending_buy_cmd(interaction: discord.Interaction, item_id: str, link: str):
+    await interaction.response.defer(ephemeral=True)
+
+    item = vending_data["items"].get(item_id)
+    if not item:
+        await interaction.followup.send(f"❌ 商品ID `{item_id}` が見つかりません。`/vending_list` で確認してください。")
+        return
+    if not item.get("enabled"):
+        await interaction.followup.send("❌ この商品は現在販売停止中です。")
+        return
+    if not item.get("stock"):
+        await interaction.followup.send("❌ この商品は在庫切れです。")
+        return
+
+    receiver_discord_id = vending_data.get("receiver_id")
+    if not receiver_discord_id:
+        await interaction.followup.send("❌ 自販機が正しくセットアップされていません。管理者に連絡してください。")
+        return
+
+    receiver_client = await pp_client_mgr.get_client(receiver_discord_id)
+    if not receiver_client:
+        await interaction.followup.send("❌ 受け取り用PayPayアカウントにログインしていません。管理者に連絡してください。")
+        return
+
+    # リンク金額を確認
+    try:
+        info = receiver_client.link_check(link)
+        link_amount = getattr(info, 'money', 0) + getattr(info, 'money_light', 0)
+        if link_amount == 0 and hasattr(info, 'amount'):
+            link_amount = info.amount
+    except Exception as e:
+        await interaction.followup.send(f"❌ リンクの確認に失敗しました: {e}")
+        return
+
+    if link_amount < item["price"]:
+        await interaction.followup.send(
+            f"❌ 金額が不足しています。\n必要金額: **¥{item['price']}** / リンク金額: **¥{link_amount}**"
+        )
+        return
+
+    # リンクを受け取る
+    try:
+        receiver_client.receive_link(link, link_amount, True)
+    except Exception:
+        try:
+            receiver_client.accept_link(link)
+        except Exception as e:
+            print(f"Link receive (non-fatal): {e}")
+
+    # コンテンツを取り出して配送
+    content = item["stock"].pop(0)
+    item["total_sold"] += 1
+    if "sales_log" not in vending_data:
+        vending_data["sales_log"] = []
+    vending_data["sales_log"].append({
+        "buyer_id": str(interaction.user.id),
+        "item_id": item_id,
+        "item_name": item["name"],
+        "price": link_amount,
+        "timestamp": time.time()
+    })
+    save_vending_data(vending_data)
+
+    # DMで商品を届ける
+    dm_embed = discord.Embed(
+        title="✅ 購入完了！",
+        description=f"**{item['name']}** をご購入いただきありがとうございます。",
+        color=discord.Color.green()
+    )
+    dm_embed.add_field(name="💴 支払金額", value=f"¥{link_amount}", inline=True)
+    dm_embed.add_field(name="📦 商品内容", value=f"||{content}||", inline=False)
+    dm_embed.set_footer(text="内容をクリック/タップすると表示されます")
+
+    try:
+        await interaction.user.send(embed=dm_embed)
+        await interaction.followup.send(f"✅ 購入完了！DMに商品内容をお送りしました。\n残り在庫: {len(item['stock'])}個")
+    except discord.Forbidden:
+        await interaction.followup.send(embed=dm_embed)
 
 
 @client.event
