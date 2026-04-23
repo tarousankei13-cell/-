@@ -235,7 +235,7 @@ def load_vending_data() -> dict:
                 return json.load(f)
     except Exception as e:
         print(f"vending_data.json の読み込みに失敗: {e}")
-    return {"items": {}, "next_id": 1, "admin_ids": [], "sales_log": [], "receiver_id": None}
+    return {"shops": {}, "next_shop_id": 1, "global_admin_ids": []}
 
 
 def save_vending_data(data: dict):
@@ -293,7 +293,7 @@ def is_allowed(interaction: discord.Interaction) -> bool:
 
 
 def is_vending_admin(user_id: int) -> bool:
-    return user_id in vending_data.get("admin_ids", [])
+    return user_id in vending_data.get("global_admin_ids", [])
 
 
 # ── PayPay セッション管理 ─────────────────────────────────────
@@ -2680,16 +2680,57 @@ async def authpanel(
     await interaction.channel.send(embed=embed, view=AuthPanel())
 
 
-# ── 自販機 UI ────────────────────────────────────────────────
+# ── 自販機システム（マルチショップ） ─────────────────────────
 
-def _build_vending_embed(items: list) -> discord.Embed:
+def _available_shops() -> list:
+    return [
+        s for s in vending_data.get("shops", {}).values()
+        if s.get("enabled", True)
+    ]
+
+
+def _shop_available_items(shop: dict) -> list:
+    return [
+        item for item in shop.get("items", {}).values()
+        if item.get("enabled", True) and len(item.get("stock", [])) > 0
+    ]
+
+
+def _is_shop_admin(user_id: int, shop: dict) -> bool:
+    return (
+        user_id in vending_data.get("global_admin_ids", [])
+        or user_id in shop.get("admin_ids", [])
+    )
+
+
+def _build_shops_embed(shops: list) -> discord.Embed:
     embed = discord.Embed(
-        title="🏪 PayPay 自販機",
-        description="購入したい商品をプルダウンから選んでください。",
+        title="🏪 自販機 ショップ一覧",
+        description="購入したいショップをプルダウンから選んでください。",
+        color=0x00b900
+    )
+    if not shops:
+        embed.description = "現在利用可能なショップはありません。"
+    else:
+        for shop in shops[:10]:
+            items = _shop_available_items(shop)
+            embed.add_field(
+                name=f"ID: {shop['id']}  {shop['name']}",
+                value=f"{shop.get('description', '説明なし')}\n販売中: {len(items)}商品",
+                inline=False
+            )
+    embed.set_footer(text="プルダウンでショップを選択してください")
+    return embed
+
+
+def _build_shop_items_embed(shop: dict, items: list) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"🛒 {shop['name']}",
+        description=shop.get("description", ""),
         color=0x00b900
     )
     if not items:
-        embed.description = "現在販売中の商品はありません。"
+        embed.add_field(name="在庫なし", value="現在販売中の商品はありません。", inline=False)
     else:
         for item in items[:10]:
             embed.add_field(
@@ -2697,19 +2738,38 @@ def _build_vending_embed(items: list) -> discord.Embed:
                 value=f"{item['description']}\n在庫: {len(item['stock'])}個",
                 inline=False
             )
-    embed.set_footer(text="プルダウンで商品を選択すると購入手順が表示されます")
+    embed.set_footer(text=f"ショップID: {shop['id']} | プルダウンで商品を選択")
     return embed
 
 
-def _available_items() -> list:
-    return [
-        item for item in vending_data["items"].values()
-        if item.get("enabled") and len(item.get("stock", [])) > 0
-    ]
+class ShopSelectMenu(discord.ui.Select):
+    def __init__(self, shops: list):
+        options = [
+            discord.SelectOption(
+                label=f"ID:{s['id']} {s['name']}"[:100],
+                value=s["id"],
+                description=f"{s.get('description','')[:50]} (商品: {len(_shop_available_items(s))}種)"[:100]
+            )
+            for s in shops[:25]
+        ]
+        super().__init__(placeholder="🏪 ショップを選択...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        shop = vending_data["shops"].get(self.values[0])
+        if not shop:
+            await interaction.response.send_message("ショップが見つかりません。", ephemeral=True)
+            return
+        items = _shop_available_items(shop)
+        await interaction.response.send_message(
+            embed=_build_shop_items_embed(shop, items),
+            view=ShopItemsView(shop, items),
+            ephemeral=True
+        )
 
 
-class VendingItemSelect(discord.ui.Select):
-    def __init__(self, items: list):
+class ShopItemSelectMenu(discord.ui.Select):
+    def __init__(self, shop: dict, items: list):
+        self._shop_id = shop["id"]
         options = [
             discord.SelectOption(
                 label=f"¥{item['price']} | {item['name']}"[:100],
@@ -2721,7 +2781,11 @@ class VendingItemSelect(discord.ui.Select):
         super().__init__(placeholder="🛒 商品を選択...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        item = vending_data["items"].get(self.values[0])
+        shop = vending_data["shops"].get(self._shop_id)
+        if not shop:
+            await interaction.response.send_message("ショップが見つかりません。", ephemeral=True)
+            return
+        item = shop["items"].get(self.values[0])
         if not item:
             await interaction.response.send_message("商品が見つかりません。", ephemeral=True)
             return
@@ -2733,24 +2797,49 @@ class VendingItemSelect(discord.ui.Select):
             value=(
                 f"1. PayPayアプリで **¥{item['price']}** の送金リンクを作成\n"
                 "2. 以下のコマンドを実行（DM推奨）:\n"
-                f"```/vending_buy {item['id']} [作成したリンクURL]```"
+                f"```/vending_buy {shop['id']} {item['id']} [リンクURL]```"
             ),
             inline=False
         )
-        embed.set_footer(text=f"商品ID: {item['id']}")
+        embed.set_footer(text=f"ショップID: {shop['id']} | 商品ID: {item['id']}")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class VendingListView(discord.ui.View):
-    def __init__(self, items: list):
+    def __init__(self, shops: list):
         super().__init__(timeout=180)
-        if items:
-            self.add_item(VendingItemSelect(items))
+        if shops:
+            self.add_item(ShopSelectMenu(shops))
 
     @discord.ui.button(label="🔄 更新", style=discord.ButtonStyle.secondary, row=1)
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
-        items = _available_items()
-        await interaction.response.edit_message(embed=_build_vending_embed(items), view=VendingListView(items))
+        shops = _available_shops()
+        await interaction.response.edit_message(embed=_build_shops_embed(shops), view=VendingListView(shops))
+
+
+class ShopItemsView(discord.ui.View):
+    def __init__(self, shop: dict, items: list):
+        super().__init__(timeout=180)
+        self._shop_id = shop["id"]
+        if items:
+            self.add_item(ShopItemSelectMenu(shop, items))
+
+    @discord.ui.button(label="◀ ショップ一覧へ戻る", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        shops = _available_shops()
+        await interaction.response.edit_message(embed=_build_shops_embed(shops), view=VendingListView(shops))
+
+    @discord.ui.button(label="🔄 更新", style=discord.ButtonStyle.secondary, row=1)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        shop = vending_data["shops"].get(self._shop_id)
+        if not shop:
+            await interaction.response.edit_message(content="ショップが見つかりません。", view=None)
+            return
+        items = _shop_available_items(shop)
+        await interaction.response.edit_message(
+            embed=_build_shop_items_embed(shop, items),
+            view=ShopItemsView(shop, items)
+        )
 
 
 class VendingAddModal(discord.ui.Modal, title="商品を追加"):
@@ -2763,7 +2852,15 @@ class VendingAddModal(discord.ui.Modal, title="商品を追加"):
         placeholder="例:\nmail@example.com:password123\nmail2@example.com:password456"
     )
 
+    def __init__(self, shop_id: str):
+        super().__init__()
+        self._shop_id = shop_id
+
     async def on_submit(self, interaction: discord.Interaction):
+        shop = vending_data["shops"].get(self._shop_id)
+        if not shop:
+            await interaction.response.send_message("ショップが見つかりません。", ephemeral=True)
+            return
         try:
             price = int(self.item_price.value.strip())
             if price <= 0:
@@ -2771,15 +2868,13 @@ class VendingAddModal(discord.ui.Modal, title="商品を追加"):
         except ValueError:
             await interaction.response.send_message("価格は正の整数で入力してください。", ephemeral=True)
             return
-
         contents = [c.strip() for c in self.item_contents.value.strip().split("\n") if c.strip()]
         if not contents:
             await interaction.response.send_message("商品内容を1つ以上入力してください。", ephemeral=True)
             return
-
-        item_id = str(vending_data["next_id"])
-        vending_data["next_id"] += 1
-        vending_data["items"][item_id] = {
+        item_id = str(shop["next_item_id"])
+        shop["next_item_id"] += 1
+        shop["items"][item_id] = {
             "id": item_id,
             "name": self.item_name.value.strip(),
             "description": self.item_description.value.strip() or "説明なし",
@@ -2790,7 +2885,8 @@ class VendingAddModal(discord.ui.Modal, title="商品を追加"):
         }
         save_vending_data(vending_data)
         await interaction.response.send_message(
-            f"✅ 商品を追加しました\n**{self.item_name.value}** | ¥{price} | 在庫: {len(contents)}個\n商品ID: `{item_id}`",
+            f"✅ **{self.item_name.value}** を追加しました\n"
+            f"価格: ¥{price} | 在庫: {len(contents)}個 | 商品ID: `{item_id}`",
             ephemeral=True
         )
 
@@ -2803,11 +2899,18 @@ class VendingStockModal(discord.ui.Modal, title="在庫を追加"):
         placeholder="例:\nmail@example.com:password123"
     )
 
+    def __init__(self, shop_id: str):
+        super().__init__()
+        self._shop_id = shop_id
+
     async def on_submit(self, interaction: discord.Interaction):
-        item_id = self.item_id_input.value.strip()
-        item = vending_data["items"].get(item_id)
+        shop = vending_data["shops"].get(self._shop_id)
+        if not shop:
+            await interaction.response.send_message("ショップが見つかりません。", ephemeral=True)
+            return
+        item = shop["items"].get(self.item_id_input.value.strip())
         if not item:
-            await interaction.response.send_message(f"商品ID `{item_id}` が見つかりません。", ephemeral=True)
+            await interaction.response.send_message(f"商品ID `{self.item_id_input.value.strip()}` が見つかりません。", ephemeral=True)
             return
         contents = [c.strip() for c in self.item_contents.value.strip().split("\n") if c.strip()]
         if not contents:
@@ -2816,7 +2919,7 @@ class VendingStockModal(discord.ui.Modal, title="在庫を追加"):
         item["stock"].extend(contents)
         save_vending_data(vending_data)
         await interaction.response.send_message(
-            f"✅ **{item['name']}** に {len(contents)}個の在庫を追加しました。現在の在庫: {len(item['stock'])}個",
+            f"✅ **{item['name']}** に {len(contents)}個追加しました。現在の在庫: {len(item['stock'])}個",
             ephemeral=True
         )
 
@@ -2905,84 +3008,215 @@ async def pp_check_link_cmd(interaction: discord.Interaction, link: str):
 
 # ── 自販機コマンド（管理者） ──────────────────────────────────
 
-@tree.command(name="vending_setup", description="自販機の管理者登録・初回セットアップ（許可ユーザー専用）")
-@app_commands.describe(receiver_id="PayPay受け取りに使うDiscord UserID（省略で自分）")
-async def vending_setup_cmd(interaction: discord.Interaction, receiver_id: str = None):
+@tree.command(name="vending_create", description="新しいショップ（自販機）を作成します（許可ユーザー専用）")
+@app_commands.describe(
+    name="ショップ名",
+    description="ショップの説明（省略可）",
+    receiver_id="PayPay受け取りに使うDiscord UserID（省略で自分）"
+)
+async def vending_create_cmd(
+    interaction: discord.Interaction,
+    name: str,
+    description: str = "説明なし",
+    receiver_id: str = None
+):
     if not is_allowed(interaction):
         await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
 
-    uid = interaction.user.id
-    if uid not in vending_data["admin_ids"]:
-        vending_data["admin_ids"].append(uid)
+    if "shops" not in vending_data:
+        vending_data["shops"] = {}
+    if "next_shop_id" not in vending_data:
+        vending_data["next_shop_id"] = 1
+    if "global_admin_ids" not in vending_data:
+        vending_data["global_admin_ids"] = []
 
+    uid = interaction.user.id
+    if uid not in vending_data["global_admin_ids"]:
+        vending_data["global_admin_ids"].append(uid)
+
+    rid = uid
     if receiver_id:
         try:
-            vending_data["receiver_id"] = int(receiver_id)
+            rid = int(receiver_id)
         except ValueError:
             await interaction.followup.send("receiver_id は数字のDiscord IDで入力してください。")
             return
-    else:
-        vending_data["receiver_id"] = uid
 
+    shop_id = str(vending_data["next_shop_id"])
+    vending_data["next_shop_id"] += 1
+    vending_data["shops"][shop_id] = {
+        "id": shop_id,
+        "name": name.strip(),
+        "description": description.strip(),
+        "receiver_id": rid,
+        "admin_ids": [uid],
+        "items": {},
+        "next_item_id": 1,
+        "sales_log": [],
+        "enabled": True
+    }
     save_vending_data(vending_data)
-    rid = vending_data["receiver_id"]
-    embed = discord.Embed(title="✅ 自販機セットアップ完了", color=discord.Color.green())
-    embed.add_field(name="管理者", value=f"<@{uid}>", inline=True)
+
+    embed = discord.Embed(title=f"✅ ショップ「{name}」を作成しました", color=discord.Color.green())
+    embed.add_field(name="ショップID", value=f"`{shop_id}`", inline=True)
     embed.add_field(name="受け取りアカウント", value=f"<@{rid}> のセッション", inline=True)
     embed.add_field(
         name="次のステップ",
         value=(
-            "1. 受け取り用アカウントで `/pp_login` でログイン\n"
-            "2. `/vending_add` で商品を追加\n"
-            "3. `/vending_list` で自販機を公開"
+            f"1. 受け取り用アカウントで `/pp_login` でログイン\n"
+            f"2. `/vending_add {shop_id}` で商品を追加\n"
+            f"3. `/vending_list` でショップを確認"
         ),
         inline=False
     )
     await interaction.followup.send(embed=embed)
 
 
-@tree.command(name="vending_add", description="自販機に商品を追加します（管理者専用）")
-async def vending_add_cmd(interaction: discord.Interaction):
-    if not is_vending_admin(interaction.user.id) and not is_allowed(interaction):
-        await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
+@tree.command(name="vending_delete", description="ショップを削除します（許可ユーザー専用）")
+@app_commands.describe(shop_id="削除するショップID")
+async def vending_delete_cmd(interaction: discord.Interaction, shop_id: str):
+    if not is_allowed(interaction):
+        await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
         return
-    await interaction.response.send_modal(VendingAddModal())
-
-
-@tree.command(name="vending_stock", description="既存商品に在庫を追加します（管理者専用）")
-async def vending_stock_cmd(interaction: discord.Interaction):
-    if not is_vending_admin(interaction.user.id) and not is_allowed(interaction):
-        await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    shop = vending_data.get("shops", {}).get(shop_id)
+    if not shop:
+        await interaction.followup.send(f"ショップID `{shop_id}` が見つかりません。")
         return
-    await interaction.response.send_modal(VendingStockModal())
+    name = shop["name"]
+    del vending_data["shops"][shop_id]
+    save_vending_data(vending_data)
+    await interaction.followup.send(f"✅ ショップ「{name}」（ID: {shop_id}）を削除しました。")
 
 
-@tree.command(name="vending_remove", description="商品を削除します（管理者専用）")
-@app_commands.describe(item_id="削除する商品ID")
-async def vending_remove_cmd(interaction: discord.Interaction, item_id: str):
-    if not is_vending_admin(interaction.user.id) and not is_allowed(interaction):
+@tree.command(name="vending_shops", description="全ショップ一覧を表示します（管理者専用）")
+async def vending_shops_cmd(interaction: discord.Interaction):
+    if not is_allowed(interaction) and not is_vending_admin(interaction.user.id):
         await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    item = vending_data["items"].get(item_id)
+    shops = list(vending_data.get("shops", {}).values())
+    if not shops:
+        await interaction.followup.send("ショップが登録されていません。`/vending_create` で作成してください。")
+        return
+    embed = discord.Embed(title="🏪 全ショップ一覧（管理者）", color=discord.Color.blurple())
+    for shop in shops:
+        status = "✅ 公開中" if shop.get("enabled", True) else "⏸️ 非公開"
+        items = list(shop.get("items", {}).values())
+        total_stock = sum(len(i["stock"]) for i in items)
+        total_sold = sum(i.get("total_sold", 0) for i in items)
+        embed.add_field(
+            name=f"ID: {shop['id']} | {shop['name']}",
+            value=(
+                f"{shop.get('description', '')}\n"
+                f"商品種: {len(items)}種 | 在庫計: {total_stock}個 | 販売済: {total_sold}個\n"
+                f"受け取り: <@{shop.get('receiver_id', '未設定')}> | {status}"
+            ),
+            inline=False
+        )
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="vending_shop_toggle", description="ショップの公開/非公開を切り替えます（管理者専用）")
+@app_commands.describe(shop_id="対象のショップID")
+async def vending_shop_toggle_cmd(interaction: discord.Interaction, shop_id: str):
+    shop = vending_data.get("shops", {}).get(shop_id)
+    if not shop:
+        await interaction.response.send_message(f"ショップID `{shop_id}` が見つかりません。", ephemeral=True)
+        return
+    if not is_allowed(interaction) and not _is_shop_admin(interaction.user.id, shop):
+        await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    shop["enabled"] = not shop.get("enabled", True)
+    save_vending_data(vending_data)
+    status = "✅ 公開" if shop["enabled"] else "⏸️ 非公開"
+    await interaction.followup.send(f"ショップ「{shop['name']}」を {status} にしました。")
+
+
+@tree.command(name="vending_set_receiver", description="ショップの受け取りPayPayアカウントを変更します（管理者専用）")
+@app_commands.describe(shop_id="対象のショップID", receiver_id="受け取りに使うDiscord UserID（省略で自分）")
+async def vending_set_receiver_cmd(interaction: discord.Interaction, shop_id: str, receiver_id: str = None):
+    shop = vending_data.get("shops", {}).get(shop_id)
+    if not shop:
+        await interaction.response.send_message(f"ショップID `{shop_id}` が見つかりません。", ephemeral=True)
+        return
+    if not is_allowed(interaction) and not _is_shop_admin(interaction.user.id, shop):
+        await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    rid = interaction.user.id
+    if receiver_id:
+        try:
+            rid = int(receiver_id)
+        except ValueError:
+            await interaction.followup.send("receiver_id は数字のDiscord IDで入力してください。")
+            return
+    shop["receiver_id"] = rid
+    save_vending_data(vending_data)
+    await interaction.followup.send(f"✅ ショップ「{shop['name']}」の受け取りアカウントを <@{rid}> に変更しました。")
+
+
+@tree.command(name="vending_add", description="ショップに商品を追加します（管理者専用）")
+@app_commands.describe(shop_id="追加するショップID")
+async def vending_add_cmd(interaction: discord.Interaction, shop_id: str):
+    shop = vending_data.get("shops", {}).get(shop_id)
+    if not shop:
+        await interaction.response.send_message(f"ショップID `{shop_id}` が見つかりません。", ephemeral=True)
+        return
+    if not is_allowed(interaction) and not _is_shop_admin(interaction.user.id, shop):
+        await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
+        return
+    await interaction.response.send_modal(VendingAddModal(shop_id))
+
+
+@tree.command(name="vending_stock", description="既存商品に在庫を追加します（管理者専用）")
+@app_commands.describe(shop_id="対象のショップID")
+async def vending_stock_cmd(interaction: discord.Interaction, shop_id: str):
+    shop = vending_data.get("shops", {}).get(shop_id)
+    if not shop:
+        await interaction.response.send_message(f"ショップID `{shop_id}` が見つかりません。", ephemeral=True)
+        return
+    if not is_allowed(interaction) and not _is_shop_admin(interaction.user.id, shop):
+        await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
+        return
+    await interaction.response.send_modal(VendingStockModal(shop_id))
+
+
+@tree.command(name="vending_remove", description="商品を削除します（管理者専用）")
+@app_commands.describe(shop_id="対象のショップID", item_id="削除する商品ID")
+async def vending_remove_cmd(interaction: discord.Interaction, shop_id: str, item_id: str):
+    shop = vending_data.get("shops", {}).get(shop_id)
+    if not shop:
+        await interaction.response.send_message(f"ショップID `{shop_id}` が見つかりません。", ephemeral=True)
+        return
+    if not is_allowed(interaction) and not _is_shop_admin(interaction.user.id, shop):
+        await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    item = shop["items"].get(item_id)
     if not item:
         await interaction.followup.send(f"商品ID `{item_id}` が見つかりません。")
         return
-    del vending_data["items"][item_id]
+    del shop["items"][item_id]
     save_vending_data(vending_data)
     await interaction.followup.send(f"✅ **{item['name']}**（ID: {item_id}）を削除しました。")
 
 
 @tree.command(name="vending_toggle", description="商品の販売を停止/再開します（管理者専用）")
-@app_commands.describe(item_id="対象の商品ID")
-async def vending_toggle_cmd(interaction: discord.Interaction, item_id: str):
-    if not is_vending_admin(interaction.user.id) and not is_allowed(interaction):
+@app_commands.describe(shop_id="対象のショップID", item_id="対象の商品ID")
+async def vending_toggle_cmd(interaction: discord.Interaction, shop_id: str, item_id: str):
+    shop = vending_data.get("shops", {}).get(shop_id)
+    if not shop:
+        await interaction.response.send_message(f"ショップID `{shop_id}` が見つかりません。", ephemeral=True)
+        return
+    if not is_allowed(interaction) and not _is_shop_admin(interaction.user.id, shop):
         await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    item = vending_data["items"].get(item_id)
+    item = shop["items"].get(item_id)
     if not item:
         await interaction.followup.send(f"商品ID `{item_id}` が見つかりません。")
         return
@@ -2992,39 +3226,49 @@ async def vending_toggle_cmd(interaction: discord.Interaction, item_id: str):
     await interaction.followup.send(f"**{item['name']}** を {status} しました。")
 
 
-@tree.command(name="vending_items", description="全商品一覧を表示します（管理者専用）")
-async def vending_items_cmd(interaction: discord.Interaction):
-    if not is_vending_admin(interaction.user.id) and not is_allowed(interaction):
+@tree.command(name="vending_items", description="ショップの全商品一覧を表示します（管理者専用）")
+@app_commands.describe(shop_id="対象のショップID")
+async def vending_items_cmd(interaction: discord.Interaction, shop_id: str):
+    shop = vending_data.get("shops", {}).get(shop_id)
+    if not shop:
+        await interaction.response.send_message(f"ショップID `{shop_id}` が見つかりません。", ephemeral=True)
+        return
+    if not is_allowed(interaction) and not _is_shop_admin(interaction.user.id, shop):
         await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    items = list(vending_data["items"].values())
+    items = list(shop["items"].values())
     if not items:
         await interaction.followup.send("商品が登録されていません。")
         return
-    embed = discord.Embed(title="📦 全商品一覧（管理者）", color=discord.Color.blurple())
+    embed = discord.Embed(title=f"📦 {shop['name']} 全商品（管理者）", color=discord.Color.blurple())
     for item in items:
-        status = "✅ 販売中" if item.get("enabled") else "⏸️ 停止中"
+        status = "✅ 販売中" if item.get("enabled", True) else "⏸️ 停止中"
         embed.add_field(
             name=f"ID: {item['id']} | {item['name']}",
-            value=f"価格: ¥{item['price']} | 在庫: {len(item['stock'])}個 | 販売済: {item['total_sold']}個 | {status}",
+            value=f"価格: ¥{item['price']} | 在庫: {len(item['stock'])}個 | 販売済: {item.get('total_sold',0)}個 | {status}",
             inline=False
         )
     await interaction.followup.send(embed=embed)
 
 
-@tree.command(name="vending_sales", description="販売履歴を表示します（管理者専用）")
-async def vending_sales_cmd(interaction: discord.Interaction):
-    if not is_vending_admin(interaction.user.id) and not is_allowed(interaction):
+@tree.command(name="vending_sales", description="ショップの販売履歴を表示します（管理者専用）")
+@app_commands.describe(shop_id="対象のショップID")
+async def vending_sales_cmd(interaction: discord.Interaction, shop_id: str):
+    shop = vending_data.get("shops", {}).get(shop_id)
+    if not shop:
+        await interaction.response.send_message(f"ショップID `{shop_id}` が見つかりません。", ephemeral=True)
+        return
+    if not is_allowed(interaction) and not _is_shop_admin(interaction.user.id, shop):
         await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    logs = vending_data.get("sales_log", [])
+    logs = shop.get("sales_log", [])
     if not logs:
         await interaction.followup.send("まだ販売履歴がありません。")
         return
     total_revenue = sum(e.get("price", 0) for e in logs)
-    embed = discord.Embed(title="📊 販売履歴（直近10件）", color=discord.Color.gold())
+    embed = discord.Embed(title=f"📊 {shop['name']} 販売履歴（直近10件）", color=discord.Color.gold())
     embed.add_field(name="総売上", value=f"¥{total_revenue}", inline=True)
     embed.add_field(name="総販売数", value=f"{len(logs)}件", inline=True)
     for entry in list(reversed(logs))[:10]:
@@ -3039,35 +3283,44 @@ async def vending_sales_cmd(interaction: discord.Interaction):
 
 # ── 自販機コマンド（ユーザー） ────────────────────────────────
 
-@tree.command(name="vending_list", description="販売中の商品一覧を表示します")
+@tree.command(name="vending_list", description="販売中のショップ・商品一覧を表示します")
 async def vending_list_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
-    items = _available_items()
-    await interaction.followup.send(embed=_build_vending_embed(items), view=VendingListView(items))
+    shops = _available_shops()
+    await interaction.followup.send(embed=_build_shops_embed(shops), view=VendingListView(shops))
 
 
 @tree.command(name="vending_buy", description="商品を購入します（PayPay送金リンクが必要）")
 @app_commands.describe(
-    item_id="購入する商品ID（/vending_list で確認）",
+    shop_id="ショップID（/vending_list で確認）",
+    item_id="商品ID（/vending_list でショップを選択後に確認）",
     link="自分が作成したPayPay送金リンク（価格ぴったりで作成してください）"
 )
-async def vending_buy_cmd(interaction: discord.Interaction, item_id: str, link: str):
+async def vending_buy_cmd(interaction: discord.Interaction, shop_id: str, item_id: str, link: str):
     await interaction.response.defer(ephemeral=True)
 
-    item = vending_data["items"].get(item_id)
-    if not item:
-        await interaction.followup.send(f"❌ 商品ID `{item_id}` が見つかりません。`/vending_list` で確認してください。")
+    shop = vending_data.get("shops", {}).get(shop_id)
+    if not shop:
+        await interaction.followup.send(f"❌ ショップID `{shop_id}` が見つかりません。`/vending_list` で確認してください。")
         return
-    if not item.get("enabled"):
+    if not shop.get("enabled", True):
+        await interaction.followup.send("❌ このショップは現在利用できません。")
+        return
+
+    item = shop["items"].get(item_id)
+    if not item:
+        await interaction.followup.send(f"❌ 商品ID `{item_id}` が見つかりません。")
+        return
+    if not item.get("enabled", True):
         await interaction.followup.send("❌ この商品は現在販売停止中です。")
         return
     if not item.get("stock"):
         await interaction.followup.send("❌ この商品は在庫切れです。")
         return
 
-    receiver_discord_id = vending_data.get("receiver_id")
+    receiver_discord_id = shop.get("receiver_id")
     if not receiver_discord_id:
-        await interaction.followup.send("❌ 自販機が正しくセットアップされていません。管理者に連絡してください。")
+        await interaction.followup.send("❌ このショップの受け取りアカウントが設定されていません。管理者に連絡してください。")
         return
 
     receiver_client = await pp_client_mgr.get_client(receiver_discord_id)
@@ -3075,7 +3328,6 @@ async def vending_buy_cmd(interaction: discord.Interaction, item_id: str, link: 
         await interaction.followup.send("❌ 受け取り用PayPayアカウントにログインしていません。管理者に連絡してください。")
         return
 
-    # リンク金額を確認
     try:
         info = receiver_client.link_check(link)
         link_amount = getattr(info, 'money', 0) + getattr(info, 'money_light', 0)
@@ -3091,7 +3343,6 @@ async def vending_buy_cmd(interaction: discord.Interaction, item_id: str, link: 
         )
         return
 
-    # リンクを受け取る
     try:
         receiver_client.receive_link(link, link_amount, True)
     except Exception:
@@ -3100,12 +3351,11 @@ async def vending_buy_cmd(interaction: discord.Interaction, item_id: str, link: 
         except Exception as e:
             print(f"Link receive (non-fatal): {e}")
 
-    # コンテンツを取り出して配送
     content = item["stock"].pop(0)
-    item["total_sold"] += 1
-    if "sales_log" not in vending_data:
-        vending_data["sales_log"] = []
-    vending_data["sales_log"].append({
+    item["total_sold"] = item.get("total_sold", 0) + 1
+    if "sales_log" not in shop:
+        shop["sales_log"] = []
+    shop["sales_log"].append({
         "buyer_id": str(interaction.user.id),
         "item_id": item_id,
         "item_name": item["name"],
@@ -3114,19 +3364,21 @@ async def vending_buy_cmd(interaction: discord.Interaction, item_id: str, link: 
     })
     save_vending_data(vending_data)
 
-    # DMで商品を届ける
     dm_embed = discord.Embed(
         title="✅ 購入完了！",
-        description=f"**{item['name']}** をご購入いただきありがとうございます。",
+        description=f"**{shop['name']}** から **{item['name']}** をご購入いただきありがとうございます。",
         color=discord.Color.green()
     )
+    dm_embed.add_field(name="🏪 ショップ", value=shop["name"], inline=True)
     dm_embed.add_field(name="💴 支払金額", value=f"¥{link_amount}", inline=True)
     dm_embed.add_field(name="📦 商品内容", value=f"||{content}||", inline=False)
     dm_embed.set_footer(text="内容をクリック/タップすると表示されます")
 
     try:
         await interaction.user.send(embed=dm_embed)
-        await interaction.followup.send(f"✅ 購入完了！DMに商品内容をお送りしました。\n残り在庫: {len(item['stock'])}個")
+        await interaction.followup.send(
+            f"✅ 購入完了！DMに商品内容をお送りしました。\n残り在庫: {len(item['stock'])}個"
+        )
     except discord.Forbidden:
         await interaction.followup.send(embed=dm_embed)
 
