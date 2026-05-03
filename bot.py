@@ -41,6 +41,12 @@ class ShopBot(commands.Bot):
             "cogs.orders",
             "cogs.tickets",
             "cogs.reviews",
+            "cogs.coupons",
+            "cogs.digital",
+            "cogs.ranks",
+            "cogs.tasks",
+            "cogs.watchlist",
+            "cogs.gifts",
         ]
         for cog in cogs:
             try:
@@ -77,11 +83,12 @@ class ShopBot(commands.Bot):
             msg = "このコマンドを実行する権限がありません。"
         elif isinstance(error, discord.app_commands.BotMissingPermissions):
             msg = f"Botに必要な権限がありません: {', '.join(error.missing_permissions)}"
+        elif isinstance(error, discord.app_commands.CheckFailure):
+            return  # Already handled in predicate
         else:
             log.error(f"App command error in {interaction.command}: {error}", exc_info=True)
-
-        embed = err_embed("エラー", msg)
         try:
+            embed = err_embed("エラー", msg)
             if interaction.response.is_done():
                 await interaction.followup.send(embed=embed, ephemeral=True)
             else:

@@ -14,9 +14,13 @@ class Config:
     ORDER_LOG_CHANNEL: int | None = int(ch) if (ch := os.getenv("ORDER_LOG_CHANNEL")) else None
     TICKET_CATEGORY: int | None = int(ch) if (ch := os.getenv("TICKET_CATEGORY")) else None
     ANNOUNCE_CHANNEL: int | None = int(ch) if (ch := os.getenv("ANNOUNCE_CHANNEL")) else None
+    FLASH_SALE_CHANNEL: int | None = int(ch) if (ch := os.getenv("FLASH_SALE_CHANNEL")) else None
+    ACHIEVEMENT_CHANNEL: int | None = int(ch) if (ch := os.getenv("ACHIEVEMENT_CHANNEL")) else None
+    RANK_UP_CHANNEL: int | None = int(ch) if (ch := os.getenv("RANK_UP_CHANNEL")) else None
 
     DAILY_REWARD: int = int(os.getenv("DAILY_REWARD", 500))
     STARTING_BALANCE: int = int(os.getenv("STARTING_BALANCE", 1000))
+    REFERRAL_REWARD: int = int(os.getenv("REFERRAL_REWARD", 1000))
     CURRENCY_NAME: str = os.getenv("CURRENCY_NAME", "ポイント")
     CURRENCY_EMOJI: str = os.getenv("CURRENCY_EMOJI", "💰")
 
@@ -32,3 +36,5 @@ class Config:
     COLOR_ERROR: int = 0xED4245
     COLOR_INFO: int = 0x00B0F4
     COLOR_SHOP: int = 0xFF6B6B
+    COLOR_GOLD: int = 0xFFD700
+    COLOR_FLASH: int = 0xFF4500

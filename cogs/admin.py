@@ -6,7 +6,7 @@ from config import Config
 import utils.embeds as E
 from utils.views import (
     AddProductModal, EditProductModal, AddCategoryModal,
-    AnnounceModal, OrderAdminView
+    AnnounceModal, OrderAdminView, FlashSaleModal, Paginator
 )
 
 
@@ -14,8 +14,7 @@ def is_admin():
     async def predicate(interaction: discord.Interaction) -> bool:
         if interaction.user.guild_permissions.administrator:
             return True
-        role = discord.utils.get(interaction.user.roles, name=Config.ADMIN_ROLE)
-        if role:
+        if any(r.name == Config.ADMIN_ROLE for r in interaction.user.roles):
             return True
         await interaction.response.send_message(embed=E.error("権限不足", "管理者権限が必要です。"), ephemeral=True)
         return False
@@ -32,25 +31,28 @@ class Admin(commands.Cog):
 
     admin = app_commands.Group(name="admin", description="管理者コマンド")
 
-    # ── Stats ──────────────────────────────────────────────────────────────
+    # ── Stats & Dashboard ──────────────────────────────────────────────────
 
-    @admin.command(name="stats", description="ショップの統計を表示します")
+    @admin.command(name="stats", description="ショップの統計ダッシュボードを表示します")
     @is_admin()
     async def stats(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         stats = await self.db.get_shop_stats()
-        await interaction.followup.send(embed=E.stats_embed(stats), ephemeral=True)
+        revenue_7d = await self.db.get_revenue_by_day(7)
+        embed = E.stats_embed(stats)
+        if revenue_7d:
+            lines = [f"`{r['day']}` {r['revenue']:,}pt / {r['order_count']}件" for r in revenue_7d]
+            embed.add_field(name="📅 直近7日売上", value="\n".join(lines), inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ── Announce ───────────────────────────────────────────────────────────
 
-    @admin.command(name="announce", description="ショップからお知らせを送信します")
+    @admin.command(name="announce", description="お知らせを送信します")
     @is_admin()
     async def announce(self, interaction: discord.Interaction):
         await interaction.response.send_modal(AnnounceModal())
 
-    # ── Category commands ──────────────────────────────────────────────────
-
-    category_group = app_commands.Group(name="category", description="カテゴリー管理", parent=None)
+    # ── Category management ────────────────────────────────────────────────
 
     @admin.command(name="category_add", description="カテゴリーを追加します")
     @is_admin()
@@ -62,12 +64,12 @@ class Admin(commands.Cog):
     async def category_list(self, interaction: discord.Interaction):
         categories = await self.db.get_categories()
         if not categories:
-            await interaction.response.send_message(embed=E.info("カテゴリーなし", "カテゴリーが登録されていません。"), ephemeral=True)
+            await interaction.response.send_message(embed=E.info("カテゴリーなし"), ephemeral=True)
             return
         embed = discord.Embed(title="📂  カテゴリー一覧", color=Config.COLOR_PRIMARY)
         for cat in categories:
-            prod_count_row = await self.db._fetch_one("SELECT COUNT(*) as c FROM products WHERE category_id=?", (cat["id"],))
-            count = prod_count_row["c"] if prod_count_row else 0
+            row = await self.db._fetch_one("SELECT COUNT(*) as c FROM products WHERE category_id=?", (cat["id"],))
+            count = row["c"] if row else 0
             embed.add_field(
                 name=f"ID:{cat['id']}  {cat['emoji']} {cat['name']}",
                 value=f"{cat['description'] or '説明なし'}  |  商品数: **{count}**",
@@ -75,7 +77,7 @@ class Admin(commands.Cog):
             )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @admin.command(name="category_delete", description="カテゴリーを削除します（商品も削除されます）")
+    @admin.command(name="category_delete", description="カテゴリーを削除します（商品も全削除）")
     @app_commands.describe(category_id="カテゴリーID")
     @is_admin()
     async def category_delete(self, interaction: discord.Interaction, category_id: int):
@@ -84,12 +86,9 @@ class Admin(commands.Cog):
             await interaction.response.send_message(embed=E.error("カテゴリーが見つかりません"), ephemeral=True)
             return
         await self.db.delete_category(category_id)
-        await interaction.response.send_message(
-            embed=E.success("カテゴリーを削除しました", f"**{cat['emoji']} {cat['name']}** を削除しました。"),
-            ephemeral=True
-        )
+        await interaction.response.send_message(embed=E.success("カテゴリーを削除しました", f"**{cat['emoji']} {cat['name']}**"), ephemeral=True)
 
-    # ── Product commands ───────────────────────────────────────────────────
+    # ── Product management ─────────────────────────────────────────────────
 
     @admin.command(name="product_add", description="商品を追加します")
     @app_commands.describe(category_id="カテゴリーID")
@@ -120,10 +119,7 @@ class Admin(commands.Cog):
             await interaction.response.send_message(embed=E.error("商品が見つかりません"), ephemeral=True)
             return
         await self.db.delete_product(product_id)
-        await interaction.response.send_message(
-            embed=E.success("商品を削除しました", f"**{p['name']}** (ID:{product_id}) を削除しました。"),
-            ephemeral=True
-        )
+        await interaction.response.send_message(embed=E.success("商品を削除しました", f"**{p['name']}** (ID:{product_id})"), ephemeral=True)
 
     @admin.command(name="product_toggle", description="商品の販売状態を切り替えます")
     @app_commands.describe(product_id="商品ID")
@@ -135,9 +131,8 @@ class Admin(commands.Cog):
             return
         new_state = 0 if p["is_available"] else 1
         await self.db.update_product(product_id, is_available=new_state)
-        label = "販売中" if new_state else "非販売"
         await interaction.response.send_message(
-            embed=E.success("ステータスを変更しました", f"**{p['name']}** を「{label}」に設定しました。"),
+            embed=E.success("ステータス変更", f"**{p['name']}** を「{'販売中' if new_state else '非販売'}」に設定しました。"),
             ephemeral=True
         )
 
@@ -149,12 +144,43 @@ class Admin(commands.Cog):
         if not p:
             await interaction.response.send_message(embed=E.error("商品が見つかりません"), ephemeral=True)
             return
+        old_stock = p["stock"]
         await self.db.update_stock(product_id, stock)
         stock_str = "無制限" if stock == -1 else f"{stock:,} 個"
         await interaction.response.send_message(
             embed=E.success("在庫を更新しました", f"**{p['name']}** の在庫: {stock_str}"),
             ephemeral=True
         )
+        # Notify watchlist if stock became available
+        if (old_stock == 0 or (old_stock != -1 and old_stock <= 0)) and (stock == -1 or stock > 0):
+            from cogs.watchlist import Watchlist
+            notified = await Watchlist.notify_watchers(interaction.client, product_id, p["name"])
+            if notified:
+                await self.db.reset_watcher_notify(product_id)
+
+    @admin.command(name="product_digital", description="商品のデジタル設定を切り替えます")
+    @app_commands.describe(product_id="商品ID")
+    @is_admin()
+    async def product_digital(self, interaction: discord.Interaction, product_id: int):
+        p = await self.db.get_product(product_id)
+        if not p:
+            await interaction.response.send_message(embed=E.error("商品が見つかりません"), ephemeral=True)
+            return
+        new_val = 0 if p["is_digital"] else 1
+        await self.db.update_product(product_id, is_digital=new_val)
+        label = "デジタル商品に設定しました" if new_val else "通常商品に変更しました"
+        await interaction.response.send_message(embed=E.success(label, f"**{p['name']}**"), ephemeral=True)
+
+    @admin.command(name="product_tags", description="商品にタグを設定します")
+    @app_commands.describe(product_id="商品ID", tags="カンマ区切りのタグ（例: ゲーム,PC,Steam）")
+    @is_admin()
+    async def product_tags(self, interaction: discord.Interaction, product_id: int, tags: str):
+        p = await self.db.get_product(product_id)
+        if not p:
+            await interaction.response.send_message(embed=E.error("商品が見つかりません"), ephemeral=True)
+            return
+        await self.db.update_product(product_id, tags=tags)
+        await interaction.response.send_message(embed=E.success("タグを設定しました", f"**{p['name']}**\nタグ: {tags}"), ephemeral=True)
 
     @admin.command(name="product_list", description="全商品一覧を表示します")
     @app_commands.describe(category_id="カテゴリーID（省略時：全商品）")
@@ -163,9 +189,8 @@ class Admin(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         products = await self.db.get_products(category_id=category_id, available_only=False)
         if not products:
-            await interaction.followup.send(embed=E.info("商品なし", "商品が登録されていません。"), ephemeral=True)
+            await interaction.followup.send(embed=E.info("商品なし"), ephemeral=True)
             return
-
         pages = []
         PAGE = 8
         for i in range(0, len(products), PAGE):
@@ -174,51 +199,96 @@ class Admin(commands.Cog):
             for p in chunk:
                 stock_str = "∞" if p["stock"] == -1 else str(p["stock"])
                 status = "🟢" if p["is_available"] else "🔴"
+                digital = "💾" if p.get("is_digital") else ""
                 embed.add_field(
-                    name=f"{status} #{p['id']} {p['cat_emoji']} {p['name']}",
+                    name=f"{status} #{p['id']} {p['cat_emoji']}{digital} {p['name']}",
                     value=f"価格: {p['price']:,}  |  在庫: {stock_str}  |  売上: {p['sold_count']}個",
                     inline=False
                 )
             embed.set_footer(text=f"ページ {i//PAGE+1}/{(len(products)+PAGE-1)//PAGE}")
             pages.append(embed)
-
         if len(pages) == 1:
             await interaction.followup.send(embed=pages[0], ephemeral=True)
         else:
-            from utils.views import Paginator
             view = Paginator(pages, interaction.user.id)
             await interaction.followup.send(embed=pages[0], view=view, ephemeral=True)
 
-    # ── Order commands ─────────────────────────────────────────────────────
+    # ── Flash sale management ──────────────────────────────────────────────
+
+    @admin.command(name="flash_sale", description="フラッシュセールを開始します")
+    @app_commands.describe(product_id="商品ID")
+    @is_admin()
+    async def flash_sale(self, interaction: discord.Interaction, product_id: int):
+        p = await self.db.get_product(product_id)
+        if not p:
+            await interaction.response.send_message(embed=E.error("商品が見つかりません"), ephemeral=True)
+            return
+        existing_sale = await self.db.get_product_flash_sale(product_id)
+        if existing_sale:
+            await interaction.response.send_message(embed=E.error("既にセール中", f"**{p['name']}** は既にフラッシュセール中です。"), ephemeral=True)
+            return
+        await interaction.response.send_modal(FlashSaleModal(p))
+
+    @admin.command(name="flash_sale_end", description="フラッシュセールを終了します")
+    @app_commands.describe(product_id="商品ID")
+    @is_admin()
+    async def flash_sale_end(self, interaction: discord.Interaction, product_id: int):
+        sale = await self.db.get_product_flash_sale(product_id)
+        if not sale:
+            await interaction.response.send_message(embed=E.error("セールが見つかりません"), ephemeral=True)
+            return
+        await self.db.update_product(product_id, price=sale["original_price"])
+        await self.db.end_flash_sale(sale["id"])
+        await interaction.response.send_message(
+            embed=E.success("フラッシュセールを終了しました", f"価格を **{sale['original_price']:,}** {Config.CURRENCY_NAME} に戻しました。"),
+            ephemeral=True
+        )
+
+    @admin.command(name="flash_sale_list", description="開催中・予定のフラッシュセール一覧")
+    @is_admin()
+    async def flash_sale_list(self, interaction: discord.Interaction):
+        active = await self.db.get_active_flash_sales()
+        upcoming = await self.db.get_upcoming_flash_sales()
+        embed = discord.Embed(title="⚡  フラッシュセール", color=Config.COLOR_FLASH)
+        if active:
+            lines = [f"**{s['product_name']}** `{s['discount_percent']}%OFF` → 終了: {s['end_time'][:16]}" for s in active]
+            embed.add_field(name="🔥 開催中", value="\n".join(lines), inline=False)
+        if upcoming:
+            lines = [f"**{s['product_name']}** `{s['discount_percent']}%OFF` → 開始: {s['start_time'][:16]}" for s in upcoming]
+            embed.add_field(name="⏰ 予定", value="\n".join(lines), inline=False)
+        if not active and not upcoming:
+            embed.description = "開催中・予定のセールはありません。"
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ── Order management ───────────────────────────────────────────────────
 
     @admin.command(name="order_list", description="注文一覧を表示します")
     @app_commands.describe(status="ステータスフィルター")
     @app_commands.choices(status=[
-        app_commands.Choice(name="全て",    value="all"),
-        app_commands.Choice(name="保留中",  value="pending"),
-        app_commands.Choice(name="処理中",  value="processing"),
-        app_commands.Choice(name="完了",    value="completed"),
+        app_commands.Choice(name="全て",       value="all"),
+        app_commands.Choice(name="保留中",     value="pending"),
+        app_commands.Choice(name="処理中",     value="processing"),
+        app_commands.Choice(name="完了",       value="completed"),
         app_commands.Choice(name="キャンセル", value="cancelled"),
     ])
     @is_admin()
     async def order_list(self, interaction: discord.Interaction, status: str = "all"):
         await interaction.response.defer(ephemeral=True)
-        filter_status = None if status == "all" else status
-        orders = await self.db.get_all_orders(status=filter_status, limit=50)
+        orders = await self.db.get_all_orders(status=None if status == "all" else status, limit=50)
         if not orders:
             await interaction.followup.send(embed=E.info("注文なし", "該当する注文がありません。"), ephemeral=True)
             return
-
         status_icons = {"pending": "⏳", "processing": "🔄", "completed": "✅", "cancelled": "❌"}
         embed = discord.Embed(title=f"📋  注文一覧  [{status}]", color=Config.COLOR_PRIMARY)
         for o in orders[:20]:
             icon = status_icons.get(o["status"], "❓")
+            gift_tag = " 🎁" if o.get("is_gift") else ""
             embed.add_field(
-                name=f"{icon} #{o['id']:05d}  ({o['created_at'][:10]})",
-                value=f"ユーザー: <@{o['user_id']}>  |  合計: **{o['total_price']:,}** {Config.CURRENCY_NAME}",
+                name=f"{icon} #{o['id']:05d}{gift_tag}  ({o['created_at'][:10]})",
+                value=f"<@{o['user_id']}>  |  **{o['total_price']:,}** {Config.CURRENCY_NAME}",
                 inline=False
             )
-        embed.set_footer(text=f"最大50件表示 | 管理: /admin order_manage <注文ID>")
+        embed.set_footer(text="/admin order_manage <ID> で管理")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @admin.command(name="order_manage", description="注文を管理します（完了/キャンセル）")
@@ -235,6 +305,26 @@ class Admin(commands.Cog):
         view = OrderAdminView(order, interaction.user.id)
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
+    @admin.command(name="order_bulk_complete", description="保留中の注文を一括完了にします")
+    @is_admin()
+    async def order_bulk_complete(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        pending = await self.db.get_all_orders(status="pending", limit=100)
+        if not pending:
+            await interaction.followup.send(embed=E.info("保留中注文なし"), ephemeral=True)
+            return
+        count = 0
+        for order in pending:
+            await self.db.update_order_status(order["id"], "completed")
+            user = self.bot.get_user(order["user_id"])
+            if user:
+                try:
+                    await user.send(embed=E.success("注文が完了しました！", f"注文 **#{order['id']:05d}** が処理されました。"))
+                except Exception:
+                    pass
+            count += 1
+        await interaction.followup.send(embed=E.success(f"{count} 件の注文を完了にしました"), ephemeral=True)
+
     # ── User management ────────────────────────────────────────────────────
 
     @admin.command(name="user_balance", description="ユーザーの残高を調整します")
@@ -247,45 +337,52 @@ class Admin(commands.Cog):
             await interaction.response.send_message(embed=E.error("残高不足", "残高がマイナスになります。"), ephemeral=True)
             return
         sign = "+" if amount >= 0 else ""
-        await self.db.add_transaction(user.id, amount, "admin", f"管理者による調整 ({interaction.user})")
-        user_row = await self.db.get_user(user.id)
+        await self.db.add_transaction(user.id, amount, "admin", f"管理者調整 by {interaction.user}")
+        u = await self.db.get_user(user.id)
         await interaction.response.send_message(
-            embed=E.success(
-                "残高を調整しました",
-                f"{user.mention} に **{sign}{amount:,}** {Config.CURRENCY_NAME} を付与しました。\n新残高: **{user_row['balance']:,}** {Config.CURRENCY_NAME}"
-            ),
+            embed=E.success("残高を調整しました", f"{user.mention}  **{sign}{amount:,}** {Config.CURRENCY_NAME}\n新残高: **{u['balance']:,}** {Config.CURRENCY_NAME}"),
             ephemeral=True
         )
 
-    @admin.command(name="user_ban", description="ユーザーのショップ利用を制限します")
-    @app_commands.describe(user="対象ユーザー", banned="BANするか解除するか")
+    @admin.command(name="user_ban", description="ユーザーのショップ利用を制限/解除します")
+    @app_commands.describe(user="対象ユーザー", banned="制限するかどうか")
     @is_admin()
     async def user_ban(self, interaction: discord.Interaction, user: discord.Member, banned: bool = True):
         await self.db.ban_user(user.id, banned)
         action = "利用制限しました" if banned else "制限を解除しました"
-        await interaction.response.send_message(
-            embed=E.success(f"ユーザーを{action}", f"{user.mention} のショップ利用を{action}。"),
-            ephemeral=True
-        )
+        await interaction.response.send_message(embed=E.success(f"ユーザーを{action}", f"{user.mention}"), ephemeral=True)
 
-    @admin.command(name="user_info", description="ユーザー情報を表示します")
+    @admin.command(name="user_info", description="ユーザー情報を詳細表示します")
     @app_commands.describe(user="対象ユーザー")
     @is_admin()
     async def user_info(self, interaction: discord.Interaction, user: discord.Member):
         await interaction.response.defer(ephemeral=True)
         u = await self.db.get_user(user.id)
+        tier = await self.db.get_user_rank_tier(user.id)
         orders = await self.db.get_user_orders(user.id, limit=5)
-        embed = discord.Embed(title=f"👤  {user.display_name}", color=Config.COLOR_PRIMARY)
+        achievements = await self.db.get_user_achievements(user.id)
+
+        embed = discord.Embed(title=f"👤  {user.display_name}", color=tier["color"] if tier else Config.COLOR_PRIMARY)
         embed.set_thumbnail(url=user.display_avatar.url)
-        embed.add_field(name="残高", value=f"{u['balance']:,} {Config.CURRENCY_NAME}", inline=True)
+        embed.add_field(name="残高",     value=f"{u['balance']:,} {Config.CURRENCY_NAME}", inline=True)
         embed.add_field(name="累計購入", value=f"{u['total_spent']:,} {Config.CURRENCY_NAME}", inline=True)
-        embed.add_field(name="BAN状態", value="🔴 制限中" if u["is_banned"] else "🟢 正常", inline=True)
-        embed.add_field(name="デイリー最終", value=u["daily_last"] or "未取得", inline=True)
-        embed.add_field(name="登録日", value=u["created_at"][:10], inline=True)
+        embed.add_field(name="ランク",   value=f"{tier['emoji']} {tier['name']}" if tier else "—", inline=True)
+        embed.add_field(name="ストリーク", value=f"{u.get('daily_streak', 0)} 日", inline=True)
+        embed.add_field(name="実績数",   value=f"{len(achievements)} 個", inline=True)
+        embed.add_field(name="BAN",      value="🔴 制限中" if u["is_banned"] else "🟢 正常", inline=True)
+        embed.add_field(name="紹介コード", value=f"`{u.get('referral_code', '—')}`", inline=True)
+        embed.add_field(name="登録日",   value=u["created_at"][:10], inline=True)
         if orders:
             lines = [f"#{o['id']:05d} {o['status']} {o['total_price']:,}pt" for o in orders]
             embed.add_field(name="最近の注文", value="\n".join(lines), inline=False)
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @admin.command(name="user_reset_streak", description="ユーザーのデイリーストリークをリセットします")
+    @app_commands.describe(user="対象ユーザー")
+    @is_admin()
+    async def user_reset_streak(self, interaction: discord.Interaction, user: discord.Member):
+        await self.db._execute("UPDATE users SET daily_streak=0 WHERE user_id=?", (user.id,))
+        await interaction.response.send_message(embed=E.success("ストリークをリセットしました", f"{user.mention}"), ephemeral=True)
 
 
 async def setup(bot):
