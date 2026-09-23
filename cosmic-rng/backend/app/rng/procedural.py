@@ -26,6 +26,7 @@ class GeneratedSpec:
     visual: dict[str, Any]
     parts: dict[str, str]
     description: str
+    combo_prob: float = 1.0  # true probability of this exact combination given the slot hit
 
 
 def _weighted(options: list[dict[str, Any]], rng: RandomSource, invert: bool = False) -> dict[str, Any]:
@@ -44,10 +45,13 @@ def build_spec(slot: ItemDef, chosen: dict[str, dict[str, Any]], snap: Snapshot)
     proc = slot.procedural or {}
     factor = 1.0
     value_mult = 1.0
+    combo_prob = 1.0
     for ptype, part in chosen.items():
         options = snap.parts.get(ptype, [])
         max_w = max((o["weight"] for o in options), default=1.0)
+        total_w = sum(o["weight"] for o in options) or 1.0
         factor *= max_w / max(part["weight"], 1e-9)
+        combo_prob *= max(part["weight"], 0.0) / total_w
         value_mult *= float(part.get("value_mult", 1.0))
     odds = float(slot.odds or 1) * factor
     words = [chosen[p]["name"] for p in ("effect", "material", "shape") if p in chosen]
@@ -67,7 +71,7 @@ def build_spec(slot: ItemDef, chosen: dict[str, dict[str, Any]], snap: Snapshot)
     desc = f"{prefix + ' ' if prefix else ''}{slot.name}から生まれた自動生成アイテム。"
     return GeneratedSpec(
         key=key[:128], name=name[:128], odds=odds, sell_value=max(1, round(float(proc.get("base_value", 10)) * value_mult * factor ** 0.35)),
-        visual=visual, parts={p: chosen[p]["key"] for p in chosen}, description=desc,
+        visual=visual, parts={p: chosen[p]["key"] for p in chosen}, description=desc, combo_prob=combo_prob,
     )
 
 

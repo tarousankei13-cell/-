@@ -1,0 +1,11 @@
+# Runtime dependencies (pinned, tested with Python 3.11+)
+fastapi==0.141.1
+starlette==1.6.0
+uvicorn[standard]==0.53.0
+SQLAlchemy[asyncio]==2.0.54
+asyncpg==0.31.0
+alembic==1.20.0
+pydantic==2.13.5
+pydantic-settings==2.15.0
+httpx==0.28.1
+pillow==12.3.0
