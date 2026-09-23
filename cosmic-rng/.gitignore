@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+# Secrets / local config
+.env
+backend/.env
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/test-results/
+# Runtime
+backups/
+logs/
+*.log
