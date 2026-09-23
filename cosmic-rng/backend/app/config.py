@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     db_pool_size: int = 20
     db_max_overflow: int = 20
     db_echo: bool = False
+    db_null_pool: bool = False  # tests: no connection reuse across event loops
 
     public_base_url: str = "http://localhost:8000"
     allowed_origins: str = ""
