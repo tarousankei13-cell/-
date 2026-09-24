@@ -5,7 +5,7 @@ import { useGame } from "../store/game";
 import { audio } from "../audio/engine";
 import { ItemIcon } from "../components/ItemIcon";
 import { Empty, ErrorBox, ItemCard, LockedFeature, Modal, RarityBadge, Spinner, Tabs, useConfirm } from "../components/ui";
-import { fmtDate, fmtInt, fmtOdds } from "../lib/format";
+import { fmtDate, fmtInt, fmtOdds, RARITY_LABEL_JA } from "../lib/format";
 import type { Instance, InventoryGroup, ItemInfo, RarityKey } from "../lib/types";
 
 const RARITIES: RarityKey[] = ["common", "rare", "epic", "legendary", "secret", "ultra_secret", "mythic", "admin"];
@@ -81,7 +81,7 @@ export function Inventory() {
     <div className="page">
       <div className="page-head">
         <div>
-          <h1>Inventory</h1>
+          <h1>所持品<span className="h1-en">Inventory</span></h1>
           {data && (
             <div className="sub">
               {fmtInt(data.count)} / {fmtInt(data.capacity)} 個 · {fmtInt(data.total)} 種類
@@ -112,7 +112,7 @@ export function Inventory() {
           {RARITIES.map((r) => (
             <button key={r} className={`chip ${rarity.includes(r) ? "on" : ""} r-${r}`}
               onClick={() => { setRarity((cur) => cur.includes(r) ? cur.filter((x) => x !== r) : [...cur, r]); setPage(1); }}>
-              {r}
+              {RARITY_LABEL_JA[r] ?? r}
             </button>
           ))}
           {rarity.length > 0 && <button className="btn xs ghost" onClick={() => setRarity([])}>クリア</button>}

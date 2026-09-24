@@ -47,9 +47,11 @@ async def public_config() -> dict[str, Any]:
     snap = reg.snap
     s = get_settings()
     return {
-        "rarities": [{"key": r.key, "name": r.name, "tier": r.tier, "min_odds": r.min_odds, "color": r.color, "color2": r.color2,
+        "rarities": [{"key": r.key, "name": r.name, "name_ja": r.name_ja, "tier": r.tier, "min_odds": r.min_odds,
+                      "color": r.color, "color2": r.color2,
                       "cutscene": r.cutscene} for r in sorted(snap.rarities.values(), key=lambda r: r.tier)],
-        "biomes": [{"key": b.key, "name": "???" if b.hidden else b.name, "kind": b.kind, "theme": b.theme, "hidden": b.hidden,
+        "biomes": [{"key": b.key, "name": "???" if b.hidden else b.name, "name_ja": "" if b.hidden else b.name_ja,
+                    "kind": b.kind, "theme": b.theme, "hidden": b.hidden,
                     "states": [{"key": st.key, "name": st.name, "theme": st.theme} for st in b.states]}
                    for b in sorted(snap.biomes.values(), key=lambda b: b.sort_order) if b.kind != "admin"],
         "unlocks": reg.setting("progression.unlocks"),
@@ -313,7 +315,8 @@ async def biomes(principal: Principal = USER_ANY, db: AsyncSession = Depends(get
         out.append({
             **(b.public() if known else {"key": b.key, "name": "???", "kind": b.kind, "hidden": True, "theme": {}, "states": []}),
             "seen": b.key in seen or b.kind == "default", "locked": principal.user.level < b.min_level,
-            "exclusive_items": [{"id": i.id, "name": i.name if (b.key in seen and not i.hidden) else "???", "rarity": i.rarity_key,
+            "exclusive_items": [{"id": i.id, "name": i.name if (b.key in seen and not i.hidden) else "???",
+                                 "name_ja": i.name_ja if (b.key in seen and not i.hidden) else "", "rarity": i.rarity_key,
                                  "odds": i.odds if not i.hidden else None} for i in sorted(exclusive, key=lambda i: i.odds or 0)] if known else [],
         })
     return {"biomes": out}
@@ -518,7 +521,9 @@ async def achievements(principal: Principal = USER_ANY, db: AsyncSession = Depen
         la = live.get(a["id"])
         hide = a["hidden"] and got is None
         out.append({
-            "key": a["key"], "name": "???" if hide else a["name"], "description": None if hide else a["description"],
+            "key": a["key"], "name": "???" if hide else a["name"],
+            "name_ja": "" if hide else (a.get("name_ja") or ""),
+            "description": None if hide else a["description"],
             "hint": a["hint"] if hide else None, "category": a["category"], "tier": a["tier"], "hidden": a["hidden"],
             "achieved": got is not None, "achieved_at": got.achieved_at.isoformat() if got else None,
             "world_first": bool(got and got.world_first), "rewards": None if hide else a["rewards"],

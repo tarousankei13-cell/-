@@ -21,6 +21,7 @@ export interface ItemInfo {
   id: number;
   key: string;
   name: string;
+  name_ja?: string | null;
   description: string;
   lore?: string;
   kind: string;
@@ -40,6 +41,7 @@ export interface ItemInfo {
 export interface RarityDef {
   key: RarityKey;
   name: string;
+  name_ja?: string | null;
   tier: number;
   min_odds: number;
   color: string;
@@ -63,6 +65,7 @@ export interface BiomeTheme {
 export interface BiomeState {
   key: string;
   name: string;
+  name_ja?: string | null;
   kind: string;
   description: string;
   luck_mult: number;
@@ -89,6 +92,7 @@ export interface LuckBreakdown {
 export interface ActiveEffect {
   id: number;
   name: string;
+  name_ja?: string | null;
   source_type: string;
   source_key: string;
   effect_type: string;
@@ -104,6 +108,7 @@ export interface EquipVisual {
   slot: string;
   key: string;
   name: string;
+  name_ja?: string | null;
   rarity: RarityKey;
   visual: Visual;
   quality_tier?: string;
@@ -146,6 +151,7 @@ export interface Fortune {
 export interface AchievementGrant {
   key: string;
   name: string;
+  name_ja?: string | null;
   description: string;
   tier: string;
   category: string;
@@ -224,6 +230,7 @@ export interface RollResponse {
 export interface UserBrief {
   id: number;
   name: string;
+  name_ja?: string | null;
   username: string;
   avatar: string | null;
   level: number;
@@ -322,6 +329,7 @@ export interface Instance {
 export interface Cinematic {
   artifact: string;
   name: string;
+  name_ja?: string | null;
   theme: string;
   tier: number;
   visual: Visual;

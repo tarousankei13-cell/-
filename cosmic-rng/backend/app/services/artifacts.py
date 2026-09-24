@@ -36,7 +36,8 @@ def artifact_public(art: dict[str, Any]) -> dict[str, Any]:
     snap = get_registry().snap
     item = snap.items.get(art["item_id"])
     return {
-        "key": art["key"], "item_id": art["item_id"], "name": item.name if item else art["key"], "lore": item.lore if item else "",
+        "key": art["key"], "item_id": art["item_id"], "name": item.name if item else art["key"],
+        "name_ja": item.name_ja if item else "", "lore": item.lore if item else "",
         "ability": art["ability"], "theme": art["theme"], "tier": art["tier"], "effect": art["effect"], "target": art["target"],
         "duration_sec": art["duration_sec"], "cooldown_sec": art["cooldown_sec"], "player_usable": art["player_usable"],
         "equip_passive": art["equip_passive"], "transfer_rules": art["transfer_rules"], "audit_rules": art["audit_rules"],
@@ -97,7 +98,8 @@ async def use(db: AsyncSession, principal: Principal, instance_id: int, params: 
                        entity_id=art["key"], new={"params": params, "result": {k: v for k, v in result.items() if k != "burst"}},
                        reason=str(params.get("reason", ""))[:500], user_agent=user_agent)
     item = snap.items.get(art["item_id"])
-    cinematic = {"artifact": art["key"], "name": item.name if item else art["key"], "theme": art["theme"], "tier": art["tier"],
+    cinematic = {"artifact": art["key"], "name": item.name if item else art["key"],
+                 "name_ja": item.name_ja if item else "", "theme": art["theme"], "tier": art["tier"],
                  "visual": item.visual if item else {}, "user": users_svc.user_brief(user), "target": art["target"]}
     if art["target"] == "global":
         queue_event(db, "all", "admin_event", {"kind": "artifact", **cinematic, "result": result.get("public")})

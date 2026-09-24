@@ -77,7 +77,7 @@ export function Quests() {
     <div className="page">
       <div className="page-head">
         <div>
-          <h1>Quest</h1>
+          <h1>依頼<span className="h1-en">Quest</span></h1>
           {data && <div className="sub">デイリーは <Countdown to={data.reset_at} /> 後にリセット</div>}
         </div>
       </div>

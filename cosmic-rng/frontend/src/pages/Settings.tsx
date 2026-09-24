@@ -70,7 +70,7 @@ export function Settings() {
     <div className="page" style={{ maxWidth: 880 }}>
       <div className="page-head">
         <div>
-          <h1>Settings</h1>
+          <h1>設定<span className="h1-en">Settings</span></h1>
           <div className="sub">変更は即座に保存されます{saving ? " · 保存中…" : ""}</div>
         </div>
       </div>

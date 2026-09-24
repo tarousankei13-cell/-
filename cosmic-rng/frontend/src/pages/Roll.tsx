@@ -5,12 +5,12 @@ import { events, serverNow, useGame } from "../store/game";
 import { audio } from "../audio/engine";
 import { getCosmos } from "../App";
 import { ItemIcon } from "../components/ItemIcon";
-import { Countdown, Empty, Modal, UserChip } from "../components/ui";
+import { Countdown, Empty, Modal, UserChip, Name } from "../components/ui";
 import { fmtCompact, fmtInt, fmtLuck, fmtOdds, fmtPercent, timeAgo } from "../lib/format";
 import type { ActiveEffect, FeedEvent, HudState, RollResponse, RollResult } from "../lib/types";
 import "./roll.css";
 
-const SPEED_LABEL: Record<string, string> = { normal: "Normal", fast: "Fast", ultra: "Ultra Fast" };
+const SPEED_LABEL: Record<string, string> = { normal: "標準", fast: "高速", ultra: "最速" };
 
 function useCooldown(hud: HudState | null) {
   const [remaining, setRemaining] = useState(0);
@@ -66,9 +66,9 @@ function BiomeCard() {
     <div className="glass pad biome-card" style={{ borderColor: theme.accent ? `${theme.accent}55` : undefined }}>
       <div className="row">
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div className="tiny faint" style={{ letterSpacing: "0.16em" }}>CURRENT BIOME</div>
+          <div className="tiny faint" style={{ letterSpacing: "0.16em" }}>現在のBiome</div>
           <div className="row" style={{ gap: 8 }}>
-            <h2 style={{ color: theme.accent ?? "var(--accent)", textShadow: `0 0 20px ${theme.accent ?? "#8ab4ff"}66` }}>{biome.name}</h2>
+            <h2 style={{ color: theme.accent ?? "var(--accent)", textShadow: `0 0 20px ${theme.accent ?? "#8ab4ff"}66` }}><Name en={biome.name} ja={biome.name_ja} /></h2>
             {biome.kind === "admin" && <span className="badge r-admin">ADMIN</span>}
             {biome.forced && <span className="badge" style={{ color: "var(--gold)" }}>FORCED</span>}
           </div>
@@ -76,7 +76,7 @@ function BiomeCard() {
         </div>
         <div className="center">
           <div className="stat">
-            <span className="k">Biome Luck</span>
+            <span className="k">Biome補正</span>
             <span className="v" style={{ color: biome.luck_mult > 1 ? "var(--good)" : undefined }}>×{biome.luck_mult.toFixed(2)}</span>
           </div>
         </div>
@@ -113,7 +113,7 @@ function ResultStrip({ roll }: { roll: RollResult }) {
       <ItemIcon visual={roll.item.visual} tier={roll.item.tier} size={44} />
       <div style={{ flex: 1, minWidth: 0 }}>
         <div className="row" style={{ gap: 6 }}>
-          <span className={`r-${roll.item.rarity}`} style={{ fontWeight: 700 }}>{roll.item.name}</span>
+          <span className={`r-${roll.item.rarity}`} style={{ fontWeight: 700 }}><Name en={roll.item.name} ja={roll.item.name_ja} /></span>
           {roll.new_collection && <span className="badge" style={{ color: "var(--good)" }}>NEW</span>}
           {roll.special && <span className="badge" style={{ color: "var(--accent)" }}>SPECIAL</span>}
           {roll.auto_deleted && <span className="badge" style={{ color: "var(--text-faint)" }}>{roll.auto_delete_mode === "sell" ? "自動売却" : "自動削除"}</span>}
@@ -282,7 +282,7 @@ export function RollPage() {
 
           <div className="glass pad roll-main">
             <div className="luck-display">
-              <div className="tiny faint" style={{ letterSpacing: "0.2em" }}>FINAL LUCK</div>
+              <div className="tiny faint" style={{ letterSpacing: "0.2em" }}>最終Luck</div>
               <div className="luck-value">{fmtLuck(luck.final)}</div>
               <div className="luck-parts">
                 {[
@@ -314,7 +314,7 @@ export function RollPage() {
 
             <div className="row-wrap center" style={{ justifyContent: "center", gap: 8 }}>
               <span className="chip tiny">#{fmtInt(hud.roll_counter + 1)}</span>
-              <span className="chip tiny">{hud.roll_speed.toFixed(1)} roll/s</span>
+              <span className="chip tiny">{hud.roll_speed.toFixed(1)} 回/秒</span>
               <span className="chip tiny">Special まで {hud.special_in}</span>
               <span className="chip tiny">{SPEED_LABEL[settings?.roll.speed ?? "normal"]}</span>
             </div>
@@ -354,7 +354,7 @@ export function RollPage() {
 
           <div className="glass pad">
             <div className="row" style={{ marginBottom: 8 }}>
-              <div className="tiny faint" style={{ letterSpacing: "0.16em", flex: 1 }}>EQUIPMENT</div>
+              <div className="tiny faint" style={{ letterSpacing: "0.16em", flex: 1 }}>装備</div>
               <Link className="btn xs ghost" to="/equipment">装備変更</Link>
             </div>
             {hud.equipment.length === 0 ? (
@@ -375,7 +375,7 @@ export function RollPage() {
 
         <div className="col" style={{ gap: 12 }}>
           <div className="glass pad">
-            <div className="tiny faint" style={{ letterSpacing: "0.16em", marginBottom: 8 }}>RECENT ROLLS</div>
+            <div className="tiny faint" style={{ letterSpacing: "0.16em", marginBottom: 8 }}>直近の抽選</div>
             {history.length === 0 ? (
               <Empty icon="✦">Rollして宇宙を観測しましょう</Empty>
             ) : (
@@ -387,7 +387,7 @@ export function RollPage() {
 
           <div className="glass pad">
             <div className="row" style={{ marginBottom: 8 }}>
-              <div className="tiny faint" style={{ letterSpacing: "0.16em", flex: 1 }}>WORLD FEED</div>
+              <div className="tiny faint" style={{ letterSpacing: "0.16em", flex: 1 }}>世界の動き</div>
               <span className="tiny faint">{feed.length}</span>
             </div>
             {feed.length === 0 ? (
@@ -416,7 +416,7 @@ export function RollPage() {
                 <tbody>
                   {table.items.map((it: any) => (
                     <tr key={it.key}>
-                      <td>{it.name}</td>
+                      <td><Name en={it.name} ja={(it as any).name_ja} /></td>
                       <td><span className={`r-${it.rarity}`}>{it.rarity}</span></td>
                       <td className="mono tiny">{fmtOdds(it.odds)}</td>
                       <td className="mono">{fmtOdds(1 / it.p)} <span className="faint tiny">({fmtPercent(it.p * 100)})</span></td>

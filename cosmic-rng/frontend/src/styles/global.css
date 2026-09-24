@@ -369,10 +369,14 @@ input[type="checkbox"] { width: 18px; height: 18px; min-height: 0; accent-color:
   background: linear-gradient(90deg, #fff, var(--accent2)); -webkit-background-clip: text; background-clip: text;
   color: transparent; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-/* On narrow phones the brand yields space so the HUD chips never push the bar wider than the screen. */
-@media (max-width: 460px) {
+.brand-mark { display: none; }
+/* On narrow phones the wordmark would be clipped mid-word ("COSMIC RN"), which
+   reads as a bug. A deliberate short mark reads as a decision. */
+@media (max-width: 520px) {
   .topbar { gap: 7px; padding-inline: 9px; }
-  .brand { flex: 0 1 auto; letter-spacing: 0.06em; font-size: var(--fs-sm); }
+  .brand { letter-spacing: 0.08em; font-size: var(--fs-sm); }
+  .brand-full { display: none; }
+  .brand-mark { display: inline; }
   .topbar .chip { padding-inline: 8px; font-size: var(--fs-xs); }
 }
 
@@ -534,4 +538,17 @@ input[type="range"]::-moz-range-thumb {
   input[type="range"] { height: var(--tap); }
   input[type="range"]::-webkit-slider-thumb { width: 24px; height: 24px; margin-top: -9px; }
   input[type="range"]::-moz-range-thumb { width: 24px; height: 24px; }
+}
+
+/* Japanese reading under an English content name. Quieter and smaller than the
+   name it belongs to, so the pair reads as one label rather than two. */
+.name-ja { color: var(--text-dim); font-size: 0.86em; font-weight: 400; }
+.name-ja.block { display: block; line-height: 1.35; }
+
+/* English kept beside a Japanese page heading: the vocabulary stays learnable
+   and matches the English item names the game is built around. */
+.h1-en {
+  display: inline-block; margin-left: 10px; vertical-align: middle;
+  font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 600;
+  letter-spacing: 0.12em; color: var(--text-faint); text-transform: uppercase;
 }

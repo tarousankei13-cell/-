@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { ItemIcon } from "../components/ItemIcon";
-import { Modal } from "../components/ui";
+import { Modal, Name } from "../components/ui";
 import { fmtDuration, fmtInt, fmtLuck, fmtOdds } from "../lib/format";
 import type { OfflineSummary } from "../lib/types";
 import { useGame } from "../store/game";
@@ -52,7 +52,7 @@ export function OfflineReport({ summary, onClose }: { summary: OfflineSummary; o
         {summary.biomes.length > 0 && (
           <div className="row-wrap tiny muted">
             <span>遭遇したBiome:</span>
-            {summary.biomes.map((b) => <span key={b.key} className="chip tiny">{b.name}</span>)}
+            {summary.biomes.map((b) => <span key={b.key} className="chip tiny"><Name en={b.name} ja={(b as any).name_ja} /></span>)}
           </div>
         )}
 
@@ -65,7 +65,7 @@ export function OfflineReport({ summary, onClose }: { summary: OfflineSummary; o
                   <div className="row" style={{ gap: 10 }}>
                     <ItemIcon visual={r.item.visual} tier={r.item.tier} size={46} />
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div className={`name r-${r.item.rarity}`}>{r.item.name}</div>
+                      <div className={`name r-${r.item.rarity}`}><Name en={r.item.name} ja={r.item.name_ja} block /></div>
                       <div className="odds mono">{fmtOdds(r.item.odds, r.item.display_odds)}</div>
                       {r.first && <span className="badge" style={{ color: "var(--gold)" }}>WORLD FIRST</span>}
                     </div>
@@ -85,7 +85,7 @@ export function OfflineReport({ summary, onClose }: { summary: OfflineSummary; o
               {rest.map((r, i) => (
                 <div key={i} className="offline-row">
                   <ItemIcon visual={r.item.visual} tier={r.item.tier} size={24} animate={false} />
-                  <span className={`r-${r.item.rarity} ellipsis`} style={{ flex: 1 }}>{r.item.name}</span>
+                  <span className={`r-${r.item.rarity} ellipsis`} style={{ flex: 1 }}><Name en={r.item.name} ja={r.item.name_ja} /></span>
                   <span className="mono tiny faint">{fmtOdds(r.item.odds, r.item.display_odds)}</span>
                   <span className="mono">×{fmtInt(r.count)}</span>
                   {r.deleted > 0 && <span className="tiny faint">({r.deleted}件 自動処理)</span>}

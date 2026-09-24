@@ -125,7 +125,7 @@ export function Equipment() {
     <div className="page">
       <div className="page-head">
         <div>
-          <h1>Equipment</h1>
+          <h1>装備<span className="h1-en">Equipment</span></h1>
           <div className="sub">Luck・Roll速度・パッシブ効果。品質（GOD ROLLまで）で性能が変わります。</div>
         </div>
       </div>

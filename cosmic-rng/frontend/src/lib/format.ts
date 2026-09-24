@@ -88,6 +88,19 @@ export const RARITY_LABEL: Record<RarityKey, string> = {
   mythic: "???", admin: "Admin Artifact",
 };
 
+/** Japanese reading shown beside the English rarity name. */
+export const RARITY_LABEL_JA: Record<RarityKey, string> = {
+  common: "並", rare: "稀少", epic: "英雄級", legendary: "伝説級", secret: "秘匿級",
+  ultra_secret: "超秘匿級", mythic: "???", admin: "管理者遺物",
+};
+
+/** "Legendary / 伝説級" — the pair, collapsed when the two would repeat. */
+export function rarityLabel(r: RarityKey | string): string {
+  const en = RARITY_LABEL[r as RarityKey] ?? r;
+  const ja = RARITY_LABEL_JA[r as RarityKey];
+  return !ja || ja === en ? en : `${en} / ${ja}`;
+}
+
 export const FEATURE_LABEL: Record<string, string> = {
   inventory: "インベントリ", collection: "コレクション", biome: "Biome図鑑", profile: "プロフィール", ranking: "ランキング",
   achievements: "実績", shop: "ショップ", auto_delete: "自動削除フィルター", equipment: "装備", crafting: "クラフト",

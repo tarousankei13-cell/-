@@ -28,19 +28,19 @@ const Settings = lazy(() => import("./pages/Settings").then((m) => ({ default: m
 const Admin = lazy(() => import("./pages/admin/Admin").then((m) => ({ default: m.Admin })));
 
 const NAV = [
-  { to: "/roll", icon: "✦", label: "Roll" },
-  { to: "/inventory", icon: "🎒", label: "Inventory", feature: "inventory" },
-  { to: "/collection", icon: "📖", label: "Collection", feature: "collection" },
-  { to: "/equipment", icon: "⚙", label: "Equip", feature: "equipment" },
+  { to: "/roll", icon: "✦", label: "抽選" },
+  { to: "/inventory", icon: "🎒", label: "所持品", feature: "inventory" },
+  { to: "/collection", icon: "📖", label: "図鑑", feature: "collection" },
+  { to: "/equipment", icon: "⚙", label: "装備", feature: "equipment" },
   { to: "/biomes", icon: "🌌", label: "Biome", feature: "biome" },
-  { to: "/shop", icon: "🛒", label: "Shop", feature: "shop" },
-  { to: "/market", icon: "💱", label: "Market", feature: "market" },
-  { to: "/trade", icon: "🤝", label: "Trade", feature: "trade" },
-  { to: "/quests", icon: "📜", label: "Quest", feature: "quests" },
-  { to: "/achievements", icon: "🏆", label: "Achieve", feature: "achievements" },
-  { to: "/ranking", icon: "📊", label: "Rank", feature: "ranking" },
-  { to: "/profile", icon: "👤", label: "Profile", feature: "profile" },
-  { to: "/settings", icon: "⚡", label: "Settings" },
+  { to: "/shop", icon: "🛒", label: "商店", feature: "shop" },
+  { to: "/market", icon: "💱", label: "市場", feature: "market" },
+  { to: "/trade", icon: "🤝", label: "取引", feature: "trade" },
+  { to: "/quests", icon: "📜", label: "依頼", feature: "quests" },
+  { to: "/achievements", icon: "🏆", label: "実績", feature: "achievements" },
+  { to: "/ranking", icon: "📊", label: "順位", feature: "ranking" },
+  { to: "/profile", icon: "👤", label: "戦績", feature: "profile" },
+  { to: "/settings", icon: "⚡", label: "設定" },
 ];
 
 // ------------------------------------------------------------------ cosmos
@@ -155,7 +155,10 @@ function TopBar() {
 
   return (
     <header className="topbar">
-      <Link to="/roll" className="brand" style={{ textDecoration: "none" }}>COSMIC RNG</Link>
+      <Link to="/roll" className="brand" style={{ textDecoration: "none" }} aria-label="COSMIC RNG">
+        <span className="brand-full">COSMIC RNG</span>
+        <span className="brand-mark" aria-hidden>✦ CRNG</span>
+      </Link>
       <div className="spacer" />
       {hud && (
         <>

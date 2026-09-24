@@ -4,7 +4,7 @@ import { useAction, useApi } from "../lib/useApi";
 import { events, useGame } from "../store/game";
 import { audio } from "../audio/engine";
 import { ItemIcon } from "../components/ItemIcon";
-import { Empty, ErrorBox, LockedFeature, Modal, Spinner, Tabs, UserChip, useConfirm } from "../components/ui";
+import { Empty, ErrorBox, LockedFeature, Modal, Spinner, Tabs, UserChip, useConfirm, Name } from "../components/ui";
 import { fmtCompact, fmtDate, fmtInt, fmtOdds } from "../lib/format";
 import type { Instance, InventoryGroup } from "../lib/types";
 
@@ -80,7 +80,7 @@ export function Market() {
     <div className="page">
       <div className="page-head">
         <div>
-          <h1>Market</h1>
+          <h1>市場<span className="h1-en">Market</span></h1>
           <div className="sub">プレイヤー間の売買。価格は自由。異常な価格は自動検知され運営に通知されます。</div>
         </div>
         <span className="chip mono" style={{ color: "var(--gold)" }}>✦ {fmtCompact(stardust)}</span>
@@ -230,7 +230,7 @@ function SellPanel({ onListed }: { onListed: () => void }) {
               borderColor: group?.item.id === g.item.id ? "var(--accent)" : "transparent", cursor: "pointer",
             }} onClick={() => { setGroup(g); setInstance(null); }}>
               <ItemIcon visual={g.item.visual} tier={g.item.tier} size={26} animate={false} />
-              <span className={`r-${g.item.rarity} ellipsis`} style={{ flex: 1 }}>{g.item.name}</span>
+              <span className={`r-${g.item.rarity} ellipsis`} style={{ flex: 1 }}><Name en={g.item.name} ja={g.item.name_ja} /></span>
               <span className="mono tiny">×{g.count}</span>
             </button>
           ))}
@@ -243,7 +243,7 @@ function SellPanel({ onListed }: { onListed: () => void }) {
             <div className="row" style={{ gap: 10 }}>
               <ItemIcon visual={group.item.visual} tier={group.item.tier} size={44} />
               <div>
-                <strong className={`r-${group.item.rarity}`}>{group.item.name}</strong>
+                <strong className={`r-${group.item.rarity}`}><Name en={group.item.name} ja={group.item.name_ja} /></strong>
                 <div className="tiny muted">売却価格 ✦{fmtInt(group.item.sell_value)}（参考）</div>
               </div>
             </div>

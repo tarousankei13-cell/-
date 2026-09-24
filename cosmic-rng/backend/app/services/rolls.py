@@ -600,7 +600,7 @@ async def _single_roll(db: AsyncSession, env: Env, *, auto: bool, flags_extra: i
     return {
         "id": roll.id, "number": roll_number, "item": {**won.info, "serial": serial}, "instance_ids": instance_ids,
         "odds": won.odds, "final_chance": won.final_chance, "final_odds": (1 / won.final_chance) if won.final_chance > 0 else None,
-        "luck": lb.as_dict(), "biome": {"key": biome_def.key, "name": biome_def.name, "state": env.biome.state.state_key},
+        "luck": lb.as_dict(), "biome": {"key": biome_def.key, "name": biome_def.name, "name_ja": biome_def.name_ja, "state": env.biome.state.state_key},
         "special": special, "hidden_special": {"key": hidden["key"], "name": hidden.get("name", hidden["key"])} if hidden else None,
         "effects_applied": mods.applied_names, "fortune": fort, "auto_deleted": bool(decision), "auto_delete_mode": decision,
         "auto_sold": auto_sold, "overflow": overflow, "first_discovery": first_payload, "new_collection": new_collection,
@@ -848,7 +848,7 @@ async def _apply_batch(db: AsyncSession, env: Env, agg: BatchAgg, *, kind: str, 
         "kind": kind, "batch_id": batch.id, "rolls": agg.rolls, "window_start": window[0].isoformat(), "window_end": window[1].isoformat(),
         "seconds": (window[1] - window[0]).total_seconds(), "totals": totals, "specials": agg.specials, "luck_max": agg.luck_max,
         "results": results[:150], "distinct": len(results), "first_discoveries": first_payloads,
-        "biomes": [{"key": k, "name": snap.biomes[k].name} for k in biomes_visited if k in snap.biomes],
+        "biomes": [{"key": k, "name": snap.biomes[k].name, "name_ja": snap.biomes[k].name_ja} for k in biomes_visited if k in snap.biomes],
     }
     batch.summary = {k: v for k, v in summary.items() if k != "first_discoveries"}
     return summary
@@ -981,6 +981,6 @@ async def table_preview(db: AsyncSession, user_id: int, limit: int = 200) -> dic
     for it, p in zip(table.items, table.probs):
         if it.hidden and not reveal_hidden:
             continue
-        rows.append({"key": it.key, "name": it.name, "rarity": it.rarity_key, "odds": it.odds, "p": p})
+        rows.append({"key": it.key, "name": it.name, "name_ja": it.name_ja, "rarity": it.rarity_key, "odds": it.odds, "p": p})
     await _finish_progress(db, env)
     return {"luck": lb.as_dict(), "biome": st.biome_key, "special": special, "items": rows[:limit], "count": len(rows)}

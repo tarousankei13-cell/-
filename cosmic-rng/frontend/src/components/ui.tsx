@@ -158,6 +158,26 @@ export function LockedFeature({ feature }: { feature: string }) {
 }
 
 // ------------------------------------------------------------------ ItemCard
+/**
+ * Bilingual content name.
+ *
+ * The English name carries the setting and stays primary; the Japanese one sits
+ * under it so a player who does not read English still knows what the thing is.
+ * Collapses to a single line when a name has no translation, or when the two
+ * would say the same thing (numbers, "???", proper nouns kept as-is).
+ */
+export function Name({ en, ja, className, block }: { en: string; ja?: string | null; className?: string; block?: boolean }) {
+  const show = ja && ja.trim() && ja.trim() !== en.trim();
+  if (!show) return <span className={className}>{en}</span>;
+  if (!block) return <span className={className}>{en}<span className="name-ja"> / {ja}</span></span>;
+  return (
+    <span className={className}>
+      {en}
+      <span className="name-ja block">{ja}</span>
+    </span>
+  );
+}
+
 export function ItemCard({
   item, count, onClick, footer, corner, selected, compact,
 }: { item: ItemInfo; count?: number; onClick?: () => void; footer?: ReactNode; corner?: ReactNode; selected?: boolean; compact?: boolean }) {
@@ -175,7 +195,7 @@ export function ItemCard({
       <div className="row" style={{ gap: 10 }}>
         <ItemIcon visual={item.visual} tier={item.tier} size={compact ? 38 : 50} />
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div className={`name r-${item.rarity}`}>{item.name}</div>
+          <div className={`name r-${item.rarity}`}><Name en={item.name} ja={item.name_ja} block /></div>
           <div className="odds mono">{fmtOdds(item.odds, item.display_odds)}</div>
         </div>
         {count !== undefined && count > 1 && (

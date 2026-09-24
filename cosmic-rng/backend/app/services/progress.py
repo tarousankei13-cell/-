@@ -103,7 +103,7 @@ async def grant_rewards(db: AsyncSession, user: User, stats: UserStats, rewards:
         from .inventory import create_instances
 
         await create_instances(db, user.id, item.id, int(it.get("qty", 1)), source, tier=item.tier)
-        granted["items"].append({"key": item.key, "name": item.name, "qty": int(it.get("qty", 1))})
+        granted["items"].append({"key": item.key, "name": item.name, "name_ja": item.name_ja, "qty": int(it.get("qty", 1))})
     xp = int(round(int(rewards.get("xp", 0) or 0) * mult))
     if xp:
         granted["xp"] = xp

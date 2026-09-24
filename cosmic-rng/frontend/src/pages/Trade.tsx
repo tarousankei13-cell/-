@@ -48,7 +48,7 @@ export function Trade() {
     <div className="page">
       <div className="page-head">
         <div>
-          <h1>Trade</h1>
+          <h1>取引<span className="h1-en">Trade</span></h1>
           <div className="sub">1対1の交換。内容が変更された提案は承認できません（revision照合）。</div>
         </div>
       </div>

@@ -41,6 +41,8 @@ class RarityDef:
     season_points: int
     cutscene: str
     announce: bool
+    name_ja: str = ""
+
 
 
 @dataclass(slots=True)
@@ -71,11 +73,14 @@ class ItemDef:
     is_active: bool
     sort_order: int
     first_discoverer_id: int | None = None
+    name_ja: str = ""
+
 
     def public(self, rarities: dict[str, RarityDef]) -> dict[str, Any]:
         r = rarities.get(self.rarity_key)
         return {
-            "id": self.id, "key": self.key, "name": self.name, "description": self.description, "lore": self.lore,
+            "id": self.id, "key": self.key, "name": self.name, "name_ja": self.name_ja,
+            "description": self.description, "lore": self.lore,
             "kind": self.kind, "rarity": self.rarity_key, "tier": self.tier, "odds": self.odds,
             "display_odds": self.display_odds, "sell_value": self.sell_value, "visual": self.visual,
             "animation": self.animation or (r.cutscene if r else None), "sound": self.sound,
@@ -112,10 +117,12 @@ class BiomeDef:
     hidden: bool
     sort_order: int
     is_active: bool
+    name_ja: str = ""
+
 
     def public(self) -> dict[str, Any]:
         return {
-            "key": self.key, "name": self.name, "description": self.description, "kind": self.kind,
+            "key": self.key, "name": self.name, "name_ja": self.name_ja, "description": self.description, "kind": self.kind,
             "odds_per_sec": self.odds_per_sec, "duration_sec": self.duration_sec, "luck_mult": self.luck_mult,
             "min_level": self.min_level, "theme": self.theme, "hidden": self.hidden,
             "states": [{"key": s.key, "name": s.name, "luck_mult": s.luck_mult, "description": s.description, "theme": s.theme}
@@ -232,7 +239,7 @@ async def build_snapshot(db: AsyncSession) -> Snapshot:
     rar_rows = await load(m.Rarity, "rarity")
     rarities = {
         r["key"]: RarityDef(
-            key=r["key"], name=r["name"], tier=r["tier"], min_odds=r["min_odds"], color=r["color"], color2=r["color2"],
+            key=r["key"], name=r["name"], name_ja=r.get("name_ja") or "", tier=r["tier"], min_odds=r["min_odds"], color=r["color"], color2=r["color2"],
             luck_exponent=r["luck_exponent"], xp=r["xp"], season_points=r["season_points"], cutscene=r["cutscene"],
             announce=r["announce"],
         )
@@ -251,7 +258,8 @@ async def build_snapshot(db: AsyncSession) -> Snapshot:
     for r in item_rows:
         tier = rarities[r["rarity_key"]].tier if r["rarity_key"] in rarities else 1
         items[r["id"]] = ItemDef(
-            id=r["id"], key=r["key"], name=r["name"], description=r["description"], lore=r["lore"], kind=r["kind"],
+            id=r["id"], key=r["key"], name=r["name"], name_ja=r.get("name_ja") or "",
+            description=r["description"], lore=r["lore"], kind=r["kind"],
             rarity_key=r["rarity_key"], tier=tier, odds=r["odds"], display_odds=r["display_odds"], rollable=r["rollable"],
             sell_value=r["sell_value"], biome_keys=frozenset(r["biome_keys"] or []),
             excluded_biome_keys=frozenset(r["excluded_biome_keys"] or []), min_luck=r["min_luck"],
@@ -278,7 +286,8 @@ async def build_snapshot(db: AsyncSession) -> Snapshot:
             if isinstance(s, dict) and s.get("key")
         ]
         biomes[r["key"]] = BiomeDef(
-            id=r["id"], key=r["key"], name=r["name"], description=r["description"], kind=r["kind"],
+            id=r["id"], key=r["key"], name=r["name"], name_ja=r.get("name_ja") or "",
+            description=r["description"], kind=r["kind"],
             odds_per_sec=r["odds_per_sec"], duration_sec=r["duration_sec"], luck_mult=r["luck_mult"],
             min_level=r["min_level"], item_boosts=r["item_boosts"] or {}, theme=r["theme"] or {}, states=states,
             announce=r["announce"], hidden=r["hidden"], sort_order=r["sort_order"], is_active=r["is_active"],

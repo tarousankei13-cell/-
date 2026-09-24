@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import models as m
 from ..core.timeutil import utcnow
-from . import seed_artifacts, seed_items, seed_progress, seed_world
+from . import seed_artifacts, seed_items, seed_names_ja, seed_progress, seed_world
 from .registry import CONTENT_VERSION_KEY, bump_content_version
 
 log = logging.getLogger("cosmic.seed")
@@ -23,7 +23,36 @@ log = logging.getLogger("cosmic.seed")
 
 def _clean(model: Any, data: dict[str, Any]) -> dict[str, Any]:
     cols = {c.key for c in model.__table__.columns}
-    return {k: v for k, v in data.items() if k in cols and k != "id"}
+    out = {k: v for k, v in data.items() if k in cols and k != "id"}
+    if "name_ja" in cols and not out.get("name_ja"):
+        ja = seed_names_ja.BY_TABLE.get(model.__tablename__, {}).get(data.get("key", ""))
+        if ja:
+            out["name_ja"] = ja
+    return out
+
+
+async def backfill_names_ja(db: AsyncSession) -> int:
+    """Fill in Japanese names for rows seeded before the column existed.
+
+    Only touches rows that have none, so a name edited in the admin panel is
+    never overwritten.
+    """
+    filled = 0
+    for model in (m.Rarity, m.Item, m.Biome, m.Equipment, m.Boost, m.Recipe, m.Shop,
+                  m.Cosmetic, m.Quest, m.Achievement):
+        table = model.__tablename__
+        names = seed_names_ja.BY_TABLE.get(table)
+        if not names:
+            continue
+        for obj in (await db.execute(select(model).where(model.name_ja == ""))).scalars().all():
+            ja = names.get(obj.key)
+            if ja:
+                obj.name_ja = ja
+                filled += 1
+    if filled:
+        await db.commit()
+        log.info("backfilled %s Japanese names", filled)
+    return filled
 
 
 async def _upsert_by_key(db: AsyncSession, model: Any, rows: list[dict[str, Any]], force: bool, key_field: str = "key") -> dict[str, Any]:

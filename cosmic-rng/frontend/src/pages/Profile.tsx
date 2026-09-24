@@ -4,7 +4,7 @@ import { get, post, put } from "../lib/api";
 import { useAction, useApi } from "../lib/useApi";
 import { useGame } from "../store/game";
 import { ItemIcon } from "../components/ItemIcon";
-import { Avatar, Empty, ErrorBox, Modal, Spinner, Tabs, TimeAgo } from "../components/ui";
+import { Avatar, Empty, ErrorBox, Modal, Spinner, Tabs, TimeAgo, Name } from "../components/ui";
 import { fmtCompact, fmtDate, fmtInt, fmtOdds } from "../lib/format";
 import type { Instance, InventoryGroup, Notification } from "../lib/types";
 
@@ -127,7 +127,7 @@ function Overview({ data }: { data: any }) {
           <div className="row" style={{ gap: 12 }}>
             <ItemIcon visual={s.best_item.visual} tier={s.best_item.tier} size={56} />
             <div>
-              <div className={`r-${s.best_item.rarity}`} style={{ fontWeight: 700, fontSize: "1.05rem" }}>{s.best_item.name}</div>
+              <div className={`r-${s.best_item.rarity}`} style={{ fontWeight: 700, fontSize: "1.05rem" }}><Name en={s.best_item.name} ja={(s.best_item as any).name_ja} /></div>
               <div className="mono tiny">{fmtOdds(s.best_item.odds, s.best_item.display_odds)}</div>
             </div>
           </div>
@@ -136,7 +136,7 @@ function Overview({ data }: { data: any }) {
 
       {data.equipment?.length > 0 && (
         <div className="glass pad">
-          <div className="tiny faint" style={{ letterSpacing: "0.14em", marginBottom: 8 }}>EQUIPMENT</div>
+          <div className="tiny faint" style={{ letterSpacing: "0.14em", marginBottom: 8 }}>装備</div>
           <div className="row-wrap">
             {data.equipment.map((e: any) => (
               <span key={e.slot} className={`chip r-${e.rarity}`}>

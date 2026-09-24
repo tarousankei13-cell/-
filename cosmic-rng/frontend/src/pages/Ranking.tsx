@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useApi } from "../lib/useApi";
 import { useGame } from "../store/game";
-import { Empty, ErrorBox, Spinner, Tabs, UserChip } from "../components/ui";
+import { Empty, ErrorBox, Spinner, Tabs, UserChip, Name } from "../components/ui";
 import { fmtCompact, fmtDate, fmtInt, fmtOdds } from "../lib/format";
 
 const BOARDS = [
@@ -45,7 +45,7 @@ export function Ranking() {
     <div className="page">
       <div className="page-head">
         <div>
-          <h1>Ranking</h1>
+          <h1>順位表<span className="h1-en">Ranking</span></h1>
           <div className="sub">リアルタイム更新。シーズン終了時の順位は永久保存されます。</div>
         </div>
       </div>
@@ -88,7 +88,7 @@ export function Ranking() {
                 </span>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <UserChip user={e.user} size={22} />
-                  {e.item && <div className="tiny"><span className={`r-${e.item.rarity}`}>{e.item.name}</span></div>}
+                  {e.item && <div className="tiny"><span className={`r-${e.item.rarity}`}><Name en={e.item.name} ja={(e.item as any).name_ja} /></span></div>}
                 </div>
                 <span className="mono" style={{ fontWeight: 600 }}>{fmtValue(e.value)}</span>
                 {e.rate !== undefined && <span className="tiny faint">{(e.rate * 100).toFixed(1)}%</span>}

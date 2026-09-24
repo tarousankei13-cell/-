@@ -59,7 +59,7 @@ EFFECTS = ("luck", "luck_mult", "min_rarity", "special_boost", "roll_speed", "co
 
 TYPES: dict[str, ContentType] = {
     "items": ContentType("items", "Items", m.Item, "item", (
-        F("key", "str", "Key", True, help="英数字と_ (変更不可)"), F("name", "str", "名前", True), F("description", "text", "説明"),
+        F("key", "str", "Key", True, help="英数字と_ (変更不可)"), F("name", "str", "名前（英）", True), F("name_ja", "str", "名前（日）", help="英語名の隣に表示されます"), F("description", "text", "説明"),
         F("lore", "text", "Lore"), F("kind", "enum", "種類", True, ("standard", "biome", "procedural_slot", "commemorative", "craft", "generated")),
         F("rarity_key", "enum", "レア度", True, TIERS), F("odds", "float", "基礎確率 (1/N のN)", min=1, help="空欄=Roll不可"),
         F("display_odds", "str", "表示確率", help="例: 1 / ???"), F("rollable", "bool", "Roll対象"),
@@ -74,7 +74,7 @@ TYPES: dict[str, ContentType] = {
         F("trade_count", "int", "取引回数", readonly=True), F("first_discoverer_id", "int", "世界初発見者ID", readonly=True),
     ), extra_filter=lambda q: q.where(m.Item.kind != "admin_artifact"), list_fields=("key", "name", "rarity_key", "odds", "kind", "is_active")),
     "biomes": ContentType("biomes", "Biomes", m.Biome, "biome", (
-        F("key", "str", "Key", True), F("name", "str", "名前", True), F("description", "text", "説明"),
+        F("key", "str", "Key", True), F("name", "str", "名前（英）", True), F("name_ja", "str", "名前（日）", help="英語名の隣に表示されます"), F("description", "text", "説明"),
         F("kind", "enum", "種類", True, ("default", "natural", "admin")), F("odds_per_sec", "float", "毎秒の出現確率 (1/N のN)", min=1),
         F("duration_sec", "int", "継続時間(秒)", min=1), F("luck_mult", "float", "Luck倍率", min=0), F("min_level", "int", "解放レベル", min=1),
         F("item_boosts", "json", "アイテム確率補正", help='{"item_key": 3}'), F("theme", "json", "テーマ/演出"),
@@ -82,7 +82,7 @@ TYPES: dict[str, ContentType] = {
         F("announce", "bool", "Feed通知"), F("hidden", "bool", "隠し"), F("sort_order", "int", "並び順"), F("is_active", "bool", "有効"),
     ), list_fields=("key", "name", "kind", "odds_per_sec", "luck_mult", "is_active")),
     "equipment": ContentType("equipment", "Equipment", m.Equipment, "equipment", (
-        F("key", "str", "Key", True), F("name", "str", "名前", True), F("description", "text", "説明"),
+        F("key", "str", "Key", True), F("name", "str", "名前（英）", True), F("name_ja", "str", "名前（日）", help="英語名の隣に表示されます"), F("description", "text", "説明"),
         F("slot", "enum", "スロット", True, ("gauntlet", "core", "relic")), F("rarity_key", "enum", "レア度", True, TIERS),
         F("luck_bonus", "float", "Luckボーナス (0.5=+50%)"), F("speed_bonus", "float", "Roll速度ボーナス"),
         F("passives", "json", "パッシブ", help='[{"type":"biome_luck","biome":"x","mult":1.5}]'), F("visual", "json", "ビジュアル"),
@@ -90,25 +90,25 @@ TYPES: dict[str, ContentType] = {
         F("is_active", "bool", "有効"),
     ), list_fields=("key", "name", "slot", "rarity_key", "luck_bonus", "is_active")),
     "boosts": ContentType("boosts", "Boosts", m.Boost, "boost", (
-        F("key", "str", "Key", True), F("name", "str", "名前", True), F("description", "text", "説明"),
+        F("key", "str", "Key", True), F("name", "str", "名前（英）", True), F("name_ja", "str", "名前（日）", help="英語名の隣に表示されます"), F("description", "text", "説明"),
         F("effect_type", "enum", "効果タイプ", True, EFFECTS), F("value", "float", "値 (luckは%)"),
         F("rolls", "int", "有効Roll数", min=1), F("duration_sec", "int", "有効時間(秒)", min=1), F("stack_mode", "enum", "重複時", True, STACK),
         F("biome_keys", "json", "発動Biome"), F("params", "json", "パラメータ"), F("rarity_key", "enum", "レア度", True, TIERS),
         F("visual", "json", "ビジュアル"), F("sell_value", "int", "価値", min=0), F("sort_order", "int", "並び順"), F("is_active", "bool", "有効"),
     ), list_fields=("key", "name", "effect_type", "value", "stack_mode", "is_active")),
     "recipes": ContentType("recipes", "Recipes", m.Recipe, "recipe", (
-        F("key", "str", "Key", True), F("name", "str", "名前", True), F("description", "text", "説明"),
+        F("key", "str", "Key", True), F("name", "str", "名前（英）", True), F("name_ja", "str", "名前（日）", help="英語名の隣に表示されます"), F("description", "text", "説明"),
         F("ingredients", "json", "素材", True, help='[{"item_key":"x","qty":3}]'), F("stardust_cost", "int", "費用", min=0),
         F("outputs", "json", "出力", True, help='[{"type":"equipment|boost|item","key":"x","qty":1,"weight":1}]'),
         F("hidden", "bool", "秘密レシピ"), F("hint", "text", "ヒント"), F("min_level", "int", "必要レベル", min=1),
         F("sort_order", "int", "並び順"), F("is_active", "bool", "有効"),
     ), list_fields=("key", "name", "hidden", "stardust_cost", "is_active")),
     "shops": ContentType("shops", "Shops", m.Shop, "shop", (
-        F("key", "str", "Key", True), F("name", "str", "名前", True), F("description", "text", "説明"),
+        F("key", "str", "Key", True), F("name", "str", "名前（英）", True), F("name_ja", "str", "名前（日）", help="英語名の隣に表示されます"), F("description", "text", "説明"),
         F("biome_key", "str", "Biome限定"), F("min_level", "int", "必要レベル", min=1), F("sort_order", "int", "並び順"), F("is_active", "bool", "有効"),
     ), list_fields=("key", "name", "biome_key", "is_active")),
     "shop_items": ContentType("shop_items", "Shop Items", m.ShopItem, "shop_item", (
-        F("key", "str", "Key", True), F("shop_key", "str", "ショップKey", True), F("name", "str", "名前", True), F("description", "text", "説明"),
+        F("key", "str", "Key", True), F("shop_key", "str", "ショップKey", True), F("name", "str", "名前（英）", True), F("name_ja", "str", "名前（日）", help="英語名の隣に表示されます"), F("description", "text", "説明"),
         F("product_type", "enum", "商品種別", True, ("boost", "equipment", "unlock", "item")), F("product_key", "str", "商品Key", True),
         F("quantity", "int", "数量", min=1), F("price", "int", "価格", True, min=0), F("limit_count", "int", "購入上限", min=1),
         F("limit_period", "enum", "上限期間", choices=("daily", "lifetime")), F("min_level", "int", "必要レベル", min=1),
@@ -116,7 +116,7 @@ TYPES: dict[str, ContentType] = {
         F("sort_order", "int", "並び順"), F("is_active", "bool", "有効"),
     ), list_fields=("key", "name", "shop_key", "price", "is_active")),
     "achievements": ContentType("achievements", "Achievements", m.Achievement, "achievement", (
-        F("key", "str", "Key", True), F("name", "str", "名前", True), F("description", "text", "説明"), F("category", "str", "カテゴリ", True),
+        F("key", "str", "Key", True), F("name", "str", "名前（英）", True), F("name_ja", "str", "名前（日）", help="英語名の隣に表示されます"), F("description", "text", "説明"), F("category", "str", "カテゴリ", True),
         F("tier", "enum", "ティア", True, ("bronze", "silver", "gold", "cosmic")),
         F("condition", "json", "条件", True, help='{"stat":"total_rolls","gte":100} / {"rarity":"epic","gte":1} / {"item":"key"} / {"biome":"key"}'),
         F("rewards", "json", "報酬", help='{"stardust":100,"cosmetics":["t_x"],"items":[{"key":"x","qty":1}]}'),
@@ -124,14 +124,14 @@ TYPES: dict[str, ContentType] = {
         F("achiever_count", "int", "達成者数", readonly=True),
     ), list_fields=("key", "name", "category", "tier", "is_active")),
     "quests": ContentType("quests", "Quests", m.Quest, "quest", (
-        F("key", "str", "Key", True), F("name", "str", "名前", True), F("description", "text", "説明"),
+        F("key", "str", "Key", True), F("name", "str", "名前（英）", True), F("name_ja", "str", "名前（日）", help="英語名の隣に表示されます"), F("description", "text", "説明"),
         F("kind", "enum", "種類", True, ("daily", "chain", "hidden")), F("chain_key", "str", "チェーンKey"), F("chain_step", "int", "ステップ", min=1),
         F("objective", "json", "目標", True, help='{"type":"roll","target":100,"per_level":5,"params":{}}'),
         F("rewards", "json", "報酬"), F("hint", "text", "ヒント"), F("weight", "float", "出現重み", min=0), F("min_level", "int", "必要レベル", min=1),
         F("sort_order", "int", "並び順"), F("is_active", "bool", "有効"),
     ), list_fields=("key", "name", "kind", "is_active")),
     "cosmetics": ContentType("cosmetics", "Cosmetics", m.Cosmetic, "cosmetic", (
-        F("key", "str", "Key", True), F("kind", "enum", "種類", True, ("title", "badge", "background")), F("name", "str", "名前", True),
+        F("key", "str", "Key", True), F("kind", "enum", "種類", True, ("title", "badge", "background")), F("name", "str", "名前（英）", True), F("name_ja", "str", "名前（日）", help="英語名の隣に表示されます"),
         F("description", "text", "説明"), F("rarity_key", "enum", "レア度", True, TIERS), F("visual", "json", "ビジュアル"), F("is_active", "bool", "有効"),
     ), list_fields=("key", "name", "kind", "rarity_key")),
     "artifacts": ContentType("artifacts", "Admin Artifacts", m.AdminArtifact, "artifact", (
@@ -143,25 +143,25 @@ TYPES: dict[str, ContentType] = {
         F("transfer_rules", "json", "移動ルール"), F("audit_rules", "json", "監査ルール"), F("sort_order", "int", "並び順"), F("is_active", "bool", "有効"),
     ), search=("key", "ability"), list_fields=("key", "theme", "tier", "target", "is_active")),
     "events": ContentType("events", "Events", m.GameEvent, "event", (
-        F("key", "str", "Key", True), F("name", "str", "名前", True), F("description", "text", "説明"),
+        F("key", "str", "Key", True), F("name", "str", "名前（英）", True), F("name_ja", "str", "名前（日）", help="英語名の隣に表示されます"), F("description", "text", "説明"),
         F("type", "enum", "種類", True, ("luck_multiplier", "biome_chance", "item_event", "announcement")),
         F("params", "json", "パラメータ", help='{"mult":2}'), F("starts_at", "datetime", "開始"), F("ends_at", "datetime", "終了"),
         F("is_active", "bool", "有効"),
     ), overridable=False, list_fields=("key", "name", "type", "starts_at", "ends_at", "is_active")),
     "rarities": ContentType("rarities", "Rarities", m.Rarity, "rarity", (
-        F("key", "str", "Key", True, readonly=True), F("name", "str", "名前", True), F("tier", "int", "ティア", readonly=True),
+        F("key", "str", "Key", True, readonly=True), F("name", "str", "名前（英）", True), F("name_ja", "str", "名前（日）", help="英語名の隣に表示されます"), F("tier", "int", "ティア", readonly=True),
         F("min_odds", "float", "最低確率N", min=1), F("color", "str", "色1"), F("color2", "str", "色2"),
         F("luck_exponent", "float", "Luck指数", help="1未満でLuckが効きにくくなる", min=0.01, max=2), F("xp", "int", "XP", min=0),
         F("season_points", "int", "シーズンポイント", min=0), F("cutscene", "str", "演出"), F("announce", "bool", "通知"),
     ), soft_delete=False, list_fields=("key", "name", "tier", "min_odds", "luck_exponent")),
     "seasons": ContentType("seasons", "Seasons", m.Season, "season", (
-        F("key", "str", "Key", True), F("name", "str", "名前", True), F("description", "text", "説明"),
+        F("key", "str", "Key", True), F("name", "str", "名前（英）", True), F("name_ja", "str", "名前（日）", help="英語名の隣に表示されます"), F("description", "text", "説明"),
         F("starts_at", "datetime", "開始", True), F("ends_at", "datetime", "終了", True),
         F("status", "enum", "状態", True, ("scheduled", "active", "ended")),
     ), soft_delete=False, overridable=False, list_fields=("key", "name", "starts_at", "ends_at", "status")),
     "parts": ContentType("parts", "Item Parts", m.ItemPart, "part", (
         F("part_type", "enum", "種類", True, ("material", "shape", "effect", "modifier")), F("key", "str", "Key", True),
-        F("name", "str", "名前", True), F("weight", "float", "重み", min=0.0001), F("value_mult", "float", "価値倍率", min=0),
+        F("name", "str", "名前（英）", True), F("name_ja", "str", "名前（日）", help="英語名の隣に表示されます"), F("weight", "float", "重み", min=0.0001), F("value_mult", "float", "価値倍率", min=0),
         F("visual", "json", "ビジュアル"), F("is_active", "bool", "有効"),
     ), overridable=False, list_fields=("part_type", "key", "name", "weight", "is_active")),
 }

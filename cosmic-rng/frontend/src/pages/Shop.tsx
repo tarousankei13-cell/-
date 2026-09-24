@@ -58,7 +58,7 @@ export function Shop() {
     <div className="page">
       <div className="page-head">
         <div>
-          <h1>Shop</h1>
+          <h1>商店<span className="h1-en">Shop</span></h1>
           <div className="sub">Boost・装備・アップグレードを Stardust で購入。Biome限定ショップはそのBiome中のみ開きます。</div>
         </div>
         <span className="chip mono" style={{ color: "var(--gold)" }}>✦ {fmtCompact(stardust)}</span>

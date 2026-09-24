@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { useApi } from "../lib/useApi";
 import { ItemIcon } from "../components/ItemIcon";
 import { Empty, ErrorBox, Modal, RarityBadge, Spinner, Tabs } from "../components/ui";
-import { fmtDate, fmtInt, fmtOdds } from "../lib/format";
+import { fmtDate, fmtInt, fmtOdds, RARITY_LABEL_JA } from "../lib/format";
 import type { ItemInfo, RarityKey } from "../lib/types";
 import { ItemDetailModal } from "./Inventory";
 
@@ -61,7 +61,7 @@ export function Collection() {
     <div className="page">
       <div className="page-head">
         <div>
-          <h1>Collection</h1>
+          <h1>図鑑<span className="h1-en">Collection</span></h1>
           {data && <div className="sub">{fmtInt(data.discovered)} / {fmtInt(data.total)} 種類発見（{(data.rate * 100).toFixed(1)}%）</div>}
         </div>
       </div>
@@ -71,7 +71,7 @@ export function Collection() {
           <div className="bar" style={{ marginBottom: 10 }}><i style={{ width: `${data.rate * 100}%` }} /></div>
           <div className="row-wrap" style={{ gap: 6 }}>
             {Object.entries(byRarity).map(([r, v]) => (
-              <span key={r} className={`chip tiny r-${r}`}>{r} {v.found}/{v.total}</span>
+              <span key={r} className={`chip tiny r-${r}`}>{RARITY_LABEL_JA[r as RarityKey] ?? r} {v.found}/{v.total}</span>
             ))}
           </div>
         </div>

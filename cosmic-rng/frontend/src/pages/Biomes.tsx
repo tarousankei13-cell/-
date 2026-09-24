@@ -1,12 +1,13 @@
 import { useState } from "react";
 import { useApi } from "../lib/useApi";
-import { Empty, ErrorBox, Modal, Spinner } from "../components/ui";
+import { Empty, ErrorBox, Modal, Spinner, Name } from "../components/ui";
 import { fmtInt, fmtOdds } from "../lib/format";
 import { useGame } from "../store/game";
 
 interface BiomeEntry {
   key: string;
   name: string;
+  name_ja?: string | null;
   kind: string;
   description?: string;
   odds_per_sec?: number | null;
@@ -18,7 +19,7 @@ interface BiomeEntry {
   states: { key: string; name: string; luck_mult: number; description: string }[];
   seen: boolean;
   locked: boolean;
-  exclusive_items: { id: number; name: string; rarity: string; odds: number | null }[];
+  exclusive_items: { id: number; name: string; name_ja?: string | null; rarity: string; odds: number | null }[];
 }
 
 export function Biomes() {
@@ -53,7 +54,7 @@ export function Biomes() {
                 <div className="row">
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div className="row" style={{ gap: 6 }}>
-                      <span className="name" style={{ color: accent }}>{b.name}</span>
+                      <span className="name" style={{ color: accent }}><Name en={b.name} ja={b.name_ja} block /></span>
                       {active && <span className="badge" style={{ color: "var(--good)" }}>NOW</span>}
                       {b.kind === "admin" && <span className="badge r-admin">ADMIN</span>}
                       {b.locked && <span className="badge" style={{ color: "var(--warn)" }}>Lv.{b.min_level}</span>}
@@ -74,7 +75,7 @@ export function Biomes() {
       )}
 
       {sel && (
-        <Modal open onClose={() => setSel(null)} title={sel.name} wide>
+        <Modal open onClose={() => setSel(null)} title={sel.name_ja ? `${sel.name} / ${sel.name_ja}` : sel.name} wide>
           <div className="col" style={{ gap: 14 }}>
             <p className="muted" style={{ margin: 0 }}>{sel.description || "未知のBiome"}</p>
             <div className="row-wrap">
@@ -104,7 +105,7 @@ export function Biomes() {
                 <div className="col" style={{ gap: 4, maxHeight: "40vh", overflow: "auto" }}>
                   {sel.exclusive_items.map((it) => (
                     <div key={it.id} className="row" style={{ gap: 8, padding: "5px 8px", borderRadius: 8, background: "rgba(255,255,255,0.03)" }}>
-                      <span className={`r-${it.rarity}`} style={{ flex: 1 }}>{it.name}</span>
+                      <span className={`r-${it.rarity}`} style={{ flex: 1 }}><Name en={it.name} ja={it.name_ja} /></span>
                       <span className="mono tiny faint">{it.odds ? fmtOdds(it.odds) : "1 / ???"}</span>
                     </div>
                   ))}

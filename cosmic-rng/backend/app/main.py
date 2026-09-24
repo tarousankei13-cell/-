@@ -56,6 +56,10 @@ async def ensure_content() -> None:
             log.warning("empty database detected — seeding initial content")
             await seed(db)
     async with session_scope() as db:
+        from .content.seeder import backfill_names_ja
+
+        await backfill_names_ja(db)
+    async with session_scope() as db:
         await get_registry().reload(db)
     async with session_scope() as db:
         from .services.users import ensure_admin_account

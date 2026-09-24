@@ -48,7 +48,7 @@ async def board(db: AsyncSession, key: str, limit: int = 100) -> dict[str, Any]:
         e: dict[str, Any] = {"rank": rank, "user": user_brief(u), "value": value}
         if key == "best" and s.best_item_id:
             item = snap.items.get(s.best_item_id)
-            e["item"] = {"name": item.name, "rarity": item.rarity_key, "visual": item.visual} if item else None
+            e["item"] = {"name": item.name, "name_ja": item.name_ja, "rarity": item.rarity_key, "visual": item.visual} if item else None
         if key == "collection":
             e["rate"] = value / total
         entries.append(e)

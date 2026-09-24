@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useApi } from "../lib/useApi";
-import { Empty, ErrorBox, Spinner, Tabs } from "../components/ui";
+import { Empty, ErrorBox, Spinner, Tabs, Name } from "../components/ui";
 import { fmtDate, fmtInt } from "../lib/format";
 
 interface Ach {
@@ -32,7 +32,7 @@ export function Achievements() {
     <div className="page">
       <div className="page-head">
         <div>
-          <h1>Achievements</h1>
+          <h1>実績<span className="h1-en">Achievements</span></h1>
           {data && <div className="sub">{fmtInt(data.achieved)} / {fmtInt(data.total)} 達成</div>}
         </div>
         <label className="switch">
@@ -61,7 +61,7 @@ export function Achievements() {
                   </div>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div className="row" style={{ gap: 6 }}>
-                      <span className="name" style={{ color: a.achieved ? TIER_COLOR[a.tier] : undefined }}>{a.name}</span>
+                      <span className="name" style={{ color: a.achieved ? TIER_COLOR[a.tier] : undefined }}><Name en={a.name} ja={(a as any).name_ja} block /></span>
                       {a.world_first && <span className="badge" style={{ color: "var(--gold)" }}>世界初</span>}
                     </div>
                     <div className="tiny muted">{a.description ?? (a.hint ? `💡 ${a.hint}` : "???")}</div>

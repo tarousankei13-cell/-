@@ -287,6 +287,8 @@ class Rarity(Base):
     id: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
     key: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(48), nullable=False)
+    # Japanese display name shown beside the English one; editable from the admin panel.
+    name_ja: Mapped[str] = mapped_column(String(128), server_default="", nullable=False)
     tier: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     min_odds: Mapped[float] = mapped_column(Double, server_default="1", nullable=False)
     color: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -310,6 +312,8 @@ class Item(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     key: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
+    # Japanese display name shown beside the English one; editable from the admin panel.
+    name_ja: Mapped[str] = mapped_column(String(128), server_default="", nullable=False)
     description: Mapped[str] = mapped_column(Text, server_default="", nullable=False)
     lore: Mapped[str] = mapped_column(Text, server_default="", nullable=False)
     kind: Mapped[str] = mapped_column(String(24), server_default="standard", nullable=False)
@@ -422,6 +426,8 @@ class Biome(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     key: Mapped[str] = mapped_column(String(48), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Japanese display name shown beside the English one; editable from the admin panel.
+    name_ja: Mapped[str] = mapped_column(String(128), server_default="", nullable=False)
     description: Mapped[str] = mapped_column(Text, server_default="", nullable=False)
     kind: Mapped[str] = mapped_column(String(16), server_default="natural", nullable=False)  # default/natural/admin
     odds_per_sec: Mapped[float | None] = mapped_column(Double)  # 1 in N chance per second
@@ -464,6 +470,8 @@ class Equipment(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     key: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(96), nullable=False)
+    # Japanese display name shown beside the English one; editable from the admin panel.
+    name_ja: Mapped[str] = mapped_column(String(128), server_default="", nullable=False)
     description: Mapped[str] = mapped_column(Text, server_default="", nullable=False)
     slot: Mapped[str] = mapped_column(String(16), nullable=False)
     rarity_key: Mapped[str] = mapped_column(ForeignKey("rarities.key", onupdate="CASCADE"), nullable=False)
@@ -513,6 +521,8 @@ class Boost(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     key: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(96), nullable=False)
+    # Japanese display name shown beside the English one; editable from the admin panel.
+    name_ja: Mapped[str] = mapped_column(String(128), server_default="", nullable=False)
     description: Mapped[str] = mapped_column(Text, server_default="", nullable=False)
     effect_type: Mapped[str] = mapped_column(String(32), nullable=False)
     value: Mapped[float] = mapped_column(Double, server_default="0", nullable=False)
@@ -569,6 +579,8 @@ class Recipe(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     key: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(96), nullable=False)
+    # Japanese display name shown beside the English one; editable from the admin panel.
+    name_ja: Mapped[str] = mapped_column(String(128), server_default="", nullable=False)
     description: Mapped[str] = mapped_column(Text, server_default="", nullable=False)
     ingredients: Mapped[list[dict[str, Any]]] = jsonb("'[]'::jsonb")
     stardust_cost: Mapped[int] = mapped_column(BigInteger, server_default="0", nullable=False)
@@ -595,6 +607,8 @@ class Shop(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     key: Mapped[str] = mapped_column(String(48), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Japanese display name shown beside the English one; editable from the admin panel.
+    name_ja: Mapped[str] = mapped_column(String(128), server_default="", nullable=False)
     description: Mapped[str] = mapped_column(Text, server_default="", nullable=False)
     biome_key: Mapped[str | None] = mapped_column(String(48))
     min_level: Mapped[int] = mapped_column(Integer, server_default="1", nullable=False)
@@ -610,6 +624,8 @@ class ShopItem(Base):
     key: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     shop_key: Mapped[str] = mapped_column(ForeignKey("shops.key", onupdate="CASCADE", ondelete="CASCADE"), nullable=False)
     name: Mapped[str] = mapped_column(String(96), nullable=False)
+    # Japanese display name shown beside the English one; editable from the admin panel.
+    name_ja: Mapped[str] = mapped_column(String(128), server_default="", nullable=False)
     description: Mapped[str] = mapped_column(Text, server_default="", nullable=False)
     product_type: Mapped[str] = mapped_column(String(16), nullable=False)  # boost/equipment/unlock/item
     product_key: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -653,6 +669,8 @@ class Cosmetic(Base):
     key: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     kind: Mapped[str] = mapped_column(String(16), nullable=False)  # title/badge/background
     name: Mapped[str] = mapped_column(String(96), nullable=False)
+    # Japanese display name shown beside the English one; editable from the admin panel.
+    name_ja: Mapped[str] = mapped_column(String(128), server_default="", nullable=False)
     description: Mapped[str] = mapped_column(Text, server_default="", nullable=False)
     rarity_key: Mapped[str] = mapped_column(ForeignKey("rarities.key", onupdate="CASCADE"), nullable=False)
     visual: Mapped[dict[str, Any]] = jsonb()
@@ -828,6 +846,8 @@ class Quest(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     key: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(96), nullable=False)
+    # Japanese display name shown beside the English one; editable from the admin panel.
+    name_ja: Mapped[str] = mapped_column(String(128), server_default="", nullable=False)
     description: Mapped[str] = mapped_column(Text, server_default="", nullable=False)
     kind: Mapped[str] = mapped_column(String(16), nullable=False)  # daily/chain/hidden
     chain_key: Mapped[str | None] = mapped_column(String(48))
@@ -868,6 +888,8 @@ class Achievement(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     key: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(96), nullable=False)
+    # Japanese display name shown beside the English one; editable from the admin panel.
+    name_ja: Mapped[str] = mapped_column(String(128), server_default="", nullable=False)
     description: Mapped[str] = mapped_column(Text, server_default="", nullable=False)
     category: Mapped[str] = mapped_column(String(32), nullable=False)
     tier: Mapped[str] = mapped_column(String(16), server_default="bronze", nullable=False)
@@ -897,6 +919,8 @@ class Season(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     key: Mapped[str] = mapped_column(String(48), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(96), nullable=False)
+    # Japanese display name shown beside the English one; editable from the admin panel.
+    name_ja: Mapped[str] = mapped_column(String(128), server_default="", nullable=False)
     description: Mapped[str] = mapped_column(Text, server_default="", nullable=False)
     starts_at: Mapped[datetime] = mapped_column(TS, nullable=False)
     ends_at: Mapped[datetime] = mapped_column(TS, nullable=False)

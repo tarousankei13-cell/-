@@ -103,7 +103,8 @@ async def dashboard(db: AsyncSession) -> dict[str, Any]:
         "total_rolls": int(total_rolls), "rare_drops_24h": rare_24h, "first_discoveries_24h": firsts_24h,
         "market_24h": {"count": mv[0], "volume": int(mv[1])}, "trades_24h": trades_24h, "errors_24h": errors_24h,
         "active_boosts": active_boosts, "flagged_listings_24h": flagged,
-        "biomes": [{"key": k, "name": snap.biomes[k].name if k in snap.biomes else k, "count": c} for k, c in biome_rows],
+        "biomes": [{"key": k, "name": snap.biomes[k].name if k in snap.biomes else k,
+                    "name_ja": snap.biomes[k].name_ja if k in snap.biomes else "", "count": c} for k, c in biome_rows],
         "rolls_per_minute": _dense_series(per_min, now, 60, timedelta(minutes=1), "%H:%M"),
         "rare_per_hour": _dense_series(rare_hour, now, 24, timedelta(hours=1), "%m-%d %H:00"),
         "tier_distribution_1h": [{"tier": t, "n": n} for t, n in tier_dist],
@@ -162,7 +163,7 @@ async def user_detail(db: AsyncSession, user_id: int) -> dict[str, Any]:
         "trades": [{"id": t.id, "status": t.status, "from": t.from_user_id, "to": t.to_user_id, "created_at": t.created_at.isoformat()}
                    for t in trades],
         "audit": await audit.search(db, target_user_id=u.id, limit=30),
-        "biome_keys": [{"key": b.key, "name": b.name, "kind": b.kind} for b in sorted(snap.biomes.values(), key=lambda b: b.sort_order)],
+        "biome_keys": [{"key": b.key, "name": b.name, "name_ja": b.name_ja, "kind": b.kind} for b in sorted(snap.biomes.values(), key=lambda b: b.sort_order)],
     }
 
 

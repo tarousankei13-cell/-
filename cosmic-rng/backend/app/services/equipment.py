@@ -88,7 +88,7 @@ async def load_equipped(db: AsyncSession, user_id: int) -> tuple[list[EquipData]
             if passive.get("luck_mult"):
                 passives.append({"type": "luck_mult", "mult": float(passive["luck_mult"])})
             data.append(EquipData(key=art["key"], slot=ARTIFACT_SLOT, luck_bonus=0.0, speed_bonus=0.0, passives=passives, name=item.name))
-            visuals.append({"slot": ARTIFACT_SLOT, "key": item.key, "name": item.name, "rarity": "admin", "visual": item.visual,
+            visuals.append({"slot": ARTIFACT_SLOT, "key": item.key, "name": item.name, "name_ja": item.name_ja, "rarity": "admin", "visual": item.visual,
                             "instance_id": art_inst.id, "aura": passive.get("aura") or art["theme"]})
     return data, visuals
 

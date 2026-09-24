@@ -21,7 +21,7 @@ def _item_row_public(it: Item) -> dict[str, Any]:
     snap = get_registry().snap
     r = snap.rarities.get(it.rarity_key)
     return {
-        "id": it.id, "key": it.key, "name": it.name, "description": it.description, "lore": it.lore, "kind": it.kind,
+        "id": it.id, "key": it.key, "name": it.name, "name_ja": it.name_ja, "description": it.description, "lore": it.lore, "kind": it.kind,
         "rarity": it.rarity_key, "tier": r.tier if r else 1, "odds": it.odds, "display_odds": it.display_odds,
         "sell_value": it.sell_value, "visual": it.visual or {}, "animation": it.animation or (r.cutscene if r else None),
         "sound": it.sound, "tradeable": it.tradeable, "biomes": list(it.biome_keys or []),
