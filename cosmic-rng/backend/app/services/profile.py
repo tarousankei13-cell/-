@@ -147,6 +147,7 @@ async def collection_book(db: AsyncSession, user_id: int, reveal_hidden: bool = 
             entries.append({
                 "id": it.id, "state": state, "rarity": it.rarity_key, "tier": it.tier,
                 "name": it.name if reveal_hidden else ("???" if (it.hidden or it.tier >= 5) else _mask(it.name)),
+                "name_ja": it.name_ja if reveal_hidden else "",
                 "odds": None if (it.hidden and not reveal_hidden) else it.odds, "display_odds": it.display_odds,
                 "biomes": biomes if not it.hidden or reveal_hidden else [], "visual": {"shape": it.visual.get("shape"), "silhouette": True},
                 "hint": _hint(it) if (it.hidden or reveal_hidden) else None,
@@ -155,7 +156,8 @@ async def collection_book(db: AsyncSession, user_id: int, reveal_hidden: bool = 
             continue
         first = discoverers.get(row.first_discoverer_id) if row and row.first_discoverer_id else None
         entries.append({
-            "id": it.id, "state": state, "key": it.key, "name": it.name, "description": it.description, "lore": it.lore,
+            "id": it.id, "state": state, "key": it.key, "name": it.name, "name_ja": it.name_ja,
+            "description": it.description, "lore": it.lore,
             "rarity": it.rarity_key, "tier": it.tier, "odds": it.odds, "display_odds": it.display_odds, "visual": it.visual,
             "biomes": biomes, "owned": owned.get(it.id, 0), "times_obtained": c.times_obtained if c else 0,
             "first_obtained_at": c.first_obtained_at.isoformat() if c else None,

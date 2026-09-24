@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useApi } from "../lib/useApi";
 import { ItemIcon } from "../components/ItemIcon";
-import { Empty, ErrorBox, Modal, RarityBadge, Spinner, Tabs } from "../components/ui";
+import { Empty, ErrorBox, Modal, RarityBadge, Spinner, Tabs, Name } from "../components/ui";
 import { fmtDate, fmtInt, fmtOdds, RARITY_LABEL_JA } from "../lib/format";
 import type { ItemInfo, RarityKey } from "../lib/types";
 import { ItemDetailModal } from "./Inventory";
@@ -111,7 +111,7 @@ export function Collection() {
                   <div className="row" style={{ gap: 10 }}>
                     <ItemIcon visual={e.visual} tier={e.tier} size={44} silhouette={e.state === "undiscovered"} />
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div className={`name ${e.state === "undiscovered" ? "faint" : `r-${e.rarity}`}`}>{e.name}</div>
+                      <div className={`name ${e.state === "undiscovered" ? "faint" : `r-${e.rarity}`}`}><Name en={e.name} ja={(e as any).name_ja} block /></div>
                       <div className="odds mono">{e.odds ? fmtOdds(e.odds, e.display_odds) : e.display_odds ?? "1 / ???"}</div>
                     </div>
                     {!!e.owned && <span className="mono tiny">×{fmtInt(e.owned)}</span>}
@@ -131,7 +131,7 @@ export function Collection() {
                   <div className="row" style={{ gap: 10 }}>
                     <ItemIcon visual={g.visual} tier={g.tier} size={44} />
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div className={`name r-${g.rarity}`}>{g.name}</div>
+                      <div className={`name r-${g.rarity}`}><Name en={g.name} ja={(g as any).name_ja} block /></div>
                       <div className="odds mono">{fmtOdds(g.odds)}</div>
                     </div>
                     <span className="mono tiny">×{fmtInt(g.owned ?? 0)}</span>
@@ -145,7 +145,7 @@ export function Collection() {
       )}
 
       {sel && (
-        <Modal open onClose={() => setSel(null)} title={sel.state === "undiscovered" ? "未発見のアイテム" : sel.name}>
+        <Modal open onClose={() => setSel(null)} title={sel.state === "undiscovered" ? "未発見のアイテム" : ((sel as any).name_ja ? `${sel.name} / ${(sel as any).name_ja}` : sel.name)}>
           <div className="col" style={{ gap: 14 }}>
             <div className="row" style={{ gap: 14, alignItems: "flex-start" }}>
               <ItemIcon visual={sel.visual} tier={sel.tier} size={86} silhouette={sel.state === "undiscovered"} />
