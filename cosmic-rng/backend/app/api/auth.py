@@ -125,15 +125,22 @@ class DevLogin(BaseModel):
     username: str = Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9_.\-]+$")
 
 
-@router.post("/dev-login")
-async def dev_login(body: DevLogin, request: Request, db: AsyncSession = Depends(get_db)) -> RedirectResponse:
-    """Development-only login (refused unless DEV_LOGIN_ENABLED and not production)."""
-    s = get_settings()
-    if not s.dev_login_enabled or s.environment == "production":
-        raise NotFound("Not Found")
+async def _dev_login(body: DevLogin, request: Request, db: AsyncSession = Depends(get_db)) -> RedirectResponse:
+    """Development-only login. The route is not registered at all in production, so the
+    endpoint is indistinguishable from a non-existent one (even for malformed bodies)."""
     check_origin(request)
     limiter.check("auth", client_ip(request))
     return await _finish_login(db, request, {"id": str(body.discord_id), "username": body.username, "global_name": body.username}, "/roll")
+
+
+def register_dev_login() -> None:
+    s = get_settings()
+    if s.dev_login_enabled and s.environment != "production":
+        router.post("/dev-login")(_dev_login)
+        log.warning("DEV LOGIN IS ENABLED — never use this configuration in production")
+
+
+register_dev_login()
 
 
 @router.post("/logout")

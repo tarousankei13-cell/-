@@ -1,0 +1,50 @@
+[Unit]
+Description=Cosmic RNG game server (FastAPI/uvicorn)
+Documentation=https://github.com/tarousankei13-cell/-
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=exec
+User=cosmic
+Group=cosmic
+WorkingDirectory=/opt/cosmic-rng/backend
+EnvironmentFile=/opt/cosmic-rng/.env
+# WORKERS: 2 × CPU cores is a good start. EVENT_BUS must be "postgres" when > 1.
+Environment=WORKERS=4
+ExecStartPre=/opt/cosmic-rng/backend/.venv/bin/python -m app.cli migrate
+ExecStart=/opt/cosmic-rng/backend/.venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 --port 8000 \
+    --workers ${WORKERS} \
+    --proxy-headers --forwarded-allow-ips=127.0.0.1 \
+    --timeout-graceful-shutdown 25 \
+    --no-access-log
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=40
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cosmic-rng
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+ReadWritePaths=/var/backups/cosmic-rng /var/log/cosmic-rng
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

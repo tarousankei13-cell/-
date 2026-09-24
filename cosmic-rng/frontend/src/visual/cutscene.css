@@ -89,6 +89,9 @@
     radial-gradient(ellipse at 50% 50%, var(--glow, #fff) 0%, transparent 12%),
     conic-gradient(from 0deg, transparent, var(--c2, #7b4dff) 25%, transparent 50%, var(--c1, #ff7bd5) 75%, transparent);
   filter: blur(14px);
+  /* Without a mask the disc's rim reads as a hard bright arc across the page. */
+  mask-image: radial-gradient(circle, #000 0%, #000 34%, transparent 72%);
+  -webkit-mask-image: radial-gradient(circle, #000 0%, #000 34%, transparent 72%);
   opacity: 0;
   animation: galaxyIn 3.2s ease forwards, spin 22s linear infinite;
 }
@@ -97,11 +100,23 @@
 .cut-body {
   position: absolute;
   border-radius: 50%;
-  background: radial-gradient(circle at 35% 30%, var(--c1, #fff), var(--c2, #6a2cff) 55%, #05030f 100%);
-  box-shadow: 0 0 120px var(--glow, #fff), inset -30px -30px 90px rgba(0, 0, 0, 0.7);
+  /* Uses the glow (always luminous) rather than the item's raw palette, whose
+     primary can be near-black and would render the body as a white blob. */
+  background: radial-gradient(circle at 35% 30%, var(--glow, #fff), var(--c2, #6a2cff) 52%, #05030f 100%);
+  box-shadow: 0 0 120px var(--glow, #fff), inset -34px -34px 96px rgba(0, 0, 0, 0.78);
   animation: bodyRise 4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
   opacity: 0;
 }
+
+/* Once the item itself takes the stage, the backdrop recedes so the reveal is the hero. */
+.cut-stage.focus .cut-body {
+  animation: bodyRise 4s cubic-bezier(0.16, 1, 0.3, 1) forwards, bodyRecede 1.6s 0.1s ease forwards;
+  box-shadow: none;   /* the 120px bloom would survive the fade as a milky smear */
+}
+.cut-stage.focus .cut-galaxy { animation: galaxyIn 3.2s ease forwards, spin 22s linear infinite, galaxyDim 1.6s 0.1s ease forwards; }
+.cut-stage.focus .rays { opacity: 0.04; }
+@keyframes bodyRecede { to { opacity: 0; transform: scale(1.6) translateY(-4vh); } }
+@keyframes galaxyDim { to { opacity: 0.2; } }
 @keyframes bodyRise {
   0% { width: 0; height: 0; opacity: 0; transform: translateY(40vh); }
   100% { width: min(70vmin, 560px); height: min(70vmin, 560px); opacity: 0.92; transform: translateY(6vh); }

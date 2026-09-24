@@ -62,6 +62,34 @@ function planFor(tier: number, firstDiscovery: boolean, isAdmin: boolean): Plan 
 
 const SFX_BY_TIER = ["reveal_common", "reveal_common", "reveal_rare", "reveal_epic", "reveal_legendary", "reveal_secret", "reveal_ultra", "reveal_mythic", "reveal_admin"] as const;
 
+/** Nebula tints come straight from item palettes, which may be pure white or pure black
+ *  (OMEGA is #000000/#ffffff). Either extreme renders the conic swirl as a flat grey
+ *  smear, so luminance is pulled back into a band where the hue survives. */
+function tint(hex: string, accent: string): string {
+  const rgb = (h: string): [number, number, number] | null => {
+    const m = /^#?([0-9a-f]{6})$/i.exec(h.trim());
+    if (!m) return null;
+    const n = parseInt(m[1], 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  };
+  const c = rgb(hex);
+  if (!c) return hex;
+  const lum = (v: [number, number, number]) => (0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2]) / 255;
+  let [r, g, b] = c;
+  const l = lum(c);
+  if (l > 0.78 || l < 0.14) {
+    const a = rgb(accent) ?? [106, 44, 255];
+    r = r * 0.3 + a[0] * 0.7;
+    g = g * 0.3 + a[1] * 0.7;
+    b = b * 0.3 + a[2] * 0.7;
+    const l2 = lum([r, g, b]);
+    if (l2 > 0.7) { const k = 0.7 / l2; r *= k; g *= k; b *= k; }
+    if (l2 < 0.12) { r = r * 0.5 + 90; g = g * 0.5 + 60; b = b * 0.5 + 150; }
+  }
+  const h2 = (x: number) => Math.round(Math.max(0, Math.min(255, x))).toString(16).padStart(2, "0");
+  return `#${h2(r)}${h2(g)}${h2(b)}`;
+}
+
 function Sparks({ count, color }: { count: number; color: string }) {
   const sparks = useMemo(
     () =>
@@ -98,9 +126,10 @@ export function RollCutscene({ roll, cosmos, onDone }: { roll: RollResult; cosmo
   const startedAt = useRef(performance.now());
   const doneRef = useRef(false);
 
-  const c1 = roll.item.visual?.colors?.[0] ?? rarity?.color ?? "#ffffff";
-  const c2 = roll.item.visual?.colors?.[1] ?? rarity?.color2 ?? "#8888ff";
-  const glow = roll.item.visual?.glow ?? c1;
+  const accent = rarity?.color2 ?? rarity?.color ?? "#6a2cff";
+  const c1 = tint(roll.item.visual?.colors?.[0] ?? rarity?.color ?? "#ffffff", accent);
+  const c2 = tint(roll.item.visual?.colors?.[1] ?? accent, accent);
+  const glow = roll.item.visual?.glow ?? rarity?.color ?? c1;
 
   const finish = useCallback(() => {
     if (doneRef.current) return;
@@ -193,7 +222,7 @@ export function RollCutscene({ roll, cosmos, onDone }: { roll: RollResult; cosmo
       {isAdmin && has("collapse") && <div className="cut-grid" />}
       {(has("collapse") && (isAdmin || tier >= 7)) && <div className="cut-fracture" />}
 
-      <div className="cut-stage" style={{ ["--glow" as any]: glow, ["--c1" as any]: c1, ["--c2" as any]: c2 }}>
+      <div className={`cut-stage ${showItem ? "focus" : ""}`} style={{ ["--glow" as any]: glow, ["--c1" as any]: c1, ["--c2" as any]: c2 }}>
         {has("ember") && !reduced && (
           <div style={{
             position: "absolute", width: 6, height: 6, borderRadius: "50%", background: glow,
@@ -321,7 +350,7 @@ export function ArtifactCutscene({
       <div className="cut-scanlines" />
       {!reduced && stage >= 1 && <div className="cut-grid" />}
       {!reduced && stage >= 1 && <div className="cut-fracture" />}
-      <div className="cut-stage" style={{ ["--glow" as any]: glow, ["--c1" as any]: colors[0], ["--c2" as any]: colors[1] }}>
+      <div className="cut-stage" style={{ ["--glow" as any]: glow, ["--c1" as any]: tint(colors[0], colors[1] ?? "#ff3cac"), ["--c2" as any]: tint(colors[1] ?? "#ff3cac", colors[0]) }}>
         {!reduced && <div className="rays" />}
         {!reduced && stage >= 1 && <div className="cut-galaxy" />}
         {stage >= 1 && <div className="halo" style={{ ["--dur" as any]: "2.6s" }} />}
