@@ -8,8 +8,7 @@
 .admin-tabs a {
   display: inline-flex; align-items: center; gap: 6px; padding: 7px 13px; border-radius: 10px;
   border: 1px solid var(--line); background: rgba(255,255,255,0.03); color: var(--text-dim);
-  text-decoration: none; white-space: nowrap; font-size: 0.86rem; transition: all 0.15s;
-}
+  text-decoration: none; white-space: nowrap; font-size: 0.86rem; transition: all 0.15s; min-height: 40px; }
 .admin-tabs a:hover { color: var(--text); border-color: var(--line-strong); text-decoration: none; }
 .admin-tabs a.active { color: var(--gold); border-color: rgba(255,208,90,0.6); background: rgba(255,208,90,0.12); }
 
@@ -18,7 +17,7 @@
   padding: 11px 13px; border-radius: 12px; border: 1px solid var(--line); background: var(--panel-2);
   display: flex; flex-direction: column; gap: 2px;
 }
-.kpi .k { font-size: 0.68rem; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.08em; }
+.kpi .k { font-size: var(--fs-xs); color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.08em; }
 .kpi .v { font-family: var(--font-display); font-size: 1.4rem; font-weight: 700; font-variant-numeric: tabular-nums; }
 .kpi.alert { border-color: rgba(255,92,122,0.5); }
 .kpi.good { border-color: rgba(77,255,184,0.4); }
@@ -29,12 +28,16 @@
 
 .admin-form { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
 .admin-form .full { grid-column: 1 / -1; }
-.admin-form textarea.json { font-family: ui-monospace, monospace; font-size: 0.78rem; min-height: 90px; }
-.field-help { font-size: 0.7rem; color: var(--text-faint); margin-top: 2px; }
+.admin-form textarea.json { font-family: ui-monospace, monospace; font-size: var(--fs-sm); min-height: 90px; }
+.field-help { font-size: var(--fs-xs); color: var(--text-dim); margin-top: 2px; }
 
 .danger-zone { border-color: rgba(255,92,122,0.45) !important; background: rgba(50,10,20,0.35) !important; }
 .artifact-card { border-color: rgba(255,233,168,0.4); background: linear-gradient(140deg, rgba(40,26,10,0.6), rgba(20,12,30,0.6)); }
-.json-view { font-family: ui-monospace, monospace; font-size: 0.74rem; white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow: auto; background: rgba(0,0,0,0.3); padding: 8px; border-radius: 8px; }
+.json-view { font-family: ui-monospace, monospace; font-size: var(--fs-xs); white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow: auto; background: rgba(0,0,0,0.3); padding: 8px; border-radius: 8px; }
 /* Named for the chart, not `empty`: that is a global empty-state utility with
    padding, and padding sets a border-box minimum that overrides the bar size. */
 .spark > i.spark-zero { background: rgba(255, 255, 255, 0.07); }
+
+@media (hover: none), (pointer: coarse) {
+  .admin-tabs a { min-height: var(--tap); }
+}

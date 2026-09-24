@@ -191,7 +191,7 @@ export function ItemCard({
 export function UserChip({ user, size = 22 }: { user: UserBrief | null | undefined; size?: number }) {
   if (!user) return <span className="muted">—</span>;
   return (
-    <Link to={`/profile/${user.id}`} className="row" style={{ gap: 6, color: "inherit", textDecoration: "none" }}>
+    <Link to={`/profile/${user.id}`} className="row user-chip" style={{ gap: 6, color: "inherit", textDecoration: "none" }}>
       <Avatar user={user} size={size} />
       <span className="ellipsis" style={{ maxWidth: 160 }}>{user.name}</span>
     </Link>
@@ -209,7 +209,8 @@ export function Avatar({ user, size = 32 }: { user: { avatar?: string | null; na
       style={{
         width: size, height: size, borderRadius: "50%", flex: "none", display: "grid", placeItems: "center",
         background: "linear-gradient(135deg, rgba(120,150,255,0.5), rgba(160,90,220,0.5))",
-        fontSize: size * 0.45, fontWeight: 700, border: "1px solid var(--line)",
+        // Floor the initial: at size 16 the old 0.45 ratio produced 7.2px, which is not a letter any more.
+        fontSize: Math.max(12, Math.round(size * 0.46)), fontWeight: 700, border: "1px solid var(--line)",
       }}
     >
       {(user.name || "?").slice(0, 1).toUpperCase()}

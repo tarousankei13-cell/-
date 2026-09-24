@@ -170,7 +170,7 @@ function TopBar() {
       <button className="icon-btn" onClick={toggleMute} aria-label={muted ? "音を有効化" : "ミュート"} title={muted ? "音を有効化" : "ミュート"}>
         {muted ? "🔇" : "🔊"}
       </button>
-      <Link to="/profile" className="row" style={{ gap: 6, textDecoration: "none", color: "inherit", position: "relative" }}>
+      <Link to="/profile" className="row user-chip" style={{ gap: 6, textDecoration: "none", color: "inherit", position: "relative" }} aria-label="プロフィール">
         <Avatar user={me?.user ?? null} size={30} />
         {unread > 0 && (
           <span className="badge" style={{ position: "absolute", top: -4, right: -4, color: "var(--bad)", background: "rgba(20,8,16,0.95)", padding: "0 5px" }}>
