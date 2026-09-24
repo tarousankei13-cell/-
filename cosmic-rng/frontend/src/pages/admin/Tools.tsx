@@ -1,3 +1,4 @@
+import { ActionForm } from "./ActionForm";
 import { useState } from "react";
 import { post } from "../../lib/api";
 import { useAction, useApi } from "../../lib/useApi";
@@ -7,14 +8,16 @@ import { fmtDate, fmtInt, fmtOdds, fmtPercent } from "../../lib/format";
 import type { Bootstrap } from "./Admin";
 
 export function AdminTools({ boot, superAdmin }: { boot: Bootstrap; superAdmin: boolean }) {
-  const [tab, setTab] = useState<"simulate" | "broadcast" | "biome" | "backup">("simulate");
+  const [tab, setTab] = useState<"simulate" | "bulk" | "broadcast" | "biome" | "backup">("simulate");
   return (
     <div className="col" style={{ gap: 12 }}>
       <Tabs value={tab} onChange={setTab} tabs={[
-        { key: "simulate", label: "RNGシミュレーション" }, { key: "biome", label: "Biome移動" },
+        { key: "simulate", label: "RNGシミュレーション" }, { key: "bulk", label: "全体操作" },
+        { key: "biome", label: "Biome移動" },
         { key: "broadcast", label: "全体通知" }, { key: "backup", label: "バックアップ" },
       ]} />
       {tab === "simulate" && <Simulate boot={boot} />}
+      {tab === "bulk" && <BulkTool boot={boot} />}
       {tab === "biome" && <BiomeTool boot={boot} />}
       {tab === "broadcast" && <Broadcast />}
       {tab === "backup" && <Backup superAdmin={superAdmin} />}
@@ -241,6 +244,47 @@ function Backup({ superAdmin }: { superAdmin: boolean }) {
         </div>
       )}
       {node}
+    </div>
+  );
+}
+
+
+/** Server-wide operations. Every one of these touches every player at once, so
+ *  the audience is picked explicitly rather than assumed. */
+function BulkTool({ boot }: { boot: Bootstrap }) {
+  const [onlyActive, setOnlyActive] = useState(false);
+  const [days, setDays] = useState(30);
+  return (
+    <div className="glass pad col" style={{ gap: 12 }}>
+      <div>
+        <h3 style={{ marginBottom: 4 }}>全プレイヤーへの操作</h3>
+        <p className="muted small" style={{ margin: 0 }}>
+          対象人数は実行時に確定し、結果と件数が監査ログに残ります。
+        </p>
+      </div>
+      <ActionForm
+        operations={boot.bulk_operations ?? []}
+        boot={boot}
+        endpoint="/api/admin/bulk"
+        scopeLabel={onlyActive ? `直近${days}日にログインしたプレイヤー全員` : "全プレイヤー"}
+        extraParams={{ only_active: onlyActive, active_days: days }}
+        extraFields={(
+          <div className="glass pad-sm col" style={{ gap: 8 }}>
+            <label className="switch">
+              <input type="checkbox" checked={onlyActive} onChange={(e) => setOnlyActive(e.target.checked)} />
+              <span className="track" />
+              <span className="small">アクティブなプレイヤーだけを対象にする</span>
+            </label>
+            {onlyActive && (
+              <div>
+                <label>直近何日以内のログイン</label>
+                <input type="number" min={1} max={3650} value={days}
+                       onChange={(e) => setDays(Math.max(1, Number(e.target.value) || 1))} />
+              </div>
+            )}
+          </div>
+        )}
+      />
     </div>
   );
 }

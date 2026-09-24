@@ -1,4 +1,5 @@
 import { type ReactNode, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
 import { ItemIcon } from "./ItemIcon";
 import { FEATURE_LABEL, RARITY_LABEL, fmtInt, fmtOdds, timeAgo } from "../lib/format";
@@ -26,7 +27,12 @@ export function Modal({
     };
   }, [open, onClose]);
   if (!open) return null;
-  return (
+  // Through a portal, not inline: a dialog anchored to whatever page opened it
+  // inherits that page's box. `.page` animates a transform, which makes it the
+  // containing block for `position: fixed`, so an inline dialog centres itself
+  // on the page rather than the screen — open one from the bottom of a long
+  // list and it lands above the fold, out of sight.
+  return createPortal((
     <div className="modal-backdrop" onMouseDown={(e) => closeOnBackdrop && e.target === e.currentTarget && onClose()}>
       <div className="modal" role="dialog" aria-modal="true" style={wide ? { width: "min(1060px, 100%)" } : undefined} ref={ref} tabIndex={-1}>
         {title && (
@@ -39,7 +45,7 @@ export function Modal({
         {footer && <div className="modal-foot">{footer}</div>}
       </div>
     </div>
-  );
+  ), document.body);
 }
 
 // ------------------------------------------------------------------- Confirm

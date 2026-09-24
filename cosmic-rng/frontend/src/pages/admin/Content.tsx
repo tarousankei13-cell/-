@@ -3,13 +3,14 @@ import { del, post, put } from "../../lib/api";
 import { useAction, useApi } from "../../lib/useApi";
 import { useGame } from "../../store/game";
 import { Empty, Modal, Spinner, Tabs, useConfirm } from "../../components/ui";
+import { FX_KEYS, ItemIcon, SHAPES_BY_MATERIAL } from "../../components/ItemIcon";
 import { fmtDate } from "../../lib/format";
 import type { Bootstrap } from "./Admin";
 
 type FieldDef = Bootstrap["content_types"][number]["fields"][number];
 
-function FieldInput({ f, value, onChange }: { f: FieldDef; value: any; onChange: (v: any) => void }) {
-  if (f.readonly) return <input value={value ?? ""} disabled />;
+function FieldInput({ f, value, onChange, locked }: { f: FieldDef; value: any; onChange: (v: any) => void; locked?: boolean }) {
+  if (locked || f.readonly) return <input value={value ?? ""} disabled />;
   switch (f.type) {
     case "bool":
       return <label className="switch"><input type="checkbox" checked={!!value} onChange={(e) => onChange(e.target.checked)} /><span className="track" /></label>;
@@ -43,6 +44,7 @@ export function AdminContent({ boot }: { boot: Bootstrap }) {
   const [page, setPage] = useState(1);
   const [editing, setEditing] = useState<any | null>(null);
   const [creating, setCreating] = useState(false);
+  const [seed, setSeed] = useState<any | null>(null);
   const [showOverrides, setShowOverrides] = useState(false);
 
   const def = useMemo(() => boot.content_types.find((t) => t.key === type)!, [boot, type]);
@@ -83,6 +85,8 @@ export function AdminContent({ boot }: { boot: Bootstrap }) {
                     <div className="row" style={{ gap: 4 }}>
                       {r._override && <span className="chip tiny" style={{ color: "var(--warn)" }}>一時変更中</span>}
                       <button className="btn xs" onClick={() => setEditing(r)}>編集</button>
+                      <button className="btn xs ghost" title="この行をひな型に新規作成"
+                              onClick={() => { setSeed({ ...r, key: `${r.key ?? "new"}_copy` }); setCreating(true); }}>複製</button>
                     </div>
                   </td>
                 </tr>
@@ -100,11 +104,115 @@ export function AdminContent({ boot }: { boot: Bootstrap }) {
       )}
 
       {(editing || creating) && (
-        <ContentEditor type={type} def={def} row={editing} creating={creating}
-          onClose={() => { setEditing(null); setCreating(false); }}
-          onSaved={() => { setEditing(null); setCreating(false); reload(); }} />
+        <ContentEditor key={editing?.key ?? seed?.key ?? "new"} type={type} def={def} row={editing ?? seed} creating={creating}
+          onClose={() => { setEditing(null); setCreating(false); setSeed(null); }}
+          onSaved={() => { setEditing(null); setCreating(false); setSeed(null); reload(); }} />
       )}
       {showOverrides && <OverridesModal onClose={() => setShowOverrides(false)} />}
+    </div>
+  );
+}
+
+
+const MATERIAL_LABEL: Record<string, string> = {
+  faceted: "結晶・多面体", sphere: "球体・有機体", metal: "金属・器物", organic: "自然物", cosmic: "天体・エネルギー",
+};
+const FX_LABEL: Record<string, string> = {
+  none: "なし", pulse: "脈動", sparkle: "きらめき", spin: "回転", orbit: "周回",
+  rainbow: "虹色", glitch: "グリッチ", flame: "炎", void: "虚無", artifact: "遺物",
+};
+const PALETTES: { name: string; colors: [string, string, string]; glow: string }[] = [
+  { name: "氷晶", colors: ["#a8e6ff", "#2f6f9e", "#ffffff"], glow: "#8fd8ff" },
+  { name: "紅蓮", colors: ["#ff8a50", "#8f2412", "#ffe0a8"], glow: "#ff6a2a" },
+  { name: "翠緑", colors: ["#8ef0a8", "#1f7a45", "#e6fff0"], glow: "#6ee89a" },
+  { name: "紫電", colors: ["#c9a0ff", "#4a2a8f", "#f0e4ff"], glow: "#b07cff" },
+  { name: "黄金", colors: ["#ffd76a", "#8a5c12", "#fff6d8"], glow: "#ffc640" },
+  { name: "深淵", colors: ["#6a6f9e", "#14162c", "#b8bfe8"], glow: "#7a6fd0" },
+  { name: "血赤", colors: ["#ff5c7a", "#7a0f28", "#ffd4de"], glow: "#ff3b63" },
+  { name: "銀鋼", colors: ["#d8dcea", "#5a6078", "#ffffff"], glow: "#aab2cc" },
+];
+
+/**
+ * Visual designer for content that carries a `visual` descriptor.
+ *
+ * Adding an item used to mean typing JSON and finding out what it looked like
+ * after a save and a reload. Everything here writes straight into that same
+ * JSON, so the raw field stays the escape hatch and the picker stays honest —
+ * and the preview is the real renderer, at the real tier, not a mock-up.
+ */
+function VisualDesigner({ json, onChange, tier }: { json: string; onChange: (next: string) => void; tier: number }) {
+  const parsed = useMemo(() => {
+    try { return JSON.parse(json || "{}"); } catch { return null; }
+  }, [json]);
+  const [previewTier, setPreviewTier] = useState(tier);
+  useEffect(() => setPreviewTier(tier), [tier]);
+
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return <div className="field-help" style={{ color: "var(--warn)" }}>JSONを直せばプレビューが再開します。</div>;
+  }
+  const v = parsed as Record<string, any>;
+  const colors: string[] = Array.isArray(v.colors) ? v.colors : [];
+  const col = (i: number) => colors[i] ?? ["#c0c8e0", "#7080a8", "#ffffff"][i];
+  const patch = (next: Record<string, any>) => onChange(JSON.stringify({ ...v, ...next }, null, 1));
+  const setColor = (i: number, value: string) => {
+    const c = [col(0), col(1), col(2)];
+    c[i] = value;
+    patch({ colors: c });
+  };
+
+  return (
+    <div className="visual-designer">
+      <div className="vd-preview">
+        <ItemIcon visual={v} size={128} tier={previewTier} />
+        <label className="tiny faint" htmlFor="vd-tier">見た目の確認Tier {previewTier}</label>
+        <input id="vd-tier" type="range" min={1} max={9} value={previewTier}
+               onChange={(e) => setPreviewTier(Number(e.target.value))} />
+      </div>
+      <div className="vd-controls">
+        <div>
+          <label>形状</label>
+          <select value={v.shape ?? "orb"} onChange={(e) => patch({ shape: e.target.value })}>
+            {Object.entries(SHAPES_BY_MATERIAL).map(([mat, shapes]) => (
+              <optgroup key={mat} label={MATERIAL_LABEL[mat] ?? mat}>
+                {shapes.map((sh) => <option key={sh} value={sh}>{sh}</option>)}
+              </optgroup>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label>エフェクト</label>
+          <select value={v.fx ?? "none"} onChange={(e) => patch({ fx: e.target.value })}>
+            {FX_KEYS.map((k) => <option key={k} value={k}>{FX_LABEL[k] ?? k}</option>)}
+          </select>
+        </div>
+        <div className="full">
+          <label>配色</label>
+          <div className="row-wrap" style={{ gap: 8 }}>
+            {["本体", "陰影", "ハイライト"].map((lbl, i) => (
+              <label key={lbl} className="vd-swatch">
+                <input type="color" value={col(i)} onChange={(e) => setColor(i, e.target.value)} aria-label={lbl} />
+                <span className="tiny faint">{lbl}</span>
+              </label>
+            ))}
+            <label className="vd-swatch">
+              <input type="color" value={v.glow ?? col(0)} onChange={(e) => patch({ glow: e.target.value })} aria-label="発光" />
+              <span className="tiny faint">発光</span>
+            </label>
+          </div>
+        </div>
+        <div className="full">
+          <label>プリセット配色</label>
+          <div className="row-wrap" style={{ gap: 6 }}>
+            {PALETTES.map((pal) => (
+              <button key={pal.name} type="button" className="btn xs ghost"
+                      onClick={() => patch({ colors: [...pal.colors], glow: pal.glow })}>
+                <span className="vd-dot" style={{ background: `linear-gradient(135deg, ${pal.colors[0]}, ${pal.colors[1]})` }} />
+                {pal.name}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -126,6 +234,10 @@ function ContentEditor({ type, def, row, creating, onClose, onSaved }: {
   const { run, busy } = useAction();
   const { confirm, node } = useConfirm();
   const toast = useGame((s) => s.toast);
+
+  /** The identity column: askable only while creating, frozen afterwards
+   *  because update_row drops it — an editable box there would lie. */
+  const isKey = (f: FieldDef) => f.name === (def.key_field ?? "key");
 
   const buildPayload = () => {
     const out: Record<string, any> = {};
@@ -195,11 +307,20 @@ function ContentEditor({ type, def, row, creating, onClose, onSaved }: {
       }>
       <div className="col" style={{ gap: 12 }}>
         <div className="admin-form">
-          {def.fields.map((f) => (
+          {def.fields.filter((f) => !(creating && f.readonly && !isKey(f))).map((f) => (
             <div key={f.name} className={f.type === "json" || f.type === "text" ? "full" : ""}>
-              <label>{f.label}{f.required && " *"}{f.readonly && <span className="tiny faint"> (読取専用)</span>}</label>
-              <FieldInput f={f} value={values[f.name]} onChange={(v) => setValues((s) => ({ ...s, [f.name]: v }))} />
+              <label>{f.label}{f.required && " *"}
+                {isKey(f) && !creating && <span className="tiny faint"> (作成後は変更できません)</span>}
+                {f.readonly && !(isKey(f) && creating) && <span className="tiny faint"> (読取専用)</span>}
+              </label>
+              <FieldInput f={{ ...f, readonly: f.readonly && !(isKey(f) && creating) }} locked={isKey(f) && !creating}
+                          value={values[f.name]} onChange={(v) => setValues((s) => ({ ...s, [f.name]: v }))} />
               {f.help && <div className="field-help">{f.help}</div>}
+              {f.name === "visual" && f.type === "json" && (
+                <VisualDesigner json={typeof values.visual === "string" ? values.visual : JSON.stringify(values.visual ?? {}, null, 1)}
+                                tier={Number(row?.tier ?? values.tier ?? 1) || 1}
+                                onChange={(next) => setValues((s) => ({ ...s, visual: next }))} />
+              )}
             </div>
           ))}
         </div>

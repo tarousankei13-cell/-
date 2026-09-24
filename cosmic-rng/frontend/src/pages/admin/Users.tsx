@@ -1,18 +1,11 @@
+import { ActionForm } from "./ActionForm";
 import { useEffect, useState } from "react";
 import { get, post } from "../../lib/api";
 import { useAction, useApi } from "../../lib/useApi";
-import { useGame } from "../../store/game";
 import { Avatar, Empty, Modal, Spinner, Tabs, useConfirm } from "../../components/ui";
 import { ItemIcon } from "../../components/ItemIcon";
 import { fmtCompact, fmtDate, fmtInt, fmtLuck, fmtOdds } from "../../lib/format";
 import type { Bootstrap } from "./Admin";
-
-interface ActionDef {
-  key: string;
-  label: string;
-  danger?: boolean;
-  fields: { name: string; label: string; type: "text" | "number" | "select" | "checkbox"; options?: { value: string; label: string }[]; placeholder?: string; required?: boolean }[];
-}
 
 export function AdminUsers({ boot }: { boot: Bootstrap }) {
   const [q, setQ] = useState("");
@@ -74,46 +67,7 @@ function UserDetail({ userId, boot, onClose, onChanged }: { userId: number; boot
   const [tab, setTab] = useState<"overview" | "actions" | "inventory" | "rolls" | "audit">("overview");
   const [table, setTable] = useState<any>(null);
 
-  const actions: ActionDef[] = [
-    { key: "give_item", label: "アイテム付与", fields: [
-      { name: "item_key", label: "アイテム", type: "select", options: boot.items.map((i) => ({ value: i.key, label: `${i.name} (${i.rarity})` })), required: true },
-      { name: "qty", label: "個数", type: "number", placeholder: "1" }] },
-    { key: "give_boost_items", label: "Boost付与", fields: [
-      { name: "boost_key", label: "Boost", type: "select", options: boot.boosts.map((b) => ({ value: b.key, label: b.name })), required: true },
-      { name: "qty", label: "個数", type: "number", placeholder: "1" }] },
-    { key: "set_base_luck", label: "Base Luck変更", fields: [{ name: "value", label: "値", type: "number", placeholder: "1.0", required: true }] },
-    { key: "set_biome", label: "Biome変更", fields: [
-      { name: "biome_key", label: "Biome", type: "select", options: boot.biomes.map((b) => ({ value: b.key, label: `${b.name} (${b.kind})` })), required: true },
-      { name: "duration", label: "継続秒数（空=既定）", type: "number" }] },
-    { key: "force_next_item", label: "次回Roll結果を指定", fields: [
-      { name: "item_key", label: "アイテム", type: "select", options: boot.items.map((i) => ({ value: i.key, label: i.name })), required: true },
-      { name: "rolls", label: "適用Roll数", type: "number", placeholder: "1" }] },
-    { key: "set_item_chance", label: "特定アイテムの確率変更", fields: [
-      { name: "item_key", label: "アイテム", type: "select", options: boot.items.map((i) => ({ value: i.key, label: i.name })), required: true },
-      { name: "mult", label: "倍率", type: "number", placeholder: "10", required: true },
-      { name: "rolls", label: "Roll数（空=時間）", type: "number" },
-      { name: "duration", label: "秒数", type: "number" }] },
-    { key: "set_rarity_chance", label: "レア度の確率変更", fields: [
-      { name: "tier", label: "レア度", type: "select", options: ["common", "rare", "epic", "legendary", "secret", "ultra_secret", "mythic"].map((t) => ({ value: t, label: t })), required: true },
-      { name: "mult", label: "倍率", type: "number", placeholder: "5", required: true },
-      { name: "duration", label: "秒数", type: "number" }] },
-    { key: "add_effect", label: "任意の効果を付与", fields: [
-      { name: "effect_type", label: "効果タイプ", type: "select", options: boot.effect_types.map((e) => ({ value: e, label: e })), required: true },
-      { name: "value", label: "値", type: "number", placeholder: "100" },
-      { name: "name", label: "表示名", type: "text", placeholder: "Admin Blessing" },
-      { name: "stack_mode", label: "重複方式", type: "select", options: ["add", "multiply", "queue", "highest"].map((s) => ({ value: s, label: s })) },
-      { name: "rolls", label: "Roll数", type: "number" },
-      { name: "duration", label: "秒数", type: "number" }] },
-    { key: "clear_effects", label: "効果をすべて解除", fields: [] },
-    { key: "adjust_stardust", label: "Stardust増減", danger: true, fields: [{ name: "delta", label: "増減値（負数可）", type: "number", required: true }] },
-    { key: "reset_cooldowns", label: "クールダウンをリセット", fields: [] },
-    { key: "freeze", label: "アカウント凍結", danger: true, fields: [{ name: "hours", label: "時間（空=無期限）", type: "number" }] },
-    { key: "ban", label: "BAN", danger: true, fields: [{ name: "hours", label: "時間（空=無期限）", type: "number" }] },
-    { key: "unrestrict", label: "制限解除", fields: [] },
-    { key: "revoke_sessions", label: "全セッション無効化", danger: true, fields: [] },
-    { key: "set_role", label: "ロール変更（スーパー管理者のみ）", danger: true, fields: [
-      { name: "role", label: "ロール", type: "select", options: [{ value: "player", label: "player" }, { value: "admin", label: "admin" }], required: true }] },
-  ];
+  const actions = boot.user_actions ?? [];
 
   const loadTable = async () => {
     setTable({ loading: true });
@@ -187,7 +141,7 @@ function UserDetail({ userId, boot, onClose, onChanged }: { userId: number; boot
             </div>
           )}
 
-          {tab === "actions" && <ActionPanel userId={userId} actions={actions} onDone={() => { reload(); onChanged(); }} />}
+          {tab === "actions" && <ActionForm operations={actions} boot={boot} endpoint={`/api/admin/users/${userId}/action`} scopeLabel={data?.user?.name ? `${data.user.name} さん` : "このプレイヤー"} onDone={() => { reload(); onChanged(); }} />}
 
           {tab === "inventory" && (
             <div className="col" style={{ gap: 8 }}>
@@ -294,70 +248,3 @@ function RecallButton({ instanceId, onDone }: { instanceId: number; onDone: () =
   </>);
 }
 
-function ActionPanel({ userId, actions, onDone }: { userId: number; actions: ActionDef[]; onDone: () => void }) {
-  const [sel, setSel] = useState<ActionDef>(actions[0]);
-  const [params, setParams] = useState<Record<string, any>>({});
-  const [reason, setReason] = useState("");
-  const { run, busy } = useAction();
-  const { confirm, node } = useConfirm();
-  const toast = useGame((s) => s.toast);
-
-  const submit = async () => {
-    if (!reason.trim()) {
-      toast("理由を入力してください", "warning");
-      return;
-    }
-    if (sel.danger) {
-      const ok = await confirm(`${sel.label} を実行`, (
-        <div className="col">
-          <p>この操作は取り消せない場合があります。監査ログに記録されます。</p>
-          <div className="json-view">{JSON.stringify({ action: sel.key, params, reason }, null, 2)}</div>
-        </div>
-      ), { danger: true });
-      if (!ok) return;
-    }
-    const payload: Record<string, any> = { ...params };
-    if (sel.danger) payload.confirm = true;
-    const res = await run(() => post(`/api/admin/users/${userId}/action`, { action: sel.key, params: payload, reason }),
-      { success: `${sel.label} を実行しました` });
-    if (res) {
-      setParams({});
-      setReason("");
-      onDone();
-    }
-  };
-
-  return (
-    <div className="col" style={{ gap: 10 }}>
-      <div>
-        <label>操作</label>
-        <select value={sel.key} onChange={(e) => { setSel(actions.find((a) => a.key === e.target.value)!); setParams({}); }}>
-          {actions.map((a) => <option key={a.key} value={a.key}>{a.danger ? "⚠ " : ""}{a.label}</option>)}
-        </select>
-      </div>
-      {sel.fields.length > 0 && (
-        <div className="admin-form">
-          {sel.fields.map((f) => (
-            <div key={f.name}>
-              <label>{f.label}{f.required && " *"}</label>
-              {f.type === "select" ? (
-                <select value={params[f.name] ?? ""} onChange={(e) => setParams((p) => ({ ...p, [f.name]: e.target.value }))}>
-                  <option value="">選択</option>
-                  {f.options?.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-                </select>
-              ) : f.type === "checkbox" ? (
-                <label className="switch"><input type="checkbox" checked={!!params[f.name]} onChange={(e) => setParams((p) => ({ ...p, [f.name]: e.target.checked }))} /><span className="track" /></label>
-              ) : (
-                <input type={f.type} placeholder={f.placeholder} value={params[f.name] ?? ""}
-                  onChange={(e) => setParams((p) => ({ ...p, [f.name]: f.type === "number" ? (e.target.value === "" ? undefined : Number(e.target.value)) : e.target.value }))} />
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-      <div><label>理由 *（監査ログに記録）</label><input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="例: サポート対応 #1234" /></div>
-      <button className={`btn ${sel.danger ? "danger" : "primary"}`} disabled={busy || !reason.trim()} onClick={submit}>{sel.label} を実行</button>
-      {node}
-    </div>
-  );
-}

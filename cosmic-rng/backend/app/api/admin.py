@@ -40,8 +40,16 @@ async def bootstrap(principal: Principal = ADMIN_ANY_MODE) -> dict[str, Any]:
         "biomes": [{"key": b.key, "name": b.name, "kind": b.kind} for b in sorted(snap.biomes.values(), key=lambda b: b.sort_order)],
         "items": [{"key": i.key, "name": i.name, "rarity": i.rarity_key, "odds": i.odds} for i in
                   sorted(snap.items.values(), key=lambda i: (i.tier, i.odds or 0)) if i.kind != "admin_artifact"],
-        "boosts": [{"key": b["key"], "name": b["name"]} for b in snap.boosts.values()],
+        "boosts": [{"key": b["key"], "name": b["name"], "name_ja": b.get("name_ja") or ""} for b in snap.boosts.values()],
+        "equipment": [{"key": e["key"], "name": e["name"], "name_ja": e.get("name_ja") or "", "slot": e.get("slot")}
+                      for e in sorted(snap.equipment.values(), key=lambda e: e.get("sort_order", 0))],
+        "cosmetics": [{"key": c["key"], "name": c["name"], "name_ja": c.get("name_ja") or "", "kind": c.get("kind")}
+                      for c in sorted(snap.cosmetics.values(), key=lambda c: (c.get("kind", ""), c.get("sort_order", 0)))],
+        "achievements": [{"key": a["key"], "name": a["name"], "name_ja": a.get("name_ja") or ""}
+                         for a in sorted(snap.achievements.values(), key=lambda a: a.get("sort_order", 0))],
         "effect_types": list(admin_content.EFFECTS),
+        "user_actions": admin_ops.USER_ACTIONS,
+        "bulk_operations": admin_ops.BULK_OPERATIONS,
     }
 
 
@@ -81,6 +89,20 @@ async def user_action(user_id: int, body: UserActionBody, request: Request, prin
                                          request.headers.get("user-agent"))
     await commit_and_publish(db)
     return result
+
+
+class BulkBody(BaseModel):
+    op: str = Field(max_length=48)
+    params: dict[str, Any] = Field(default_factory=dict)
+    reason: str = Field(min_length=1, max_length=400)
+
+
+@router.post("/bulk")
+async def bulk_operation(body: BulkBody, request: Request, principal: Principal = ADMIN,
+                         db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """Server-wide operations. Audited as one entry naming how many rows it touched."""
+    return await admin_ops.bulk_operation(db, principal, body.op, body.params, body.reason,
+                                          request.headers.get("user-agent"))
 
 
 # --- Content -----------------------------------------------------------------

@@ -17,14 +17,19 @@ export interface Bootstrap {
   admin_mode: boolean;
   is_super_admin: boolean;
   content_types: {
-    key: string; label: string; overridable: boolean; list_fields: string[];
+    key: string; label: string; overridable: boolean; list_fields: string[]; key_field: string;
     fields: { name: string; type: string; label: string; required: boolean; choices: string[]; readonly: boolean; help: string; min: number | null; max: number | null }[];
   }[];
   artifacts: any[];
-  biomes: { key: string; name: string; kind: string }[];
-  items: { key: string; name: string; rarity: string; odds: number | null }[];
-  boosts: { key: string; name: string }[];
+  biomes: { key: string; name: string; name_ja?: string | null; kind: string }[];
+  items: { key: string; name: string; name_ja?: string | null; rarity: string; odds: number | null }[];
+  boosts: { key: string; name: string; name_ja?: string | null }[];
+  equipment?: { key: string; name: string; name_ja?: string | null; slot?: string | null }[];
+  cosmetics?: { key: string; name: string; name_ja?: string | null; kind?: string | null }[];
+  achievements?: { key: string; name: string; name_ja?: string | null }[];
   effect_types: string[];
+  user_actions: import("./ActionForm").OperationDef[];
+  bulk_operations: import("./ActionForm").OperationDef[];
 }
 
 const TABS = [

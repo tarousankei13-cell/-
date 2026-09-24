@@ -170,6 +170,10 @@ TYPES: dict[str, ContentType] = {
 def type_meta() -> list[dict[str, Any]]:
     return [{
         "key": t.key, "label": t.label, "overridable": t.overridable, "list_fields": list(t.list_fields),
+        # The panel needs to know which field is the identity: it is the one field
+        # a create must ask for even when it is otherwise read-only, and the one an
+        # edit must not offer, because update_row drops it.
+        "key_field": t.key_field,
         "fields": [{"name": f.name, "type": f.type, "label": f.label or f.name, "required": f.required, "choices": list(f.choices),
                     "readonly": f.readonly, "help": f.help, "min": f.min, "max": f.max} for f in t.fields],
     } for t in TYPES.values()]

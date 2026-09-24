@@ -741,10 +741,21 @@ function Artwork({ shape, p, animate }: { shape: string; p: Paint; animate: bool
   }
 }
 
+/** Every shape the renderer knows, grouped by material — the admin item editor
+ *  builds its shape picker from this, so the panel can never offer a shape that
+ *  would fall through to the default sphere. */
+export const SHAPES_BY_MATERIAL: Record<Mat, string[]> = (() => {
+  const out: Record<Mat, string[]> = { faceted: [], sphere: [], metal: [], organic: [], cosmic: [] };
+  for (const [shape, mat] of Object.entries(MATERIAL)) out[mat].push(shape);
+  return out;
+})();
+
 const FX_CLASS: Record<string, string> = {
   pulse: "fx-pulse", sparkle: "fx-pulse", spin: "fx-spin", orbit: "fx-spin",
   rainbow: "fx-rainbow", glitch: "fx-glitch", flame: "fx-pulse", void: "fx-pulse", artifact: "fx-pulse",
 };
+
+export const FX_KEYS = ["none", ...Object.keys(FX_CLASS)];
 
 /** Frame, aura and orbits: the rarity should be legible before the name is read. */
 function RarityFrame({ tier, c1, c3, glow, animate }: { tier: number; c1: string; c3: string; glow: string; animate: boolean }) {

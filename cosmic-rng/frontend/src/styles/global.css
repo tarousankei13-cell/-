@@ -147,7 +147,10 @@ button, input, select, textarea { font-family: inherit; font-size: inherit; colo
   max-width: 1280px;
   margin: 0 auto;
   padding: 14px 14px calc(var(--nav-h) + 26px + var(--safe-b));
-  animation: pageIn 0.34s ease both;
+  /* `backwards`, not `both`: a filled transform animation keeps acting as a
+     containing block for `position: fixed` long after it has finished, which
+     quietly traps every fixed child inside the page box. */
+  animation: pageIn 0.34s ease backwards;
 }
 @keyframes pageIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
 .page-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
@@ -551,4 +554,24 @@ input[type="range"]::-moz-range-thumb {
   display: inline-block; margin-left: 10px; vertical-align: middle;
   font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 600;
   letter-spacing: 0.12em; color: var(--text-faint); text-transform: uppercase;
+}
+
+/* ------------------------------------------------- admin visual designer */
+.visual-designer {
+  display: grid; grid-template-columns: 168px 1fr; gap: 14px; margin-top: 10px;
+  padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: rgba(8, 11, 26, 0.6);
+}
+.vd-preview { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.vd-preview > input[type="range"] { width: 100%; }
+.vd-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; align-content: start; }
+.vd-controls .full { grid-column: 1 / -1; }
+.vd-swatch { display: flex; flex-direction: column; align-items: center; gap: 3px; }
+.vd-swatch input[type="color"] {
+  width: 44px; height: 32px; padding: 0; border: 1px solid var(--line-strong); border-radius: 8px;
+  background: none; cursor: pointer;
+}
+.vd-dot { width: 11px; height: 11px; border-radius: 50%; margin-right: 5px; display: inline-block; vertical-align: -1px; }
+@media (max-width: 640px) {
+  .visual-designer { grid-template-columns: 1fr; }
+  .vd-controls { grid-template-columns: 1fr; }
 }

@@ -7,19 +7,20 @@ import random
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import and_, delete, func, or_, select, text, update
+from sqlalchemy import and_, delete, func, or_, select, text, true as sa_true, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import models as m
 from ..content.registry import bump_content_version, get_registry
 from ..content.settings_schema import DEF_MAP, definitions_public, validate_setting
-from ..db import is_sqlite, upsert as insert
+from ..db import greatest, is_sqlite, upsert as insert
 from ..core.errors import AppError, Forbidden, NotFound
 from ..core.pubsub import queue_event
 from ..core.security import Principal, compute_admin, revoke_user_sessions
 from ..core.timeutil import utcnow
 from ..rng import engine as rng_engine
 from ..rng.engine import RollContext, compile_table
+from . import admin_content
 from . import artifacts as artifacts_svc
 from . import audit
 from . import biomes as biomes_svc
@@ -29,6 +30,7 @@ from . import feed as feed_svc
 from . import inventory as inv_svc
 from .constants import TIER_BY_KEY
 from .metrics import metrics
+from . import users as users_svc
 from .users import avatar_url, lock_user, user_brief
 
 
@@ -167,7 +169,97 @@ async def user_detail(db: AsyncSession, user_id: int) -> dict[str, Any]:
     }
 
 
-DANGEROUS = {"ban", "delete_instances", "set_role", "adjust_stardust", "reset_user"}
+DANGEROUS = {"ban", "delete_instances", "set_role", "adjust_stardust", "reset_user",
+             "clear_inventory", "revoke_achievement"}
+
+
+def _a(action: str, label: str, group: str, fields: list[dict[str, Any]], *, help: str = "") -> dict[str, Any]:
+    return {"action": action, "label": label, "group": group, "fields": fields,
+            "dangerous": action in DANGEROUS, "help": help}
+
+
+def _f(name: str, label: str, type: str = "str", **kw: Any) -> dict[str, Any]:
+    return {"name": name, "label": label, "type": type, **kw}
+
+
+# The panel builds its forms from this, so an action can never exist in the API
+# without a way to reach it, and the two can never disagree about its arguments.
+USER_ACTIONS: list[dict[str, Any]] = [
+    _a("give_item", "アイテムを付与", "所持品",
+       [_f("item_key", "アイテム", "item", required=True), _f("qty", "個数", "int", default=1, min=1, max=10000)]),
+    _a("delete_instances", "所持アイテムを削除", "所持品",
+       [_f("instance_ids", "インスタンスID（カンマ区切り）", "ids", required=True)]),
+    _a("clear_inventory", "所持品を全消去", "所持品", [], help="装備とBoostは残ります"),
+    _a("give_boost_items", "Boostを付与", "所持品",
+       [_f("boost_key", "Boost", "boost", required=True), _f("qty", "個数", "int", default=1, min=1, max=1000)]),
+    _a("give_equipment", "装備を付与", "装備",
+       [_f("equipment_key", "装備", "equipment", required=True),
+        _f("quality_tier", "品質ティア", "enum", choices=["normal", "fine", "superior", "god"], default="normal"),
+        _f("quality", "品質倍率", "float", default=1.0, min=0.1, max=5.0)]),
+    _a("remove_equipment", "装備を削除", "装備", [_f("equipment_id", "装備インスタンスID", "int", required=True)]),
+    _a("adjust_stardust", "スターダストを増減", "経済",
+       [_f("delta", "増減量", "int", required=True)], help="負の値で減らせます"),
+    _a("set_level", "レベルを設定", "進行",
+       [_f("level", "レベル", "int", required=True, min=1, max=500)], help="XPも整合するよう設定されます"),
+    _a("add_xp", "XPを増減", "進行", [_f("amount", "増減量", "int", required=True)]),
+    _a("set_base_luck", "基礎Luckを設定", "進行", [_f("value", "倍率", "float", required=True, min=0)]),
+    _a("set_roll_counter", "抽選回数を設定", "進行", [_f("value", "回数", "int", required=True, min=0)]),
+    _a("grant_achievement", "実績を付与", "進行", [_f("achievement_key", "実績", "achievement", required=True)]),
+    _a("revoke_achievement", "実績を剥奪", "進行", [_f("achievement_key", "実績", "achievement", required=True)]),
+    _a("grant_cosmetic", "称号・背景を付与", "進行", [_f("cosmetic_key", "コスメティック", "cosmetic", required=True)]),
+    _a("unlock_feature", "機能を解放", "進行", [_f("unlock_key", "解放キー", "str", required=True)]),
+    _a("set_biome", "Biomeを変更", "世界",
+       [_f("biome_key", "Biome", "biome", required=True), _f("duration", "継続（秒・空で既定）", "int", min=1)]),
+    _a("add_effect", "一時効果を付与", "世界",
+       [_f("effect_type", "効果", "enum", choices=list(admin_content.EFFECTS), required=True),
+        _f("value", "値", "float", required=True), _f("name", "表示名", "str"),
+        _f("stack_mode", "重ねかた", "enum", choices=["add", "multiply", "queue", "highest"], default="add"),
+        _f("rolls", "適用回数", "int", min=1), _f("duration", "継続（秒）", "int", min=1)]),
+    _a("clear_effects", "一時効果を全解除", "世界", []),
+    _a("force_next_item", "次の抽選結果を固定", "抽選",
+       [_f("item_key", "アイテム", "item", required=True), _f("rolls", "適用回数", "int", default=1, min=1)]),
+    _a("set_item_chance", "特定アイテムの確率を上書き", "抽選",
+       [_f("item_key", "アイテム", "item", required=True), _f("mult", "倍率", "float", required=True, min=0),
+        _f("rolls", "適用回数", "int", min=1), _f("duration", "継続（秒）", "int", min=1)]),
+    _a("set_rarity_chance", "レア度の確率を上書き", "抽選",
+       [_f("tier", "レア度", "rarity", required=True), _f("mult", "倍率", "float", required=True, min=0),
+        _f("rolls", "適用回数", "int", min=1), _f("duration", "継続（秒）", "int", min=1)]),
+    _a("reset_cooldowns", "クールダウンを解除", "抽選", []),
+    _a("set_auto_roll", "Auto Rollを切替", "抽選", [_f("enabled", "有効にする", "bool", default=True)]),
+    _a("grant_artifact", "Admin Artifactを付与", "管理者遺物",
+       [_f("artifact_key", "遺物", "artifact", required=True), _f("can_use", "本人が使用可能", "bool", default=False),
+        _f("uses", "使用回数", "int", min=1), _f("hours", "有効時間", "float", min=0)]),
+    _a("recall_artifact", "Admin Artifactを回収", "管理者遺物",
+       [_f("instance_id", "インスタンスID", "int", required=True)]),
+    _a("rename", "表示名を変更", "アカウント", [_f("display_name", "表示名", "str", required=True)]),
+    _a("set_title", "称号を設定", "アカウント", [_f("title_key", "称号（空で解除）", "cosmetic")]),
+    _a("freeze", "凍結（閲覧のみ可）", "アカウント", [_f("hours", "期間（時間・空で無期限）", "float", min=0)]),
+    _a("ban", "利用停止", "アカウント", [_f("hours", "期間（時間・空で無期限）", "float", min=0)]),
+    _a("unrestrict", "制限を解除", "アカウント", []),
+    _a("set_role", "権限を変更", "アカウント",
+       [_f("role", "権限", "enum", choices=["player", "admin"], required=True)],
+       help="スーパー管理者は設定ファイル側でのみ決まります"),
+    _a("revoke_sessions", "全端末からログアウト", "アカウント", []),
+    _a("reset_user", "進行をすべて初期化", "アカウント", [], help="アカウントは残り、進行だけが消えます"),
+]
+
+BULK_OPERATIONS: list[dict[str, Any]] = [
+    _a("give_stardust", "全員にスターダスト", "配布", [_f("amount", "増減量", "int", required=True)]),
+    _a("give_item", "全員にアイテム", "配布",
+       [_f("item_key", "アイテム", "item", required=True), _f("qty", "個数", "int", default=1, min=1, max=100)]),
+    _a("give_boost", "全員にBoost", "配布",
+       [_f("boost_key", "Boost", "boost", required=True), _f("qty", "個数", "int", default=1, min=1, max=100)]),
+    _a("grant_cosmetic", "全員に称号・背景", "配布", [_f("cosmetic_key", "コスメティック", "cosmetic", required=True)]),
+    _a("reset_all_cooldowns", "全員のクールダウン解除", "運用", []),
+    _a("clear_all_effects", "全員の一時効果を解除", "運用", []),
+    _a("wipe_market", "出品をすべて取り下げ", "運用", [], help="出品中のアイテムは出品者に戻ります"),
+    _a("recompute_stats", "統計を再計算", "運用", [], help="所有数・相場・総資産を作り直します"),
+]
+
+# BULK_DANGEROUS is defined with the operation itself, further down.
+_BULK_DANGEROUS_NAMES = {"wipe_market", "clear_all_effects", "reset_all_cooldowns"}
+for _op in BULK_OPERATIONS:
+    _op["dangerous"] = _op["action"] in _BULK_DANGEROUS_NAMES
 
 
 async def user_action(db: AsyncSession, principal: Principal, user_id: int, action: str, p: dict[str, Any], reason: str,
@@ -323,6 +415,130 @@ async def user_action(db: AsyncSession, principal: Principal, user_id: int, acti
         await revoke_user_sessions(db, user.id)
         queue_event(db, "user", "force_logout", {"reason": "sessions_revoked"}, user_id=user.id)
         new = "revoked"
+
+    # --- progression ---------------------------------------------------------
+    elif action == "set_level":
+        level = int(p.get("level", 1))
+        if not 1 <= level <= 500:
+            raise AppError("レベルは1〜500です", code="invalid_level")
+        old = {"level": user.level, "xp": user.xp}
+        # XP has to follow, or the next roll immediately recomputes the level back.
+        user.level, user.xp = level, users_svc.xp_for_level(level)
+        new = {"level": level, "xp": user.xp}
+
+    elif action == "add_xp":
+        amount = int(p.get("amount", 0))
+        if abs(amount) > 10**12:
+            raise AppError("XPの値が大きすぎます", code="invalid_amount")
+        old = {"xp": user.xp, "level": user.level}
+        user.xp = max(0, user.xp + amount)
+        user.level = users_svc.level_for_xp(user.xp)
+        new = {"xp": user.xp, "level": user.level}
+
+    elif action == "set_roll_counter":
+        n = int(p.get("value", 0))
+        if not 0 <= n <= 10**12:
+            raise AppError("値が不正です", code="invalid_value")
+        old, user.roll_counter, new = user.roll_counter, n, n
+
+    # --- inventory and equipment --------------------------------------------
+    elif action == "give_equipment":
+        eq = snap.equipment.get(str(p.get("equipment_key")))
+        if eq is None:
+            raise AppError("装備が見つかりません", code="invalid_equipment")
+        tier = str(p.get("quality_tier") or "normal")
+        q = float(p.get("quality") or 1.0)
+        if not 0.1 <= q <= 5.0:
+            raise AppError("品質は0.1〜5.0です", code="invalid_quality")
+        row = await equipment_svc.create_instance(db, user.id, eq["key"], "admin", quality=(tier, q))
+        new = {"equipment": eq["key"], "quality_tier": tier, "quality": q, "id": row.id}
+        result["equipment_id"] = row.id
+
+    elif action == "remove_equipment":
+        eid = int(p.get("equipment_id", 0))
+        row = (await db.execute(select(m.UserEquipment).where(m.UserEquipment.id == eid,
+                                                              m.UserEquipment.user_id == user.id))).scalar_one_or_none()
+        if row is None:
+            raise NotFound("その装備を所持していません")
+        old = {"equipment": row.equipment_key, "id": row.id}
+        await db.delete(row)
+        new = "removed"
+
+    elif action == "clear_inventory":
+        res = await db.execute(delete(m.ItemInstance).where(m.ItemInstance.owner_id == user.id,
+                                                            m.ItemInstance.state == "owned"))
+        new = {"deleted": res.rowcount or 0}
+
+    # --- unlocks and cosmetics ----------------------------------------------
+    elif action == "grant_achievement":
+        ach = snap.achievements.get(str(p.get("achievement_key")))
+        if ach is None:
+            raise AppError("実績が見つかりません", code="invalid_achievement")
+        await db.execute(insert(m.UserAchievement).values(user_id=user.id, achievement_id=ach["id"])
+                         .on_conflict_do_nothing())
+        new = {"achievement": ach["key"]}
+
+    elif action == "revoke_achievement":
+        ach = snap.achievements.get(str(p.get("achievement_key")))
+        if ach is None:
+            raise AppError("実績が見つかりません", code="invalid_achievement")
+        await db.execute(delete(m.UserAchievement).where(m.UserAchievement.user_id == user.id,
+                                                         m.UserAchievement.achievement_id == ach["id"]))
+        old, new = ach["key"], "revoked"
+
+    elif action == "grant_cosmetic":
+        key = str(p.get("cosmetic_key"))
+        if key not in snap.cosmetics:
+            raise AppError("コスメティックが見つかりません", code="invalid_cosmetic")
+        await db.execute(insert(m.UserCosmetic).values(user_id=user.id, cosmetic_key=key, source="admin")
+                         .on_conflict_do_nothing())
+        new = {"cosmetic": key}
+
+    elif action == "unlock_feature":
+        key = str(p.get("unlock_key"))
+        if not key:
+            raise AppError("解放キーを指定してください", code="invalid_unlock")
+        await db.execute(insert(m.UserUnlock).values(user_id=user.id, unlock_key=key, value={})
+                         .on_conflict_do_nothing())
+        new = {"unlock": key}
+
+    # --- identity -------------------------------------------------------------
+    elif action == "rename":
+        name = str(p.get("display_name") or "").strip()
+        if not 1 <= len(name) <= 64:
+            raise AppError("表示名は1〜64文字です", code="invalid_name")
+        old, user.display_name, new = user.display_name, name, name
+
+    elif action == "set_title":
+        key = str(p.get("title_key") or "") or None
+        if key and key not in snap.cosmetics:
+            raise AppError("称号が見つかりません", code="invalid_title")
+        old, user.title_key, new = user.title_key, key, key
+
+    # --- automation -----------------------------------------------------------
+    elif action == "set_auto_roll":
+        on = bool(p.get("enabled"))
+        old = user.auto_roll_enabled
+        user.auto_roll_enabled = on
+        user.auto_roll_since = utcnow() if on else None
+        new = on
+
+    elif action == "reset_user":
+        # Everything except the account itself: the player starts over but keeps
+        # their login, so this is recoverable by re-granting rather than by restore.
+        await db.execute(delete(m.ItemInstance).where(m.ItemInstance.owner_id == user.id))
+        for model in (m.Collection, m.UserAchievement, m.UserQuest, m.UserEquipment, m.Inventory,
+                      m.ActiveEffect, m.UserUnlock, m.UserRecipe, m.UserItemPref):
+            await db.execute(delete(model).where(model.user_id == user.id))
+        old = {"level": user.level, "stardust": user.stardust, "rolls": user.roll_counter}
+        user.level, user.xp, user.stardust, user.roll_counter = 1, 0, 0, 0
+        user.title_key, user.profile_background, user.base_luck = None, None, 1.0
+        stats = await users_svc.lock_stats(db, user.id)
+        for col in ("total_rolls", "offline_rolls", "special_rolls", "items_obtained", "items_auto_deleted",
+                    "stardust_earned", "items_sold", "net_worth"):
+            if hasattr(stats, col):
+                setattr(stats, col, 0)
+        new = "reset"
     else:
         raise AppError("不明な操作です", code="unknown_action")
     await rec()
@@ -498,3 +714,105 @@ async def user_table(db: AsyncSession, user_id: int) -> dict[str, Any]:
             "min_tier": ctx.min_tier, "flatten": ctx.flatten,
             "items": [{"key": it.key, "name": it.name, "rarity": it.rarity_key, "odds": it.odds, "p": p}
                       for it, p in zip(table.items, table.probs)]}
+
+
+# ---------------------------------------------------------------------------
+# Server-wide operations
+#
+# Everything here touches every player at once, so each one is audited as a
+# single entry with the row count it affected, and the destructive ones need an
+# explicit confirmation from the caller.
+# ---------------------------------------------------------------------------
+BULK_DANGEROUS = _BULK_DANGEROUS_NAMES
+
+
+async def bulk_operation(db: AsyncSession, principal: Principal, op: str, p: dict[str, Any], reason: str,
+                         user_agent: str | None = None) -> dict[str, Any]:
+    if not reason.strip():
+        raise AppError("理由を入力してください", code="reason_required")
+    if op in BULK_DANGEROUS and not p.get("confirm"):
+        raise AppError("全プレイヤーに影響します。確認が必要です", code="confirmation_required")
+
+    snap = get_registry().snap
+    only_active = bool(p.get("only_active"))
+    cutoff = utcnow() - timedelta(days=int(p.get("active_days", 30)))
+    # Set-based operations reuse the predicate so a large server never builds a
+    # giant IN clause; per-row ones need the ids and take them from the same filter.
+    audience = (m.User.last_seen_at > cutoff) if only_active else sa_true()
+    ids = [r[0] for r in (await db.execute(select(m.User.id).where(audience))).all()]
+    detail: dict[str, Any] = {"op": op, "targets": len(ids), "only_active": only_active}
+
+    if op == "give_stardust":
+        amount = int(p.get("amount", 0))
+        if not -10**12 <= amount <= 10**12:
+            raise AppError("金額が不正です", code="invalid_amount")
+        await db.execute(update(m.User).where(audience)
+                         .values(stardust=greatest(m.User.stardust + amount, 0)))
+        detail["amount"] = amount
+
+    elif op == "give_item":
+        item = snap.items_by_key.get(str(p.get("item_key")))
+        qty = int(p.get("qty", 1))
+        if item is None or item.kind == "admin_artifact":
+            raise AppError("アイテムが不正です", code="invalid_item")
+        if not 1 <= qty <= 100:
+            raise AppError("一括付与は1〜100個までです", code="invalid_quantity")
+        from .rolls import collection_upsert
+
+        for uid in ids:
+            await inv_svc.create_instances(db, uid, item.id, qty, "admin", tier=item.tier,
+                                           meta={"granted_by": principal.user.id, "bulk": True})
+            await collection_upsert(db, uid, item.id, qty)
+        detail.update({"item": item.key, "qty": qty})
+
+    elif op == "give_boost":
+        boost = snap.boosts.get(str(p.get("boost_key")))
+        qty = int(p.get("qty", 1))
+        if boost is None:
+            raise AppError("Boostが見つかりません", code="invalid_boost")
+        if not 1 <= qty <= 100:
+            raise AppError("一括付与は1〜100個までです", code="invalid_quantity")
+        for uid in ids:
+            await effects_svc.grant_boost_items(db, uid, boost["key"], qty)
+        detail.update({"boost": boost["key"], "qty": qty})
+
+    elif op == "grant_cosmetic":
+        key = str(p.get("cosmetic_key"))
+        if key not in snap.cosmetics:
+            raise AppError("コスメティックが見つかりません", code="invalid_cosmetic")
+        for uid in ids:
+            await db.execute(insert(m.UserCosmetic).values(user_id=uid, cosmetic_key=key, source="admin")
+                             .on_conflict_do_nothing())
+        detail["cosmetic"] = key
+
+    elif op == "clear_all_effects":
+        res = await db.execute(delete(m.ActiveEffect))
+        detail["removed"] = res.rowcount or 0
+
+    elif op == "reset_all_cooldowns":
+        await db.execute(update(m.User).where(audience).values(next_roll_at=None))
+        detail["reset"] = len(ids)
+
+    elif op == "wipe_market":
+        res = await db.execute(update(m.MarketListing).where(m.MarketListing.status == "active")
+                               .values(status="cancelled", closed_at=utcnow()))
+        # Listed items go back to their sellers rather than vanishing.
+        await db.execute(update(m.ItemInstance).where(m.ItemInstance.state == "listed").values(state="owned"))
+        detail["cancelled"] = res.rowcount or 0
+
+    elif op == "recompute_stats":
+        from . import stats as stats_svc
+
+        await stats_svc.recompute_owner_counts(db)
+        await stats_svc.recompute_market_values(db)
+        await stats_svc.recompute_net_worth(db, active_minutes=10**6)
+        detail["recomputed"] = True
+
+    else:
+        raise AppError("不明な操作です", code="unknown_operation")
+
+    await audit.record(db, principal, f"bulk_{op}", entity_type="server", entity_id=op,
+                       new=detail, reason=reason, user_agent=user_agent)
+    await db.commit()
+    queue_event(db, "all", "admin_event", {"kind": "bulk", "op": op})
+    return {"ok": True, **detail}
