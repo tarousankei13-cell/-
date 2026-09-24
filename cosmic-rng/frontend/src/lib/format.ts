@@ -34,7 +34,11 @@ export function fmtLuck(v: number | null | undefined): string {
 export function fmtPercent(p: number, digits = 2): string {
   if (p >= 1) return `${p.toFixed(digits)}%`;
   if (p >= 0.01) return `${p.toFixed(Math.max(digits, 3))}%`;
-  return `${p.toExponential(2)}%`;
+  if (p <= 0) return "0%";
+  // Below 0.01% toFixed() rounds to zero and toExponential() shows a player
+  // "1.00e-7%", so write the decimals out: these are the numbers the game is about.
+  const decimals = Math.min(12, Math.ceil(-Math.log10(p)) + 2);
+  return `${p.toFixed(decimals).replace(/0+$/, "").replace(/\.$/, "")}%`;
 }
 
 export function fmtChance(p: number | null | undefined): string {

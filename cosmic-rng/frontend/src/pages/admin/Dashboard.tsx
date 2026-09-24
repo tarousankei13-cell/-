@@ -9,7 +9,8 @@ function Spark({ data, max }: { data: { t: string; n: number }[]; max?: number }
   return (
     <div className="spark" title={`最大 ${peak}`}>
       {data.slice(-60).map((d, i) => (
-        <i key={i} style={{ height: `${Math.max(3, (d.n / peak) * 100)}%` }} title={`${d.t}: ${d.n}`} />
+        <i key={i} className={d.n === 0 ? "spark-zero" : undefined}
+           style={{ height: `${Math.max(2, (d.n / peak) * 100)}%` }} title={`${d.t}: ${d.n}`} />
       ))}
     </div>
   );

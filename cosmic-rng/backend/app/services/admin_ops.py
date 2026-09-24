@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import math
 import random
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import and_, delete, func, or_, select, text, update
@@ -35,6 +35,25 @@ from .users import avatar_url, lock_user, user_brief
 # ---------------------------------------------------------------------------
 # Dashboard
 # ---------------------------------------------------------------------------
+def _dense_series(rows: Any, now: datetime, buckets: int, step: timedelta, fmt: str) -> list[dict[str, Any]]:
+    """Every bucket in the window, including the empty ones.
+
+    A GROUP BY only returns the periods that had activity, so a chart built from
+    it puts a busy minute from an hour ago right next to the present one and
+    reads as if it just happened. Filling the gaps keeps the x axis a time axis.
+    """
+    counts = {str(r[0]): int(r[1]) for r in rows}
+    start = (now - step * (buckets - 1)).replace(second=0, microsecond=0)
+    if step >= timedelta(hours=1):
+        start = start.replace(minute=0)
+    out = []
+    for i in range(buckets):
+        label = (start + step * i).strftime(fmt)
+        out.append({"t": label, "n": counts.get(label, 0)})
+    return out
+
+
+
 async def dashboard(db: AsyncSession) -> dict[str, Any]:
     now = utcnow()
     snap = get_registry().snap
@@ -85,7 +104,8 @@ async def dashboard(db: AsyncSession) -> dict[str, Any]:
         "market_24h": {"count": mv[0], "volume": int(mv[1])}, "trades_24h": trades_24h, "errors_24h": errors_24h,
         "active_boosts": active_boosts, "flagged_listings_24h": flagged,
         "biomes": [{"key": k, "name": snap.biomes[k].name if k in snap.biomes else k, "count": c} for k, c in biome_rows],
-        "rolls_per_minute": [{"t": r[0], "n": int(r[1])} for r in per_min], "rare_per_hour": [{"t": r[0], "n": int(r[1])} for r in rare_hour],
+        "rolls_per_minute": _dense_series(per_min, now, 60, timedelta(minutes=1), "%H:%M"),
+        "rare_per_hour": _dense_series(rare_hour, now, 24, timedelta(hours=1), "%m-%d %H:00"),
         "tier_distribution_1h": [{"tier": t, "n": n} for t, n in tier_dist],
         "recent_errors": [{"error_id": e.error_id, "path": e.path, "type": e.exc_type, "message": e.message[:200],
                            "created_at": e.created_at.isoformat()} for e in recent_errors],
