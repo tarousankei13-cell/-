@@ -9,6 +9,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -34,6 +35,9 @@ class Settings(BaseSettings):
 
     public_base_url: str = "http://localhost:8000"
     allowed_origins: str = ""
+    # Sub-path the site is served under, e.g. "/s/kazino" behind a shared host.
+    # Empty means the app owns the whole origin.
+    base_path: str = ""
 
     discord_client_id: str = ""
     discord_client_secret: str = ""
@@ -48,7 +52,8 @@ class Settings(BaseSettings):
     cookie_domain: str | None = None
     session_ttl_days: int = 30
 
-    event_bus: Literal["postgres", "local"] = "postgres"
+    # "auto" follows the database: LISTEN/NOTIFY on PostgreSQL, in-process on SQLite.
+    event_bus: Literal["auto", "postgres", "local"] = "auto"
     worker_id: str = ""
 
     backup_dir: str = str(BASE_DIR.parent / "backups")
@@ -65,6 +70,14 @@ class Settings(BaseSettings):
     dev_login_enabled: bool = False
     run_scheduler: bool = True
 
+    @field_validator("base_path", mode="before")
+    @classmethod
+    def _normalise_base(cls, v: str | None) -> str:
+        v = (v or "").strip().rstrip("/")
+        if v and not v.startswith("/"):
+            v = "/" + v
+        return v
+
     @field_validator("cookie_domain", mode="before")
     @classmethod
     def _empty_domain(cls, v: str | None) -> str | None:
@@ -80,16 +93,38 @@ class Settings(BaseSettings):
         elif not self.secret_key:
             # Non-production convenience only; production refuses to boot above.
             self.secret_key = "dev-insecure-secret-key-change-me-0123456789"
+        if self.event_bus == "auto":
+            self.event_bus = "local" if self.database_url.startswith("sqlite") else "postgres"
+        elif self.event_bus == "postgres" and self.database_url.startswith("sqlite"):
+            raise ValueError("EVENT_BUS=postgres needs a PostgreSQL DATABASE_URL")
         return self
+
+    @property
+    def is_sqlite(self) -> bool:
+        return self.database_url.startswith("sqlite")
 
     @property
     def admin_ids(self) -> set[int]:
         return {int(x) for x in self.admin_discord_ids.replace(" ", "").split(",") if x.isdigit()}
 
+    @staticmethod
+    def _origin_of(url: str) -> str:
+        """scheme://host[:port] — an Origin header never carries a path, so a
+        PUBLIC_BASE_URL like https://host/s/kazino must be reduced to compare."""
+        u = urlsplit(url.strip())
+        if u.scheme and u.netloc:
+            return f"{u.scheme}://{u.netloc}"
+        return url.strip().rstrip("/")
+
     @property
     def origins(self) -> list[str]:
-        items = [o.strip().rstrip("/") for o in self.allowed_origins.split(",") if o.strip()]
-        base = self.public_base_url.rstrip("/")
+        items: list[str] = []
+        for o in self.allowed_origins.split(","):
+            if o.strip():
+                origin = self._origin_of(o)
+                if origin not in items:
+                    items.append(origin)
+        base = self._origin_of(self.public_base_url)
         if base and base not in items:
             items.append(base)
         return items
@@ -97,6 +132,14 @@ class Settings(BaseSettings):
     @property
     def trusted_proxy_set(self) -> set[str]:
         return {x.strip() for x in self.trusted_proxies.split(",") if x.strip()}
+
+    def url(self, path: str) -> str:
+        """Absolute in-app path, including the sub-path the site is mounted on."""
+        return f"{self.base_path}{path}" if path.startswith("/") else path
+
+    @property
+    def cookie_path(self) -> str:
+        return self.base_path or "/"
 
     @property
     def is_dev(self) -> bool:

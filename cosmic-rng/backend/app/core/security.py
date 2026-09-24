@@ -107,14 +107,14 @@ def set_session_cookie(response: Response, token: str) -> None:
         httponly=True,
         secure=s.cookie_secure,
         samesite="lax",
-        path="/",
+        path=s.cookie_path,
         domain=s.cookie_domain,
     )
 
 
 def clear_session_cookie(response: Response) -> None:
     s = get_settings()
-    response.delete_cookie(SESSION_COOKIE, path="/", domain=s.cookie_domain, secure=s.cookie_secure, httponly=True)
+    response.delete_cookie(SESSION_COOKIE, path=s.cookie_path, domain=s.cookie_domain, secure=s.cookie_secure, httponly=True)
 
 
 async def revoke_user_sessions(db: AsyncSession, user_id: int) -> None:

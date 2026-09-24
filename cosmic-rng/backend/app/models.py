@@ -12,11 +12,11 @@ Design notes
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import (
-    BigInteger,
+    BigInteger as _BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -31,20 +31,135 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import JSON, TypeDecorator
+from sqlalchemy.dialects.postgresql import JSONB as _JSONB
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.sql.expression import ColumnElement
 
 from .db import Base
 
-TS = DateTime(timezone=True)
+# --- dialect variants -------------------------------------------------------
+# The same models serve PostgreSQL (production) and SQLite (single-file mode).
+# SQLite has no BIGSERIAL: a BIGINT primary key is not an alias for ROWID, so
+# autoincrement silently stops working. INTEGER is 64-bit there regardless.
+BigInteger = _BigInteger().with_variant(Integer, "sqlite")
+
+# JSONB gains nothing on SQLite, and its operators are never used in queries —
+# every JSON column is read and written whole through the ORM.
+JSONB = _JSONB().with_variant(JSON(), "sqlite")
+
+
+class _JsonDefault(ColumnElement[Any]):
+    """DDL default for a JSON column: PostgreSQL wants the ``::jsonb`` cast."""
+
+    inherit_cache = True
+
+    def __init__(self, literal: str) -> None:
+        self.literal = literal
+
+
+@compiles(_JsonDefault)
+def _json_default_pg(element: _JsonDefault, compiler: Any, **kw: Any) -> str:
+    return f"'{element.literal}'::jsonb"
+
+
+@compiles(_JsonDefault, "sqlite")
+def _json_default_sqlite(element: _JsonDefault, compiler: Any, **kw: Any) -> str:
+    return f"'{element.literal}'"
+
+
+class _BoolDefault(ColumnElement[Any]):
+    """DDL default for a boolean column.
+
+    PostgreSQL accepts ``DEFAULT false``. SQLite has no boolean type: the same
+    DDL stores the *string* "false", which is not what a BOOLEAN column reads
+    back, so rows silently fail every ``WHERE flag IS false`` comparison.
+    """
+
+    inherit_cache = True
+
+    def __init__(self, value: bool) -> None:
+        self.value = value
+
+
+@compiles(_BoolDefault)
+def _bool_default_pg(element: _BoolDefault, compiler: Any, **kw: Any) -> str:
+    return "true" if element.value else "false"
+
+
+@compiles(_BoolDefault, "sqlite")
+def _bool_default_sqlite(element: _BoolDefault, compiler: Any, **kw: Any) -> str:
+    return "1" if element.value else "0"
+
+
+TRUE = _BoolDefault(True)
+FALSE = _BoolDefault(False)
+
+
+class UtcDateTime(TypeDecorator[datetime]):
+    """Timezone-aware timestamps on both backends.
+
+    PostgreSQL round-trips ``timestamptz`` natively. SQLite stores no timezone,
+    so values come back naive and blow up on comparison with ``datetime.now(UTC)``.
+    Everything is normalised to UTC on the way in and re-tagged on the way out.
+    """
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect: Any) -> Any:
+        return dialect.type_descriptor(DateTime(timezone=dialect.name != "sqlite"))
+
+    def process_bind_param(self, value: datetime | None, dialect: Any) -> datetime | None:
+        if value is None or dialect.name != "sqlite":
+            return value
+        return value.astimezone(UTC).replace(tzinfo=None) if value.tzinfo else value
+
+    def process_result_value(self, value: datetime | None, dialect: Any) -> datetime | None:
+        if value is None or dialect.name != "sqlite":
+            return value
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+TS = UtcDateTime()
+
+
+class _Now(ColumnElement[datetime]):
+    """Current UTC time, at microsecond precision on both backends.
+
+    SQLite's CURRENT_TIMESTAMP (what ``func.now()`` compiles to) is whole
+    seconds, while bound datetimes are stored with six fractional digits. Since
+    SQLite compares timestamps as text, a row written by the default would sort
+    *before* a parameter naming the very same instant, and every
+    ``created_at >= :t`` window silently dropped its first second of rows.
+    """
+
+    inherit_cache = True
+    type = TS
+
+
+@compiles(_Now)
+def _now_pg(element: _Now, compiler: Any, **kw: Any) -> str:
+    return "now()"
+
+
+@compiles(_Now, "sqlite")
+def _now_sqlite(element: _Now, compiler: Any, **kw: Any) -> str:
+    # strftime's %f gives milliseconds; pad to the six digits the driver writes.
+    return "(strftime('%Y-%m-%d %H:%M:%f', 'now') || '000')"
+
+
+NOW = _Now()
 
 
 def now_col(**kw: Any) -> Mapped[datetime]:
-    return mapped_column(TS, server_default=func.now(), nullable=False, **kw)
+    return mapped_column(TS, server_default=NOW, nullable=False, **kw)
 
 
 def jsonb(default: str = "'{}'::jsonb", nullable: bool = False) -> Mapped[Any]:
-    return mapped_column(JSONB, server_default=text(default), nullable=nullable)
+    literal = default.split("'")[1] if "'" in default else "{}"
+    return mapped_column(JSONB, server_default=_JsonDefault(literal), nullable=nullable)
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +191,7 @@ class User(Base):
     next_roll_at: Mapped[datetime | None] = mapped_column(TS)
     last_roll_at: Mapped[datetime | None] = mapped_column(TS)
     last_seen_at: Mapped[datetime | None] = mapped_column(TS)
-    auto_roll_enabled: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    auto_roll_enabled: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
     auto_roll_since: Mapped[datetime | None] = mapped_column(TS)
     offline_processed_until: Mapped[datetime | None] = mapped_column(TS)
 
@@ -86,7 +201,7 @@ class User(Base):
     bio: Mapped[str | None] = mapped_column(String(200))
 
     created_at: Mapped[datetime] = now_col()
-    updated_at: Mapped[datetime] = now_col(onupdate=func.now())
+    updated_at: Mapped[datetime] = now_col(onupdate=NOW)
 
 
 class Session(Base):
@@ -96,10 +211,10 @@ class Session(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)  # sha256(token)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     csrf_token: Mapped[str] = mapped_column(String(64), nullable=False)
-    admin_mode: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    admin_mode: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
     ip: Mapped[str | None] = mapped_column(String(64))
     user_agent: Mapped[str | None] = mapped_column(String(256))
-    revoked: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    revoked: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
     created_at: Mapped[datetime] = now_col()
     last_used_at: Mapped[datetime] = now_col()
     expires_at: Mapped[datetime] = mapped_column(TS, nullable=False)
@@ -110,7 +225,7 @@ class UserSettings(Base):
 
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     data: Mapped[dict[str, Any]] = jsonb()
-    updated_at: Mapped[datetime] = now_col(onupdate=func.now())
+    updated_at: Mapped[datetime] = now_col(onupdate=NOW)
 
 
 class UserStats(Base):
@@ -150,7 +265,7 @@ class UserStats(Base):
     rarity_counts: Mapped[dict[str, int]] = jsonb()
     biomes_seen: Mapped[list[str]] = jsonb("'[]'::jsonb")
     counters: Mapped[dict[str, Any]] = jsonb()  # misc trackers (streaks, hidden quest state)
-    updated_at: Mapped[datetime] = now_col(onupdate=func.now())
+    updated_at: Mapped[datetime] = now_col(onupdate=NOW)
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +285,7 @@ class Rarity(Base):
     xp: Mapped[int] = mapped_column(Integer, server_default="1", nullable=False)
     season_points: Mapped[int] = mapped_column(Integer, server_default="1", nullable=False)
     cutscene: Mapped[str] = mapped_column(String(32), nullable=False)
-    announce: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    announce: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
     extra: Mapped[dict[str, Any]] = jsonb()
 
 
@@ -191,7 +306,7 @@ class Item(Base):
     rarity_key: Mapped[str] = mapped_column(ForeignKey("rarities.key", onupdate="CASCADE"), nullable=False)
     odds: Mapped[float | None] = mapped_column(Double)
     display_odds: Mapped[str | None] = mapped_column(String(48))
-    rollable: Mapped[bool] = mapped_column(Boolean, server_default="true", nullable=False)
+    rollable: Mapped[bool] = mapped_column(Boolean, server_default=TRUE, nullable=False)
     sell_value: Mapped[int] = mapped_column(BigInteger, server_default="0", nullable=False)
     market_value: Mapped[int] = mapped_column(BigInteger, server_default="0", nullable=False)
     biome_keys: Mapped[list[str]] = jsonb("'[]'::jsonb")
@@ -203,8 +318,8 @@ class Item(Base):
     visual: Mapped[dict[str, Any]] = jsonb()
     animation: Mapped[str | None] = mapped_column(String(32))
     sound: Mapped[str | None] = mapped_column(String(32))
-    tradeable: Mapped[bool] = mapped_column(Boolean, server_default="true", nullable=False)
-    hidden: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    tradeable: Mapped[bool] = mapped_column(Boolean, server_default=TRUE, nullable=False)
+    hidden: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
     procedural: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     first_discoverer_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     first_discovered_at: Mapped[datetime | None] = mapped_column(TS)
@@ -215,9 +330,9 @@ class Item(Base):
     trade_count: Mapped[int] = mapped_column(BigInteger, server_default="0", nullable=False)
     serial_counter: Mapped[int] = mapped_column(BigInteger, server_default="0", nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, server_default="true", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, server_default=TRUE, nullable=False)
     created_at: Mapped[datetime] = now_col()
-    updated_at: Mapped[datetime] = now_col(onupdate=func.now())
+    updated_at: Mapped[datetime] = now_col(onupdate=NOW)
 
 
 class ItemRevision(Base):
@@ -247,7 +362,7 @@ class ItemPart(Base):
     weight: Mapped[float] = mapped_column(Double, server_default="1", nullable=False)
     value_mult: Mapped[float] = mapped_column(Double, server_default="1", nullable=False)
     visual: Mapped[dict[str, Any]] = jsonb()
-    is_active: Mapped[bool] = mapped_column(Boolean, server_default="true", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, server_default=TRUE, nullable=False)
 
 
 class ItemInstance(Base):
@@ -264,8 +379,8 @@ class ItemInstance(Base):
     serial: Mapped[int | None] = mapped_column(BigInteger)
     source: Mapped[str] = mapped_column(String(16), nullable=False)
     state: Mapped[str] = mapped_column(String(16), server_default="owned", nullable=False)
-    locked: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
-    favorite: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    locked: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
+    favorite: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
     roll_id: Mapped[int | None] = mapped_column(BigInteger)
     meta: Mapped[dict[str, Any]] = jsonb()
     obtained_at: Mapped[datetime] = now_col()
@@ -278,7 +393,7 @@ class UserItemPref(Base):
 
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     item_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), primary_key=True)
-    favorite: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    favorite: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
 
 
 class Collection(Base):
@@ -306,10 +421,10 @@ class Biome(Base):
     item_boosts: Mapped[dict[str, float]] = jsonb()
     theme: Mapped[dict[str, Any]] = jsonb()
     special_states: Mapped[list[dict[str, Any]]] = jsonb("'[]'::jsonb")
-    announce: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
-    hidden: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    announce: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
+    hidden: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, server_default="true", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, server_default=TRUE, nullable=False)
 
 
 class UserBiome(Base):
@@ -326,7 +441,7 @@ class UserBiome(Base):
     state_ends_at: Mapped[datetime | None] = mapped_column(TS)
     next_state_at: Mapped[datetime | None] = mapped_column(TS)
     next_state_key: Mapped[str | None] = mapped_column(String(48))
-    forced: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    forced: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
     forced_by: Mapped[int | None] = mapped_column(BigInteger)
     locked_until: Mapped[datetime | None] = mapped_column(TS)
     sample_sig: Mapped[str] = mapped_column(String(64), server_default="", nullable=False)
@@ -349,7 +464,7 @@ class Equipment(Base):
     sell_value: Mapped[int] = mapped_column(BigInteger, server_default="0", nullable=False)
     min_level: Mapped[int] = mapped_column(Integer, server_default="1", nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, server_default="true", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, server_default=TRUE, nullable=False)
 
 
 class UserEquipment(Base):
@@ -361,7 +476,10 @@ class UserEquipment(Base):
             "user_id",
             "equipped_slot",
             unique=True,
+            # Partial index: a player may hold many unequipped copies, but only one
+            # per slot. Both dialects support it under their own keyword.
             postgresql_where=text("equipped_slot IS NOT NULL"),
+            sqlite_where=text("equipped_slot IS NOT NULL"),
         ),
     )
 
@@ -373,7 +491,7 @@ class UserEquipment(Base):
     luck_bonus: Mapped[float] = mapped_column(Double, server_default="0", nullable=False)
     speed_bonus: Mapped[float] = mapped_column(Double, server_default="0", nullable=False)
     equipped_slot: Mapped[str | None] = mapped_column(String(16))
-    locked: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    locked: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
     source: Mapped[str] = mapped_column(String(16), server_default="craft", nullable=False)
     meta: Mapped[dict[str, Any]] = jsonb()
     obtained_at: Mapped[datetime] = now_col()
@@ -397,7 +515,7 @@ class Boost(Base):
     visual: Mapped[dict[str, Any]] = jsonb()
     sell_value: Mapped[int] = mapped_column(BigInteger, server_default="0", nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, server_default="true", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, server_default=TRUE, nullable=False)
 
 
 class Inventory(Base):
@@ -409,7 +527,7 @@ class Inventory(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     boost_id: Mapped[int] = mapped_column(ForeignKey("boosts.id", ondelete="CASCADE"), primary_key=True)
     quantity: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
-    updated_at: Mapped[datetime] = now_col(onupdate=func.now())
+    updated_at: Mapped[datetime] = now_col(onupdate=NOW)
 
 
 class ActiveEffect(Base):
@@ -445,11 +563,11 @@ class Recipe(Base):
     ingredients: Mapped[list[dict[str, Any]]] = jsonb("'[]'::jsonb")
     stardust_cost: Mapped[int] = mapped_column(BigInteger, server_default="0", nullable=False)
     outputs: Mapped[list[dict[str, Any]]] = jsonb("'[]'::jsonb")
-    hidden: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    hidden: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
     hint: Mapped[str | None] = mapped_column(Text)
     min_level: Mapped[int] = mapped_column(Integer, server_default="1", nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, server_default="true", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, server_default=TRUE, nullable=False)
 
 
 class UserRecipe(Base):
@@ -471,7 +589,7 @@ class Shop(Base):
     biome_key: Mapped[str | None] = mapped_column(String(48))
     min_level: Mapped[int] = mapped_column(Integer, server_default="1", nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, server_default="true", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, server_default=TRUE, nullable=False)
 
 
 class ShopItem(Base):
@@ -494,7 +612,7 @@ class ShopItem(Base):
     biome_key: Mapped[str | None] = mapped_column(String(48))
     visual: Mapped[dict[str, Any]] = jsonb()
     sort_order: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, server_default="true", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, server_default=TRUE, nullable=False)
 
 
 class ShopPurchase(Base):
@@ -528,7 +646,7 @@ class Cosmetic(Base):
     description: Mapped[str] = mapped_column(Text, server_default="", nullable=False)
     rarity_key: Mapped[str] = mapped_column(ForeignKey("rarities.key", onupdate="CASCADE"), nullable=False)
     visual: Mapped[dict[str, Any]] = jsonb()
-    is_active: Mapped[bool] = mapped_column(Boolean, server_default="true", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, server_default=TRUE, nullable=False)
 
 
 class UserCosmetic(Base):
@@ -597,7 +715,7 @@ class RollBatch(Base):
     summary: Mapped[dict[str, Any]] = jsonb()
     rng_version: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     content_version: Mapped[int] = mapped_column(Integer, nullable=False)
-    seen: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    seen: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
     created_at: Mapped[datetime] = now_col()
 
 
@@ -615,6 +733,7 @@ class MarketListing(Base):
             "instance_id",
             unique=True,
             postgresql_where=text("status = 'active'"),
+            sqlite_where=text("status = 'active'"),
         ),
         CheckConstraint("price > 0", name="price_pos"),
     )
@@ -627,7 +746,7 @@ class MarketListing(Base):
     status: Mapped[str] = mapped_column(String(16), server_default="active", nullable=False)
     buyer_id: Mapped[int | None] = mapped_column(BigInteger)
     fee: Mapped[int] = mapped_column(BigInteger, server_default="0", nullable=False)
-    flagged: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    flagged: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
     flag_reason: Mapped[str | None] = mapped_column(Text)
     snapshot: Mapped[dict[str, Any]] = jsonb()
     created_at: Mapped[datetime] = now_col()
@@ -657,7 +776,7 @@ class Trade(Base):
     snapshot: Mapped[dict[str, Any]] = jsonb()
     failure_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = now_col()
-    updated_at: Mapped[datetime] = now_col(onupdate=func.now())
+    updated_at: Mapped[datetime] = now_col(onupdate=NOW)
     expires_at: Mapped[datetime] = mapped_column(TS, nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(TS)
 
@@ -709,7 +828,7 @@ class Quest(Base):
     weight: Mapped[float] = mapped_column(Double, server_default="1", nullable=False)
     min_level: Mapped[int] = mapped_column(Integer, server_default="1", nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, server_default="true", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, server_default=TRUE, nullable=False)
 
 
 class UserQuest(Base):
@@ -744,13 +863,13 @@ class Achievement(Base):
     tier: Mapped[str] = mapped_column(String(16), server_default="bronze", nullable=False)
     condition: Mapped[dict[str, Any]] = jsonb()
     rewards: Mapped[dict[str, Any]] = jsonb()
-    hidden: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    hidden: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
     hint: Mapped[str | None] = mapped_column(Text)
     first_achiever_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     first_achieved_at: Mapped[datetime | None] = mapped_column(TS)
     achiever_count: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, server_default="true", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, server_default=TRUE, nullable=False)
 
 
 class UserAchievement(Base):
@@ -759,7 +878,7 @@ class UserAchievement(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     achievement_id: Mapped[int] = mapped_column(ForeignKey("achievements.id", ondelete="CASCADE"), primary_key=True)
     achieved_at: Mapped[datetime] = now_col()
-    world_first: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    world_first: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
 
 
 class Season(Base):
@@ -816,7 +935,7 @@ class WorldEvent(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     type: Mapped[str] = mapped_column(String(32), nullable=False)
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
-    public: Mapped[bool] = mapped_column(Boolean, server_default="true", nullable=False)
+    public: Mapped[bool] = mapped_column(Boolean, server_default=TRUE, nullable=False)
     payload: Mapped[dict[str, Any]] = jsonb()
     created_at: Mapped[datetime] = now_col()
 
@@ -834,7 +953,7 @@ class GameEvent(Base):
     params: Mapped[dict[str, Any]] = jsonb()
     starts_at: Mapped[datetime | None] = mapped_column(TS)
     ends_at: Mapped[datetime | None] = mapped_column(TS)
-    is_active: Mapped[bool] = mapped_column(Boolean, server_default="true", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, server_default=TRUE, nullable=False)
     created_by: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = now_col()
 
@@ -845,12 +964,12 @@ class Notification(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
-    for_admins: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    for_admins: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
     type: Mapped[str] = mapped_column(String(32), nullable=False)
     title: Mapped[str] = mapped_column(String(160), nullable=False)
     body: Mapped[str] = mapped_column(Text, server_default="", nullable=False)
     data: Mapped[dict[str, Any]] = jsonb()
-    read: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    read: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
     created_at: Mapped[datetime] = now_col()
 
 
@@ -885,12 +1004,12 @@ class AdminArtifact(Base):
     duration_sec: Mapped[int | None] = mapped_column(Integer)
     cooldown_sec: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
     tier: Mapped[int] = mapped_column(SmallInteger, server_default="1", nullable=False)
-    player_usable: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    player_usable: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
     equip_passive: Mapped[dict[str, Any]] = jsonb()
     transfer_rules: Mapped[dict[str, Any]] = jsonb()
     audit_rules: Mapped[dict[str, Any]] = jsonb()
     sort_order: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, server_default="true", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, server_default=TRUE, nullable=False)
 
 
 class AdminGrant(Base):
@@ -903,7 +1022,7 @@ class AdminGrant(Base):
     admin_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     target_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     action: Mapped[str] = mapped_column(String(16), nullable=False)  # grant/recall
-    can_use: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    can_use: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
     uses_remaining: Mapped[int | None] = mapped_column(Integer)
     expires_at: Mapped[datetime | None] = mapped_column(TS)
     reason: Mapped[str] = mapped_column(Text, server_default="", nullable=False)
@@ -937,7 +1056,7 @@ class AuditLog(Base):
     old_value: Mapped[Any | None] = mapped_column(JSONB)
     new_value: Mapped[Any | None] = mapped_column(JSONB)
     reason: Mapped[str] = mapped_column(Text, server_default="", nullable=False)
-    admin_mode: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    admin_mode: Mapped[bool] = mapped_column(Boolean, server_default=FALSE, nullable=False)
     ip: Mapped[str | None] = mapped_column(String(64))
     session_hash: Mapped[str | None] = mapped_column(String(16))
     user_agent: Mapped[str | None] = mapped_column(String(256))
@@ -950,7 +1069,7 @@ class GameSetting(Base):
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[Any] = mapped_column(JSONB, nullable=False)
     updated_by: Mapped[int | None] = mapped_column(BigInteger)
-    updated_at: Mapped[datetime] = now_col(onupdate=func.now())
+    updated_at: Mapped[datetime] = now_col(onupdate=NOW)
 
 
 class ContentOverride(Base):
@@ -965,7 +1084,7 @@ class ContentOverride(Base):
     patch: Mapped[dict[str, Any]] = jsonb()
     reason: Mapped[str] = mapped_column(Text, server_default="", nullable=False)
     created_by: Mapped[int | None] = mapped_column(BigInteger)
-    active: Mapped[bool] = mapped_column(Boolean, server_default="true", nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, server_default=TRUE, nullable=False)
     starts_at: Mapped[datetime] = now_col()
     expires_at: Mapped[datetime] = mapped_column(TS, nullable=False)
     created_at: Mapped[datetime] = now_col()

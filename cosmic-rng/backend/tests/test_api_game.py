@@ -77,8 +77,17 @@ async def achievement_stardust_since(user_id: int, since) -> int:
 
 
 async def _db_now():
+    """Server clock as the database sees it.
+
+    PostgreSQL may run on another host, so its clock is the authority. SQLite is
+    in-process, where the app clock is the same clock.
+    """
     from sqlalchemy import text
 
+    from app.db import is_sqlite
+
+    if is_sqlite():
+        return utcnow()
     async with session_scope() as db:
         return (await db.execute(text("SELECT now()"))).scalar_one()
 

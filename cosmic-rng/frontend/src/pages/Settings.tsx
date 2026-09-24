@@ -1,3 +1,4 @@
+import { withBase } from "../lib/base";
 import { useEffect, useState } from "react";
 import { post } from "../lib/api";
 import { useAction, useApi } from "../lib/useApi";
@@ -60,7 +61,7 @@ export function Settings() {
     const ok = await confirm("ログアウト", "ログアウトしますか？");
     if (!ok) return;
     await run(() => post("/api/auth/logout"));
-    location.href = "/";
+    location.href = withBase("/");
   };
 
   if (!local) return null;

@@ -1,4 +1,5 @@
 /** WebSocket client: session-cookie authenticated, auto-reconnecting, dispatches realtime events into the store. */
+import { withBase } from "./base";
 import { events, useGame } from "../store/game";
 import type { FeedEvent, FirstDiscovery } from "./types";
 import { audio } from "../audio/engine";
@@ -11,7 +12,7 @@ let stopped = false;
 
 function url() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  return `${proto}://${location.host}/ws`;
+  return `${proto}://${location.host}${withBase("/ws")}`;
 }
 
 export function connectSocket() {
@@ -41,7 +42,7 @@ export function connectSocket() {
     useGame.getState().set({ connected: false });
     window.clearInterval(pingTimer);
     if (ev.code === 4001) {
-      location.href = "/?error=session";
+      location.href = withBase("/?error=session");
       return;
     }
     if (!stopped) scheduleReconnect();
@@ -148,7 +149,7 @@ function handle(type: string, data: any) {
       st.refreshHud();
       break;
     case "force_logout":
-      location.href = "/?error=session";
+      location.href = withBase("/?error=session");
       break;
     default:
       break;

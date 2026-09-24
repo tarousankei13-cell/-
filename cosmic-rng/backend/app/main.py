@@ -12,8 +12,10 @@ from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from sqlalchemy import select
+from starlette.applications import Starlette
+from starlette.routing import Mount
 
 from .config import BASE_DIR, get_settings
 from .content.registry import get_registry
@@ -136,7 +138,6 @@ def create_app() -> FastAPI:
 
     # Optional: serve the built SPA directly (Nginx normally does this in production).
     if FRONTEND_DIST.exists():
-        index = FRONTEND_DIST / "index.html"
 
         @app.get("/{path:path}", include_in_schema=False)
         async def spa(path: str) -> Response:
@@ -144,9 +145,42 @@ def create_app() -> FastAPI:
             if path and candidate.is_file() and FRONTEND_DIST.resolve() in candidate.parents:
                 headers = {"Cache-Control": "public, max-age=31536000, immutable"} if "/assets/" in f"/{path}" else {}
                 return FileResponse(candidate, headers=headers)
-            return FileResponse(index, headers={"Cache-Control": "no-cache"})
+            return HTMLResponse(_spa_shell(), headers={"Cache-Control": "no-cache"})
 
-    return app
+    base = get_settings().base_path
+    if not base:
+        return app
+
+    # Served under a sub-path (shared hosting, a reverse proxy that does not strip
+    # its prefix). Mounting keeps every route relative while the browser sees the
+    # full path; the SPA shell carries the same prefix in its <base href>.
+    outer = Starlette(routes=[Mount(base, app=app)])
+    outer.state.inner = app
+    outer.router.lifespan_context = app.router.lifespan_context
+    log.info("mounted under %s", base)
+    return outer
+
+
+_shell_cache: tuple[float, str] | None = None
+
+
+def _spa_shell() -> str:
+    """index.html with a <base href> so relative asset and route URLs resolve
+    correctly whether the app owns the origin or sits under a sub-path.
+
+    Re-read when the file changes, so deploying a new frontend build does not
+    keep serving a shell that points at the previous bundle's hashed assets.
+    """
+    global _shell_cache
+    index = FRONTEND_DIST / "index.html"
+    mtime = index.stat().st_mtime
+    if _shell_cache is not None and _shell_cache[0] == mtime:
+        return _shell_cache[1]
+    html = index.read_text(encoding="utf-8")
+    if "<base " not in html:
+        html = html.replace("<head>", f'<head>\n    <base href="{get_settings().base_path}/">', 1)
+    _shell_cache = (mtime, html)
+    return html
 
 
 app = create_app()

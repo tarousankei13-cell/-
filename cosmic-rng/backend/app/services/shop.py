@@ -6,10 +6,10 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..content.registry import get_registry
+from ..db import upsert as insert
 from ..core.errors import AppError, Forbidden, NotFound
 from ..core.timeutil import utcnow
 from ..models import ShopPurchase, User, UserBiome, UserUnlock

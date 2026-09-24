@@ -1,4 +1,8 @@
-"""Integration test fixtures: a real PostgreSQL test database, migrated and seeded once per session."""
+"""Integration test fixtures: a real database, migrated and seeded once per session.
+
+Defaults to PostgreSQL. Point ``TEST_DATABASE_URL`` at a ``sqlite+aiosqlite://``
+file to run the same suite against the single-file backend.
+"""
 from __future__ import annotations
 
 import os
@@ -37,14 +41,20 @@ ADMIN_DISCORD_ID = 999000001
 def _reset_database() -> None:
     import asyncio
 
-    import asyncpg
+    if TEST_DB.startswith("sqlite"):
+        for suffix in ("", "-wal", "-shm"):
+            f = Path(TEST_DB.split("///", 1)[1] + suffix)
+            if f.exists():
+                f.unlink()
+    else:
+        import asyncpg
 
-    async def reset() -> None:
-        conn = await asyncpg.connect(TEST_DB.replace("postgresql+asyncpg://", "postgresql://"))
-        await conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
-        await conn.close()
+        async def reset() -> None:
+            conn = await asyncpg.connect(TEST_DB.replace("postgresql+asyncpg://", "postgresql://"))
+            await conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+            await conn.close()
 
-    asyncio.run(reset())
+        asyncio.run(reset())
     subprocess.run([sys.executable, "-m", "app.cli", "migrate"], cwd=BACKEND, env=dict(os.environ), check=True,
                    stdout=subprocess.DEVNULL)
 

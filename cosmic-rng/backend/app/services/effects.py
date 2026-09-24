@@ -114,7 +114,7 @@ async def use_boost(db: AsyncSession, user_id: int, boost_key: str, quantity: in
 
 
 async def grant_boost_items(db: AsyncSession, user_id: int, boost_key: str, quantity: int) -> None:
-    from sqlalchemy.dialects.postgresql import insert
+    from ..db import upsert as insert
 
     snap = get_registry().snap
     boost = snap.boosts.get(boost_key)

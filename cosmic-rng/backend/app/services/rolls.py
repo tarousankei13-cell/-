@@ -20,11 +20,11 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import literal_column, select, update
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from ..content.registry import ItemDef, Snapshot, get_registry
+from ..db import is_sqlite, upsert as insert
 from ..core.errors import AppError, Forbidden, RateLimited
 from ..core.pubsub import queue_event
 from ..core.timeutil import utcnow
@@ -294,9 +294,18 @@ def sell_price(env: Env, info: dict[str, Any], count: int = 1) -> int:
 
 
 async def collection_upsert(db: AsyncSession, user_id: int, item_id: int, count: int) -> bool:
+    """Record the item in the player's collection; True if this is their first one."""
     stmt = insert(Collection).values(user_id=user_id, item_id=item_id, times_obtained=count)
     stmt = stmt.on_conflict_do_update(index_elements=["user_id", "item_id"],
                                       set_={"times_obtained": Collection.times_obtained + count})
+    if is_sqlite():
+        # No xmax, but SQLite has a single writer: this transaction already holds the
+        # write lock, so a pre-check cannot race with another insert.
+        existed = (await db.execute(
+            select(Collection.user_id).where(Collection.user_id == user_id, Collection.item_id == item_id)
+        )).first() is not None
+        await db.execute(stmt)
+        return not existed
     res = await db.execute(stmt.returning(literal_column("(xmax = 0)").label("inserted")))
     return bool(res.scalar_one())
 

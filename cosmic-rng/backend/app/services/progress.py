@@ -14,11 +14,11 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, update
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from ..content.registry import Snapshot, get_registry
+from ..db import upsert as insert
 from ..core.errors import AppError, NotFound
 from ..core.pubsub import queue_event
 from ..core.timeutil import period_key, utcnow

@@ -1,4 +1,10 @@
-"""Database backup / restore via pg_dump / pg_restore (custom format)."""
+"""Database backup / restore.
+
+PostgreSQL uses ``pg_dump``/``pg_restore`` in custom format. SQLite uses the
+online backup API, which snapshots a live database consistently without stopping
+the server and, on restore, writes the pages back through SQLite itself so open
+connections stay valid.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -15,11 +21,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import get_settings
 from ..core.errors import AppError, NotFound
 from ..core.timeutil import utcnow
+from ..db import is_sqlite, sqlite_path
 from ..models import Backup
 
 log = logging.getLogger("cosmic.backup")
-NAME_RE = re.compile(r"^cosmic-rng-\d{8}-\d{6}(-[a-z]+)?\.dump$")
+NAME_RE = re.compile(r"^cosmic-rng-\d{8}-\d{6}(-[a-z]+)?\.(dump|sqlite3)$")
 _lock = asyncio.Lock()
+
+
+def _sqlite_copy(src: Path, dst: Path) -> None:
+    """Consistent copy of a live SQLite database (blocking; run in a thread)."""
+    import sqlite3
+
+    source = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=60)
+    try:
+        target = sqlite3.connect(dst, timeout=60)
+        try:
+            target.execute("PRAGMA busy_timeout=60000")
+            source.backup(target)
+        finally:
+            target.close()
+    finally:
+        source.close()
 
 
 def _conn_env() -> tuple[list[str], dict[str, str]]:
@@ -53,13 +76,21 @@ async def create(db: AsyncSession, *, kind: str = "manual", by: int | None = Non
     if _lock.locked():
         raise AppError("別のバックアップ/リストアが実行中です", code="backup_busy", status_code=409)
     async with _lock:
-        name = f"cosmic-rng-{utcnow().strftime('%Y%m%d-%H%M%S')}-{kind}.dump"
+        ext = "sqlite3" if is_sqlite() else "dump"
+        name = f"cosmic-rng-{utcnow().strftime('%Y%m%d-%H%M%S')}-{kind}.{ext}"
         path = backup_dir() / name
         row = Backup(filename=name, kind=kind, status="running", created_by=by, note=note)
         db.add(row)
         await db.commit()
-        args, env = _conn_env()
-        code, err = await _run([get_settings().pg_dump_path, "-Fc", "--no-owner", "-f", str(path), *args], env)
+        if is_sqlite():
+            try:
+                await asyncio.to_thread(_sqlite_copy, sqlite_path(), path)
+                code, err = 0, ""
+            except Exception as exc:  # noqa: BLE001 - reported through the backup row
+                code, err = 1, f"{type(exc).__name__}: {exc}"
+        else:
+            args, env = _conn_env()
+            code, err = await _run([get_settings().pg_dump_path, "-Fc", "--no-owner", "-f", str(path), *args], env)
         row.finished_at = utcnow()
         if code == 0 and path.exists():
             row.status = "done"
@@ -97,7 +128,7 @@ async def list_backups(db: AsyncSession) -> list[dict[str, Any]]:
     known = {r.filename for r in rows}
     out = [backup_public(r, (backup_dir() / r.filename).exists()) for r in rows]
     # Files created by the CLI/cron script that are not in the table (e.g. after a restore)
-    for p in sorted(backup_dir().glob("cosmic-rng-*.dump"), reverse=True):
+    for p in sorted(backup_dir().glob("cosmic-rng-*.*"), reverse=True):
         if p.name not in known and NAME_RE.match(p.name):
             out.append({"id": None, "filename": p.name, "size_bytes": p.stat().st_size, "kind": "file", "status": "done", "note": None,
                         "created_by": None, "created_at": None, "finished_at": None, "file_exists": True})
@@ -119,6 +150,12 @@ async def restore(filename: str) -> tuple[bool, str]:
     if _lock.locked():
         raise AppError("別のバックアップ/リストアが実行中です", code="backup_busy", status_code=409)
     async with _lock:
+        if is_sqlite():
+            try:
+                await asyncio.to_thread(_sqlite_copy, path, sqlite_path())
+            except Exception as exc:  # noqa: BLE001 - reported to the caller
+                return False, f"{type(exc).__name__}: {exc}"
+            return True, ""
         args, env = _conn_env()
         code, err = await _run([get_settings().pg_restore_path, "--clean", "--if-exists", "--no-owner", "--single-transaction",
                                 *args, str(path)], env, timeout=7200)

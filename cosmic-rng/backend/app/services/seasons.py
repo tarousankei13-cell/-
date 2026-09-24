@@ -6,9 +6,9 @@ import time
 from typing import Any
 
 from sqlalchemy import func, select
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..db import greatest, upsert as insert
 from ..core.timeutil import utcnow
 from ..models import Ranking, Season, SeasonStats, User
 
@@ -46,7 +46,7 @@ async def add_stats(db: AsyncSession, user_id: int, *, rolls: int = 0, points: i
         set_={
             "rolls": SeasonStats.rolls + rolls,
             "points": SeasonStats.points + points,
-            "best_odds": func.greatest(SeasonStats.best_odds, best_odds),
+            "best_odds": greatest(SeasonStats.best_odds, best_odds),
             "first_discoveries": SeasonStats.first_discoveries + first_discoveries,
         },
     )

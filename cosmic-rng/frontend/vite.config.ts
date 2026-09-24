@@ -4,6 +4,8 @@ import react from "@vitejs/plugin-react";
 // In development the Vite dev server proxies API and WebSocket traffic to FastAPI.
 // In production Nginx serves dist/ and proxies /api and /ws.
 export default defineConfig({
+  // Relative asset URLs: the bundle must load from any mount prefix.
+  base: "./",
   plugins: [react()],
   server: {
     host: "127.0.0.1",

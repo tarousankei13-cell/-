@@ -5,10 +5,10 @@ from collections import OrderedDict
 from typing import Any
 
 from sqlalchemy import Select, and_, case, delete, func, select, update
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..content.registry import get_registry
+from ..db import upsert as insert
 from ..core.errors import AppError, Forbidden, NotFound
 from ..models import Item, ItemInstance, Rarity, UserItemPref, UserUnlock
 from .constants import SERIAL_MIN_TIER

@@ -3,7 +3,8 @@
 Events produced by any worker (rare drops, biome changes, trade updates, admin
 broadcasts ...) must reach WebSocket clients connected to *any* worker. With
 ``EVENT_BUS=postgres`` events travel through PostgreSQL LISTEN/NOTIFY (no extra
-infrastructure); ``local`` dispatches in-process (single worker / tests).
+infrastructure); ``local`` dispatches in-process (single worker / SQLite / tests)
+and is selected automatically when there is no PostgreSQL to listen on.
 
 Envelope: {"scope": "all"|"user"|"admins", "user_id": int|None, "type": str, "data": {...}}
 """
@@ -15,9 +16,8 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-import asyncpg
-
 from ..config import get_settings
+from ..db import is_sqlite
 
 log = logging.getLogger("cosmic.pubsub")
 
@@ -29,7 +29,7 @@ MAX_PAYLOAD = 7800
 class EventBus:
     def __init__(self) -> None:
         self._handlers: list[Handler] = []
-        self._conn: asyncpg.Connection | None = None
+        self._conn: Any | None = None
         self._mode = "local"
         self._task: asyncio.Task[None] | None = None
         self._closing = False
@@ -39,12 +39,15 @@ class EventBus:
 
     async def start(self) -> None:
         s = get_settings()
-        self._mode = s.event_bus
+        # A single SQLite process has nothing to broadcast to but itself.
+        self._mode = "local" if is_sqlite() else s.event_bus
         if self._mode == "postgres":
             await self._connect()
             self._task = asyncio.create_task(self._watchdog())
 
     async def _connect(self) -> None:
+        import asyncpg
+
         dsn = get_settings().sync_database_url
         self._conn = await asyncpg.connect(dsn)
         await self._conn.add_listener(CHANNEL, self._on_notify)

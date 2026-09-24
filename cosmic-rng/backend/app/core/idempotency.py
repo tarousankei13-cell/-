@@ -16,9 +16,9 @@ from typing import Any
 
 from fastapi import Request
 from sqlalchemy import select, update
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..db import upsert as insert
 from ..models import IdempotencyKey
 from .errors import AppError, Conflict
 

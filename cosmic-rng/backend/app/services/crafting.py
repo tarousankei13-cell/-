@@ -5,10 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..content.registry import get_registry
+from ..db import upsert as insert
 from ..core.errors import AppError, Forbidden, NotFound
 from ..core.timeutil import utcnow
 from ..models import ActiveEffect, User, UserRecipe

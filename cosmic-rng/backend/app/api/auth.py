@@ -55,7 +55,7 @@ async def login(request: Request, next: str | None = Query(default=None)) -> Red
               "scope": "identify", "state": state, "prompt": "none"}
     resp = RedirectResponse(f"{s.discord_oauth_authorize_url}?{urlencode(params)}", status_code=302)
     resp.set_cookie(OAUTH_COOKIE, sign_value(f"{state}~{_safe_next(next)}", 600), max_age=600, httponly=True,
-                    secure=s.cookie_secure, samesite="lax", path="/api/auth")
+                    secure=s.cookie_secure, samesite="lax", path=s.url("/api/auth"))
     return resp
 
 
@@ -88,13 +88,13 @@ async def _finish_login(db: AsyncSession, request: Request, profile: dict[str, A
 
         if not user.status_until or user.status_until > utcnow():
             await db.commit()
-            return RedirectResponse("/?error=banned", status_code=302)
+            return RedirectResponse(get_settings().url("/?error=banned"), status_code=302)
     await progress_svc.ensure_quests(db, user)
     token = await create_session(db, user, request)
     await db.commit()
-    resp = RedirectResponse(next_url if not created else "/roll?welcome=1", status_code=302)
+    resp = RedirectResponse(get_settings().url(next_url if not created else "/roll?welcome=1"), status_code=302)
     set_session_cookie(resp, token)
-    resp.delete_cookie(OAUTH_COOKIE, path="/api/auth")
+    resp.delete_cookie(OAUTH_COOKIE, path=get_settings().url("/api/auth"))
     return resp
 
 
@@ -103,21 +103,21 @@ async def callback(request: Request, code: str | None = None, state: str | None 
                    db: AsyncSession = Depends(get_db)) -> RedirectResponse:
     limiter.check("auth", client_ip(request))
     if error:
-        return RedirectResponse("/?error=oauth_denied", status_code=302)
+        return RedirectResponse(get_settings().url("/?error=oauth_denied"), status_code=302)
     raw = unsign_value(request.cookies.get(OAUTH_COOKIE))
     if not raw or not code or not state:
-        return RedirectResponse("/?error=oauth_state", status_code=302)
+        return RedirectResponse(get_settings().url("/?error=oauth_state"), status_code=302)
     expected, _, next_url = raw.partition("~")
     if not secrets.compare_digest(expected, state):
-        return RedirectResponse("/?error=oauth_state", status_code=302)
+        return RedirectResponse(get_settings().url("/?error=oauth_state"), status_code=302)
     try:
         profile = await _exchange_code(code)
     except AppError:
-        return RedirectResponse("/?error=oauth_failed", status_code=302)
+        return RedirectResponse(get_settings().url("/?error=oauth_failed"), status_code=302)
     try:
         return await _finish_login(db, request, profile, _safe_next(next_url))
     except AppError as e:
-        return RedirectResponse(f"/?error={e.code}", status_code=302)
+        return RedirectResponse(get_settings().url(f"/?error={e.code}"), status_code=302)
 
 
 class DevLogin(BaseModel):

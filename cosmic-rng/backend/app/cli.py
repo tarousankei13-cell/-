@@ -20,12 +20,37 @@ from .config import BASE_DIR, get_settings
 
 
 def _alembic_upgrade() -> None:
+    """Bring the schema up to date.
+
+    The Alembic revisions are written against PostgreSQL (JSONB, BIGSERIAL,
+    timestamptz). SQLite mode has no upgrade history to replay -- the single file
+    either exists at the current schema or is created from the models -- so there
+    the schema is emitted straight from the metadata, which carries the same
+    tables, constraints and indexes through the dialect variants in app.db.
+    """
+    from .db import is_sqlite
+
+    if is_sqlite():
+        asyncio.run(_create_all())
+        return
     from alembic import command
     from alembic.config import Config
 
     cfg = Config(str(BASE_DIR / "alembic.ini"))
     cfg.set_main_option("script_location", str(BASE_DIR / "migrations"))
     command.upgrade(cfg, "head")
+
+
+async def _create_all() -> None:
+    from .db import Base, dispose_engine, get_engine, sqlite_path
+    from . import models  # noqa: F401 - registers every table on Base.metadata
+
+    sqlite_path().parent.mkdir(parents=True, exist_ok=True)
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    await dispose_engine()
+    print(f"schema ready: {sqlite_path()}")
 
 
 async def _seed(force: bool) -> None:
@@ -83,11 +108,23 @@ async def _check() -> None:
     print("discord oauth configured:", bool(s.discord_client_id and s.discord_client_secret and s.discord_redirect_uri))
     print("discord bot token (DM notifications):", bool(s.discord_bot_token))
     print("admin discord ids:", sorted(s.admin_ids))
+    from .db import is_sqlite
+
     async with session_scope() as db:
-        v = (await db.execute(text("SELECT version()"))).scalar_one()
-        print("database:", v.split(",")[0])
-        rev = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar_one_or_none()
-        print("migration revision:", rev)
+        if is_sqlite():
+            from .db import sqlite_path
+
+            v = (await db.execute(text("SELECT sqlite_version()"))).scalar_one()
+            path = sqlite_path()
+            size = f"{path.stat().st_size / 1_048_576:.1f} MB" if path.exists() else "not created yet"
+            print(f"database: SQLite {v} ({path}, {size})")
+            tables = (await db.execute(text("SELECT count(*) FROM sqlite_master WHERE type='table'"))).scalar_one()
+            print("tables:", tables)
+        else:
+            v = (await db.execute(text("SELECT version()"))).scalar_one()
+            print("database:", v.split(",")[0])
+            rev = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar_one_or_none()
+            print("migration revision:", rev)
     print("backup dir:", Path(s.backup_dir).resolve())
 
 

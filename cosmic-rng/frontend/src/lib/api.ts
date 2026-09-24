@@ -1,4 +1,5 @@
 /** Thin fetch wrapper: same-origin cookies, CSRF header, idempotency keys, typed errors. */
+import { withBase } from "./base";
 
 export class ApiError extends Error {
   code: string;
@@ -31,6 +32,7 @@ export interface RequestOptions {
 }
 
 function buildUrl(path: string, query?: RequestOptions["query"]) {
+  path = withBase(path);
   if (!query) return path;
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(query)) {

@@ -7,13 +7,13 @@ import random
 from datetime import timedelta
 from typing import Any
 
-from sqlalchemy import and_, delete, func, or_, select, text
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import and_, delete, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import models as m
 from ..content.registry import bump_content_version, get_registry
 from ..content.settings_schema import DEF_MAP, definitions_public, validate_setting
+from ..db import is_sqlite, upsert as insert
 from ..core.errors import AppError, Forbidden, NotFound
 from ..core.pubsub import queue_event
 from ..core.security import Principal, compute_admin, revoke_user_sessions
@@ -40,7 +40,7 @@ async def dashboard(db: AsyncSession) -> dict[str, Any]:
     snap = get_registry().snap
     online_cut = now - timedelta(seconds=90)
     day = now - timedelta(days=1)
-    q = lambda stmt: db.execute(stmt)  # noqa: E731
+    q = lambda stmt, params=None: db.execute(stmt, params)  # noqa: E731
     online = (await q(select(func.count()).select_from(m.User).where(m.User.last_seen_at > online_cut))).scalar_one()
     users_total = (await q(select(func.count()).select_from(m.User))).scalar_one()
     rolls_10s = (await q(select(func.count()).select_from(m.Roll).where(m.Roll.created_at > now - timedelta(seconds=10)))).scalar_one()
@@ -58,12 +58,22 @@ async def dashboard(db: AsyncSession) -> dict[str, Any]:
     biome_rows = (await q(select(m.UserBiome.biome_key, func.count()).join(m.User, m.User.id == m.UserBiome.user_id)
                           .where(m.User.last_seen_at > online_cut, or_(m.UserBiome.ends_at.is_(None), m.UserBiome.ends_at > now))
                           .group_by(m.UserBiome.biome_key))).all()
-    per_min = (await q(text(
-        "SELECT to_char(date_trunc('minute', created_at), 'HH24:MI') AS t, count(*) AS n FROM rolls "
-        "WHERE created_at > now() - interval '60 minutes' GROUP BY date_trunc('minute', created_at) ORDER BY 1"))).all()
-    rare_hour = (await q(text(
-        "SELECT to_char(date_trunc('hour', created_at), 'MM-DD HH24:00') AS t, count(*) AS n FROM rolls "
-        "WHERE tier >= 4 AND created_at > now() - interval '24 hours' GROUP BY date_trunc('hour', created_at) ORDER BY 1"))).all()
+    if is_sqlite():
+        per_min = (await q(text(
+            "SELECT strftime('%H:%M', created_at) AS t, count(*) AS n FROM rolls "
+            "WHERE created_at > :cut GROUP BY t ORDER BY 1"), {"cut": now - timedelta(minutes=60)})).all()
+        rare_hour = (await q(text(
+            "SELECT strftime('%m-%d %H:00', created_at) AS t, count(*) AS n FROM rolls "
+            "WHERE tier >= 4 AND created_at > :cut GROUP BY t ORDER BY 1"), {"cut": day})).all()
+    else:
+        per_min = (await q(text(
+            "SELECT to_char(date_trunc('minute', created_at), 'HH24:MI') AS t, count(*) AS n FROM rolls "
+            "WHERE created_at > :cut GROUP BY date_trunc('minute', created_at) ORDER BY 1"),
+            {"cut": now - timedelta(minutes=60)})).all()
+        rare_hour = (await q(text(
+            "SELECT to_char(date_trunc('hour', created_at), 'MM-DD HH24:00') AS t, count(*) AS n FROM rolls "
+            "WHERE tier >= 4 AND created_at > :cut GROUP BY date_trunc('hour', created_at) ORDER BY 1"),
+            {"cut": day})).all()
     tier_dist = (await q(select(m.Roll.tier, func.count()).where(m.Roll.created_at > now - timedelta(hours=1)).group_by(m.Roll.tier))).all()
     recent_errors = (await q(select(m.ErrorLog).order_by(m.ErrorLog.id.desc()).limit(8))).scalars().all()
     notes = (await q(select(m.Notification).where(m.Notification.for_admins.is_(True)).order_by(m.Notification.id.desc()).limit(12))).scalars().all()
@@ -276,7 +286,7 @@ async def user_action(db: AsyncSession, principal: Principal, user_id: int, acti
             raise AppError("ロールが不正です", code="invalid_role")
         old, user.role, new = user.role, role, role
         if role == "player":
-            await db.execute(text("UPDATE sessions SET admin_mode = false WHERE user_id = :u"), {"u": user.id})
+            await db.execute(update(m.Session).where(m.Session.user_id == user.id).values(admin_mode=False))
     elif action == "grant_artifact":
         result = await artifacts_svc.grant(db, principal, user.id, str(p.get("artifact_key")), can_use=bool(p.get("can_use")),
                                            uses=int(p["uses"]) if p.get("uses") else None,

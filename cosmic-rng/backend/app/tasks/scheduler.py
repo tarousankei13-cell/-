@@ -3,7 +3,8 @@
 Per-worker loops: content freshness, stat buffer flush, WebSocket presence and
 biome ticks. Cluster-wide jobs (expiry, rankings push, Discord outbox, season
 transitions, retention) run only on the leader worker, elected with a
-PostgreSQL advisory lock held on a dedicated connection.
+PostgreSQL advisory lock held on a dedicated connection. In SQLite mode there is
+exactly one worker, so it is the leader from the start and no lock is needed.
 """
 from __future__ import annotations
 
@@ -14,15 +15,14 @@ from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from typing import Any
 
-import asyncpg
-from sqlalchemy import delete, text
+from sqlalchemy import delete, func, select, text
 
 from ..config import get_settings
 from ..content.registry import get_registry
 from ..core.pubsub import bus
 from ..core.timeutil import utcnow
-from ..db import session_scope
-from ..models import IdempotencyKey, Notification, Session as DBSession, WorldEvent
+from ..db import is_sqlite, session_scope
+from ..models import IdempotencyKey, Notification, Session as DBSession, User, WorldEvent
 from ..rng.engine import table_cache
 from ..services import admin_content, discord_notify, effects as effects_svc, market as market_svc, rankings as rankings_svc
 from ..services import seasons as seasons_svc, stats as stats_svc, trades as trades_svc
@@ -37,7 +37,7 @@ class Scheduler:
     def __init__(self) -> None:
         self.tasks: list[asyncio.Task[Any]] = []
         self.is_leader = False
-        self._leader_conn: asyncpg.Connection | None = None
+        self._leader_conn: Any | None = None
         self._last_rank_sig = ""
         self._stop = asyncio.Event()
 
@@ -90,6 +90,12 @@ class Scheduler:
         return wrapper
 
     async def _leader_election(self) -> None:
+        if is_sqlite():
+            self.is_leader = True
+            log.info("single-process mode: this worker is the scheduler leader")
+            return
+        import asyncpg
+
         while not self._stop.is_set():
             try:
                 if self._leader_conn is None or self._leader_conn.is_closed():
@@ -130,7 +136,8 @@ class Scheduler:
     # --- leader --------------------------------------------------------------
     async def _push_online(self) -> None:
         async with session_scope() as db:
-            n = (await db.execute(text("SELECT count(*) FROM users WHERE last_seen_at > now() - interval '90 seconds'"))).scalar_one()
+            cutoff = utcnow() - timedelta(seconds=90)
+            n = (await db.execute(select(func.count()).select_from(User).where(User.last_seen_at > cutoff))).scalar_one()
         await bus.publish("all", "online", {"count": int(n)})
 
     async def _push_rankings(self) -> None:
