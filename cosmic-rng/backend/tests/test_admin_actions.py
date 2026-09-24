@@ -168,3 +168,32 @@ async def test_bulk_is_admin_only(app):
     r = await p.post("/api/admin/bulk", json={"op": "recompute_stats", "params": {}, "reason": "x"})
     assert r.status_code == 404, "the endpoint must not even exist for a normal player"
     await p.c.aclose()
+
+
+def test_every_seeded_content_row_has_a_japanese_name_or_already_is_one():
+    """A shop shelf or a season with a bare English label is the case players
+    hit most often, because those pages are visited every session."""
+    import re
+
+    from app.content import seed_names_ja as ja
+    from app.content import seed_items, seed_progress, seed_world
+
+    ASCII = re.compile(r"^[\x20-\x7e]+$")
+    sources = {
+        "items": [*seed_items.GENERAL_ITEMS, *seed_items.BIOME_ITEMS, *seed_items.SPECIAL_ITEMS],
+        "rarities": seed_items.RARITIES, "biomes": seed_world.BIOMES,
+        "equipment": seed_world.EQUIPMENT, "boosts": seed_world.BOOSTS, "recipes": seed_world.RECIPES,
+        "shops": seed_world.SHOPS, "shop_items": seed_world.SHOP_ITEMS, "cosmetics": seed_world.COSMETICS,
+        "quests": seed_progress.QUESTS, "achievements": seed_progress.ACHIEVEMENTS,
+    }
+    missing = []
+    for table, rows in sources.items():
+        names = ja.BY_TABLE.get(table, {})
+        for row in rows:
+            name = row.get("name") or ""
+            # A name that is already Japanese needs no second one.
+            if not ASCII.match(name):
+                continue
+            if not names.get(row["key"]):
+                missing.append(f"{table}/{row['key']} ({name})")
+    assert not missing, "untranslated: " + ", ".join(missing[:20])

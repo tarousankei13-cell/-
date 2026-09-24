@@ -144,6 +144,7 @@ export interface HudState {
 export interface Fortune {
   key: string;
   label: string;
+  label_ja?: string | null;
   top_percent: number;
   score: number;
 }
@@ -184,7 +185,7 @@ export interface RollResult {
   final_chance: number;
   final_odds: number | null;
   luck: LuckBreakdown;
-  biome: { key: string; name: string; state: string | null };
+  biome: { key: string; name: string; name_ja?: string | null; state: string | null };
   special: boolean;
   hidden_special: { key: string; name: string } | null;
   effects_applied: string[];

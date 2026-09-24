@@ -124,7 +124,7 @@ function ResultStrip({ roll }: { roll: RollResult }) {
           {roll.auto_sold > 0 && ` · +✦${fmtInt(roll.auto_sold)}`}
         </div>
       </div>
-      <span className="tiny" style={{ color: "var(--gold)" }}>{roll.fortune.label}</span>
+      <span className="tiny" style={{ color: "var(--gold)" }}>{roll.fortune.label_ja || roll.fortune.label}</span>
     </div>
   );
 }
@@ -161,20 +161,18 @@ export function RollPage() {
     setLastError(null);
     audio.sfx("roll_start", 0.8);
     getCosmos()?.pulse(hud?.biome?.theme?.accent ?? "#8ab4ff", 0.16);
+    // Hold notifications from here, not from when the cutscene mounts: the
+    // socket can announce this very roll before its response has arrived.
+    useGame.getState().setToastHold(true);
     try {
       const res = await post<RollResponse>("/api/roll", { auto: autoRef.current });
       setHud(res.state);
       const roll = res.roll;
       setHistory((h) => [roll, ...h].slice(0, 40));
-      useGame.getState().announceAchievements(roll.progress.achievements);
-      if (roll.progress.level_up) {
-        audio.sfx("level_up");
-        toast(`LEVEL UP — Lv.${roll.progress.level_up.to}`, "success",
-          roll.progress.unlocked.length ? `解放: ${roll.progress.unlocked.join(", ")}` : undefined);
-      }
-      for (const q of roll.progress.quests_completed) toast(`クエスト達成: ${q.name}`, "success", "報酬を受け取れます");
-      if (res.offline) enqueue({ type: "offline", summary: res.offline });
 
+      // Queue the cutscene before anything that raises a toast: the store holds
+      // notifications back while a reveal is on screen, and it can only do that
+      // if it already knows one is coming.
       const skippedByFilter = skipThreshold > 0 && roll.odds < skipThreshold && roll.item.tier < cutsceneTier;
       const cutscenesOn = settings?.roll.cutscenes !== false;
       const forceFull = roll.item.tier >= cutsceneTier || !!roll.first_discovery || roll.item.rarity === "admin";
@@ -184,6 +182,16 @@ export function RollPage() {
         audio.sfx(roll.item.tier >= 3 ? "reveal_epic" : roll.item.tier >= 2 ? "reveal_rare" : "reveal_common", 0.7);
         if (roll.item.tier >= 4) getCosmos()?.pulse(roll.item.visual?.glow ?? "#fff", 0.4);
       }
+      useGame.getState().setToastHold(false);
+
+      useGame.getState().announceAchievements(roll.progress.achievements);
+      if (roll.progress.level_up) {
+        audio.sfx("level_up");
+        toast(`LEVEL UP — Lv.${roll.progress.level_up.to}`, "success",
+          roll.progress.unlocked.length ? `解放: ${roll.progress.unlocked.join(", ")}` : undefined);
+      }
+      for (const q of roll.progress.quests_completed) toast(`クエスト達成: ${q.name}`, "success", "報酬を受け取れます");
+      if (res.offline) enqueue({ type: "offline", summary: res.offline });
     } catch (e) {
       const err = e as ApiError;
       if (err.code === "cooldown") {
@@ -197,6 +205,9 @@ export function RollPage() {
         setAuto(false);
       }
     } finally {
+      // A thrown roll never reaches the release above, and a permanent hold
+      // would silence the game.
+      useGame.getState().setToastHold(false);
       rollingRef.current = false;
       setBusy(false);
     }
@@ -438,7 +449,7 @@ function FeedRow({ ev }: { ev: FeedEvent }) {
   if (ev.type === "first_discovery") {
     return (
       <div className="feed-row first">
-        <span className="badge" style={{ color: "var(--gold)" }}>WORLD FIRST</span>
+        <span className="badge" style={{ color: "var(--gold)" }}>世界初</span>
         {item && <ItemIcon visual={item.visual} tier={item.tier} size={20} animate={false} />}
         <span className="ellipsis" style={{ flex: 1 }}>
           <span className={`r-${item?.rarity}`}>{item?.name}</span> — {ev.user ? <UserChip user={ev.user} size={16} /> : <span className="faint">匿名</span>}
@@ -474,7 +485,7 @@ function FeedRow({ ev }: { ev: FeedEvent }) {
   if (ev.type === "world_first_achievement") {
     return (
       <div className="feed-row first">
-        <span className="badge" style={{ color: "var(--good)" }}>ACHIEVEMENT</span>
+        <span className="badge" style={{ color: "var(--good)" }}>実績</span>
         <span className="ellipsis" style={{ flex: 1 }}>{p.name}</span>
         {ev.user && <UserChip user={ev.user} size={16} />}
       </div>

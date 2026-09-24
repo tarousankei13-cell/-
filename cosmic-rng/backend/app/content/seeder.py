@@ -39,7 +39,7 @@ async def backfill_names_ja(db: AsyncSession) -> int:
     """
     filled = 0
     for model in (m.Rarity, m.Item, m.Biome, m.Equipment, m.Boost, m.Recipe, m.Shop,
-                  m.Cosmetic, m.Quest, m.Achievement):
+                  m.ShopItem, m.Cosmetic, m.Quest, m.Achievement, m.Season):
         table = model.__tablename__
         names = seed_names_ja.BY_TABLE.get(table)
         if not names:

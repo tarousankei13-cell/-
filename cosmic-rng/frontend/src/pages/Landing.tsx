@@ -16,7 +16,7 @@ const FEATURES = [
   { icon: "🌌", title: "個人Biome", body: "毎秒抽選される17種のBiome。Void RiftやSingularityでは世界が別物になります。" },
   { icon: "✦", title: "超レア演出", body: "レア度が上がるほど演出は長く豪華に。最高レアは30秒級のクライマックス。" },
   { icon: "🏆", title: "世界初発見", body: "誰も引いたことのないアイテムを最初に引くと、世界中に通知されます。" },
-  { icon: "🤝", title: "Market / Trade", body: "プレイヤー同士で売買・交換・贈与。相場も履歴も残ります。" },
+  { icon: "🤝", title: "市場・取引", body: "プレイヤー同士で売買・交換・贈与。相場も履歴も残ります。" },
   { icon: "🌙", title: "オフラインRoll", body: "ブラウザを閉じている間もAuto Rollが進行。復帰時にまとめて結果を確認。" },
 ];
 

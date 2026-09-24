@@ -5,19 +5,19 @@ import { Empty, ErrorBox, Spinner, Tabs, UserChip, Name } from "../components/ui
 import { fmtCompact, fmtDate, fmtInt, fmtOdds } from "../lib/format";
 
 const BOARDS = [
-  { key: "rolls", label: "Total Rolls" },
-  { key: "best", label: "Best Rarity" },
-  { key: "collection", label: "Collection" },
-  { key: "achievements", label: "Achievements" },
-  { key: "wealth", label: "Wealth" },
-  { key: "firsts", label: "First Discoveries" },
-  { key: "season", label: "Season" },
+  { key: "rolls", label: "総Roll数" },
+  { key: "best", label: "最高レア度" },
+  { key: "collection", label: "図鑑" },
+  { key: "achievements", label: "実績" },
+  { key: "wealth", label: "資産" },
+  { key: "firsts", label: "世界初発見" },
+  { key: "season", label: "シーズン" },
 ];
 
 const SEASON_METRICS = [
-  { key: "points", label: "Points" },
-  { key: "rolls", label: "Rolls" },
-  { key: "best", label: "Best" },
+  { key: "points", label: "ポイント" },
+  { key: "rolls", label: "Roll数" },
+  { key: "best", label: "最高" },
   { key: "firsts", label: "Firsts" },
 ];
 

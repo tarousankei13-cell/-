@@ -56,6 +56,10 @@ interface GameStore {
   connected: boolean;
   bootstrapped: boolean;
   toasts: Toast[];
+  /** Toasts withheld while a cutscene is on screen. */
+  heldToasts: Toast[];
+  /** Set while a roll is in flight, before its cutscene exists to hold them. */
+  toastHold: boolean;
   reveals: RevealJob[];
   worldBanners: FirstDiscovery[];
   adminStats: Record<string, any> | null;
@@ -69,6 +73,8 @@ interface GameStore {
   setStardust: (n: number) => void;
   toast: (title: string, kind?: Toast["kind"], body?: string, ttl?: number) => void;
   dismissToast: (id: number) => void;
+  flushHeldToasts: () => void;
+  setToastHold: (on: boolean) => void;
   pushFeed: (ev: FeedEvent) => void;
   setFeed: (evs: FeedEvent[]) => void;
   saveSettings: (patch: Partial<PlayerSettings> | Record<string, any>) => Promise<void>;
@@ -94,6 +100,8 @@ export const useGame = create<GameStore>((set, getState) => ({
   connected: false,
   bootstrapped: false,
   toasts: [],
+  heldToasts: [],
+  toastHold: false,
   reveals: [],
   worldBanners: [],
   adminStats: null,
@@ -138,14 +146,42 @@ export const useGame = create<GameStore>((set, getState) => ({
   setStardust: (n) => set((s) => ({ hud: s.hud ? { ...s.hud, stardust: n } : s.hud, me: s.me ? { ...s.me, user: { ...s.me.user, stardust: n } } : s.me })),
 
   toast: (title, kind = "info", body, ttl = 4200) => {
-    const me = getState().me;
-    if (me && !me.settings.notifications.toasts && kind === "info") return;
+    const st = getState();
+    if (st.me && !st.me.settings.notifications.toasts && kind === "info") return;
     const t: Toast = { id: toastId++, kind, title, body, ttl };
-    set((s) => ({ toasts: [...s.toasts.slice(-4), t] }));
+    // A reveal is the moment the whole game is built around; five notification
+    // cards stacked over it is the opposite of a payoff. Hold them and show the
+    // lot once the stage is clear.
+    // The socket announces a world first as soon as the server commits it, which
+    // can land before the roll's own response has come back and queued the
+    // cutscene. Without the hold flag that one notification beats the reveal
+    // onto the screen — and it is the notification for the very item being
+    // revealed.
+    if (st.reveals.length > 0 || st.toastHold) {
+      set((s) => ({ heldToasts: [...s.heldToasts, t].slice(-8) }));
+      return;
+    }
+    set((s) => ({ toasts: [...s.toasts.slice(-2), t] }));
     window.setTimeout(() => getState().dismissToast(t.id), ttl);
   },
 
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
+
+  setToastHold: (on) => {
+    set({ toastHold: on });
+    if (!on && getState().reveals.length === 0) getState().flushHeldToasts();
+  },
+
+  /** Release what the cutscene held back, spaced so they can be read. */
+  flushHeldToasts: () => {
+    const held = getState().heldToasts;
+    if (!held.length) return;
+    set({ heldToasts: [] });
+    held.forEach((t, i) => window.setTimeout(() => {
+      set((s) => ({ toasts: [...s.toasts.slice(-2), t] }));
+      window.setTimeout(() => getState().dismissToast(t.id), t.ttl);
+    }, i * 550));
+  },
 
   pushFeed: (ev) => set((s) => (s.feed.some((f) => f.id === ev.id) ? {} : { feed: [ev, ...s.feed].slice(0, 60) })),
   setFeed: (evs) => set({ feed: evs.slice(0, 60) }),
@@ -156,7 +192,10 @@ export const useGame = create<GameStore>((set, getState) => ({
   },
 
   enqueueReveal: (job) => set((s) => ({ reveals: [...s.reveals, job].slice(-20) })),
-  shiftReveal: () => set((s) => ({ reveals: s.reveals.slice(1) })),
+  shiftReveal: () => {
+    set((s) => ({ reveals: s.reveals.slice(1) }));
+    if (getState().reveals.length === 0 && !getState().toastHold) getState().flushHeldToasts();
+  },
   pushBanner: (b) => set((s) => ({ worldBanners: [...s.worldBanners, b].slice(-5) })),
   shiftBanner: () => set((s) => ({ worldBanners: s.worldBanners.slice(1) })),
 

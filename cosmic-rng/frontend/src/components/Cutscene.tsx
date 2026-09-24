@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ItemIcon } from "./ItemIcon";
+import { Name } from "./ui";
 import { fmtInt, fmtLuck, fmtOdds, fmtPercent } from "../lib/format";
 import type { RollResult } from "../lib/types";
 import { audio } from "../audio/engine";
@@ -245,23 +246,31 @@ export function RollCutscene({ roll, cosmos, onDone }: { roll: RollResult; cosmo
         {showItem && (
           <div className="cut-item">
             {first && has("full") && (
-              <div className="cut-banner" style={{ color: "var(--gold)" }}>FIRST DISCOVERY</div>
+              <div className="cut-banner" style={{ color: "var(--gold)" }}>FIRST DISCOVERY<span className="cut-banner-ja">世界初発見</span></div>
             )}
             <div className={`cut-icon-wrap ${!revealed ? "silhouette" : "reveal-flash"}`} style={{ ["--glow" as any]: glow }}>
               <ItemIcon visual={roll.item.visual} tier={tier} size={Math.min(260, Math.max(120, 90 + tier * 22))} animate={!reduced} />
             </div>
             {showName && (
-              <div
-                className={`cut-name r-${roll.item.rarity} ${isAdmin || tier >= 7 ? "glitch-text" : ""}`}
-                data-text={roll.item.name}
-                style={{ color: rarity?.color }}
-              >
-                {roll.item.name}
-              </div>
+              <>
+                <div
+                  className={`cut-name r-${roll.item.rarity} ${isAdmin || tier >= 7 ? "glitch-text" : ""}`}
+                  data-text={roll.item.name}
+                  style={{ color: rarity?.color }}
+                >
+                  {roll.item.name}
+                </div>
+                {roll.item.name_ja && roll.item.name_ja !== roll.item.name && (
+                  <div className="cut-name-ja">{roll.item.name_ja}</div>
+                )}
+              </>
             )}
             {showName && (
               <div className="row-wrap" style={{ justifyContent: "center", gap: 8 }}>
-                <span className={`badge r-${roll.item.rarity}`}>{rarity?.name ?? roll.item.rarity}</span>
+                <span className={`badge r-${roll.item.rarity}`}>
+                  {rarity?.name ?? roll.item.rarity}
+                  {rarity?.name_ja && rarity.name_ja !== rarity.name && <span className="badge-ja">{rarity.name_ja}</span>}
+                </span>
                 {roll.special && <span className="badge" style={{ color: "var(--accent)" }}>SPECIAL ROLL</span>}
                 {roll.hidden_special && <span className="badge" style={{ color: "var(--gold)" }}>{roll.hidden_special.name}</span>}
                 {roll.duplicated > 0 && <span className="badge" style={{ color: "var(--good)" }}>×{1 + roll.duplicated} 複製</span>}
@@ -276,8 +285,10 @@ export function RollCutscene({ roll, cosmos, onDone }: { roll: RollResult; cosmo
                 <div className="cut-meta">
                   <span className="chip">Luck {fmtLuck(roll.luck.final)}</span>
                   <span className="chip">実質 {fmtOdds(roll.final_odds)}</span>
-                  <span className="chip">{roll.biome.name}</span>
-                  <span className="chip" style={{ color: "var(--gold)" }}>{roll.fortune.label}</span>
+                  <span className="chip"><Name en={roll.biome.name} ja={roll.biome.name_ja} /></span>
+                  <span className="chip" style={{ color: "var(--gold)" }}>
+                    <Name en={roll.fortune.label} ja={roll.fortune.label_ja} />
+                  </span>
                   {roll.item.serial && <span className="chip">世界で {fmtInt(roll.item.serial)} 個目</span>}
                   {roll.new_collection && <span className="chip" style={{ color: "var(--good)" }}>NEW</span>}
                 </div>

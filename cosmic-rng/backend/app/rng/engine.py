@@ -333,24 +333,28 @@ table_cache = TableCache()
 # ---------------------------------------------------------------------------
 # Fortune rating
 # ---------------------------------------------------------------------------
-FORTUNE_BANDS: list[tuple[float, str, str]] = [
-    (0.5, "ordinary", "Ordinary"),
-    (0.1, "good", "Good"),
-    (0.01, "lucky", "Lucky"),
-    (1e-3, "great", "Great Fortune"),
-    (1e-4, "blessed", "Blessed"),
-    (1e-5, "miraculous", "Miraculous"),
-    (1e-6, "celestial", "Celestial"),
-    (0.0, "cosmic", "Cosmic Miracle"),
+# Threshold, key, English label, Japanese label. The band is the one line that
+# tells a player how their luck compared to everyone else's, so it is shown in
+# both languages like every other name in the game.
+FORTUNE_BANDS: list[tuple[float, str, str, str]] = [
+    (0.5, "ordinary", "Ordinary", "並"),
+    (0.1, "good", "Good", "好調"),
+    (0.01, "lucky", "Lucky", "幸運"),
+    (1e-3, "great", "Great Fortune", "大吉"),
+    (1e-4, "blessed", "Blessed", "祝福"),
+    (1e-5, "miraculous", "Miraculous", "奇跡"),
+    (1e-6, "celestial", "Celestial", "天啓"),
+    (0.0, "cosmic", "Cosmic Miracle", "宇宙的奇跡"),
 ]
 
 
 def fortune(tail_probability: float) -> dict[str, Any]:
     t = max(min(tail_probability, 1.0), 1e-300)
-    for threshold, key, label in FORTUNE_BANDS:
+    for threshold, key, label, label_ja in FORTUNE_BANDS:
         if t > threshold:
-            return {"key": key, "label": label, "top_percent": t * 100, "score": -math.log10(t)}
-    return {"key": "cosmic", "label": "Cosmic Miracle", "top_percent": t * 100, "score": -math.log10(t)}
+            return {"key": key, "label": label, "label_ja": label_ja, "top_percent": t * 100, "score": -math.log10(t)}
+    _, _, label, label_ja = FORTUNE_BANDS[-1]
+    return {"key": "cosmic", "label": label, "label_ja": label_ja, "top_percent": t * 100, "score": -math.log10(t)}
 
 
 def pick_rarer(a: ItemDef, b: ItemDef) -> ItemDef:

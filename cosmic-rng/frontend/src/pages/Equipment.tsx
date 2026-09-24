@@ -20,7 +20,7 @@ interface Artifact {
   usable: boolean; uses_remaining: number | null; ready_at: string | null;
 }
 
-const SLOT_LABEL: Record<string, string> = { gauntlet: "Gauntlet", core: "Core", relic: "Relic", artifact: "Artifact" };
+const SLOT_LABEL: Record<string, string> = { gauntlet: "手甲", core: "コア", relic: "遺物", artifact: "管理者遺物" };
 const QUALITY_COLOR: Record<string, string> = { normal: "var(--text-dim)", fine: "var(--r-rare)", superior: "var(--r-epic)", perfect: "var(--r-legendary)", god: "var(--gold)" };
 
 function PassiveText({ p }: { p: any }) {
@@ -130,7 +130,7 @@ export function Equipment() {
         </div>
       </div>
 
-      <Tabs tabs={[{ key: "equipment", label: `装備 (${data?.items.length ?? 0})` }, { key: "artifacts", label: `Artifact (${arts?.artifacts.length ?? 0})` }]} value={tab} onChange={setTab} />
+      <Tabs tabs={[{ key: "equipment", label: `装備 (${data?.items.length ?? 0})` }, { key: "artifacts", label: `管理者遺物 (${arts?.artifacts.length ?? 0})` }]} value={tab} onChange={setTab} />
 
       {tab === "equipment" ? (
         <>

@@ -190,9 +190,17 @@ function BottomNav() {
   const unlocks = useGame((s) => s.config?.unlocks);
   const level = useGame((s) => s.hud?.level ?? s.me?.user.level ?? 1);
   const unread = useGame((s) => s.unread);
+  const navRef = useRef<HTMLElement>(null);
+  const { pathname } = useLocation();
+  // On a phone the strip is wider than the screen, so the destination you are on
+  // can sit off the edge with nothing saying the row scrolls at all.
+  useEffect(() => {
+    const el = navRef.current?.querySelector<HTMLElement>("a.active");
+    el?.scrollIntoView({ inline: "center", block: "nearest", behavior: "smooth" });
+  }, [pathname]);
   if (!me) return null;
   return (
-    <nav className="bottom-nav" aria-label="メインナビゲーション">
+    <nav className="bottom-nav" ref={navRef} aria-label="メインナビゲーション">
       {NAV.map((n) => {
         const need = n.feature ? unlocks?.[n.feature] ?? 1 : 1;
         const locked = level < need;
@@ -208,7 +216,7 @@ function BottomNav() {
       {me.is_admin && (
         <NavLink to="/admin" className={({ isActive }) => `admin ${isActive ? "active" : ""}`} onClick={() => audio.sfx("click")}>
           <span className="ic">🛠</span>
-          <span>Admin</span>
+          <span>管理</span>
         </NavLink>
       )}
     </nav>

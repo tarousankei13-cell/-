@@ -412,6 +412,45 @@ QUESTS = {
 }
 
 # Table name -> {content key: Japanese name}
+# Shop listings. A listing usually resells a boost, so it borrows that boost's
+# wording; the upgrade licences are the shop's own goods and are named here.
+SHOP_ITEMS = {
+    "s_biome_magnet": "Biome磁石",
+    "s_celestial_surge": "天体の高まり",
+    "s_chrono_capsule": "時律カプセル",
+    "s_cosmic_stock": "宇宙の備蓄",
+    "s_epic_guarantee": "英雄確定",
+    "s_fortune_elixir": "幸運の霊薬",
+    "s_ion_core": "イオン核",
+    "s_nebula_incense": "星雲の香",
+    "s_nebula_tonic": "恒星の強壮薬（特価）",
+    "s_next_roll_boost": "次回抽選強化",
+    "s_overdrive_chip": "過駆動チップ",
+    "s_rare_guarantee": "稀少確定",
+    "s_solar_chip": "過駆動チップ（特価）",
+    "s_solar_lens": "太陽レンズ",
+    "s_special_amplifier": "特別抽選増幅器",
+    "s_stargazer_glove": "観星者の手袋",
+    "s_starlight_candle": "星明かりの蝋燭",
+    "s_stellar_tonic": "恒星の強壮薬",
+    "s_triple_charm": "三重のお守り",
+    "s_void_resonator": "虚無共鳴器",
+    "u_auto_skip_100": "自動スキップ 1/100",
+    "u_auto_skip_1000": "自動スキップ 1/1,000",
+    "u_auto_skip_10000": "自動スキップ 1/10,000",
+    "u_auto_skip_custom": "カスタムフィルター許可証",
+    "u_fast_mode": "高速モジュール",
+    "u_inventory_exp": "所持枠の拡張",
+    "u_offline_1": "オフライン処理装置I",
+    "u_offline_2": "オフライン処理装置II",
+    "u_rng_analyzer": "確率解析器",
+    "u_ultra_fast": "超高速モジュール",
+}
+
+SEASONS = {
+    "season_1": "シーズン1: 最初の光",
+}
+
 BY_TABLE: dict[str, dict[str, str]] = {
     "rarities": RARITIES,
     "items": ITEMS,
@@ -423,4 +462,6 @@ BY_TABLE: dict[str, dict[str, str]] = {
     "recipes": RECIPES,
     "achievements": ACHIEVEMENTS,
     "quests": QUESTS,
+    "shop_items": SHOP_ITEMS,
+    "seasons": SEASONS,
 }

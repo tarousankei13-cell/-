@@ -20,6 +20,11 @@
   -webkit-background-clip: text; background-clip: text; color: transparent;
   filter: drop-shadow(0 0 22px rgba(138,180,255,0.35));
 }
+/* Without the clip the Luck figure — the number the whole page is about —
+   would render as nothing at all. */
+@supports not ((background-clip: text) or (-webkit-background-clip: text)) {
+  .luck-value { background: none; color: var(--text); }
+}
 .luck-parts { display: flex; flex-wrap: wrap; gap: 5px; justify-content: center; max-width: 520px; width: 100%; }
 
 .roll-button {

@@ -111,19 +111,19 @@ function Overview({ data }: { data: any }) {
     <div className="col" style={{ gap: 12 }}>
       <div className="glass pad">
         <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(128px, 1fr))", gap: 12 }}>
-          <div className="stat"><span className="k">Total Rolls</span><span className="v mono">{fmtCompact(s.total_rolls)}</span></div>
-          <div className="stat"><span className="k">Best</span><span className="v mono">{fmtOdds(s.best_odds)}</span></div>
-          <div className="stat"><span className="k">Collection</span><span className="v mono">{fmtInt(s.discovered)} <span className="tiny faint">({(s.collection_rate * 100).toFixed(1)}%)</span></span></div>
-          <div className="stat"><span className="k">Assets</span><span className="v mono">✦{fmtCompact(s.assets)}</span></div>
-          <div className="stat"><span className="k">First Discoveries</span><span className="v mono">{fmtInt(s.first_discoveries)}</span></div>
-          <div className="stat"><span className="k">Achievements</span><span className="v mono">{fmtInt(s.achievements)}</span></div>
-          <div className="stat"><span className="k">Special Rolls</span><span className="v mono">{fmtCompact(s.special_rolls)}</span></div>
+          <div className="stat"><span className="k">総Roll数</span><span className="v mono">{fmtCompact(s.total_rolls)}</span></div>
+          <div className="stat"><span className="k">最高レア度</span><span className="v mono">{fmtOdds(s.best_odds)}</span></div>
+          <div className="stat"><span className="k">図鑑</span><span className="v mono">{fmtInt(s.discovered)} <span className="tiny faint">({(s.collection_rate * 100).toFixed(1)}%)</span></span></div>
+          <div className="stat"><span className="k">総資産</span><span className="v mono">✦{fmtCompact(s.assets)}</span></div>
+          <div className="stat"><span className="k">世界初発見</span><span className="v mono">{fmtInt(s.first_discoveries)}</span></div>
+          <div className="stat"><span className="k">実績</span><span className="v mono">{fmtInt(s.achievements)}</span></div>
+          <div className="stat"><span className="k">Special Roll</span><span className="v mono">{fmtCompact(s.special_rolls)}</span></div>
         </div>
       </div>
 
       {s.best_item && (
         <div className="glass pad">
-          <div className="tiny faint" style={{ letterSpacing: "0.14em", marginBottom: 8 }}>BEST ITEM</div>
+          <div className="tiny faint" style={{ letterSpacing: "0.14em", marginBottom: 8 }}>最高の一品</div>
           <div className="row" style={{ gap: 12 }}>
             <ItemIcon visual={s.best_item.visual} tier={s.best_item.tier} size={56} />
             <div>

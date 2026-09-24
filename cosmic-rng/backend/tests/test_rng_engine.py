@@ -207,3 +207,17 @@ def test_procedural_generation(snap):
     a = generate(slot, snap, random.Random(99))
     b = generate(slot, snap, random.Random(99))
     assert a.key == b.key and a.odds == b.odds
+
+
+def test_every_fortune_band_carries_both_labels():
+    """The band is the one number-free summary of how lucky a roll was, so it is
+    shown to players; a missing Japanese label would put bare English on the
+    reveal screen."""
+    from app.rng.engine import FORTUNE_BANDS, fortune
+
+    for _, key, label, label_ja in FORTUNE_BANDS:
+        assert label and label_ja, key
+        assert label_ja != label, key
+    for p in (0.9, 0.3, 0.05, 5e-3, 5e-4, 5e-6, 5e-7, 1e-12):
+        f = fortune(p)
+        assert f["label_ja"], p

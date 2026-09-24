@@ -40,9 +40,9 @@ export function AdminDashboard() {
       <div className="kpi-grid">
         <div className="kpi good"><span className="k">Online</span><span className="v">{fmtInt(d.online)}</span><span className="tiny faint">/ {fmtInt(d.users)} users</span></div>
         <div className="kpi"><span className="k">Rolls / sec</span><span className="v">{d.rolls_per_sec?.toFixed(2)}</span><span className="tiny faint">worker {d.worker_rolls_per_sec?.toFixed(2)}</span></div>
-        <div className="kpi"><span className="k">Total Rolls</span><span className="v">{fmtCompact(d.total_rolls)}</span></div>
+        <div className="kpi"><span className="k">総Roll数</span><span className="v">{fmtCompact(d.total_rolls)}</span></div>
         <div className="kpi"><span className="k">Rare Drops 24h</span><span className="v">{fmtInt(d.rare_drops_24h)}</span></div>
-        <div className="kpi"><span className="k">First Discoveries</span><span className="v">{fmtInt(d.first_discoveries_24h)}</span><span className="tiny faint">24h</span></div>
+        <div className="kpi"><span className="k">世界初発見</span><span className="v">{fmtInt(d.first_discoveries_24h)}</span><span className="tiny faint">24h</span></div>
         <div className="kpi"><span className="k">Market 24h</span><span className="v">{fmtInt(d.market_24h?.count)}</span><span className="tiny faint">✦{fmtCompact(d.market_24h?.volume)}</span></div>
         <div className="kpi"><span className="k">Trades 24h</span><span className="v">{fmtInt(d.trades_24h)}</span></div>
         <div className="kpi"><span className="k">Active Boosts</span><span className="v">{fmtInt(d.active_boosts)}</span></div>

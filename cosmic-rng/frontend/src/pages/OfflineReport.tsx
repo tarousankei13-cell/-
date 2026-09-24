@@ -67,7 +67,7 @@ export function OfflineReport({ summary, onClose }: { summary: OfflineSummary; o
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div className={`name r-${r.item.rarity}`}><Name en={r.item.name} ja={r.item.name_ja} block /></div>
                       <div className="odds mono">{fmtOdds(r.item.odds, r.item.display_odds)}</div>
-                      {r.first && <span className="badge" style={{ color: "var(--gold)" }}>WORLD FIRST</span>}
+                      {r.first && <span className="badge" style={{ color: "var(--gold)" }}>世界初</span>}
                     </div>
                     {r.count > 1 && <span className="mono">×{r.count}</span>}
                   </div>
