@@ -11,7 +11,11 @@ backend/.env
 frontend/node_modules/
 frontend/dist/
 frontend/test-results/
-# Runtime
+# Runtime state created by main.py (SQLite database, session signing key)
+data/
+*.db
+*.db-wal
+*.db-shm
 backups/
 logs/
 *.log
