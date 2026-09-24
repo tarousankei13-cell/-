@@ -38,16 +38,16 @@ CONFIG: dict[str, object] = {
     # ブラウザからアクセスするURL。ポート番号まで実際のものと一致させてください。
     # ここが違うとログインだけが失敗します（403）。
     # 空にすると http://localhost:<ポート> として扱います。
-    "PUBLIC_BASE_URL": "",
+    "PUBLIC_BASE_URL": "https://rng-e90io.puratya.com",
 
     # https://example.com/s/kazino/ のようにサブパスで配信する場合のみ "/s/kazino"。
     # ドメイン直下で配信するなら空のまま。
     "BASE_PATH": "",
 
-    # 待ち受け設定。PORT を None にすると、ホストが指定する PORT 環境変数、
-    # それも無ければ 8000 を使います。
+    # 待ち受け設定。None にするとホストが渡す PORT / HOST 環境変数を使います
+    # （見つからなければ 8000 / 0.0.0.0）。ホスティングパネルではこのままに。
     "PORT": None,
-    "HOST": "0.0.0.0",
+    "HOST": None,
 
     # --- データベース -------------------------------------------------------
     # 既定は単一ファイルの SQLite（外部サービス不要）。
@@ -121,7 +121,9 @@ def secret_key() -> str:
 def apply_config() -> tuple[str, int, str]:
     """Publish CONFIG as the environment the app reads. Returns host, port, public URL."""
     port = int(CONFIG["PORT"] or os.environ.get("PORT") or 8000)
-    host = str(CONFIG["HOST"] or "0.0.0.0")
+    # The host assigns these; hard-coding 127.0.0.1 would make the site
+    # unreachable from outside, which is the usual way this goes wrong.
+    host = str(CONFIG["HOST"] or os.environ.get("HOST") or "0.0.0.0")
     base_path = str(CONFIG["BASE_PATH"] or "").rstrip("/")
     public = str(CONFIG["PUBLIC_BASE_URL"] or "").rstrip("/") or f"http://localhost:{port}{base_path}"
 
