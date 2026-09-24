@@ -262,7 +262,8 @@ export interface PlayerSettings {
 
 export interface Me {
   user: UserBrief & {
-    discord_id: string;
+    discord_id: string | null;
+    email: string | null;
     status: string;
     status_reason: string | null;
     stardust: number;
@@ -290,7 +291,7 @@ export interface PublicConfig {
   features: Record<string, boolean>;
   maintenance: { enabled: boolean; message: string };
   discord_login: boolean;
-  dev_login: boolean;
+  registration_open: boolean;
   rng_version: number;
   content_version: number;
 }

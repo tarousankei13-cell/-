@@ -67,8 +67,13 @@ class Settings(BaseSettings):
 
     trusted_proxies: str = "127.0.0.1,::1"
 
-    dev_login_enabled: bool = False
     run_scheduler: bool = True
+
+    # Bootstrap administrator, created on first boot (see main.py CONFIG).
+    admin_username: str = ""
+    admin_email: str = ""
+    admin_password: str = ""
+    admin_reset_password: bool = False
 
     @field_validator("base_path", mode="before")
     @classmethod
@@ -88,8 +93,6 @@ class Settings(BaseSettings):
         if self.environment == "production":
             if len(self.secret_key) < 32:
                 raise ValueError("SECRET_KEY must be at least 32 characters in production")
-            if self.dev_login_enabled:
-                raise ValueError("DEV_LOGIN_ENABLED must never be true in production")
         elif not self.secret_key:
             # Non-production convenience only; production refuses to boot above.
             self.secret_key = "dev-insecure-secret-key-change-me-0123456789"

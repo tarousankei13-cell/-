@@ -142,8 +142,17 @@ class Principal:
 
 
 def compute_admin(user: User) -> tuple[bool, bool]:
+    """(is_admin, is_super_admin).
+
+    Super-admin is a property of the deployment configuration, never of a database
+    row: it is the account named in the launcher config (or an ADMIN_DISCORD_IDS
+    entry). An administrator promoted from inside the game therefore cannot raise
+    themselves to super-admin, which is what gates restores and role changes.
+    """
     s = get_settings()
-    super_admin = user.discord_id in s.admin_ids
+    super_admin = (user.discord_id is not None and user.discord_id in s.admin_ids) or (
+        bool(s.admin_email) and bool(user.email) and user.email == s.admin_email.strip().lower()
+    )
     return (super_admin or user.role == "admin"), super_admin
 
 

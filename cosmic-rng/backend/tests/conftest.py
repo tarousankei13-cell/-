@@ -20,8 +20,10 @@ os.environ.update({
     "EVENT_BUS": "local",
     "RUN_SCHEDULER": "false",
     "COOKIE_SECURE": "false",
-    "DEV_LOGIN_ENABLED": "true",
-    "ADMIN_DISCORD_IDS": "999000001",
+    "ADMIN_DISCORD_IDS": "",
+    "ADMIN_USERNAME": "architect",
+    "ADMIN_EMAIL": "architect@example.test",
+    "ADMIN_PASSWORD": "architect-password-4417",
     "PUBLIC_BASE_URL": "http://testserver",
     "ALLOWED_ORIGINS": "http://testserver",
     "DB_NULL_POOL": "true",
@@ -35,7 +37,8 @@ import pytest  # noqa: E402
 import pytest_asyncio  # noqa: E402
 
 BACKEND = Path(__file__).resolve().parent.parent
-ADMIN_DISCORD_ID = 999000001
+ADMIN_USERNAME = "architect"
+ADMIN_PASSWORD = "architect-password-4417"
 
 
 def _reset_database() -> None:
@@ -123,12 +126,18 @@ def make_client(app: Any) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=transport, base_url="http://testserver", headers={"Origin": "http://testserver"})
 
 
-async def login(app: Any, discord_id: int | None = None, name: str | None = None) -> Player:
-    discord_id = discord_id or int(uuid.uuid4().int % 10**15) + 10**16
-    name = name or f"p{discord_id % 100000}"
+TEST_PASSWORD = "test-password-9021"
+
+
+async def login(app: Any, name: str | None = None, password: str = TEST_PASSWORD) -> Player:
+    """Register (or sign in to) a real local account, exactly as a player would."""
+    name = name or f"p{uuid.uuid4().hex[:10]}"
     c = make_client(app)
-    r = await c.post("/api/auth/dev-login", json={"discord_id": discord_id, "username": name})
-    assert r.status_code == 302, r.text
+    r = await c.post("/api/auth/register", json={"email": f"{name}@example.test", "username": name,
+                                                 "password": password})
+    if r.status_code == 409:  # already registered by an earlier fixture
+        r = await c.post("/api/auth/login", json={"login": name, "password": password})
+    assert r.status_code == 200, r.text
     me = (await c.get("/api/me")).json()
     c.headers["X-CSRF-Token"] = me["csrf"]
     return Player(c, me)
@@ -150,7 +159,7 @@ async def player2(app: Any) -> AsyncIterator[Player]:
 
 @pytest_asyncio.fixture
 async def admin(app: Any) -> AsyncIterator[Player]:
-    p = await login(app, ADMIN_DISCORD_ID, "architect")
+    p = await login(app, ADMIN_USERNAME, ADMIN_PASSWORD)
     r = await p.post("/api/auth/admin-mode", json={"enabled": True})
     assert r.status_code == 200, r.text
     yield p

@@ -1,4 +1,9 @@
-"""Authentication: Discord OAuth2 (authorization code flow), sessions, admin mode."""
+"""Authentication: email + password accounts, optional Discord OAuth2, sessions, admin mode.
+
+Local accounts are the default and need no external service. Discord OAuth stays
+available for anyone who configures it, and its routes simply report that it is
+not set up otherwise.
+"""
 from __future__ import annotations
 
 import logging
@@ -8,12 +13,13 @@ from urllib.parse import urlencode
 
 import httpx
 from fastapi import APIRouter, Depends, Query, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
 from ..content.registry import get_registry
+from ..core import passwords
 from ..core.errors import AppError, Forbidden, NotFound
 from ..core.pubsub import commit_and_publish, queue_event
 from ..core.ratelimit import limiter
@@ -30,6 +36,7 @@ from ..core.security import (
     sign_value,
     unsign_value,
 )
+from ..core.timeutil import utcnow
 from ..db import get_db
 from ..services import audit, progress as progress_svc, user_settings as settings_svc, users as users_svc
 
@@ -49,7 +56,8 @@ async def login(request: Request, next: str | None = Query(default=None)) -> Red
     s = get_settings()
     limiter.check("auth", client_ip(request))
     if not s.discord_client_id or not s.discord_redirect_uri:
-        raise AppError("Discordログインが設定されていません", code="oauth_not_configured", status_code=503)
+        raise AppError("Discordログインは設定されていません（メールアドレスでログインしてください）",
+                       code="oauth_not_configured", status_code=503)
     state = secrets.token_urlsafe(24)
     params = {"client_id": s.discord_client_id, "redirect_uri": s.discord_redirect_uri, "response_type": "code",
               "scope": "identify", "state": state, "prompt": "none"}
@@ -120,27 +128,77 @@ async def callback(request: Request, code: str | None = None, state: str | None 
         return RedirectResponse(get_settings().url(f"/?error={e.code}"), status_code=302)
 
 
-class DevLogin(BaseModel):
-    discord_id: int = Field(ge=1, le=2**63 - 1)
-    username: str = Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9_.\-]+$")
+# ---------------------------------------------------------------------------
+# Local accounts
+# ---------------------------------------------------------------------------
+class RegisterBody(BaseModel):
+    email: str = Field(min_length=3, max_length=190)
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=1, max_length=128)
 
 
-async def _dev_login(body: DevLogin, request: Request, db: AsyncSession = Depends(get_db)) -> RedirectResponse:
-    """Development-only login. The route is not registered at all in production, so the
-    endpoint is indistinguishable from a non-existent one (even for malformed bodies)."""
+class LoginBody(BaseModel):
+    # Either the email address or the username.
+    login: str = Field(min_length=1, max_length=190)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class PasswordBody(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=1, max_length=128)
+
+
+async def _start_session(db: AsyncSession, request: Request, user: Any) -> dict[str, Any]:
+    """Issue a session for an authenticated user and return the JSON body."""
+    if user.status == "banned" and (not user.status_until or user.status_until > utcnow()):
+        await db.commit()
+        raise Forbidden(user.status_reason or "このアカウントは利用できません", code="banned")
+    await progress_svc.ensure_quests(db, user)
+    token = await create_session(db, user, request)
+    await db.commit()
+    resp = JSONResponse({"ok": True, "user_id": user.id, "next": get_settings().url("/roll")})
+    set_session_cookie(resp, token)
+    return resp
+
+
+@router.post("/register")
+async def register(body: RegisterBody, request: Request, db: AsyncSession = Depends(get_db)) -> Any:
     check_origin(request)
     limiter.check("auth", client_ip(request))
-    return await _finish_login(db, request, {"id": str(body.discord_id), "username": body.username, "global_name": body.username}, "/roll")
+    await get_registry().ensure_fresh(db)
+    user = await users_svc.register_local(db, email=body.email, username=body.username, password=body.password)
+    log.info("registered account %s (%s)", user.id, user.username)
+    return await _start_session(db, request, user)
 
 
-def register_dev_login() -> None:
-    s = get_settings()
-    if s.dev_login_enabled and s.environment != "production":
-        router.post("/dev-login")(_dev_login)
-        log.warning("DEV LOGIN IS ENABLED — never use this configuration in production")
+@router.post("/login")
+async def login_local(body: LoginBody, request: Request, db: AsyncSession = Depends(get_db)) -> Any:
+    check_origin(request)
+    limiter.check("auth", client_ip(request))
+    await get_registry().ensure_fresh(db)
+    user = await users_svc.authenticate(db, body.login, body.password)
+    return await _start_session(db, request, user)
 
 
-register_dev_login()
+@router.post("/password")
+async def change_password(body: PasswordBody, request: Request,
+                          principal: Principal = Depends(require_user("api", allow_frozen=True)),
+                          db: AsyncSession = Depends(get_db)) -> Any:
+    """Change the password, then re-issue this device's session (the others are revoked)."""
+    limiter.check("auth", client_ip(request))
+    user = principal.user
+    if not user.password_hash:
+        raise AppError("このアカウントはパスワードを使用していません", code="no_password")
+    if not passwords.verify_password(body.current_password, user.password_hash):
+        raise AppError("現在のパスワードが違います", code="invalid_credentials", status_code=401)
+    await users_svc.set_password(db, user, body.new_password)
+    await audit.record(db, principal, "password_change", entity_type="user", entity_id=str(user.id),
+                       user_agent=request.headers.get("user-agent"))
+    token = await create_session(db, user, request)
+    await db.commit()
+    resp = JSONResponse({"ok": True})
+    set_session_cookie(resp, token)
+    return resp
 
 
 @router.post("/logout")

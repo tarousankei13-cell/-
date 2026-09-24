@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
-"""COSMIC RNG — 単一エントリポイント起動スクリプト / single-file launcher.
+"""COSMIC RNG — 起動スクリプト / launcher.
 
     python main.py
 
-これ一つで .env の生成・依存関係の確認・DBスキーマ作成・初期コンテンツ投入・
-サーバ起動まで行います。データベースは既定で SQLite（data/cosmic.db）なので、
-PostgreSQL が無いホストでもそのまま動きます。DATABASE_URL に PostgreSQL の
-URL を書けば、そちらへ切り替わります（本番向け・マルチワーカー可）。
-
-主な環境変数（.env で設定）:
-    DATABASE_URL   sqlite+aiosqlite:///./data/cosmic.db  もしくは postgresql+asyncpg://...
-    PORT / HOST    待ち受けポート・アドレス
-    BASE_PATH      /s/kazino のようにサブパス配信するとき
-    ENVIRONMENT    production にすると開発用ログインを完全に無効化
+設定はすべて下の CONFIG に書きます。.env ファイルは不要です。
+データベースは既定で SQLite（data/cosmic.db）なので、PostgreSQL が無いホストでも
+そのまま動きます。初回起動時にスキーマ作成・初期コンテンツ投入・管理者アカウント
+作成まで自動で行います。
 """
 from __future__ import annotations
 
@@ -23,9 +17,72 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+
+# ===========================================================================
+#  設定 — ここだけ書き換えれば動きます
+# ===========================================================================
+CONFIG: dict[str, object] = {
+
+    # --- 管理者アカウント ---------------------------------------------------
+    # 初回起動時にこの内容で作成されます。ゲーム内のログイン画面から
+    # このユーザー名（またはメールアドレス）とパスワードでログインしてください。
+    "ADMIN_USERNAME": "admin",
+    "ADMIN_EMAIL": "admin@cosmic-rng.local",
+    "ADMIN_PASSWORD": "Runakunn0513",
+
+    # 通常は False。True にすると、起動のたびに上のパスワードへ強制的に戻します
+    # （パスワードを忘れたときの復旧用。戻したら False に戻してください）。
+    "ADMIN_RESET_PASSWORD": False,
+
+    # --- 公開設定 -----------------------------------------------------------
+    # ブラウザからアクセスするURL。ポート番号まで実際のものと一致させてください。
+    # ここが違うとログインだけが失敗します（403）。
+    # 空にすると http://localhost:<ポート> として扱います。
+    "PUBLIC_BASE_URL": "",
+
+    # https://example.com/s/kazino/ のようにサブパスで配信する場合のみ "/s/kazino"。
+    # ドメイン直下で配信するなら空のまま。
+    "BASE_PATH": "",
+
+    # 待ち受け設定。PORT を None にすると、ホストが指定する PORT 環境変数、
+    # それも無ければ 8000 を使います。
+    "PORT": None,
+    "HOST": "0.0.0.0",
+
+    # --- データベース -------------------------------------------------------
+    # 既定は単一ファイルの SQLite（外部サービス不要）。
+    # PostgreSQL を使う場合:
+    #   "postgresql+asyncpg://cosmic:パスワード@127.0.0.1:5432/cosmic_rng"
+    "DATABASE_URL": "sqlite+aiosqlite:///./data/cosmic.db",
+
+    # PostgreSQL のときだけ 2 以上にできます（SQLite は書き込みが単一のため 1 固定）。
+    "WORKERS": 1,
+
+    # --- 任意 ---------------------------------------------------------------
+    # 新規登録の可否は管理パネルからも切り替えられます。
+
+    # Discord ログインも併用したい場合のみ設定（空ならメール認証のみ）。
+    "DISCORD_CLIENT_ID": "",
+    "DISCORD_CLIENT_SECRET": "",
+    # 上を設定した場合は PUBLIC_BASE_URL + "/api/auth/callback" を指定します。
+    "DISCORD_REDIRECT_URI": "",
+    # Discord DM で通知を送る場合のみ（Bot トークン）。
+    "DISCORD_BOT_TOKEN": "",
+
+    # 追加で許可したいアクセス元（カンマ区切り）。通常は空で構いません。
+    "ALLOWED_ORIGINS": "",
+
+    "LOG_LEVEL": "INFO",
+    # ログをファイルにも残す場合はパスを書きます（例 "logs/cosmic.log"）。
+    "LOG_FILE": "",
+}
+# ===========================================================================
+#  ここから下は通常編集不要です
+# ===========================================================================
+
 BACKEND = ROOT / "backend"
-ENV_FILE = ROOT / ".env"
 REQUIREMENTS = ROOT / "requirements.txt"
+SECRET_FILE = ROOT / "data" / "secret.key"
 
 BANNER = r"""
    ______  ____  __  ___ _____ ______   ____  _   __ ______
@@ -40,59 +97,61 @@ def log(msg: str) -> None:
     print(f"[cosmic] {msg}", flush=True)
 
 
-# ---------------------------------------------------------------------------
-# .env
-# ---------------------------------------------------------------------------
-def write_default_env() -> None:
-    """First run: generate a working .env with a fresh secret key."""
+def secret_key() -> str:
+    """Stable signing key, generated once and kept out of the source file.
+
+    Sessions are signed with it, so a key that changed on every boot would log
+    everyone out each restart.
+    """
+    if SECRET_FILE.exists():
+        key = SECRET_FILE.read_text(encoding="utf-8").strip()
+        if len(key) >= 32:
+            return key
+    SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
     key = secrets.token_urlsafe(48)
-    port = os.environ.get("PORT", "8000")
-    ENV_FILE.write_text(
-        f"""# COSMIC RNG 設定ファイル（初回起動時に自動生成されました）
-# ---------------------------------------------------------------------------
-# この鍵はセッション Cookie の署名に使われます。絶対に公開しないでください。
-SECRET_KEY={key}
+    SECRET_FILE.write_text(key, encoding="utf-8")
+    try:
+        SECRET_FILE.chmod(0o600)
+    except OSError:
+        pass  # filesystems without POSIX permissions (some shared hosts)
+    log(f"署名鍵を生成しました: {SECRET_FILE.relative_to(ROOT)}（削除すると全員ログアウトになります）")
+    return key
 
-# development = 動作確認モード（下の DEV_LOGIN_ENABLED が使えます）
-# production  = 本番モード（Discord ログインのみ / 開発用ログインは無効）
-ENVIRONMENT=development
 
-# データベース。既定は単一ファイルの SQLite で、外部サービスは不要です。
-# PostgreSQL を使う場合は次の行を書き換えてください:
-#   DATABASE_URL=postgresql+asyncpg://cosmic:PASSWORD@127.0.0.1:5432/cosmic_rng
-DATABASE_URL=sqlite+aiosqlite:///./data/cosmic.db
+def apply_config() -> tuple[str, int, str]:
+    """Publish CONFIG as the environment the app reads. Returns host, port, public URL."""
+    port = int(CONFIG["PORT"] or os.environ.get("PORT") or 8000)
+    host = str(CONFIG["HOST"] or "0.0.0.0")
+    base_path = str(CONFIG["BASE_PATH"] or "").rstrip("/")
+    public = str(CONFIG["PUBLIC_BASE_URL"] or "").rstrip("/") or f"http://localhost:{port}{base_path}"
 
-# 公開URL。ブラウザからアクセスするアドレスをそのまま書いてください。
-PUBLIC_BASE_URL=http://localhost:{port}
-# https:// で公開する場合は true のままに。http:// で試すときは false。
-COOKIE_SECURE=false
+    env = {
+        "ENVIRONMENT": "production",
+        "SECRET_KEY": secret_key(),
+        "DATABASE_URL": str(CONFIG["DATABASE_URL"]),
+        "PUBLIC_BASE_URL": public,
+        "BASE_PATH": base_path,
+        "ALLOWED_ORIGINS": str(CONFIG["ALLOWED_ORIGINS"] or ""),
+        "COOKIE_SECURE": "true" if public.startswith("https://") else "false",
+        "ADMIN_USERNAME": str(CONFIG["ADMIN_USERNAME"] or ""),
+        "ADMIN_EMAIL": str(CONFIG["ADMIN_EMAIL"] or ""),
+        "ADMIN_PASSWORD": str(CONFIG["ADMIN_PASSWORD"] or ""),
+        "ADMIN_RESET_PASSWORD": "true" if CONFIG["ADMIN_RESET_PASSWORD"] else "false",
+        "DISCORD_CLIENT_ID": str(CONFIG["DISCORD_CLIENT_ID"] or ""),
+        "DISCORD_CLIENT_SECRET": str(CONFIG["DISCORD_CLIENT_SECRET"] or ""),
+        "DISCORD_REDIRECT_URI": str(CONFIG["DISCORD_REDIRECT_URI"] or ""),
+        "DISCORD_BOT_TOKEN": str(CONFIG["DISCORD_BOT_TOKEN"] or ""),
+        "LOG_LEVEL": str(CONFIG["LOG_LEVEL"] or "INFO"),
+        "LOG_FILE": str(CONFIG["LOG_FILE"] or ""),
+        "EVENT_BUS": "auto",
+        "BACKUP_DIR": str(ROOT / "backups"),
+    }
+    os.environ.update(env)
+    return host, port, public
 
-# サブパスで配信する場合のみ設定（例: https://example.com/s/kazino/ なら /s/kazino）
-BASE_PATH=
 
-# --- Discord ログイン -------------------------------------------------------
-# 本番運用にはこの3つが必要です。https://discord.com/developers/applications
-# で作成し、OAuth2 のリダイレクトURLに PUBLIC_BASE_URL + /api/auth/callback を登録。
-DISCORD_CLIENT_ID=
-DISCORD_CLIENT_SECRET=
-DISCORD_REDIRECT_URI=
-
-# 管理者にする Discord ユーザーID（カンマ区切り）。空なら管理者は存在しません。
-ADMIN_DISCORD_IDS=
-
-# Discord DM 通知を使う場合のみ（Bot トークン）
-DISCORD_BOT_TOKEN=
-
-# --- 動作確認用ログイン -----------------------------------------------------
-# true の間は Discord なしで任意のIDとしてログインできます。
-# 一般公開する前に必ず false にし、ENVIRONMENT=production にしてください。
-DEV_LOGIN_ENABLED=true
-
-LOG_LEVEL=INFO
-""",
-        encoding="utf-8",
-    )
-    log(f".env を生成しました: {ENV_FILE}")
+def database_url() -> str:
+    return os.environ["DATABASE_URL"]
 
 
 # ---------------------------------------------------------------------------
@@ -109,10 +168,10 @@ def missing_packages() -> list[str]:
         "httpx": "httpx",
         "PIL": "pillow",
     }
-    url = database_url()
-    needed["aiosqlite" if url.startswith("sqlite") else "asyncpg"] = (
-        "aiosqlite" if url.startswith("sqlite") else "asyncpg"
-    )
+    sqlite = database_url().startswith("sqlite")
+    needed["aiosqlite" if sqlite else "asyncpg"] = "aiosqlite" if sqlite else "asyncpg"
+    if not sqlite:
+        needed["alembic"] = "alembic"
     return [dist for mod, dist in needed.items() if importlib.util.find_spec(mod) is None]
 
 
@@ -130,78 +189,39 @@ def ensure_dependencies() -> None:
         log("自動インストールに失敗しました。手動で次を実行してください:")
         log(f"  {sys.executable} -m pip install -r requirements.txt")
         raise SystemExit(1)
-    still = missing_packages()
-    if still:
-        log(f"インストール後もまだ読み込めません: {', '.join(still)}")
+    if missing_packages():
+        log(f"インストール後もまだ読み込めません: {', '.join(missing_packages())}")
         raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------
-# environment
+# checks
 # ---------------------------------------------------------------------------
-def load_env_file() -> None:
-    """Read .env into the process before anything imports the settings."""
-    if not ENV_FILE.exists():
-        return
-    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        os.environ.setdefault(k.strip(), v.strip())
+def check_config(public: str, port: int) -> None:
+    problems: list[str] = []
+    password = str(CONFIG["ADMIN_PASSWORD"] or "")
+    if CONFIG["ADMIN_USERNAME"] and not password:
+        problems.append("ADMIN_PASSWORD が空です。管理者アカウントは作成されません。")
+    elif password and len(password) < 8:
+        problems.append("ADMIN_PASSWORD が8文字未満です。管理者アカウントは作成されません。")
+    if not str(CONFIG["ADMIN_EMAIL"] or "").count("@"):
+        problems.append("ADMIN_EMAIL の形式が正しくありません。")
+    for p in problems:
+        log(f"警告: {p}")
 
-
-def database_url() -> str:
-    return os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./data/cosmic.db")
-
-
-def warn_about_open_login() -> None:
-    env = os.environ.get("ENVIRONMENT", "production")
-    dev_login = os.environ.get("DEV_LOGIN_ENABLED", "").lower() in ("1", "true", "yes")
-    if env == "production" or not dev_login:
-        return
-    admins = [x for x in os.environ.get("ADMIN_DISCORD_IDS", "").replace(" ", "").split(",") if x]
-    print(
-        "\n"
-        "  ┌──────────────────────────────────────────────────────────────┐\n"
-        "  │  動作確認モードで起動しています（DEV_LOGIN_ENABLED=true）    │\n"
-        "  │  Discord 認証なしで、誰でも任意のIDとしてログインできます。  │\n"
-        "  │  一般公開する前に .env を次のように変更してください:         │\n"
-        "  │      ENVIRONMENT=production                                  │\n"
-        "  │      DEV_LOGIN_ENABLED=false                                 │\n"
-        "  │      DISCORD_CLIENT_ID / SECRET / REDIRECT_URI を設定        │\n"
-        "  └──────────────────────────────────────────────────────────────┘",
-        flush=True,
-    )
-    if admins:
-        log(f"警告: 管理者ID {', '.join(admins)} が設定されています。"
-            "このモードでは第三者がその管理者としてログインできます。")
-    print(flush=True)
-
-
-def warn_about_public_url(public: str, port: int) -> None:
-    """PUBLIC_BASE_URL anchors the CSRF origin check, so a wrong value does not
-    fail loudly at boot -- it fails later, as a 403 on every login."""
-    if not public:
-        log("警告: PUBLIC_BASE_URL が未設定です。ログインが 403 になります。")
-        return
-    local = any(h in public for h in ("localhost", "127.0.0.1", "0.0.0.0"))
-    if local:
-        log("ヒント: PUBLIC_BASE_URL がローカルアドレスのままです。外部からアクセスする場合は、")
-        log("        ブラウザに入力するURL（ポート番号まで一致）へ .env を書き換えてください。")
-        log("        不一致のままだとログインが 403（不正なリクエスト元です）になります。")
+    if any(h in public for h in ("localhost", "127.0.0.1", "0.0.0.0")):
+        log("ヒント: PUBLIC_BASE_URL がローカルアドレスです。外部からアクセスするなら、")
+        log("        ブラウザに入力するURL（ポート番号まで一致）を CONFIG に設定してください。")
+        log("        不一致のままだとログインだけが 403 になります。")
     elif public.startswith("http://"):
-        log("警告: PUBLIC_BASE_URL が http:// です。公開時は https:// にし、COOKIE_SECURE=true を推奨します。")
-    if f":{port}" not in public and not public.startswith("https://") and not local:
-        log(f"ヒント: 待ち受けポート {port} が PUBLIC_BASE_URL に含まれていません。"
-            "リバースプロキシ経由でないなら :ポート番号 を付けてください。")
+        log("警告: PUBLIC_BASE_URL が http:// です。公開時は https:// を強く推奨します")
+        log("      （http:// ではセッションCookieが暗号化されずに流れます）。")
 
 
 # ---------------------------------------------------------------------------
 # database
 # ---------------------------------------------------------------------------
 def prepare_database() -> None:
-    """Create the schema (and seed content on an empty database)."""
     import asyncio
 
     from app.cli import _alembic_upgrade  # noqa: PLC2701 - internal on purpose
@@ -237,30 +257,27 @@ def prepare_database() -> None:
 # ---------------------------------------------------------------------------
 def main() -> None:
     print(BANNER, flush=True)
-    if not ENV_FILE.exists():
-        write_default_env()
-    load_env_file()
-    os.environ.setdefault("PYTHONUNBUFFERED", "1")
     sys.path.insert(0, str(BACKEND))
     os.chdir(ROOT)
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
+    host, port, public = apply_config()
     ensure_dependencies()
+    check_config(public, port)
 
-    host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", "8000"))
     url = database_url()
     sqlite = url.startswith("sqlite")
     # SQLite has a single writer; more than one worker would only contend for it.
-    workers = 1 if sqlite else int(os.environ.get("WORKERS", "1"))
+    workers = 1 if sqlite else max(1, int(CONFIG["WORKERS"] or 1))
 
-    public = os.environ.get("PUBLIC_BASE_URL", "")
     prepare_database()
-    warn_about_open_login()
 
+    base_path = os.environ["BASE_PATH"]
     log(f"データベース: {'SQLite (' + url.split('///')[-1] + ')' if sqlite else 'PostgreSQL'}")
-    log(f"待ち受け: http://{host}:{port}{os.environ.get('BASE_PATH', '')}/")
-    log(f"公開URL : {public} (PUBLIC_BASE_URL)")
-    warn_about_public_url(public, port)
+    log(f"待ち受け: http://{host}:{port}{base_path}/" + (f" · ワーカー {workers}" if workers > 1 else ""))
+    log(f"公開URL : {public}")
+    if CONFIG["ADMIN_USERNAME"]:
+        log(f"管理者ログイン: ユーザー名 {CONFIG['ADMIN_USERNAME']} / メール {CONFIG['ADMIN_EMAIL']}")
 
     import uvicorn
 
@@ -269,7 +286,7 @@ def main() -> None:
         host=host,
         port=port,
         workers=workers if workers > 1 else None,
-        log_level=os.environ.get("LOG_LEVEL", "info").lower(),
+        log_level=str(CONFIG["LOG_LEVEL"] or "info").lower(),
         proxy_headers=True,
         forwarded_allow_ips="*",
         access_log=False,

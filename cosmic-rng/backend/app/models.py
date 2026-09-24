@@ -170,10 +170,20 @@ class User(Base):
     __table_args__ = (
         CheckConstraint("stardust >= 0", name="stardust_nonneg"),
         Index("ix_users_last_seen", "last_seen_at"),
+        # Usernames are a login identifier, so they are unique case-insensitively:
+        # "Admin" and "admin" must not be two accounts. Emails are lowercased by the
+        # application before they are stored, so the plain unique constraint suffices.
+        Index("uq_users_username_lower", text("lower(username)"), unique=True),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    discord_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
+    # Local accounts are the default. Discord stays supported for anyone who wants
+    # it, so exactly one of discord_id / password_hash is set on a given account.
+    discord_id: Mapped[int | None] = mapped_column(BigInteger, unique=True)
+    email: Mapped[str | None] = mapped_column(String(190), unique=True)
+    password_hash: Mapped[str | None] = mapped_column(String(255))
+    failed_logins: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
+    locked_until: Mapped[datetime | None] = mapped_column(TS)
     username: Mapped[str] = mapped_column(String(64), nullable=False)
     display_name: Mapped[str] = mapped_column(String(64), nullable=False)
     avatar: Mapped[str | None] = mapped_column(String(128))

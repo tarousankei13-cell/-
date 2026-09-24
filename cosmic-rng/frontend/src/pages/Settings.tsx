@@ -245,11 +245,76 @@ export function Settings() {
         </Section>
 
         <Section title="アカウント">
-          <Row label="Discord ID"><span className="mono tiny">{me?.user.discord_id}</span></Row>
+          <Row label="ユーザー名"><span className="mono tiny">{me?.user.username}</span></Row>
+          {me?.user.email && <Row label="メールアドレス"><span className="mono tiny">{me.user.email}</span></Row>}
+          {me?.user.discord_id && <Row label="Discord ID"><span className="mono tiny">{me.user.discord_id}</span></Row>}
+          {me?.user.email && <PasswordChange />}
           <Row label="ログアウト"><button className="btn sm danger" onClick={logout}>ログアウト</button></Row>
         </Section>
       </div>
       {node}
+    </div>
+  );
+}
+
+function PasswordChange() {
+  const [open, setOpen] = useState(false);
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [again, setAgain] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const toast = useGame((s) => s.toast);
+
+  const mismatch = again.length > 0 && next !== again;
+  const ready = current.length > 0 && next.length >= 8 && next === again && !busy;
+
+  const submit = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await post("/api/auth/password", { current_password: current, new_password: next });
+      setCurrent(""); setNext(""); setAgain(""); setOpen(false);
+      toast("パスワードを変更しました", "success", "他の端末のログインは無効になりました");
+      audio.sfx("success");
+    } catch (e) {
+      setError((e as Error).message);
+      audio.sfx("error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!open) {
+    return (
+      <Row label="パスワード">
+        <button className="btn sm" onClick={() => setOpen(true)}>変更する</button>
+      </Row>
+    );
+  }
+  return (
+    <div style={{ padding: "10px 0", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
+      <div className="col" style={{ gap: 8, maxWidth: 340 }}>
+        <label className="field">
+          <span>現在のパスワード</span>
+          <input type="password" value={current} onChange={(e) => setCurrent(e.target.value)} autoComplete="current-password" />
+        </label>
+        <label className="field">
+          <span>新しいパスワード（8文字以上）</span>
+          <input type="password" value={next} onChange={(e) => setNext(e.target.value)} autoComplete="new-password" />
+        </label>
+        <label className="field">
+          <span>新しいパスワード（確認）</span>
+          <input type="password" value={again} onChange={(e) => setAgain(e.target.value)} autoComplete="new-password" />
+        </label>
+        {mismatch && <div className="auth-error small">確認用のパスワードが一致しません</div>}
+        {error && <div className="auth-error small">{error}</div>}
+        <div className="row" style={{ gap: 8 }}>
+          <button className="btn sm primary" onClick={submit} disabled={!ready}>{busy ? "変更中…" : "変更する"}</button>
+          <button className="btn sm ghost" onClick={() => { setOpen(false); setError(null); }}>キャンセル</button>
+        </div>
+        <p className="muted tiny" style={{ margin: 0 }}>変更すると、この端末以外のログインはすべて無効になります。</p>
+      </div>
     </div>
   );
 }

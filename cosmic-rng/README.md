@@ -1,7 +1,10 @@
 # COSMIC RNG
 
-宇宙を舞台にしたオンラインRNGゲーム。Discordでログインし、個人に割り当てられたBiomeの中で
-Rollを重ね、世界にまだ存在しないアイテムの「世界初発見」を目指します。
+宇宙を舞台にしたオンラインRNGゲーム。メールアドレスとパスワードでアカウントを作り、
+個人に割り当てられたBiomeの中でRollを重ね、世界にまだ存在しないアイテムの
+「世界初発見」を目指します。
+
+手早く動かしたいだけなら `SETUP.md` を参照してください（`python main.py` だけで起動します）。
 
 RNGの判定・Luck計算・クールダウン・オフライン進行はすべてサーバー側で行われ、
 クライアントからの改ざんは一切受け付けません。
@@ -12,7 +15,7 @@ Browser (React SPA)
    ▼
 Nginx ──► FastAPI (uvicorn, 複数worker)
              ├─ REST API / WebSocket
-             ├─ Discord OAuth2
+             ├─ Auth (email + password / 任意で Discord OAuth2)
              ├─ RNG Engine (versioned)
              ├─ Biome Engine (毎秒抽選をイベント駆動で再現)
              ├─ Inventory / Equipment / Crafting / Shop
@@ -33,7 +36,8 @@ Nginx ──► FastAPI (uvicorn, 複数worker)
 - [必要環境](#必要環境)
 - [クイックスタート（開発）](#クイックスタート開発)
 - [本番デプロイ](#本番デプロイ)
-- [Discord OAuth の設定](#discord-oauth-の設定)
+- [アカウントと管理者](#アカウントと管理者)
+- [Discord OAuth の設定（任意）](#discord-oauth-の設定任意)
 - [運用](#運用)
 - [ゲーム仕様](#ゲーム仕様)
 - [管理者機能](#管理者機能)
@@ -71,9 +75,9 @@ bash deploy/scripts/dev.sh
 - ゲーム: http://localhost:5173
 - API ドキュメント（開発時のみ）: http://localhost:8000/api/docs
 
-開発モードでは `DEV_LOGIN_ENABLED=true` なので、トップページの「開発用ログイン」から
-Discord なしでログインできます。`.env` の `ADMIN_DISCORD_IDS` に入れた ID でログインすると
-管理者になります。**本番では自動的に拒否されます。**
+トップページからメールアドレス・ユーザー名・パスワードでアカウントを作成できます。
+`.env` の `ADMIN_EMAIL` と一致するアカウントがスーパー管理者になります
+（起動時に `ADMIN_USERNAME` / `ADMIN_EMAIL` / `ADMIN_PASSWORD` で自動作成されます）。
 
 ---
 
@@ -134,7 +138,40 @@ sudo -u cosmic .venv/bin/python -m app.cli set-role <discord_id> admin
 
 ---
 
-## Discord OAuth の設定
+## アカウントと管理者
+
+アカウントはメールアドレス・ユーザー名・パスワードで作成します。確認メールは
+送信しません（メール送信サーバを必要としない設計です）。パスワードは `scrypt`
+でハッシュ化して保存され、平文は保存もAPI応答もされません。
+
+```ini
+ADMIN_USERNAME=admin
+ADMIN_EMAIL=admin@example.com
+ADMIN_PASSWORD=十分に長いパスワード
+```
+
+この3つを設定すると、初回起動時に管理者アカウントが作成されます。既存アカウントの
+パスワードが勝手に上書きされることはありません（復旧が必要なときだけ
+`ADMIN_RESET_PASSWORD=true` にして再起動し、終わったら戻します）。
+
+**スーパー管理者**は `ADMIN_EMAIL`（または `ADMIN_DISCORD_IDS`）と一致する
+アカウントだけです。バックアップ復元や権限変更はスーパー管理者に限られ、
+管理パネルから昇格させた管理者は通常権限にとどまります。権限の最上位を
+データベース側に置かないことで、パネル経由での自己昇格を防いでいます。
+
+セキュリティ上の挙動:
+
+- ログイン失敗8回でそのアカウントを15分ロックします。
+- 認証失敗のメッセージは、存在しないアカウントでも同一文面です。
+- パスワード変更時は、変更した端末以外のセッションをすべて失効させます。
+- 管理APIは管理者以外に **404** を返します（存在自体を秘匿）。
+
+---
+
+## Discord OAuth の設定（任意）
+
+メール認証だけで完結するため、Discord の設定は必須ではありません。追加の
+ログイン手段として提供したい場合のみ設定してください。
 
 1. https://discord.com/developers/applications で New Application
 2. **OAuth2 → Redirects** に `https://YOUR.DOMAIN/api/auth/callback` を**完全一致**で追加

@@ -57,6 +57,12 @@ async def ensure_content() -> None:
             await seed(db)
     async with session_scope() as db:
         await get_registry().reload(db)
+    async with session_scope() as db:
+        from .services.users import ensure_admin_account
+
+        status = await ensure_admin_account(db)
+        if status:
+            log.info("%s", status)
 
 
 @asynccontextmanager

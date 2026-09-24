@@ -1,8 +1,6 @@
 import { withBase } from "../lib/base";
-import { useState } from "react";
 import { useGame } from "../store/game";
-import { post } from "../lib/api";
-import { audio } from "../audio/engine";
+import { AuthPanel } from "../components/AuthPanel";
 
 const ERRORS: Record<string, string> = {
   banned: "このアカウントは現在利用できません。",
@@ -25,23 +23,12 @@ const FEATURES = [
 export function Landing() {
   const config = useGame((s) => s.config);
   const bootstrap = useGame((s) => s.bootstrap);
-  const [devId, setDevId] = useState("1324938326741876758");
-  const [busy, setBusy] = useState(false);
   const params = new URLSearchParams(location.search);
   const error = params.get("error");
 
-  const devLogin = async () => {
-    setBusy(true);
-    try {
-      // Discord IDs are 64-bit snowflakes: they must travel as strings or JS number precision truncates them.
-      await post("/api/auth/dev-login", { discord_id: devId, username: `dev_${devId.slice(-5)}` });
-      await bootstrap();
-      history.replaceState(null, "", withBase("/roll"));
-    } catch (e) {
-      useGame.getState().toast("ログインに失敗しました", "error", (e as Error).message);
-    } finally {
-      setBusy(false);
-    }
+  const signedIn = async () => {
+    await bootstrap();
+    history.replaceState(null, "", withBase("/roll"));
   };
 
   return (
@@ -72,28 +59,8 @@ export function Landing() {
           </div>
         )}
 
-        <div className="col" style={{ gap: 10, width: "min(360px, 100%)" }}>
-          {config?.discord_login ? (
-            <a className="btn primary block" href={withBase("/api/auth/login?next=/roll")} style={{ minHeight: 52, fontSize: "1.02rem" }}
-               onClick={() => audio.sfx("click")}>
-              <svg width="22" height="17" viewBox="0 0 71 55" fill="currentColor" aria-hidden="true">
-                <path d="M60.1 4.9A58.5 58.5 0 0 0 45.6.4a41 41 0 0 0-1.9 3.8 54.1 54.1 0 0 0-16.2 0A41 41 0 0 0 25.6.4a58.4 58.4 0 0 0-14.5 4.5C1.9 18.6-.6 32 .6 45.2a58.9 58.9 0 0 0 17.8 9 43.7 43.7 0 0 0 3.8-6.2 38.2 38.2 0 0 1-6-2.9l1.5-1.2a42 42 0 0 0 35.9 0l1.5 1.2a38.2 38.2 0 0 1-6 2.9 43.6 43.6 0 0 0 3.8 6.2 58.7 58.7 0 0 0 17.8-9c1.4-15.3-2.4-28.6-10.6-40.3ZM23.7 37.3c-3.5 0-6.4-3.2-6.4-7.2s2.8-7.3 6.4-7.3 6.5 3.3 6.4 7.3c0 4-2.8 7.2-6.4 7.2Zm23.6 0c-3.5 0-6.4-3.2-6.4-7.2s2.8-7.3 6.4-7.3 6.5 3.3 6.4 7.3c0 4-2.8 7.2-6.4 7.2Z" />
-              </svg>
-              Discordでログイン
-            </a>
-          ) : (
-            <div className="glass pad small muted">Discord OAuthが未設定です。<code className="mono">.env</code> を確認してください。</div>
-          )}
-
-          {config?.dev_login && (
-            <details className="glass pad-sm" style={{ textAlign: "left" }}>
-              <summary className="small muted" style={{ cursor: "pointer" }}>開発用ログイン（本番では無効）</summary>
-              <div className="col" style={{ marginTop: 8 }}>
-                <input value={devId} onChange={(e) => setDevId(e.target.value.replace(/\D/g, ""))} placeholder="Discord ID" inputMode="numeric" />
-                <button className="btn" onClick={devLogin} disabled={busy || !devId}>{busy ? "ログイン中…" : "ログイン"}</button>
-              </div>
-            </details>
-          )}
+        <div className="col" style={{ gap: 10, width: "min(380px, 100%)" }}>
+          <AuthPanel onDone={signedIn} />
         </div>
       </div>
 

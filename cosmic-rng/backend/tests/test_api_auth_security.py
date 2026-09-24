@@ -6,7 +6,7 @@ import uuid
 
 import pytest
 
-from tests.conftest import ADMIN_DISCORD_ID, admin_action, login, make_client, set_user
+from tests.conftest import ADMIN_PASSWORD, ADMIN_USERNAME, TEST_PASSWORD, admin_action, login, make_client, set_user
 
 
 async def test_unauthenticated_is_rejected(app):
@@ -20,7 +20,8 @@ async def test_unauthenticated_is_rejected(app):
 
 async def test_session_cookie_is_httponly_and_hashed(app):
     c = make_client(app)
-    r = await c.post("/api/auth/dev-login", json={"discord_id": 424242, "username": "cookie"})
+    r = await c.post("/api/auth/register", json={"email": "cookie@example.test", "username": "cookie",
+                                                 "password": TEST_PASSWORD})
     cookie = r.headers["set-cookie"]
     assert "crng_session=" in cookie and "HttpOnly" in cookie and "SameSite=lax" in cookie.replace("Lax", "lax")
     token = c.cookies.get("crng_session")
@@ -85,7 +86,7 @@ async def test_admin_routes_hidden_from_players(player):
 
 
 async def test_admin_requires_admin_mode(app):
-    a = await login(app, ADMIN_DISCORD_ID, "architect")
+    a = await login(app, ADMIN_USERNAME, ADMIN_PASSWORD)
     r = await a.get("/api/admin/dashboard")
     assert r.status_code == 403 and r.json()["error"]["code"] == "admin_mode_required"
     assert (await a.get("/api/admin/bootstrap")).status_code == 200
@@ -165,8 +166,8 @@ async def test_banned_user_session_is_invalidated(admin, app):
     r = await p.get("/api/me")
     assert r.status_code == 401
     c = make_client(app)
-    r = await c.post("/api/auth/dev-login", json={"discord_id": p.me["user"]["discord_id"], "username": "again"})
-    assert r.status_code == 302 and "banned" in r.headers["location"]
+    r = await c.post("/api/auth/login", json={"login": p.me["user"]["username"], "password": TEST_PASSWORD})
+    assert r.status_code == 403 and r.json()["error"]["code"] == "banned"
 
 
 async def test_frozen_user_can_read_but_not_act(admin, app):

@@ -56,7 +56,8 @@ async def public_config() -> dict[str, Any]:
         "special_interval": reg.setting("roll.special_interval"),
         "features": {k.split(".", 1)[1]: v for k, v in snap.settings.items() if k.startswith("features.") and isinstance(v, bool)},
         "maintenance": {"enabled": bool(reg.setting("features.maintenance_mode")), "message": reg.setting("features.maintenance_message")},
-        "discord_login": bool(s.discord_client_id), "dev_login": bool(s.dev_login_enabled and s.environment != "production"),
+        "discord_login": bool(s.discord_client_id and s.discord_redirect_uri),
+        "registration_open": bool(reg.setting("features.registration_open")),
         "rng_version": RNG_VERSION, "content_version": snap.version,
     }
 
@@ -69,7 +70,9 @@ async def me(principal: Principal = USER_ANY, db: AsyncSession = Depends(get_db)
     unread = await feed_svc.unread_count(db, user.id)
     await db.commit()
     return {
-        "user": {**users_svc.user_brief(user), "discord_id": str(user.discord_id), "status": user.status,
+        # The account's own email is returned only here, to the owner of the session.
+        "user": {**users_svc.user_brief(user), "email": user.email,
+                 "discord_id": str(user.discord_id) if user.discord_id else None, "status": user.status,
                  "status_reason": user.status_reason, "stardust": user.stardust, "xp": user.xp, "level": user.level,
                  "roll_counter": user.roll_counter, "auto_roll": user.auto_roll_enabled, "title_key": user.title_key,
                  "background": user.profile_background, "created_at": user.created_at.isoformat()},
