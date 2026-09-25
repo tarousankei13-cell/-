@@ -160,6 +160,7 @@ export function RollPage() {
     setBusy(true);
     setLastError(null);
     audio.sfx("roll_start", 0.8);
+    audio.nudge(autoRef.current ? 0.08 : 0.22);
     getCosmos()?.pulse(hud?.biome?.theme?.accent ?? "#8ab4ff", 0.16);
     // Hold notifications from here, not from when the cutscene mounts: the
     // socket can announce this very roll before its response has arrived.
@@ -216,6 +217,7 @@ export function RollPage() {
   // auto roll loop
   useEffect(() => {
     autoRef.current = auto;
+    audio.setIntensity(auto ? 0.8 : 0.45);
     if (!auto) return;
     let stop = false;
     const loop = async () => {
@@ -257,13 +259,17 @@ export function RollPage() {
     return off;
   }, []);
 
-  const toggleAutoServer = async (on: boolean) => {
+  /** One switch for both halves of Auto Roll: the loop in this tab and the
+   *  server flag that lets those rolls through. They used to be separate
+   *  controls, so pressing the button alone made every roll fail with 409. */
+  const toggleAuto = async (on: boolean) => {
     try {
       await post("/api/roll/auto", { enabled: on });
+      setAuto(on);
       useGame.getState().refreshHud();
-      toast(on ? "Auto Rollを有効にしました" : "Auto Rollを無効にしました", "info",
-        on ? "ブラウザを閉じている間もオフラインRollが進行します" : undefined);
+      if (on) toast("Auto Rollを開始しました", "info", "このページを開いている間、自動でRollします");
     } catch (e) {
+      setAuto(false);
       toast((e as ApiError).message, "error");
     }
   };
@@ -331,14 +337,12 @@ export function RollPage() {
             </div>
 
             <div className="row-wrap" style={{ justifyContent: "center", gap: 8 }}>
-              <button className={`btn sm ${auto ? "active" : "ghost"}`} onClick={() => { audio.sfx("click"); setAuto((a) => !a); }}>
+              <button className={`btn sm ${auto ? "active" : "ghost"}`} onClick={() => { audio.sfx("click"); void toggleAuto(!auto); }}>
                 {auto ? "■ Auto停止" : "▶ Auto Roll"}
               </button>
-              <label className="switch" title="オフラインでもRollを進める">
-                <input type="checkbox" checked={hud.auto_roll} onChange={(e) => toggleAutoServer(e.target.checked)} />
-                <span className="track" />
-                <span className="tiny">オフラインRoll</span>
-              </label>
+              <span className="chip tiny" title="離席中のぶんは自動でたまり、次に開いたときにまとめて受け取れます">
+                🌙 オフラインRoll 自動
+              </span>
               {(hud.unlocks.includes("rng_analyzer") || hud.reveal_rng) && (
                 <button className="btn sm ghost" onClick={openTable}>RNG解析</button>
               )}

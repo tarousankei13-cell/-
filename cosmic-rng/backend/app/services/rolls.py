@@ -333,15 +333,27 @@ async def try_fastest(db: AsyncSession, env: Env, won: Won, roll_number: int) ->
     )
 
 
+def note_best_item(stats: UserStats, item_id: int, odds: float) -> bool:
+    """Record a player's rarest item, whatever brought it to them.
+
+    Rolled, procedurally generated, or handed over by an admin — if it is the
+    rarest thing they own it is their best, and the leaderboard should say so.
+    Returns whether this became the new best.
+    """
+    if not item_id or odds <= stats.best_odds:
+        return False
+    stats.best_odds = float(odds)
+    stats.best_item_id = item_id
+    return True
+
+
 def _record_rarity(env: Env, won: Won, count: int) -> None:
     rc = dict(env.stats.rarity_counts or {})
     rk = str(won.info.get("rarity"))
     rc[rk] = int(rc.get(rk, 0)) + count
     env.stats.rarity_counts = rc
     flag_modified(env.stats, "rarity_counts")
-    if won.odds > env.stats.best_odds:
-        env.stats.best_odds = won.odds
-        env.stats.best_item_id = won.item_id
+    note_best_item(env.stats, won.item_id, won.odds)
 
 
 def _streak(env: Env, item_id: int) -> int:
@@ -389,13 +401,21 @@ async def announce_drop(db: AsyncSession, env: Env, won: Won, *, roll_luck: floa
 # Online single roll
 # ---------------------------------------------------------------------------
 def _offline_window(env: Env) -> tuple[datetime, datetime] | None:
+    """The stretch of time this player was away that has not been paid out yet.
+
+    Accruing does not depend on the Auto Roll switch. Time away is time away,
+    and a player who closes the tab without having found a toggle should come
+    back to the same thing as one who found it. The switch still governs the
+    live loop that rolls while the page is open; only the global feature flag
+    (admin panel) can turn accrual off.
+    """
     u = env.user
     s = env.snap.settings
-    if not u.auto_roll_enabled or not s.get("features.offline_roll_enabled") or not s.get("features.auto_roll_enabled"):
+    if not s.get("features.offline_roll_enabled"):
         return None
     if u.last_roll_at is None:
         return None
-    start = max(u.last_roll_at, u.offline_processed_until or u.last_roll_at, u.auto_roll_since or u.last_roll_at)
+    start = max(u.last_roll_at, u.offline_processed_until or u.last_roll_at)
     if (env.now - start).total_seconds() < float(s.get("offline.min_gap_seconds", 45)):
         return None
     hours = float(s.get("offline.max_hours", 8))
@@ -417,7 +437,12 @@ async def perform_roll(db: AsyncSession, user_id: int, *, auto: bool = False) ->
         if not user.auto_roll_enabled:
             raise AppError("Auto Rollが無効です", code="auto_roll_disabled", status_code=409)
     tolerance = timedelta(milliseconds=int(reg.setting("roll.tolerance_ms") or 0))
-    offline_needed = bool(user.auto_roll_enabled and user.last_roll_at)
+    # Recording the biome segments for the away window is real work, and a
+    # player rolling once a second is not away. Only pay for it once the gap is
+    # long enough that _offline_window would actually return one.
+    offline_from = max(user.last_roll_at, user.offline_processed_until or user.last_roll_at) if user.last_roll_at else None
+    min_gap = float(reg.setting("offline.min_gap_seconds") or 45)
+    offline_needed = offline_from is not None and (now - offline_from).total_seconds() >= min_gap
     record_from = None
     if offline_needed and user.last_roll_at:
         record_from = max(user.last_roll_at, now - timedelta(hours=24))
@@ -888,7 +913,7 @@ async def claim_offline(db: AsyncSession, user_id: int) -> dict[str, Any]:
     user = await users_svc.lock_user(db, user_id)
     if user.status == "banned":
         raise Forbidden("アカウントが停止されています", code="account_restricted")
-    record_from = max(user.last_roll_at, now - timedelta(hours=24)) if (user.auto_roll_enabled and user.last_roll_at) else None
+    record_from = max(user.last_roll_at, now - timedelta(hours=24)) if user.last_roll_at else None
     env = await load_env(db, user, now, record_from=record_from)
     summary = None
     window = _offline_window(env) if user.status == "active" else None
@@ -908,7 +933,9 @@ async def set_auto_roll(db: AsyncSession, user_id: int, enabled: bool) -> dict[s
     now = utcnow()
     user.auto_roll_enabled = enabled
     user.auto_roll_since = now if enabled else None
-    user.offline_processed_until = now
+    # The marker is deliberately left alone: offline time accrues whether or not
+    # this switch is on, so moving it here would quietly forfeit time already
+    # earned, just because the player touched the toggle.
     return {"auto_roll": enabled, "offline_enabled": bool(reg.setting("features.offline_roll_enabled"))}
 
 

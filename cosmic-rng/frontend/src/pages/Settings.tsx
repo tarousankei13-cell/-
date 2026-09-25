@@ -27,6 +27,22 @@ function Row({ label, hint, children }: { label: string; hint?: string; children
   );
 }
 
+/** The piece the engine is playing, refreshed once a second while the page is open. */
+function NowPlayingRow() {
+  const [np, setNp] = useState(() => audio.nowPlaying);
+  useEffect(() => {
+    const t = window.setInterval(() => setNp(audio.nowPlaying), 1000);
+    return () => window.clearInterval(t);
+  }, []);
+  return (
+    <Row label="現在のBGM">
+      {np && np.running
+        ? <span className="small mono">♪ {np.profile} · {np.bpm} BPM · {np.bar + 1}小節目 · 強度 {Math.round(np.intensity * 100)}%</span>
+        : <span className="small muted">画面をクリックすると再生が始まります</span>}
+    </Row>
+  );
+}
+
 export function Settings() {
   const me = useGame((s) => s.me);
   const saveSettings = useGame((s) => s.saveSettings);
@@ -93,6 +109,7 @@ export function Settings() {
             <span className="mono tiny" style={{ width: 34 }}>{Math.round(local.audio.sfx * 100)}%</span>
           </Row>
           <Row label="テスト再生"><button className="btn sm ghost" onClick={() => audio.sfx("reveal_legendary")}>▶ 再生</button></Row>
+          <NowPlayingRow />
         </Section>
 
         <Section title="🎨 グラフィック">

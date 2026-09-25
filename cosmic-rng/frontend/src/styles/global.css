@@ -10,9 +10,13 @@
   --font-body: "Exo 2", -apple-system, BlinkMacSystemFont, "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic UI", sans-serif;
 
   --bg: #05060f;
-  --panel: rgba(16, 20, 42, 0.62);
+  /* Panels let a little of the sky through on purpose, but not enough to
+     change what colour the text is sitting on. Along with the brightness
+     ceiling the starfield renderer applies, this keeps the same palette
+     readable on every biome rather than only the dark ones. */
+  --panel: rgba(14, 18, 40, 0.78);
   --panel-solid: #0c1024;
-  --panel-2: rgba(24, 30, 58, 0.72);
+  --panel-2: rgba(22, 27, 54, 0.84);
   --line: rgba(150, 175, 255, 0.16);
   --line-strong: rgba(160, 190, 255, 0.34);
   --text: #eef1ff;

@@ -290,9 +290,13 @@ async def grant(db: AsyncSession, principal: Principal, target_user_id: int, art
     g = AdminGrant(artifact_key=art["key"], instance_id=ids[0], admin_id=principal.user.id, target_user_id=target.id, action="grant",
                    can_use=can_use and art["player_usable"], uses_remaining=uses, expires_at=expires, reason=reason)
     db.add(g)
-    from .rolls import collection_upsert
+    from .rolls import collection_upsert, note_best_item
 
     await collection_upsert(db, target.id, art["item_id"], 1)
+    # An Admin Artifact is the rarest thing in the game; it belongs in the
+    # holder's best-roll record and on the leaderboard like anything else.
+    granted = snap.items.get(art["item_id"])
+    note_best_item(await users_svc.lock_stats(db, target.id), art["item_id"], float((granted.odds if granted else 0) or 0))
     await audit.record(db, principal, "artifact_grant", target_user_id=target.id, entity_type="artifact", entity_id=art["key"],
                        new={"instance_id": ids[0], "can_use": g.can_use, "uses": uses, "expires_at": expires}, reason=reason)
     item = snap.items.get(art["item_id"])

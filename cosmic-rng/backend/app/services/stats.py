@@ -12,7 +12,7 @@ from collections import defaultdict
 
 from datetime import timedelta
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.timeutil import utcnow
@@ -78,6 +78,39 @@ async def recompute_owner_counts(db: AsyncSession) -> None:
             ") s WHERE s.id = i.id AND i.owner_count IS DISTINCT FROM COALESCE(s.c, 0)"
         ))
     await db.commit()
+
+
+async def recompute_best_items(db: AsyncSession) -> int:
+    """Rebuild every player's rarest item from what they have actually obtained.
+
+    Before granted and generated items counted towards the record, players who
+    received a rare item from an admin, or generated one, had a best that was
+    quietly lower than the truth. The collection table lists everything a player
+    has ever obtained, so the rarest of those is the answer. Returns the number
+    of players whose record changed.
+    """
+    from ..models import Collection, Item, UserStats
+
+    rows = (await db.execute(
+        select(Collection.user_id, Item.id, Item.odds).join(Item, Item.id == Collection.item_id).where(Item.odds.is_not(None))
+    )).all()
+    best: dict[int, tuple[float, int]] = {}
+    for uid, iid, odds in rows:
+        o = float(odds or 0)
+        if uid not in best or o > best[uid][0]:
+            best[uid] = (o, iid)
+    changed = 0
+    for st in (await db.execute(select(UserStats))).scalars().all():
+        got = best.get(st.user_id)
+        if got is None:
+            continue
+        odds, iid = got
+        if odds > st.best_odds or (odds == st.best_odds and st.best_item_id is None):
+            st.best_odds = odds
+            st.best_item_id = iid
+            changed += 1
+    await db.commit()
+    return changed
 
 
 async def recompute_market_values(db: AsyncSession) -> None:

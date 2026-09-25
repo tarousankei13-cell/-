@@ -47,6 +47,29 @@ def setup_logging() -> None:
     root._cosmic_configured = True  # type: ignore[attr-defined]
 
 
+async def run_once(db, marker: str, fn) -> None:
+    """Run a data repair exactly once per database, recorded in game_settings.
+
+    For fixes that must touch rows written before the code changed — here, best
+    item records that predate granted and generated items counting — and that
+    should not cost every subsequent boot a full table scan.
+    """
+    from .models import GameSetting
+
+    if await db.get(GameSetting, marker) is not None:
+        return
+    result = await fn(db)
+    db.add(GameSetting(key=marker, value={"done": True, "result": result}))
+    await db.commit()
+    log.info("one-time repair %s: %s", marker, result)
+
+
+async def _recompute_best_items(db):
+    from .services.stats import recompute_best_items
+
+    return await recompute_best_items(db)
+
+
 async def ensure_content() -> None:
     from .content.seeder import seed
     from .models import Rarity
@@ -61,6 +84,8 @@ async def ensure_content() -> None:
         await backfill_names_ja(db)
     async with session_scope() as db:
         await get_registry().reload(db)
+    async with session_scope() as db:
+        await run_once(db, "backfill.best_items_v1", _recompute_best_items)
     async with session_scope() as db:
         from .services.users import ensure_admin_account
 

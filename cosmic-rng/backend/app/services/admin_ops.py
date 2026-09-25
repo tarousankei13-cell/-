@@ -253,7 +253,7 @@ BULK_OPERATIONS: list[dict[str, Any]] = [
     _a("reset_all_cooldowns", "全員のクールダウン解除", "運用", []),
     _a("clear_all_effects", "全員の一時効果を解除", "運用", []),
     _a("wipe_market", "出品をすべて取り下げ", "運用", [], help="出品中のアイテムは出品者に戻ります"),
-    _a("recompute_stats", "統計を再計算", "運用", [], help="所有数・相場・総資産を作り直します"),
+    _a("recompute_stats", "統計を再計算", "運用", [], help="所有数・相場・総資産・各プレイヤーの最高レア記録を作り直します"),
 ]
 
 # BULK_DANGEROUS is defined with the operation itself, further down.
@@ -289,9 +289,12 @@ async def user_action(db: AsyncSession, principal: Principal, user_id: int, acti
         if qty < 1 or qty > 10000:
             raise AppError("数量が不正です", code="invalid_quantity")
         ids = await inv_svc.create_instances(db, user.id, item.id, qty, "admin", tier=item.tier, meta={"granted_by": principal.user.id})
-        from .rolls import collection_upsert
+        from .rolls import collection_upsert, note_best_item
 
         await collection_upsert(db, user.id, item.id, qty)
+        # A granted item counts towards the player's rarest, same as a rolled one.
+        stats = await users_svc.lock_stats(db, user.id)
+        note_best_item(stats, item.id, float(item.odds or 0))
         new = {"item": item.key, "qty": qty, "instance_ids": ids[:20]}
         await feed_svc.notify_user(db, user.id, "admin_gift", f"管理者から {item.name} ×{qty} が付与されました", reason)
     elif action == "delete_instances":
@@ -806,6 +809,7 @@ async def bulk_operation(db: AsyncSession, principal: Principal, op: str, p: dic
         await stats_svc.recompute_owner_counts(db)
         await stats_svc.recompute_market_values(db)
         await stats_svc.recompute_net_worth(db, active_minutes=10**6)
+        detail["best_items_changed"] = await stats_svc.recompute_best_items(db)
         detail["recomputed"] = True
 
     else:

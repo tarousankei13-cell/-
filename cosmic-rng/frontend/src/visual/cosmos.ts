@@ -43,7 +43,7 @@ interface Nebula {
   phase: number;
 }
 
-const DEFAULT_THEME: Required<Pick<BiomeTheme, "bg" | "nebula" | "accent" | "accent2" | "particles" | "particle_color" | "intensity" | "fx" | "vignette">> = {
+const DEFAULT_THEME: Required<Pick<BiomeTheme, "bg" | "nebula" | "accent" | "accent2" | "particles" | "particle_color" | "intensity" | "fx" | "vignette">> & { ceiling: number } = {
   bg: ["#03040c", "#070b24", "#140f3a"],
   nebula: ["#1d2a6b", "#4b2d8a", "#0f4a7a"],
   accent: "#8ab4ff",
@@ -53,21 +53,52 @@ const DEFAULT_THEME: Required<Pick<BiomeTheme, "bg" | "nebula" | "accent" | "acc
   intensity: 0.35,
   fx: "none",
   vignette: 0.4,
+  ceiling: 0,
 };
 
 type Theme = typeof DEFAULT_THEME;
 
+/** Relative luminance of a hex colour (WCAG), 0..1. */
+function luminance(hex: string): number {
+  const [r, g, b] = hexToRgb(hex).map((c) => {
+    const v = c / 255;
+    return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/**
+ * How much to darken a theme so the interface stays readable on top of it.
+ *
+ * Every colour in the UI — text, panels, chips — is chosen for a dark stage.
+ * A biome is free to paint the sky as bright as it likes (Genesis is nearly
+ * white), so the sky gets its colour and the interface gets its stage: the
+ * frame is pulled down until the brightest tone of the palette sits at about
+ * the luminance of the darkest panel. Dark themes are left exactly as they are.
+ */
+const STAGE_LUMINANCE = 0.06;
+function ceilingFor(bg: string[], nebula: string[], intensity: number): number {
+  const brightest = Math.max(...bg.map(luminance), ...nebula.map((c) => luminance(c) * (0.25 + 0.45 * intensity)));
+  if (brightest <= STAGE_LUMINANCE) return 0;
+  // fraction of black to lay over the frame so brightest * (1 - k) ≈ target
+  return Math.min(0.86, 1 - STAGE_LUMINANCE / brightest);
+}
+
 function normalize(t: BiomeTheme | null | undefined): Theme {
+  const bg = (t?.bg && t.bg.length >= 3 ? t.bg : DEFAULT_THEME.bg).slice(0, 3);
+  const nebula = (t?.nebula && t.nebula.length >= 3 ? t.nebula : DEFAULT_THEME.nebula).slice(0, 3);
+  const intensity = t?.intensity ?? DEFAULT_THEME.intensity;
   return {
-    bg: (t?.bg && t.bg.length >= 3 ? t.bg : DEFAULT_THEME.bg).slice(0, 3),
-    nebula: (t?.nebula && t.nebula.length >= 3 ? t.nebula : DEFAULT_THEME.nebula).slice(0, 3),
+    bg,
+    nebula,
     accent: t?.accent ?? DEFAULT_THEME.accent,
     accent2: t?.accent2 ?? DEFAULT_THEME.accent2,
     particles: t?.particles ?? DEFAULT_THEME.particles,
     particle_color: t?.particle_color ?? DEFAULT_THEME.particle_color,
-    intensity: t?.intensity ?? DEFAULT_THEME.intensity,
+    intensity,
     fx: t?.fx ?? DEFAULT_THEME.fx,
     vignette: t?.vignette ?? DEFAULT_THEME.vignette,
+    ceiling: ceilingFor(bg, nebula, intensity),
   };
 }
 
@@ -151,6 +182,7 @@ export class CosmosRenderer {
       intensity: lerp(this.from.intensity, this.to.intensity, m),
       fx: m > 0.5 ? this.to.fx : this.from.fx,
       vignette: lerp(this.from.vignette, this.to.vignette, m),
+      ceiling: lerp(this.from.ceiling, this.to.ceiling, m),
     };
   }
 
@@ -464,6 +496,12 @@ export class CosmosRenderer {
         ctx.arc(W / 2, H / 2, r, 0, Math.PI * 2);
         ctx.stroke();
       }
+    }
+
+    // legibility ceiling: the sky keeps its hue, the interface keeps its stage
+    if (th.ceiling > 0.01) {
+      ctx.fillStyle = `rgba(3,4,12,${th.ceiling.toFixed(3)})`;
+      ctx.fillRect(0, 0, W, H);
     }
 
     // vignette

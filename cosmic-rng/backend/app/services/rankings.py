@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..content.registry import get_registry
 from ..core.errors import NotFound
-from ..models import Ranking, Season, SeasonStats, User, UserStats
+from ..models import Item, Ranking, Season, SeasonStats, User, UserStats
 from . import seasons as seasons_svc
 from .users import user_brief
 
@@ -42,13 +42,28 @@ async def board(db: AsyncSession, key: str, limit: int = 100) -> dict[str, Any]:
         .where(User.status != "banned", col > 0).order_by(col.desc(), User.id).limit(100)
     )).all()
     total = len(snap.collectible_ids) or 1
+    # Procedurally generated items are kept out of the in-memory snapshot (there
+    # can be very many), so the board used to show a rank and a number with no
+    # item beside it whenever someone's rarest find was a generated one. Fetch
+    # exactly the missing rows, in one query.
+    art: dict[int, dict[str, Any]] = {}
+    if key == "best":
+        wanted = {s.best_item_id for _, s in rows if s.best_item_id}
+        for iid in wanted:
+            it = snap.items.get(iid)
+            if it is not None:
+                art[iid] = {"name": it.name, "name_ja": it.name_ja, "rarity": it.rarity_key, "visual": it.visual}
+        missing = [i for i in wanted if i not in art]
+        if missing:
+            for it2 in (await db.execute(select(Item).where(Item.id.in_(missing)))).scalars().all():
+                art[it2.id] = {"name": it2.name, "name_ja": it2.name_ja, "rarity": it2.rarity_key, "visual": it2.visual or {}}
+
     entries = []
     for rank, (u, s) in enumerate(rows, start=1):
         value = float(getattr(s, col.key))
         e: dict[str, Any] = {"rank": rank, "user": user_brief(u), "value": value}
         if key == "best" and s.best_item_id:
-            item = snap.items.get(s.best_item_id)
-            e["item"] = {"name": item.name, "name_ja": item.name_ja, "rarity": item.rarity_key, "visual": item.visual} if item else None
+            e["item"] = art.get(s.best_item_id)
         if key == "collection":
             e["rate"] = value / total
         entries.append(e)

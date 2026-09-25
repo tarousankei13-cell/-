@@ -16,9 +16,9 @@ class _M(BaseModel):
 
 
 class AudioSettings(_M):
-    master: float = Field(0.8, ge=0, le=1)
-    bgm: float = Field(0.5, ge=0, le=1)
-    sfx: float = Field(0.8, ge=0, le=1)
+    master: float = Field(0.9, ge=0, le=1)
+    bgm: float = Field(0.7, ge=0, le=1)
+    sfx: float = Field(0.9, ge=0, le=1)
     muted: bool = False
 
 
