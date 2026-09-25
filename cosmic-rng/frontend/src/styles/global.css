@@ -143,6 +143,16 @@ button, input, select, textarea { font-family: inherit; font-size: inherit; colo
 
 /* --------------------------------------------------------------- layout */
 .page {
+  /* Above the starfield, always.
+     #cosmos is fixed with z-index 0, which paints above ordinary in-flow
+     content. Inside the signed-in shell .app-shell supplies the positioned
+     layer, but the signed-out landing page renders bare under #root — so the
+     canvas covered the whole login screen. Everything stayed in the DOM, the
+     right size and the right colour, and clicks still landed on it because the
+     canvas is pointer-events:none; it simply was not painted. Pinning every
+     page into the positioned layer makes that impossible to reintroduce. */
+  position: relative;
+  z-index: 1;
   width: 100%;
   max-width: 1280px;
   margin: 0 auto;

@@ -325,9 +325,16 @@ export default function App() {
   const me = useGame((s) => s.me);
   const bootstrap = useGame((s) => s.bootstrap);
   const claimedRef = useRef(false);
+  // Last-resort deadline on the boot screen itself. Requests carry their own
+  // now, but nothing about "the login form is reachable" should depend on the
+  // network behaving — if boot has not finished by here, show the page anyway
+  // and let it flip to the game if the session turns out to be valid.
+  const [bootStalled, setBootStalled] = useState(false);
 
   useEffect(() => {
     bootstrap();
+    const t = window.setTimeout(() => setBootStalled(true), 10000);
+    return () => window.clearTimeout(t);
   }, [bootstrap]);
 
   useEffect(() => {
@@ -358,14 +365,19 @@ export default function App() {
     <>
       <CosmosCanvas />
       <MaintenanceBar />
-      {!bootstrapped ? (
-        <Spinner label="宇宙を展開しています…" />
+      {!bootstrapped && !bootStalled ? (
+        // Also inside the shell: a bare spinner lands under the starfield too.
+        <div className="app-shell"><Spinner label="宇宙を展開しています…" /></div>
       ) : me ? (
         <Shell />
       ) : (
-        <Routes>
-          <Route path="*" element={<Landing />} />
-        </Routes>
+        // Same wrapper as the signed-in shell, so both states share one
+        // stacking layer instead of the landing page relying on its own.
+        <div className="app-shell">
+          <Routes>
+            <Route path="*" element={<Landing />} />
+          </Routes>
+        </div>
       )}
       <Toasts />
       <WorldBanner />

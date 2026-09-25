@@ -60,6 +60,8 @@ interface GameStore {
   heldToasts: Toast[];
   /** Set while a roll is in flight, before its cutscene exists to hold them. */
   toastHold: boolean;
+  /** The last boot could not reach the server at all. */
+  offline: boolean;
   reveals: RevealJob[];
   worldBanners: FirstDiscovery[];
   adminStats: Record<string, any> | null;
@@ -102,6 +104,7 @@ export const useGame = create<GameStore>((set, getState) => ({
   toasts: [],
   heldToasts: [],
   toastHold: false,
+  offline: false,
   reveals: [],
   worldBanners: [],
   adminStats: null,
@@ -111,20 +114,43 @@ export const useGame = create<GameStore>((set, getState) => ({
   set: (p) => set(p),
 
   bootstrap: async () => {
-    const config = await get<PublicConfig>("/api/config").catch(() => null);
+    // Short deadlines here on purpose: this runs before anything is on screen,
+    // and a slow answer must not be the difference between a login form and a
+    // spinner. Anything that misses it is treated as "server unreachable",
+    // which the landing page says out loud and offers to retry.
+    const BOOT_TIMEOUT = 8000;
+    let reachable = true;
+    const unreachable = (e: unknown) => { if (e instanceof ApiError && e.status === 0) reachable = false; };
+
+    // Both in flight at once: they do not depend on each other, and boot should
+    // take one timeout to fail, not two in a row.
+    const [config, meRes] = await Promise.all([
+      get<PublicConfig>("/api/config", undefined, undefined, BOOT_TIMEOUT).catch((e) => { unreachable(e); return null; }),
+      get<Me>("/api/me", undefined, undefined, BOOT_TIMEOUT).then(
+        (me) => ({ me }),
+        (e) => {
+          // 401 is the normal answer for a signed-out visitor, not a failure.
+          if (!(e instanceof ApiError) || e.status !== 401) console.warn("bootstrap", e);
+          unreachable(e);
+          return { me: null };
+        },
+      ),
+    ]);
     set({ config, maintenance: config?.maintenance ?? null });
-    try {
-      const me = await get<Me>("/api/me");
-      setCsrf(me.csrf);
-      set({ me, unread: me.unread });
-      const hud = await get<HudState>("/api/state");
-      getState().setHud(hud);
-    } catch (e) {
-      if (!(e instanceof ApiError) || e.status !== 401) console.warn("bootstrap", e);
+
+    if (meRes.me) {
+      setCsrf(meRes.me.csrf);
+      set({ me: meRes.me, unread: meRes.me.unread });
+      try {
+        getState().setHud(await get<HudState>("/api/state", undefined, undefined, BOOT_TIMEOUT));
+      } catch (e) {
+        unreachable(e);
+        console.warn("bootstrap state", e);
+      }
+    } else {
       set({ me: null });
-    } finally {
-      set({ bootstrapped: true });
     }
+    set({ bootstrapped: true, offline: !reachable });
   },
 
   setHud: (hud) => {

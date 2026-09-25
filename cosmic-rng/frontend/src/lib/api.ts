@@ -29,6 +29,32 @@ export interface RequestOptions {
   idempotent?: boolean;
   signal?: AbortSignal;
   query?: Record<string, string | number | boolean | string[] | undefined | null>;
+  /** Milliseconds before the request is abandoned. 0 disables the deadline. */
+  timeout?: number;
+}
+
+/**
+ * Every request gets a deadline.
+ *
+ * `fetch` has none of its own: a proxy that accepts the connection and then
+ * says nothing leaves the promise pending for as long as the tab is open. The
+ * app boots by awaiting two of these, so one stalled response used to leave
+ * players on the loading spinner with no way forward — the login screen never
+ * appeared at all.
+ */
+const DEFAULT_TIMEOUT = 20000;
+
+function deadline(ms: number, outer?: AbortSignal): { signal: AbortSignal; done: () => void; timedOut: () => boolean } {
+  const ctl = new AbortController();
+  let expired = false;
+  const timer = ms > 0 ? window.setTimeout(() => { expired = true; ctl.abort(); }, ms) : 0;
+  const relay = () => ctl.abort();
+  outer?.addEventListener("abort", relay);
+  return {
+    signal: ctl.signal,
+    done: () => { if (timer) window.clearTimeout(timer); outer?.removeEventListener("abort", relay); },
+    timedOut: () => expired,
+  };
 }
 
 function buildUrl(path: string, query?: RequestOptions["query"]) {
@@ -50,19 +76,26 @@ export async function api<T = any>(method: Method, path: string, body?: unknown,
   if (method !== "GET" && csrfToken) headers["X-CSRF-Token"] = csrfToken;
   if (opts.idempotent) headers["Idempotency-Key"] = idempotencyKey();
   let res: Response;
+  let text: string;
+  // The deadline has to cover reading the body too: a proxy can send headers
+  // and then stall, which leaves res.text() pending just as long as fetch would.
+  const limit = deadline(opts.timeout ?? DEFAULT_TIMEOUT, opts.signal);
   try {
     res = await fetch(buildUrl(path, opts.query), {
       method,
       headers,
       credentials: "same-origin",
       body: body !== undefined ? JSON.stringify(body) : undefined,
-      signal: opts.signal,
+      signal: limit.signal,
     });
+    text = await res.text();
   } catch (e) {
+    if (limit.timedOut()) throw new ApiError(0, "timeout", "サーバーの応答がありません。しばらくしてからお試しください。");
     if ((e as Error).name === "AbortError") throw e;
     throw new ApiError(0, "network", "サーバーに接続できません。通信状況を確認してください。");
+  } finally {
+    limit.done();
   }
-  const text = await res.text();
   let data: any = null;
   if (text) {
     try {
@@ -79,8 +112,8 @@ export async function api<T = any>(method: Method, path: string, body?: unknown,
   return data as T;
 }
 
-export const get = <T = any>(path: string, query?: RequestOptions["query"], signal?: AbortSignal) =>
-  api<T>("GET", path, undefined, { query, signal });
+export const get = <T = any>(path: string, query?: RequestOptions["query"], signal?: AbortSignal, timeout?: number) =>
+  api<T>("GET", path, undefined, { query, signal, timeout });
 export const post = <T = any>(path: string, body?: unknown, idempotent = false) => api<T>("POST", path, body ?? {}, { idempotent });
 export const put = <T = any>(path: string, body?: unknown) => api<T>("PUT", path, body ?? {});
 export const del = <T = any>(path: string, query?: RequestOptions["query"]) => api<T>("DELETE", path, undefined, { query });

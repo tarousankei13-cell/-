@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import { withBase } from "../lib/base";
 import { useGame } from "../store/game";
 import { AuthPanel } from "../components/AuthPanel";
@@ -22,14 +23,40 @@ const FEATURES = [
 
 export function Landing() {
   const config = useGame((s) => s.config);
+  // Landing only renders once boot finished — or once App gave up waiting for
+  // it. Either way, "not bootstrapped here" means the server never answered.
+  const bootstrapped = useGame((s) => s.bootstrapped);
+  const unreachable = useGame((s) => s.offline) || !bootstrapped;
   const bootstrap = useGame((s) => s.bootstrap);
   const params = new URLSearchParams(location.search);
   const error = params.get("error");
+  const [retrying, setRetrying] = useState(false);
+  const attempt = useRef(0);
 
   const signedIn = async () => {
     await bootstrap();
     history.replaceState(null, "", withBase("/roll"));
   };
+
+  const retry = async () => {
+    setRetrying(true);
+    try {
+      await bootstrap();
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  // Shared hosts put an idle app to sleep, so the first visit after a quiet
+  // spell can time out while the process is still waking. Keep trying on the
+  // player's behalf, backing off, so the page heals without a manual reload.
+  useEffect(() => {
+    if (!unreachable) { attempt.current = 0; return; }
+    const wait = Math.min(30000, 3000 * 2 ** attempt.current);
+    attempt.current += 1;
+    const t = window.setTimeout(() => { void bootstrap(); }, wait);
+    return () => window.clearTimeout(t);
+  }, [unreachable, bootstrap]);
 
   return (
     <div className="page" style={{ maxWidth: 940, paddingTop: "min(9vh, 70px)" }}>
@@ -50,6 +77,18 @@ export function Landing() {
         {error && (
           <div className="glass pad" style={{ borderColor: "rgba(255,92,122,0.5)", maxWidth: 480 }}>
             {ERRORS[error] ?? "エラーが発生しました。"}
+          </div>
+        )}
+
+        {unreachable && (
+          <div className="glass pad col" style={{ borderColor: "rgba(255,193,77,0.5)", maxWidth: 480, gap: 8 }}>
+            <strong>サーバーに接続できません</strong>
+            <span className="muted small">
+              起動直後や混雑時は少し時間がかかることがあります。自動で再接続を試みています。
+            </span>
+            <button className="btn sm" disabled={retrying} onClick={retry}>
+              {retrying ? "接続中…" : "今すぐ再試行"}
+            </button>
           </div>
         )}
 
