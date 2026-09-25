@@ -35,12 +35,24 @@ async function paints(page, handle) {
   if (!box || box.width < 2 || box.height < 2) return null;
   const clip = { x: Math.max(0, box.x), y: Math.max(0, box.y),
                  width: Math.min(box.width, 700), height: Math.min(box.height, 200) };
-  const shown = await page.screenshot({ clip });
-  await handle.evaluate((e) => { e.style.visibility = "hidden"; });
-  await page.waitForTimeout(70);
-  const hidden = await page.screenshot({ clip });
-  await handle.evaluate((e) => { e.style.visibility = ""; });
-  return !(shown.length === hidden.length && shown.equals(hidden));
+  // A paint is a frame: wait for the compositor to produce one after each
+  // toggle rather than a fixed delay. The music scheduler and the starfield
+  // both take main-thread time, and a fixed 70ms sometimes captured the
+  // previous frame, which reported a visible chip as unpainted.
+  const frame = () => page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true)))));
+  const capture = async (hide) => {
+    await handle.evaluate((e, h) => { e.style.visibility = h ? "hidden" : ""; }, hide);
+    await frame();
+    return page.screenshot({ clip });
+  };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const shown = await capture(false);
+    const hidden = await capture(true);
+    await handle.evaluate((e) => { e.style.visibility = ""; });
+    if (!(shown.length === hidden.length && shown.equals(hidden))) return true;
+    await page.waitForTimeout(250); // once more, generously, before calling it invisible
+  }
+  return false;
 }
 
 /** Nothing can be compared against a moving background. */
