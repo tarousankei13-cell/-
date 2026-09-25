@@ -21,7 +21,9 @@ mkdir -p "$DEST"
 cp "$ROOT/main.py" "$ROOT/README.md" "$ROOT/SETUP.md" "$DEST/"
 cp "$ROOT/backend/requirements.txt" "$DEST/requirements.txt"
 [ -f "$ROOT/.env.example" ] && cp "$ROOT/.env.example" "$DEST/"
-cp -r "$ROOT/backend" "$ROOT/frontend" "$ROOT/deploy" "$DEST/"
+# -a, not -r: -r follows symlinks, so a link inside node_modules (a linked dev
+# tool, a pnpm store) would be copied in full before the prune below runs.
+cp -a "$ROOT/backend" "$ROOT/frontend" "$ROOT/deploy" "$DEST/"
 
 # Nothing machine-local travels: caches, virtualenvs, node_modules, a developer's
 # database, or the previous ZIPs.
