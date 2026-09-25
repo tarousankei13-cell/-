@@ -69,17 +69,32 @@ async function sweep(page, label) {
   for (const h of handles.slice(0, MAX_PER_PAGE)) {
     const visible = await h.evaluate((e) => {
       const b = e.getBoundingClientRect(), cs = getComputedStyle(e);
-      return b.width >= 8 && b.height >= 8 && b.top >= 0 && b.bottom <= innerHeight &&
-             b.left >= 0 && b.right <= innerWidth && cs.visibility !== "hidden" &&
-             cs.display !== "none" && cs.opacity !== "0" &&
-             (!!e.textContent?.trim() || e.tagName === "INPUT");
+      if (!(b.width >= 8 && b.height >= 8 && b.top >= 0 && b.bottom <= innerHeight &&
+            b.left >= 0 && b.right <= innerWidth && cs.visibility !== "hidden" &&
+            cs.display !== "none" && (!!e.textContent?.trim() || e.tagName === "INPUT"))) return false;
+      // opacity does not inherit, so a transparent ancestor (a fading wrapper, a
+      // hidden duplicate header) leaves the element with a box and opacity 1
+      // while painting nothing — that is not a page bug, it is the ancestor
+      for (let p = e; p && p !== document.documentElement; p = p.parentElement) {
+        if (parseFloat(getComputedStyle(p).opacity) === 0) return false;
+      }
+      // and something else may simply be on top of it (a toast, a fixed bar)
+      const top = document.elementFromPoint(b.x + b.width / 2, b.y + b.height / 2);
+      return !!top && (top === e || e.contains(top) || top.contains(e));
     });
     if (!visible) continue;
+    // React re-renders live values (the balance, rarity counts) between the
+    // moment the handles were collected and the moment this one is tested. A
+    // handle to a node React has since replaced toggles nothing on screen —
+    // that says nothing about the page, so it is skipped rather than failed.
+    if (!(await h.evaluate((e) => e.isConnected))) continue;
     const painted = await paints(page, h);
     if (painted === null) continue;
+    if (!painted && !(await h.evaluate((e) => e.isConnected))) continue;
     checked += 1;
     if (!painted) {
-      const what = await h.evaluate((e) => `<${e.tagName.toLowerCase()} class="${String(e.className).slice(0, 40)}"> ${(e.textContent || "").trim().slice(0, 30)}`);
+      const what = await h.evaluate((e) => { const b = e.getBoundingClientRect();
+        return `<${e.tagName.toLowerCase()} class="${String(e.className).slice(0, 40)}"> ${(e.textContent || "").trim().slice(0, 30)} @${Math.round(b.x)},${Math.round(b.y)} ${Math.round(b.width)}x${Math.round(b.height)}`; });
       fail.push(`${label}: 描画されていない ${what}`);
     }
   }
