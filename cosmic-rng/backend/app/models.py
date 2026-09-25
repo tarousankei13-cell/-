@@ -373,6 +373,8 @@ class ItemPart(Base):
     part_type: Mapped[str] = mapped_column(String(16), nullable=False)  # material/shape/effect/modifier
     key: Mapped[str] = mapped_column(String(48), nullable=False)
     name: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Japanese wording of the part, composed into the generated item's name_ja.
+    name_ja: Mapped[str] = mapped_column(String(64), server_default="", nullable=False)
     weight: Mapped[float] = mapped_column(Double, server_default="1", nullable=False)
     value_mult: Mapped[float] = mapped_column(Double, server_default="1", nullable=False)
     visual: Mapped[dict[str, Any]] = jsonb()

@@ -113,6 +113,30 @@ async def recompute_best_items(db: AsyncSession) -> int:
     return changed
 
 
+async def backfill_generated_names_ja(db: AsyncSession) -> int:
+    """Give already-generated items the Japanese name they would get today.
+
+    A generated item stores which parts made it, so its Japanese name can be
+    composed after the fact once the parts have theirs. Returns rows changed.
+    """
+    from ..models import Item, ItemPart
+    from ..rng.procedural import compose_name_ja
+
+    parts = {(r.part_type, r.key): {"name_ja": r.name_ja} for r in (await db.execute(select(ItemPart))).scalars().all()}
+    changed = 0
+    for it in (await db.execute(select(Item).where(Item.kind == "generated", Item.name_ja == ""))).scalars().all():
+        chosen_keys = (it.procedural or {}).get("parts") or {}
+        chosen = {ptype: parts.get((ptype, key)) for ptype, key in chosen_keys.items()}
+        if any(v is None for v in chosen.values()):
+            continue
+        ja = compose_name_ja(chosen)
+        if ja:
+            it.name_ja = ja
+            changed += 1
+    await db.commit()
+    return changed
+
+
 async def recompute_market_values(db: AsyncSession) -> None:
     """Reference market value = median of the last 20 sales (last 30 days)."""
     cutoff = utcnow() - timedelta(days=30)

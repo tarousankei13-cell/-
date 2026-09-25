@@ -221,3 +221,22 @@ def test_every_fortune_band_carries_both_labels():
     for p in (0.9, 0.3, 0.05, 5e-3, 5e-4, 5e-6, 5e-7, 1e-12):
         f = fortune(p)
         assert f["label_ja"], p
+
+
+def test_generated_items_get_a_japanese_name():
+    """Every part has a Japanese word, so every combination has a Japanese
+    name — in Japanese word order, and never a half-translated one."""
+    from app.rng.procedural import compose_name_ja
+
+    chosen = {
+        "effect": {"name": "Radiant", "name_ja": "光り輝く"},
+        "material": {"name": "Gold", "name_ja": "黄金の"},
+        "shape": {"name": "Orb", "name_ja": "宝珠"},
+        "modifier": {"name": "of Dawn", "name_ja": "暁の"},
+    }
+    assert compose_name_ja(chosen) == "暁の光り輝く黄金の宝珠"
+    # no modifier → still a full name
+    assert compose_name_ja({k: v for k, v in chosen.items() if k != "modifier"}) == "光り輝く黄金の宝珠"
+    # one part without a Japanese word → no Japanese name rather than a mixed one
+    broken = dict(chosen, shape={"name": "Orb", "name_ja": ""})
+    assert compose_name_ja(broken) == ""

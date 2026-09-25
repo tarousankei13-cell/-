@@ -44,6 +44,9 @@ async def test_generated_item_appears_on_the_board(admin, player):
     assert r.status_code == 200, r.text
     won = r.json()["roll"]["item"]
     assert won["kind"] == "generated"
+    # composed from the parts' Japanese words, through the seeded database
+    assert won.get("name_ja"), f"generated item has no Japanese name: {won['name']}"
+    assert all(ord(ch) > 0x2E80 for ch in won["name_ja"]), won["name_ja"]
 
     st = await _stats(player)
     assert st["best_item"] and st["best_item"]["key"] == won["key"]

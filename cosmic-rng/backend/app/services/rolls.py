@@ -238,7 +238,7 @@ async def materialize_generated(db: AsyncSession, snap: Snapshot, slot: ItemDef,
     rar = snap.rarity_for_odds(spec.odds)
     new_id = (await db.execute(
         insert(Item).values(
-            key=spec.key, name=spec.name, description=spec.description, kind="generated", rarity_key=rar.key, odds=spec.odds,
+            key=spec.key, name=spec.name, name_ja=spec.name_ja, description=spec.description, kind="generated", rarity_key=rar.key, odds=spec.odds,
             rollable=False, sell_value=spec.sell_value, visual=spec.visual, procedural={"slot": slot.key, "parts": spec.parts},
             tradeable=True, sort_order=100000,
         ).on_conflict_do_nothing(index_elements=["key"]).returning(Item.id)

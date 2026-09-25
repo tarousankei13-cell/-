@@ -21,6 +21,7 @@ from .engine import RandomSource
 class GeneratedSpec:
     key: str
     name: str
+    name_ja: str
     odds: float
     sell_value: int
     visual: dict[str, Any]
@@ -39,6 +40,26 @@ def _weighted(options: list[dict[str, Any]], rng: RandomSource, invert: bool = F
         if u < acc:
             return o
     return options[-1]
+
+
+def compose_name_ja(chosen: dict[str, dict[str, Any]]) -> str:
+    """Japanese name for a part combination, or "" if any part lacks one.
+
+    Japanese reads modifier → effect → material → shape ("暁の輝く黄金の宝珠"),
+    the reverse of the English "Radiant Gold Orb of Dawn". A half-translated
+    name is worse than none, so one missing part means no Japanese name at all.
+    """
+    order = ("modifier", "effect", "material", "shape")
+    words = []
+    for ptype in order:
+        part = chosen.get(ptype)
+        if part is None:
+            continue
+        ja = (part.get("name_ja") or "").strip()
+        if not ja:
+            return ""
+        words.append(ja)
+    return "".join(words)
 
 
 def build_spec(slot: ItemDef, chosen: dict[str, dict[str, Any]], snap: Snapshot) -> GeneratedSpec:
@@ -70,7 +91,8 @@ def build_spec(slot: ItemDef, chosen: dict[str, dict[str, Any]], snap: Snapshot)
     key = "gen:" + slot.key + ":" + "-".join(chosen[p]["key"] for p in sorted(chosen))
     desc = f"{prefix + ' ' if prefix else ''}{slot.name}から生まれた自動生成アイテム。"
     return GeneratedSpec(
-        key=key[:128], name=name[:128], odds=odds, sell_value=max(1, round(float(proc.get("base_value", 10)) * value_mult * factor ** 0.35)),
+        key=key[:128], name=name[:128], name_ja=compose_name_ja(chosen)[:128], odds=odds,
+        sell_value=max(1, round(float(proc.get("base_value", 10)) * value_mult * factor ** 0.35)),
         visual=visual, parts={p: chosen[p]["key"] for p in chosen}, description=desc, combo_prob=combo_prob,
     )
 

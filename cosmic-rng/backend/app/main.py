@@ -70,6 +70,12 @@ async def _recompute_best_items(db):
     return await recompute_best_items(db)
 
 
+async def _generated_names_ja(db):
+    from .services.stats import backfill_generated_names_ja
+
+    return await backfill_generated_names_ja(db)
+
+
 async def ensure_content() -> None:
     from .content.seeder import seed
     from .models import Rarity
@@ -86,6 +92,8 @@ async def ensure_content() -> None:
         await get_registry().reload(db)
     async with session_scope() as db:
         await run_once(db, "backfill.best_items_v1", _recompute_best_items)
+    async with session_scope() as db:
+        await run_once(db, "backfill.generated_names_ja_v1", _generated_names_ja)
     async with session_scope() as db:
         from .services.users import ensure_admin_account
 

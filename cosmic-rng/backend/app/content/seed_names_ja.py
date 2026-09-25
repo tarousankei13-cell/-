@@ -451,6 +451,26 @@ SEASONS = {
     "season_1": "シーズン1: 最初の光",
 }
 
+# Parts of procedurally generated items. A generated item's Japanese name is
+# these four words in Japanese order (modifier, effect, material, shape), so
+# "Radiant Gold Orb of Dawn" reads "暁の輝く黄金の宝珠".
+ITEM_PARTS = {
+    # materials（〜の）
+    "iron": "鉄の", "copper": "銅の", "silver": "銀の", "gold": "黄金の", "obsidian": "黒曜石の",
+    "moonsilver": "月銀の", "starsteel": "星鋼の", "nebulite": "星雲石の", "orichalcum": "オリハルコンの",
+    "voidglass": "虚無硝子の", "aetherium": "エーテリウムの", "neutronium": "中性子石の",
+    # shapes
+    "ring": "指輪", "shard": "破片", "orb": "宝珠", "idol": "神像", "prism": "稜鏡", "chalice": "聖杯",
+    "sigil": "印章", "crown": "王冠", "mask": "仮面", "astrolabe": "星盤",
+    # effects（連体形）
+    "glowing": "輝く", "humming": "唸る", "shimmering": "煌めく", "radiant": "光り輝く", "resonant": "共鳴する",
+    "frozen": "凍てつく", "burning": "燃える", "cursed": "呪われた", "blessed": "祝福された", "eternal": "永遠の",
+    "paradoxical": "逆説の",
+    # modifiers（〜の）
+    "dawn": "暁の", "silence": "静寂の", "void": "虚無の", "andromeda": "アンドロメダの",
+    "suns": "万の太陽の", "first_star": "最初の星の", "infinity": "無限の",
+}
+
 BY_TABLE: dict[str, dict[str, str]] = {
     "rarities": RARITIES,
     "items": ITEMS,
@@ -464,4 +484,5 @@ BY_TABLE: dict[str, dict[str, str]] = {
     "quests": QUESTS,
     "shop_items": SHOP_ITEMS,
     "seasons": SEASONS,
+    "item_parts": ITEM_PARTS,
 }

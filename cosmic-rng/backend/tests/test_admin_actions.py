@@ -185,6 +185,7 @@ def test_every_seeded_content_row_has_a_japanese_name_or_already_is_one():
         "equipment": seed_world.EQUIPMENT, "boosts": seed_world.BOOSTS, "recipes": seed_world.RECIPES,
         "shops": seed_world.SHOPS, "shop_items": seed_world.SHOP_ITEMS, "cosmetics": seed_world.COSMETICS,
         "quests": seed_progress.QUESTS, "achievements": seed_progress.ACHIEVEMENTS,
+        "item_parts": seed_items.ITEM_PARTS,
     }
     missing = []
     for table, rows in sources.items():
