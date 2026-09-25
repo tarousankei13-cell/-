@@ -49,7 +49,9 @@ function deadline(ms: number, outer?: AbortSignal): { signal: AbortSignal; done:
   let expired = false;
   const timer = ms > 0 ? window.setTimeout(() => { expired = true; ctl.abort(); }, ms) : 0;
   const relay = () => ctl.abort();
-  outer?.addEventListener("abort", relay);
+  // An already-aborted caller signal never fires the event, so honour it now.
+  if (outer?.aborted) ctl.abort();
+  else outer?.addEventListener("abort", relay);
   return {
     signal: ctl.signal,
     done: () => { if (timer) window.clearTimeout(timer); outer?.removeEventListener("abort", relay); },

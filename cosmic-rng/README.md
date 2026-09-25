@@ -449,9 +449,26 @@ pytest -q -k security                    # セキュリティ関連
 | `test_biome_engine.py` | Biome出現頻度の理論値との一致、継続時間、特殊状態、長期不在時の処理 |
 | `test_api_auth_security.py` | 認証、CSRF、Origin、管理画面の秘匿、IDOR、改ざん、冪等性、**同時実行での二重課金防止**、SQLi、Rate Limit |
 | `test_api_game.py` | Roll、クールダウン、自動削除、Boost、オフラインRoll、クエスト、クラフト、Market（**同時購入の競合**）、Trade、Gift、Artifact、管理操作 |
+| `test_admin_actions.py` | 管理操作カタログとハンドラの整合、一括操作、権限、コンテンツの日本語名の網羅 |
 | `test_ws.py` | WebSocket認証、Origin拒否、イベント配信 |
 
 RNGの統計検証は管理パネル（Tools → RNGシミュレーション）でも任意の条件で実行できます。
+
+### 画面が本当に描画されているかの検査
+
+DOMを調べるテストは「要素は存在するのに画面には出ていない」状態を見抜けません。
+実際にログイン画面が背景の下に描かれて見えなくなる不具合を通してしまったので、
+描画そのものを確認するテストを用意しています。要素を隠して箇所を撮影し、表示して
+もう一度撮影し、画素が変わらなければ「見えていない」と判定します。
+
+```bash
+cd frontend
+npm i -D playwright && npx playwright install chromium   # 初回のみ
+node tests/visible.mjs http://localhost:8000 admin <パスワード>
+```
+
+パスワードを省くとログイン画面だけを検査します。既にあるブラウザを使う場合は
+`CHROMIUM_PATH` を指定してください。
 
 ---
 

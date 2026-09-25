@@ -72,6 +72,14 @@ CONFIG: dict[str, object] = {
     # 追加で許可したいアクセス元（カンマ区切り）。通常は空で構いません。
     "ALLOWED_ORIGINS": "",
 
+    # リバースプロキシのアドレス（カンマ区切り）。
+    # このアドレスから来たリクエストだけ X-Forwarded-For を信用して、本当の
+    # 接続元IPを取り出します。ホスティングパネルの多くは localhost から
+    # 転送するので既定のままで動きます。もしプロキシが別のアドレス
+    # （Dockerの 172.17.0.1 など）にある場合はここに追加してください。
+    # 設定しないと全員が同じIPとして扱われ、ログインの回数制限を共有します。
+    "TRUSTED_PROXIES": "127.0.0.1,::1",
+
     "LOG_LEVEL": "INFO",
     # ログをファイルにも残す場合はパスを書きます（例 "logs/cosmic.log"）。
     "LOG_FILE": "",
@@ -134,6 +142,7 @@ def apply_config() -> tuple[str, int, str]:
         "PUBLIC_BASE_URL": public,
         "BASE_PATH": base_path,
         "ALLOWED_ORIGINS": str(CONFIG["ALLOWED_ORIGINS"] or ""),
+        "TRUSTED_PROXIES": str(CONFIG["TRUSTED_PROXIES"] or "127.0.0.1,::1"),
         "COOKIE_SECURE": "true" if public.startswith("https://") else "false",
         "ADMIN_USERNAME": str(CONFIG["ADMIN_USERNAME"] or ""),
         "ADMIN_EMAIL": str(CONFIG["ADMIN_EMAIL"] or ""),

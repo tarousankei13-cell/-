@@ -206,3 +206,18 @@ async def test_error_responses_do_not_leak_internals(player):
 async def test_admin_endpoints_look_nonexistent(path, player):
     r = await player.get(path)
     assert r.status_code == 404 and r.json()["error"]["code"] == "not_found"
+
+
+def test_trusted_proxies_is_configurable(monkeypatch):
+    """Behind a reverse proxy every request arrives from the proxy's address.
+    If that address is not trusted, X-Forwarded-For is ignored and all players
+    share one rate-limit bucket — one person's failed logins lock out everyone.
+    """
+    from app.config import Settings
+
+    for var, val in {"EVENT_BUS": "local", "SECRET_KEY": "x" * 32,
+                     "DATABASE_URL": "sqlite+aiosqlite:///./t.db",
+                     "TRUSTED_PROXIES": "127.0.0.1, 172.17.0.1 ,10.0.0.5"}.items():
+        monkeypatch.setenv(var, val)
+    s = Settings()
+    assert s.trusted_proxy_set == {"127.0.0.1", "172.17.0.1", "10.0.0.5"}
