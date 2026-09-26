@@ -1243,6 +1243,277 @@ class ChargeService:
         self.queue_wakeup.set()
 
     # ==================================================================
+    # Kyash 請求リンク (Bot が発行 → 利用者が支払う → 自動で反映)
+    # ==================================================================
+    async def start_claim_charge(
+        self, guild_id: int, user_id: int, raw_amount: str
+    ) -> dict[str, Any]:
+        """請求リンクを発行して支払いを待つ取引を作る。
+
+        Bot が金額を指定して発行するため、送金リンク方式と違い
+        **金額不一致が原理的に起きない**。管理者の承認も不要。
+
+        Returns:
+            表示に必要な情報 (tx_id / url / amount / rate / 期限 など)。
+        """
+        settings = await self.ensure_usable_guild(guild_id)
+        # 入力検証を先に行い、書式エラーでレート制限を消費しない
+        amount = utils.parse_user_amount(raw_amount)
+        if amount is None:
+            raise ChargeError(config.ErrorCode.INVALID_AMOUNT)
+        if not self._charge_rate_limiter.check(f"claim:{guild_id}:{user_id}"):
+            raise ChargeError(config.ErrorCode.RATE_LIMITED)
+        # 請求リンク方式でも Kyash の受取用アカウントは必要
+        await self.preflight(guild_id, user_id, settings)
+        provider = config.ChargeProvider.KYASH_CLAIM
+        row = await self.db.get_provider_settings(guild_id, provider)
+        if row is not None and not row["enabled"]:
+            raise ChargeError(config.ErrorCode.PROVIDER_DISABLED)
+        charge_rate, role_id = await self.resolve_provider_rate(
+            guild_id, user_id, provider, settings
+        )
+        low, high = await self.provider_limits(guild_id, provider, settings)
+        await self._check_limits(
+            guild_id, user_id, amount, settings,
+            charge_rate=charge_rate, minimum=low, maximum=high,
+        )
+        async with self._user_locks.acquire(f"charge:{guild_id}:{user_id}"):
+            active = await self.db.count_active_transactions(guild_id, user_id)
+            if active > 0:
+                raise ChargeError(config.ErrorCode.ACTIVE_TRANSACTION_EXISTS)
+            wallet_before: int | None = None
+            try:
+                wallet = await self.kyash.get_wallet()
+                wallet_before = wallet.all_balance
+            except kyash_service.KyashServiceError as exc:
+                # 残高が取れなくても履歴照合で確認できるため続行する
+                logger.info("請求リンク発行前の残高取得に失敗しました: %s", exc)
+            try:
+                claim = await self.kyash.create_claim_link(amount)
+            except kyash_service.KyashServiceError as exc:
+                logger.warning("請求リンクの発行に失敗しました guild=%s user=%s: %s",
+                               guild_id, user_id, exc)
+                raise ChargeError(
+                    config.ErrorCode.CLAIM_LINK_FAILED, utils.safe_error_text(exc)
+                ) from exc
+            await self.db.ensure_user(guild_id, user_id)
+            try:
+                tx_id = await self.db.create_claim_transaction(
+                    guild_id=guild_id,
+                    user_id=user_id,
+                    requested_amount=amount,
+                    charge_rate=charge_rate,
+                    link_hash=utils.link_hash(claim.link_id),
+                    link_uuid=claim.link_uuid,
+                    claim_link_id=claim.link_id,
+                    wallet_before=wallet_before,
+                    expires_at=utils.now_ts() + config.CLAIM_WAIT_SECONDS,
+                )
+            except Exception:
+                # 取引を作れなかったリンクは残さない
+                await self._safe(
+                    self.kyash.cancel_link(claim.link_uuid), context="請求リンク破棄"
+                )
+                raise
+        logger.info(
+            "請求リンクを発行しました tx=%s guild=%s user=%s amount=%s rate=%s",
+            tx_id, guild_id, user_id, amount, charge_rate,
+        )
+        await self._safe(self.log_event(
+            guild_id,
+            "🧾 請求リンクを発行しました",
+            fields=(
+                ("利用者", f"<@{user_id}>", True),
+                ("金額", utils.fmt_yen(amount), True),
+                ("取引ID", f"`{tx_id}`", True),
+                ("適用レート",
+                 utils.fmt_rate(charge_rate) + (f" (<@&{role_id}>)" if role_id else ""), True),
+            ),
+            color=config.Color.WARNING,
+        ), context="請求リンクログ")
+        return {
+            "tx_id": tx_id,
+            "amount": amount,
+            "charge_rate": charge_rate,
+            "role_id": role_id,
+            "credited": utils.calc_credited_amount(amount, charge_rate),
+            "url": claim.url,
+            "expires_at": utils.now_ts() + config.CLAIM_WAIT_SECONDS,
+        }
+
+    async def check_claim_payment(self, tx_id: str, *, user_id: int | None = None) -> str:
+        """請求リンクの支払いを確認し、確認できたら残高を付与する。
+
+        Args:
+            user_id: 指定した場合、その利用者の取引でなければ拒否する。
+
+        Returns:
+            ``"CREDITED"`` 付与した / ``"PENDING"`` まだ確認できない /
+            ``"DONE"`` 既に処理済み / ``"REVIEW"`` 手動確認へ回した。
+        """
+        row = await self.db.get_transaction(tx_id)
+        if row is None:
+            raise ChargeError(config.ErrorCode.REQUEST_NOT_FOUND, "取引が見つかりません")
+        if user_id is not None and int(row["user_id"]) != int(user_id):
+            raise ChargeError(config.ErrorCode.NOT_ALLOWED, "他人の取引です")
+        status = str(row["status"])
+        if status == config.TxStatus.COMPLETED:
+            return "DONE"
+        if status in config.TERMINAL_STATUSES:
+            raise ChargeError(
+                config.ErrorCode.TRANSACTION_EXPIRED,
+                f"この取引は既に終了しています ({config.STATUS_LABELS.get(status, status)})",
+            )
+        if status != config.TxStatus.WAITING_PAYMENT:
+            # 既に受取済み → 付与処理だけ進める
+            await self.credit_transaction(tx_id)
+            return "CREDITED"
+
+        link_uuid = str(row["link_uuid"] or "")
+        if not link_uuid:
+            await self._to_manual_review(
+                tx_id, config.ErrorCode.UNKNOWN_ERROR, "請求リンクの識別子がありません"
+            )
+            return "REVIEW"
+
+        amount = int(row["requested_amount"])
+        # 請求リンクは「残高が増えた」だけでは判定しない。複数の請求リンクが
+        # 同時に未払いで残り得るため、他人の支払いを自分のものと誤認しないよう
+        # 履歴に自分の link_uuid が現れることを必須にする。
+        verification = await self.kyash.verify_receipt(
+            link_uuid=link_uuid,
+            amount=amount,
+            wallet_before=row["wallet_before"],
+            allow_wallet_delta=False,
+        )
+        if verification.verdict == kyash_service.Verdict.CONFIRMED:
+            return await self._settle_claim(tx_id, amount, verification.detail)
+        if verification.verdict == kyash_service.Verdict.NO_EVIDENCE:
+            logger.debug("請求リンクの支払いは未確認です tx=%s (%s)", tx_id, verification.detail)
+            return "PENDING"
+        logger.warning("請求リンクの支払い確認ができません tx=%s: %s",
+                       tx_id, verification.detail)
+        return "PENDING"
+
+    async def _settle_claim(self, tx_id: str, amount: int, detail: str) -> str:
+        """支払い確認済みの請求リンク取引を受取済みにして残高を付与する。"""
+        try:
+            await self.db.mark_claim_paid(tx_id, amount)
+        except IllegalStateTransition as exc:
+            # 自動確認と手動確認が同時に走った場合。付与自体は冪等。
+            logger.info("請求リンクの受取記録をスキップしました tx=%s: %s", tx_id, exc)
+            fresh = await self.db.get_transaction(tx_id)
+            if fresh is not None and str(fresh["status"]) == config.TxStatus.COMPLETED:
+                return "DONE"
+        logger.info("請求リンクの支払いを確認しました tx=%s (%s)", tx_id, detail)
+        # 支払い済みのリンクは再利用させない (repeatable な請求リンクのため)
+        row = await self.db.get_transaction(tx_id)
+        if row is not None and row["link_uuid"]:
+            await self._safe(
+                self.kyash.cancel_link(str(row["link_uuid"])), context="請求リンク無効化"
+            )
+        await self.credit_transaction(tx_id)
+        return "CREDITED"
+
+    async def check_waiting_payments(self) -> int:
+        """支払い待ちの請求リンクをまとめて確認する (バックグラウンド)。
+
+        履歴の取得は 1 回だけ行い、その結果を全件の突合に使うことで
+        Kyash への問い合わせ回数を抑える。
+
+        Returns:
+            残高を付与した件数。
+        """
+        rows = await self.db.list_waiting_payments(limit=50)
+        if not rows:
+            return 0
+        if not self.kyash.is_usable:
+            return 0
+        try:
+            timelines = await self.kyash.get_history(config.KYASH_HISTORY_LIMIT)
+        except kyash_service.KyashServiceError as exc:
+            logger.info("請求リンクの自動確認をスキップしました (履歴取得失敗): %s", exc)
+            return 0
+        credited = 0
+        for row in rows:
+            tx_id = str(row["id"])
+            link_uuid = str(row["link_uuid"] or "")
+            if not link_uuid:
+                continue
+            if not utils.json_contains_text(timelines, link_uuid):
+                continue
+            try:
+                if await self._settle_claim(
+                    tx_id, int(row["requested_amount"]), "履歴にリンク識別子を確認 (自動)"
+                ) == "CREDITED":
+                    credited += 1
+            except Exception:  # noqa: BLE001
+                logger.exception("請求リンクの自動付与に失敗しました tx=%s", tx_id)
+        if credited:
+            logger.info("請求リンクの支払いを %d 件自動で反映しました", credited)
+        return credited
+
+    async def expire_claim_transactions(self) -> int:
+        """期限切れの請求リンク取引を閉じ、リンクを無効化する。"""
+        rows = await self.db.list_waiting_payments(limit=100)
+        now = utils.now_ts()
+        expired = 0
+        for row in rows:
+            if not row["expires_at"] or int(row["expires_at"]) > now:
+                continue
+            tx_id = str(row["id"])
+            # 期限切れの直前に支払われている可能性があるため、最後に一度確認する
+            try:
+                result = await self.check_claim_payment(tx_id)
+                if result in ("CREDITED", "DONE"):
+                    continue
+            except ChargeError as exc:
+                # 期限切れ処理は続行する (確認できないことは異常ではない)
+                logger.debug("期限切れ直前の支払い確認に失敗しました tx=%s: %s", tx_id, exc.code)
+            if row["link_uuid"]:
+                await self._safe(
+                    self.kyash.cancel_link(str(row["link_uuid"])), context="請求リンク無効化"
+                )
+            try:
+                await self.db.transition_status(
+                    tx_id, config.TxStatus.EXPIRED,
+                    expected=(config.TxStatus.WAITING_PAYMENT,),
+                    error_code=config.ErrorCode.TRANSACTION_EXPIRED,
+                    error_message="請求リンクの支払い期限を過ぎました",
+                )
+            except IllegalStateTransition as exc:
+                logger.info("請求リンクの期限処理をスキップしました tx=%s: %s", tx_id, exc)
+                continue
+            expired += 1
+            await self._safe(self.notify_result(tx_id), context="期限切れDM")
+        if expired:
+            logger.info("期限切れの請求リンクを %d 件処理しました", expired)
+        return expired
+
+    async def cancel_claim_transaction(self, tx_id: str, user_id: int) -> None:
+        """利用者が支払い前の請求リンクを取り消す。"""
+        row = await self.db.get_transaction(tx_id)
+        if row is None:
+            raise ChargeError(config.ErrorCode.REQUEST_NOT_FOUND, "取引が見つかりません")
+        if int(row["user_id"]) != int(user_id):
+            raise ChargeError(config.ErrorCode.NOT_ALLOWED, "他人の取引です")
+        if str(row["status"]) != config.TxStatus.WAITING_PAYMENT:
+            raise ChargeError(
+                config.ErrorCode.REQUEST_ALREADY_HANDLED,
+                f"取り消せない状態です ({config.STATUS_LABELS.get(str(row['status']))})",
+            )
+        if row["link_uuid"]:
+            await self._safe(
+                self.kyash.cancel_link(str(row["link_uuid"])), context="請求リンク無効化"
+            )
+        await self.db.transition_status(
+            tx_id, config.TxStatus.CANCELLED,
+            expected=(config.TxStatus.WAITING_PAYMENT,),
+            error_message="利用者が取り消しました",
+        )
+        logger.info("請求リンクを取り消しました tx=%s user=%s", tx_id, user_id)
+
+    # ==================================================================
     # チャージ方式 (PayPay / LTC: 申請 → 管理者承認)
     # ==================================================================
     #: 審査チャンネル (全サーバー共通) を保存する system_settings のキー
@@ -1351,10 +1622,14 @@ class ChargeService:
             if not enabled:
                 reason = "管理者が停止しています"
                 code = config.ErrorCode.PROVIDER_DISABLED
-            elif provider == config.ChargeProvider.KYASH:
+            elif provider in config.KYASH_PROVIDERS:
+                # 送金リンク・請求リンクのどちらも受取用 Kyash アカウントが必要
                 if not self.kyash.is_usable:
                     reason = "受取用アカウントの準備中です"
                     code = config.ErrorCode.KYASH_UNAVAILABLE
+                elif self.kyash.wallet_limit_reached:
+                    reason = "受取用アカウントの残高上限に達しています"
+                    code = config.ErrorCode.WALLET_LIMIT
             else:
                 if provider not in destinations:
                     reason = "入金先が未登録です"

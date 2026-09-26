@@ -244,8 +244,10 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         received_amount        INTEGER,
         charge_rate            TEXT    NOT NULL,
         credited_amount        INTEGER,
+        provider               TEXT    NOT NULL DEFAULT 'KYASH',
         link_hash              TEXT UNIQUE,
         link_uuid              TEXT UNIQUE,
+        claim_link_id          TEXT,
         status                 TEXT    NOT NULL,
         retry_count            INTEGER NOT NULL DEFAULT 0,
         error_code             TEXT,
@@ -1389,6 +1391,97 @@ class Database:
             raise DatabaseError("取引IDの生成に失敗しました")
 
         return await self.run(_fn, write=True)
+
+    async def create_claim_transaction(
+        self,
+        *,
+        guild_id: int,
+        user_id: int,
+        requested_amount: int,
+        charge_rate: Decimal,
+        link_hash: str,
+        link_uuid: str,
+        claim_link_id: str,
+        wallet_before: int | None,
+        expires_at: int,
+    ) -> str:
+        """請求リンクの支払い待ち (WAITING_PAYMENT) 取引を作る。
+
+        ``link_uuid`` / ``link_hash`` は UNIQUE なので、同じ請求リンクで
+        2つの取引を作ることはできない。
+
+        ``claim_link_id`` は Bot が発行した請求リンクの識別子。利用者の
+        送金リンクと違い、これを知っても Bot へ送金する操作しかできない
+        (金銭的価値を持たない) ため、再表示と無効化のために保存する。
+        """
+        now = utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> str:
+            for _ in range(8):
+                tx_id = utils.new_transaction_id()
+                try:
+                    conn.execute(
+                        "INSERT INTO charge_transactions("
+                        "id, guild_id, user_id, requested_amount, charge_rate, status, "
+                        "source, provider, link_hash, link_uuid, claim_link_id, "
+                        "wallet_before, expires_at, created_at, updated_at) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            tx_id, guild_id, user_id, int(requested_amount),
+                            utils.rate_to_db(charge_rate), config.TxStatus.WAITING_PAYMENT,
+                            config.TxSource.KYASH_CLAIM, config.ChargeProvider.KYASH_CLAIM,
+                            link_hash, link_uuid, claim_link_id, wallet_before,
+                            int(expires_at), now, now,
+                        ),
+                    )
+                    return tx_id
+                except sqlite3.IntegrityError as exc:
+                    if "charge_transactions.id" in str(exc):
+                        continue  # ID 衝突 → 再生成
+                    raise
+            raise DatabaseError("取引IDの生成に失敗しました")
+
+        return await self.run(_fn, write=True)
+
+    async def mark_claim_paid(self, tx_id: str, received_amount: int) -> sqlite3.Row:
+        """支払いを確認できた請求リンク取引を RECEIVED にする。
+
+        ``WAITING_PAYMENT`` からのみ遷移できるため、同じ取引で 2 回
+        受取済みにすることはできない (残高付与自体も別途冪等)。
+        """
+        now = utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> sqlite3.Row:
+            row = conn.execute(
+                "SELECT status FROM charge_transactions WHERE id=?", (tx_id,)
+            ).fetchone()
+            if row is None:
+                raise DatabaseError(f"取引が見つかりません: {tx_id}")
+            current = str(row["status"])
+            if config.TxStatus.RECEIVED not in config.ALLOWED_TRANSITIONS.get(current, ()):
+                raise IllegalStateTransition(
+                    f"{tx_id}: {current} → RECEIVED は許可されていません"
+                )
+            conn.execute(
+                "UPDATE charge_transactions SET status=?, received_amount=?, "
+                "updated_at=? WHERE id=? AND status=?",
+                (config.TxStatus.RECEIVED, int(received_amount), now, tx_id, current),
+            )
+            updated = conn.execute(
+                "SELECT * FROM charge_transactions WHERE id=?", (tx_id,)
+            ).fetchone()
+            assert updated is not None
+            return updated
+
+        return await self.run(_fn, write=True)
+
+    async def list_waiting_payments(self, *, limit: int = 50) -> list[sqlite3.Row]:
+        """支払い待ちの請求リンク取引 (古い順)。自動確認に使う。"""
+        return await self.fetchall(
+            "SELECT * FROM charge_transactions WHERE status=? "
+            "ORDER BY created_at ASC LIMIT ?",
+            (config.TxStatus.WAITING_PAYMENT, int(limit)),
+        )
 
     async def credit_transaction(
         self,
@@ -4049,6 +4142,8 @@ _FORWARD_COMPAT_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("ranking_panels", "last_updated_at", "INTEGER"),
     ("admin_audit_logs", "operation_id", "TEXT"),
     # v3 で追加
+    ("charge_transactions", "provider", "TEXT NOT NULL DEFAULT 'KYASH'"),
+    ("charge_transactions", "claim_link_id", "TEXT"),
     ("charge_requests", "operation_id", "TEXT"),
     ("charge_requests", "role_id", "INTEGER"),
 )

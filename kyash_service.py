@@ -372,6 +372,37 @@ def _sync_link_check(client: Kyash, url: str) -> LinkInfo:
     )
 
 
+@dataclass(slots=True)
+class ClaimLink:
+    """Bot が発行した請求リンク。
+
+    利用者が支払う先なので、URL 自体に金銭的価値はない
+    (これを知っても Bot へ送る操作しかできない)。利用者の送金リンクとは
+    性質が異なるため、再表示とキャンセルのために URL を保持してよい。
+    """
+
+    url: str
+    link_id: str        #: URL の末尾 (kyash.me/payments/<link_id>)
+    link_uuid: str      #: 履歴との突合に使う識別子
+    amount: int
+
+
+def _sync_create_claim_link(client: Kyash, amount: int, message: str) -> tuple[str, dict[str, Any]]:
+    """請求リンクを発行する (添付モジュール ``create_link(is_claim=True)``)。"""
+    result = client.create_link(amount=int(amount), message=message, is_claim=True)
+    url = getattr(result, "link", None)
+    if not isinstance(url, str) or not url:
+        raise KyashServiceError("請求リンクの URL を取得できませんでした")
+    raw = getattr(result, "raw", None)
+    return url, raw if isinstance(raw, dict) else {}
+
+
+def _sync_cancel_link(client: Kyash, link_uuid: str) -> dict[str, Any]:
+    """発行済みリンクを無効化する (添付モジュール ``link_cancel``)。"""
+    result = client.link_cancel(link_uuid=link_uuid)
+    return result if isinstance(result, dict) else {}
+
+
 def _sync_link_receive(client: Kyash, link_uuid: str) -> dict[str, Any]:
     """送金リンクの受取 (link_uuid 指定でスクレイピングを省略する)。"""
     result = client.link_recieve(link_uuid=link_uuid)
@@ -855,6 +886,63 @@ class KyashService:
             raise LinkIsClaimError("請求リンクは受け取れません")
         return info
 
+    async def create_claim_link(self, amount: int, *, message: str | None = None) -> ClaimLink:
+        """Bot 名義の請求リンクを発行する。
+
+        利用者に「この金額を支払ってください」と提示するためのリンク。
+        金額は Bot が指定するので、送金リンク方式のような金額不一致は起きない。
+
+        履歴との突合に使う ``link_uuid`` は、発行した URL をページ解析して
+        取得する (``create_link`` の応答構造には依存しない)。
+
+        Raises:
+            KyashServiceError: 発行または識別子の取得に失敗した場合。
+        """
+        client = self._require_client()
+        text = message if message is not None else config.CLAIM_LINK_MESSAGE
+        url, _raw = await self._call(
+            lambda: _sync_create_claim_link(client, amount, text),
+            context="請求リンク発行", exclusive=True,
+        )
+        try:
+            link_id = utils.normalize_kyash_link(url)[1]
+        except utils.LinkParseError as exc:
+            raise KyashServiceError(f"発行された請求リンクを解釈できません: {exc}") from exc
+        info: LinkInfo = await self._call(
+            lambda: _sync_link_check(client, url), context="請求リンク確認"
+        )
+        if info.send_to_me:
+            # 送金リンクが返ってきた = is_claim が効いていない。受け取り側の
+            # 取り違えを防ぐため、ここで明確に失敗させる。
+            raise KyashServiceError("請求リンクではなく送金リンクが発行されました")
+        if info.amount != int(amount):
+            raise KyashServiceError(
+                f"発行された請求リンクの金額が一致しません (要求 {amount} / 実際 {info.amount})"
+            )
+        logger.info("請求リンクを発行しました amount=%s link=%s",
+                    amount, utils.mask_identifier(link_id))
+        return ClaimLink(url=url, link_id=link_id, link_uuid=info.uuid, amount=int(amount))
+
+    async def cancel_link(self, link_uuid: str) -> bool:
+        """発行済みリンクを無効化する (失敗しても致命的にしない)。"""
+        client = self._client
+        if client is None:
+            return False
+        try:
+            await self._call(
+                lambda: _sync_cancel_link(client, link_uuid),
+                context="リンク無効化", exclusive=True,
+            )
+        except KyashServiceError as exc:
+            logger.info("リンクの無効化に失敗しました (無視します): %s", exc)
+            return False
+        return True
+
+    async def find_payment(self, link_uuid: str, *, limit: int | None = None) -> bool:
+        """履歴にその請求リンクの支払いがあるかを確認する。"""
+        timelines = await self.get_history(limit or config.KYASH_HISTORY_LIMIT)
+        return utils.json_contains_text(timelines, link_uuid)
+
     async def link_receive(self, link_uuid: str) -> dict[str, Any]:
         """送金リンクを受け取る。
 
@@ -867,12 +955,30 @@ class KyashService:
         )
 
     async def verify_receipt(
-        self, *, link_uuid: str, amount: int, wallet_before: int | None
+        self,
+        *,
+        link_uuid: str,
+        amount: int,
+        wallet_before: int | None,
+        allow_wallet_delta: bool = True,
     ) -> VerificationResult:
         """実際に受け取れたかを履歴・残高から確認する。
 
         添付モジュールで利用できる情報 (履歴 / Wallet) のみを使い、
         スキーマに依存しない形で突合する。
+
+        Args:
+            allow_wallet_delta: 履歴に痕跡が無いとき、受取用アカウントの
+                残高増加を根拠にしてよいか。
+
+                送金リンク方式では Bot 自身が受取を実行した直後に確認するため、
+                残高の増加はその受取によるものと見なせる。
+
+                一方、**請求リンク方式では False を渡すこと**。支払いは
+                利用者が任意のタイミングで行い、複数の請求リンクが同時に
+                未払いで残り得るため、他人の支払いによる残高増加を
+                自分の支払いと誤認して残高を発行してしまう。
+                (この場合は履歴に ``link_uuid`` が現れるまで待つ)
         """
         history_error: str | None = None
         wallet_error: str | None = None
@@ -892,6 +998,20 @@ class KyashService:
             wallet_after = wallet.all_balance
         except KyashServiceError as exc:
             wallet_error = str(exc)
+
+        if not allow_wallet_delta:
+            # 残高差分を根拠にしない方式。履歴に現れていない = まだ未払い。
+            if history_error is None:
+                return VerificationResult(
+                    verdict=Verdict.NO_EVIDENCE,
+                    detail="履歴に支払いの痕跡がありません",
+                    wallet_after=wallet_after,
+                )
+            return VerificationResult(
+                verdict=Verdict.UNAVAILABLE,
+                detail=f"履歴を取得できません: {history_error}",
+                wallet_after=wallet_after,
+            )
 
         if wallet_before is not None and wallet_after is not None:
             delta = wallet_after - wallet_before

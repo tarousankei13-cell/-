@@ -94,6 +94,7 @@ class BackgroundTasks:
             self.integrity_task,
             self.shop_expiry,
             self.request_task,
+            self.claim_task,
             self.heartbeat,
             self.summary_task,
             self.campaign_task,
@@ -448,6 +449,22 @@ class BackgroundTasks:
 
     @shop_expiry.before_loop
     async def _before_shop(self) -> None:
+        await self._wait_ready()
+
+    @tasks.loop(seconds=config.TASK_CLAIM_INTERVAL)
+    async def claim_task(self) -> None:
+        """請求リンクの支払いを自動で確認し、期限切れを閉じる。"""
+        try:
+            await self.charge.check_waiting_payments()
+        except Exception:  # noqa: BLE001
+            logger.exception("請求リンクの支払い確認に失敗しました")
+        try:
+            await self.charge.expire_claim_transactions()
+        except Exception:  # noqa: BLE001
+            logger.exception("請求リンクの期限処理に失敗しました")
+
+    @claim_task.before_loop
+    async def _before_claim(self) -> None:
         await self._wait_ready()
 
     @tasks.loop(seconds=config.TASK_REQUEST_INTERVAL)

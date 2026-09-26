@@ -331,6 +331,38 @@ def main() -> None:
         "destination": Row(address="ltc1q" + "x" * 40, label="受取用", note="長い注意" * 80),
         "quote_expires_at": now + 1800,
     }
+    claim_quote = {
+        "tx_id": "TX-CLAIM01", "amount": 1000, "charge_rate": Decimal("130"),
+        "role_id": 101, "credited": 1300,
+        "url": "https://kyash.me/payments/CLAIM0001",
+        "expires_at": now + 1200,
+    }
+    verify("claim_link_embed", ui.claim_link_embed(claim_quote))
+    verify("claim_link_embed (再開)", ui.claim_link_embed(claim_quote, resumed=True))
+    verify("claim_link_embed (ロールなし)",
+           ui.claim_link_embed({**claim_quote, "role_id": None}))
+    verify("claim_pending_embed",
+           ui.claim_pending_embed(tx_id="TX-CLAIM01", amount=1000))
+    kyash_claim_entry = {
+        "provider": config.ChargeProvider.KYASH_CLAIM, "available": True, "reason": None,
+        "error_code": None, "minimum": 100, "maximum": 50_000,
+        "rate": Decimal("130"), "destination": None,
+    }
+    verify("provider_select_embed (請求リンクを含む)",
+           ui.provider_select_embed([entries[0], kyash_claim_entry, *entries[1:]]))
+    verify("charge_panel_embed (請求リンクを含む)",
+           ui.charge_panel_embed(settings, kyash_ready=True,
+                                 providers=[entries[0], kyash_claim_entry, *entries[1:]]))
+    check("```" in (ui.invite_link_embed(
+              url="https://discord.gg/x", code="x",
+              summary={"confirmed":0,"pending":0,"hold":0,"rejected":0,"reward":0},
+              created=True).fields[0].value or ""),
+          "招待リンクにコピー用ブロックがある")
+    check("https://discord.gg/x" in (ui.invite_link_embed(
+              url="https://discord.gg/x", code="x",
+              summary={"confirmed":0,"pending":0,"hold":0,"rejected":0,"reward":0},
+              created=True).fields[1].value or ""),
+          "招待リンクにタップできる素のURLがある")
     verify("deposit_embed (LTC)", ui.deposit_embed(ltc_quote))
     verify("deposit_embed (LTC・代替レート)",
            ui.deposit_embed({**ltc_quote, "price_stale": True}))

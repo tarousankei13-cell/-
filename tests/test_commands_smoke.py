@@ -918,6 +918,123 @@ async def main() -> None:
             interaction = fresh(owner)
             await run_ui(f"確認View: {item.label}", item.callback(interaction), interaction)
 
+    # --- 請求リンク (Kyash) の UI ---
+    settings = await bot.db.get_settings(G)
+    claim_limits = await bot.charge.provider_limits(
+        G, config.ChargeProvider.KYASH_CLAIM, settings
+    )
+    claim_modal = ui.ManualAmountModal(
+        config.ChargeProvider.KYASH_CLAIM, settings, claim_limits
+    )
+    claim_modal.amount._value = "1000"  # type: ignore[attr-defined]
+    interaction = fresh(target)
+    await run_ui("Modal: 請求リンクの金額入力", claim_modal.on_submit(interaction), interaction)
+    # 外部通信は禁止しているため発行は失敗するが、取引が残らないことを確認する
+    leftover = await bot.db.count_active_transactions(G, target.id)
+    if leftover == 0:
+        OK.append("請求リンクの発行失敗で取引が残らない")
+        print(f"  ok   検証: 発行失敗で取引を残さない (進行中 {leftover}件)")
+    else:
+        FAILURES.append(("Modal: 請求リンクの金額入力",
+                         f"失敗したのに取引が残っている ({leftover}件)"))
+        print(f" FAIL  検証: 発行失敗で取引が残った ({leftover}件)")
+    claim_view = ui.ClaimPaymentView("TX-NOTEXIST", owner_id=target.id, timeout=60)
+    for item in claim_view.children:
+        if isinstance(item, discord.ui.Button):
+            interaction = fresh(target)
+            await run_ui(f"請求リンクView: {item.label}",
+                         item.callback(interaction), interaction)
+
+    # --- コマンドの二重登録 (グローバル + ギルド) が起きないこと ---
+    print("\n--- コマンド登録スコープ ---")
+    tree_calls: list[str] = []
+    fetched: dict[int, list[object]] = {guild.id: [object(), object(), object()]}
+
+    class TreeSpy:
+        """tree.sync / copy_global_to の呼び出しを記録する。
+
+        グローバルとギルドの両方へ同じコマンドを登録すると Discord は
+        それぞれを別枠で表示するため、全コマンドが二重に見えてしまう。
+        ここではギルドへの「登録」が起きないこと、ギルドへの sync が
+        「削除 (空の同期)」としてのみ使われることを確かめる。
+        """
+
+        def __init__(self) -> None:
+            self.cleared: list[int] = []
+
+        async def sync(self, *, guild=None):
+            if guild is None:
+                tree_calls.append("sync:global")
+                return [object()] * 5
+            gid = int(getattr(guild, "id", guild))
+            tree_calls.append(f"sync:guild:{gid}")
+            fetched[gid] = []
+            return []
+
+        def copy_global_to(self, *, guild) -> None:
+            tree_calls.append("copy_global_to")
+
+        def clear_commands(self, *, guild=None) -> None:
+            gid = int(getattr(guild, "id", guild)) if guild is not None else 0
+            tree_calls.append(f"clear:{gid}")
+            self.cleared.append(gid)
+
+        async def fetch_commands(self, *, guild=None):
+            if guild is None:
+                return [object()] * 5
+            return fetched.get(int(getattr(guild, "id", guild)), [])
+
+    from commands import ServerGroup
+
+    server_group = ServerGroup()
+    spy = TreeSpy()
+    # CommandTree は読み取り専用プロパティなので内部属性を差し替える
+    bot._connection = getattr(bot, "_connection", None)  # 触らないことを明示
+    object.__setattr__(bot, "_TestTree__spy", spy)
+    type(bot).tree = property(lambda self: spy)  # type: ignore[assignment]
+
+    interaction = fresh(owner)
+    await run_ui("/server allow (再同期しない)",
+                 server_group.allow.callback(server_group, interaction, str(guild.id), None),
+                 interaction)
+    if "copy_global_to" in tree_calls:
+        FAILURES.append(("/server allow", "ギルドへコマンドをコピーしている (二重登録の原因)"))
+        print(" FAIL  検証: /server allow がギルドへコマンドをコピーしている")
+    else:
+        OK.append("/server allow はギルドへコマンドをコピーしない")
+        print("  ok   検証: /server allow はギルドへコピーしない")
+    if guild.id in spy.cleared:
+        OK.append("/server allow が残骸のギルドコマンドを削除する")
+        print(f"  ok   検証: 残骸のギルドコマンドを削除 (呼び出し {tree_calls})")
+    else:
+        FAILURES.append(("/server allow", "残骸のギルドコマンドを削除していない"))
+        print(" FAIL  検証: 残骸のギルドコマンドを削除していない")
+
+    tree_calls.clear()
+    fetched[guild.id] = [object(), object()]
+    await bot.db.set_system_value(bot.GUILD_COMMAND_CLEANUP_KEY, "")
+    interaction = fresh(owner)
+    await run_ui("/server sync (グローバルのみ)",
+                 server_group.sync.callback(server_group, interaction, False), interaction)
+    guild_syncs = [c for c in tree_calls if c.startswith("sync:guild")]
+    if "copy_global_to" in tree_calls or guild_syncs:
+        FAILURES.append(("/server sync", f"ギルドへも同期している: {tree_calls}"))
+        print(f" FAIL  検証: /server sync がギルドへ同期している ({tree_calls})")
+    else:
+        OK.append("/server sync はグローバルのみ同期する")
+        print(f"  ok   検証: グローバルのみ同期 ({tree_calls})")
+
+    tree_calls.clear()
+    interaction = fresh(owner)
+    await run_ui("/server sync cleanup:True",
+                 server_group.sync.callback(server_group, interaction, True), interaction)
+    if guild.id in spy.cleared and "copy_global_to" not in tree_calls:
+        OK.append("/server sync cleanup で重複を削除できる")
+        print(f"  ok   検証: cleanup で重複を削除 ({tree_calls})")
+    else:
+        FAILURES.append(("/server sync cleanup", f"重複を削除していない: {tree_calls}"))
+        print(f" FAIL  検証: cleanup が重複を削除していない ({tree_calls})")
+
     print("\n--- 権限チェック (一般利用者は拒否されるか) ---")
     class PlainBot(SmokeBot):
         async def is_server_admin(self, interaction) -> bool:  # type: ignore[override]

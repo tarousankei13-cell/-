@@ -543,6 +543,42 @@ async def main() -> None:
     check("LINK1" not in masked, "ログで送金リンクIDがマスクされる")
     check("hunter2" not in masked and "123456" not in masked, "パスワード/OTPがマスクされる")
     check("abcdefghijklmnopqrstuvwxyz0123456789ABCD" not in masked, "トークン風文字列がマスクされる")
+    # 認証ヘッダはスキームごと行末までマスクする
+    # (先に "Bearer" だけを消してトークン本体を残す不具合を防ぐ)
+    leaks = {
+        "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature":
+            ("eyJhbGciOiJIUzI1NiJ9", "payload", "signature"),
+        "authorization=Bearer abcdefghijklmnopqrstuvwxyz012345": ("abcdefghijklmnop",),
+        "Cookie: session=abc123; csrf=def456": ("abc123", "def456"),
+        '{"accessToken":"eyJ0eXAiOiJKV1QifQ.body.sig"}': ("eyJ0eXAiOiJKV1QifQ", "body"),
+        "X-Api-Key: verysecretkeyvalue": ("verysecretkeyvalue",),
+    }
+    leaked: list[str] = []
+    for text, secrets in leaks.items():
+        out = utils.sanitize_for_log(text)
+        leaked.extend(f"{x} ({text[:20]}…)" for x in secrets if x in out)
+    check(not leaked, f"認証ヘッダ・JWTが漏れない (漏洩: {leaked or 'なし'})")
+    # ログハンドラ経由 (traceback 込み) でも漏れない
+    import io
+    import logging as _logging
+
+    import main as _main_module
+
+    _buf = io.StringIO()
+    _handler = _logging.StreamHandler(_buf)
+    _handler.setFormatter(_main_module.SanitizingFormatter("%(message)s"))
+    _lg = _logging.getLogger("leak-check")
+    _lg.handlers = [_handler]
+    _lg.setLevel(_logging.DEBUG)
+    _lg.propagate = False
+    try:
+        raise RuntimeError("auth failed: Authorization: Bearer topsecrettoken12345")
+    except RuntimeError:
+        _lg.exception("失敗")
+    _lg.error("直接 %s", "https://kyash.me/payments/SECRETLINKID")
+    _logged = _buf.getvalue()
+    check("topsecrettoken12345" not in _logged, "traceback 内のトークンもマスクされる")
+    check("SECRETLINKID" not in _logged, "ログ引数のリンクIDもマスクされる")
     # 正規化: 表記揺れでも同じハッシュになる
     variants = [
         "https://kyash.me/payments/LINK1",
@@ -568,13 +604,18 @@ async def main() -> None:
     await setup_commands(bot)
     names = sorted(c.name for c in bot.tree.get_commands())
     expected = {
-        "setup", "charge_panel", "charge_panels", "ranking_panel", "ranking_panels",
+        "setup", "charge_panel", "panels", "ranking_panel",
         "kyash", "server", "settings", "balance", "user", "history", "stats", "queue",
         "system", "logs", "maintenance", "emergency_stop", "achievement", "transaction",
-        "config", "data", "backup",
+        "config", "data", "backup", "provider", "request", "shop", "campaign",
+        "rate", "export", "global", "inspect", "admin_panel",
     }
     missing = expected - set(names)
     check(not missing, f"必要なコマンドが揃っている (不足: {missing or 'なし'})")
+    # 重複や紛らわしい別名が残っていないこと
+    retired = {"charge_panels", "ranking_panels"}
+    check(not (retired & set(names)),
+          f"統合済みのコマンドが残っていない (残存: {retired & set(names) or 'なし'})")
     total_subcommands = sum(
         len(c.commands) if hasattr(c, "commands") else 1 for c in bot.tree.get_commands()
     )

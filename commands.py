@@ -15,7 +15,7 @@ import logging
 import platform
 from datetime import datetime
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 import discord
 from discord import app_commands
@@ -335,60 +335,120 @@ async def charge_panel_command(interaction: discord.Interaction) -> None:
     )
 
 
-@app_commands.command(name="charge_panels", description="設置済みチャージパネルの一覧 (管理者)")
-@app_commands.describe(disable_message_id="無効化するパネルのメッセージID (省略時は一覧のみ)")
+# ---------------------------------------------------------------------------
+# パネル一覧 / 無効化 (種類をまとめて扱う)
+# ---------------------------------------------------------------------------
+#: /panels で選べるパネルの種類。RANKING は別テーブルで管理している。
+_PANEL_KINDS: Final[dict[str, str]] = {
+    config.PANEL_TYPE_CHARGE: "💰 チャージパネル",
+    "RANKING": "🏆 ランキングパネル",
+    config.PANEL_TYPE_SHOP: "🛒 ショップパネル",
+    config.PANEL_TYPE_INVITE: "🤝 招待パネル",
+    config.PANEL_TYPE_ADMIN: "🛠 管理ダッシュボード",
+}
+
+
+@app_commands.command(name="panels", description="設置済みパネルの一覧と無効化 (管理者)")
+@app_commands.describe(
+    type="パネルの種類", disable_message_id="無効化するパネルのメッセージID",
+)
+@app_commands.choices(type=[
+    app_commands.Choice(name=label, value=key) for key, label in _PANEL_KINDS.items()
+])
 @app_commands.guild_only()
 @require_admin()
-async def charge_panels_command(
-    interaction: discord.Interaction, disable_message_id: str | None = None
+async def panels_command(
+    interaction: discord.Interaction,
+    type: app_commands.Choice[str],
+    disable_message_id: str | None = None,
 ) -> None:
-    """チャージパネルの一覧表示と無効化。"""
+    """パネルの一覧表示と無効化。
+
+    チャージ / ランキング / ショップ / 招待 / 管理の 5 種類を 1 つの
+    コマンドで扱う (種類ごとにコマンドを分けない)。
+    """
     bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
     await interaction.response.defer(ephemeral=True, thinking=True)
     guild = interaction.guild
     assert guild is not None
+    kind = type.value
+    is_ranking = kind == "RANKING"
+
+    async def fetch() -> list[Any]:
+        if is_ranking:
+            return list(await bot.db.list_ranking_panels(guild.id, active_only=False))
+        return list(await bot.db.list_panels(guild.id, panel_type=kind, active_only=False))
 
     if disable_message_id:
-        if not disable_message_id.strip().isdigit():
+        raw = disable_message_id.strip()
+        if not raw.isdigit():
             await interaction.followup.send(
                 embed=ui.info_embed("入力が不正です", "メッセージIDは数字で指定してください。",
                                     color=config.Color.DANGER),
                 ephemeral=True,
             )
             return
-        message_id = int(disable_message_id.strip())
-        panels = await bot.db.list_panels(guild.id, active_only=False)
-        if not any(int(p["message_id"]) == message_id for p in panels):
+        message_id = int(raw)
+        if not any(int(p["message_id"]) == message_id for p in await fetch()):
             await interaction.followup.send(
-                embed=ui.info_embed("見つかりません", "このサーバーに該当するパネルがありません。",
-                                    color=config.Color.DANGER),
+                embed=ui.info_embed(
+                    "見つかりません",
+                    f"このサーバーに該当する{_PANEL_KINDS[kind]}がありません。",
+                    color=config.Color.DANGER,
+                ),
                 ephemeral=True,
             )
             return
-        await bot.db.deactivate_panel(message_id=message_id)
-        await _audit(interaction, "PANEL_DISABLE", detail={"message_id": message_id})
+        if is_ranking:
+            await bot.db.deactivate_ranking_panel(message_id=message_id)
+        else:
+            await bot.db.deactivate_panel(message_id=message_id)
+        op_id = await _audit(
+            interaction, "PANEL_DISABLE",
+            detail={"message_id": message_id, "panel_type": kind},
+        )
         await interaction.followup.send(
-            embed=ui.success_embed("✅ 無効化しました",
-                                   f"メッセージID `{message_id}` のパネルを無効化しました。\n"
-                                   "メッセージ自体は残るため、不要な場合は手動で削除してください。"),
+            embed=ui.success_embed(
+                "✅ 無効化しました",
+                f"{_PANEL_KINDS[kind]} `{message_id}` を無効化しました。\n"
+                f"操作ID: `{op_id}`\n"
+                "メッセージ自体は残るため、不要な場合は手動で削除してください。",
+            ),
             ephemeral=True,
         )
         return
 
-    panels = await bot.db.list_panels(guild.id, active_only=False)
+    panels = await fetch()
     if not panels:
+        setup_hint = {
+            config.PANEL_TYPE_CHARGE: "`/charge_panel`",
+            "RANKING": "`/ranking_panel`",
+            config.PANEL_TYPE_SHOP: "`/shop panel`",
+            config.PANEL_TYPE_INVITE: "`/campaign panel`",
+            config.PANEL_TYPE_ADMIN: "`/admin_panel`",
+        }[kind]
         await interaction.followup.send(
-            embed=ui.info_embed("チャージパネル", "まだ設置されていません。`/charge_panel` で設置できます。"),
+            embed=ui.info_embed(
+                _PANEL_KINDS[kind], f"まだ設置されていません。{setup_hint} で設置できます。"
+            ),
             ephemeral=True,
         )
         return
-    lines = [
-        f"{'🟢' if p['active'] else '⚫'} <#{p['channel_id']}> / `{p['message_id']}` / "
-        f"{utils.format_jst(p['created_at'])}"
-        for p in panels
-    ]
+    lines = []
+    for p in panels[:25]:
+        extra = ""
+        if is_ranking and "ranking_type" in p.keys():
+            extra = f" / {config.RANKING_TYPE_LABELS.get(str(p['ranking_type']), '')}"
+        lines.append(
+            f"{'🟢' if p['active'] else '⚫'} <#{p['channel_id']}> / "
+            f"`{p['message_id']}` / {utils.format_jst(p['created_at'])}{extra}"
+        )
     await interaction.followup.send(
-        embed=ui.info_embed("💰 チャージパネル一覧", f"{ui.SEPARATOR}\n" + "\n".join(lines[:25])),
+        embed=ui.info_embed(
+            f"{_PANEL_KINDS[kind]} 一覧",
+            f"{ui.SEPARATOR}\n" + "\n".join(lines)
+            + f"\n{ui.SEPARATOR}\n無効化するには `disable_message_id` にIDを指定してください。",
+        ),
         ephemeral=True,
     )
 
@@ -470,64 +530,6 @@ async def ranking_panel_command(
     )
 
 
-@app_commands.command(name="ranking_panels", description="設置済みランキングパネルの一覧 (管理者)")
-@app_commands.describe(disable_message_id="無効化するパネルのメッセージID (省略時は一覧のみ)")
-@app_commands.guild_only()
-@require_admin()
-async def ranking_panels_command(
-    interaction: discord.Interaction, disable_message_id: str | None = None
-) -> None:
-    """ランキングパネルの一覧表示と無効化 (チャージパネルとは別管理)。"""
-    bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    guild = interaction.guild
-    assert guild is not None
-
-    if disable_message_id:
-        if not disable_message_id.strip().isdigit():
-            await interaction.followup.send(
-                embed=ui.info_embed("入力が不正です", "メッセージIDは数字で指定してください。",
-                                    color=config.Color.DANGER),
-                ephemeral=True,
-            )
-            return
-        message_id = int(disable_message_id.strip())
-        panels = await bot.db.list_ranking_panels(guild.id, active_only=False)
-        if not any(int(p["message_id"]) == message_id for p in panels):
-            await interaction.followup.send(
-                embed=ui.info_embed("見つかりません", "このサーバーに該当するパネルがありません。",
-                                    color=config.Color.DANGER),
-                ephemeral=True,
-            )
-            return
-        await bot.db.deactivate_ranking_panel(message_id=message_id)
-        await _audit(interaction, "RANKING_PANEL_DISABLE", detail={"message_id": message_id})
-        await interaction.followup.send(
-            embed=ui.success_embed("✅ 無効化しました",
-                                   f"メッセージID `{message_id}` のランキングパネルを無効化しました。"),
-            ephemeral=True,
-        )
-        return
-
-    panels = await bot.db.list_ranking_panels(guild.id, active_only=False)
-    if not panels:
-        await interaction.followup.send(
-            embed=ui.info_embed("ランキングパネル", "まだ設置されていません。`/ranking_panel` で設置できます。"),
-            ephemeral=True,
-        )
-        return
-    lines = [
-        f"{'🟢' if p['active'] else '⚫'} <#{p['channel_id']}> / `{p['message_id']}`\n"
-        f"　{config.RANKING_TYPE_LABELS.get(str(p['ranking_type']), str(p['ranking_type']))} / "
-        f"最終更新 {utils.format_jst(p['last_updated_at'])}"
-        for p in panels
-    ]
-    await interaction.followup.send(
-        embed=ui.info_embed("🏆 ランキングパネル一覧", f"{ui.SEPARATOR}\n" + "\n".join(lines[:25])),
-        ephemeral=True,
-    )
-
-
 # ---------------------------------------------------------------------------
 # /server (Bot Owner 専用)
 # ---------------------------------------------------------------------------
@@ -558,21 +560,22 @@ class ServerGroup(app_commands.Group):
         op_id = await _audit(interaction, "SERVER_ALLOW",
                              detail={"guild_id": target_id, "note": note})
         guild = bot.get_guild(target_id)
-        # 許可直後にコマンドを使えるよう、そのサーバーへ同期する
-        synced = 0
+        # コマンドはグローバルにのみ登録する。ここでギルドへコピーすると
+        # グローバル分と二重に表示されてしまうため、同期は行わない。
+        # 許可の判定は実行時 (require_admin / ensure_usable_guild) で行うので、
+        # 許可した時点で既に登録済みのコマンドがそのまま使える。
+        removed = 0
         if guild is not None:
-            try:
-                bot.tree.copy_global_to(guild=guild)
-                synced = len(await bot.tree.sync(guild=guild))
-            except (discord.HTTPException, discord.ClientException) as exc:
-                # application_id 未設定 (起動直後) などでも許可自体は成立させる
-                logger.warning("ギルドコマンド同期に失敗しました guild=%s: %s",
-                               target_id, utils.safe_error_text(exc))
+            # 旧バージョンが残したギルド単位のコマンドがあれば掃除する
+            removed = await bot.clear_guild_commands(guild)
         await interaction.followup.send(
             embed=ui.success_embed(
                 "✅ サーバーを許可しました",
                 f"対象: **{guild.name if guild else '未参加'}** (`{target_id}`)\n"
-                f"コマンド同期: {synced} 件\n操作ID: `{op_id}`",
+                f"操作ID: `{op_id}`\n\n"
+                "コマンドはグローバル登録のため、すぐに使えます。"
+                + (f"\n重複していたギルド専用コマンド {removed} 件を削除しました。"
+                   if removed else ""),
             ),
             ephemeral=True,
         )
@@ -692,26 +695,40 @@ class ServerGroup(app_commands.Group):
         embed.set_footer(text=f"許可済み {await bot.db.count_allowed_guilds()} / 参加 {len(bot.guilds)}")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="sync", description="スラッシュコマンドを再同期します")
+    @app_commands.command(
+        name="sync", description="スラッシュコマンドを再同期します (Bot Owner)"
+    )
+    @app_commands.describe(
+        cleanup="コマンドが二重に表示される場合に ON。ギルド専用の重複登録を削除します"
+    )
     @require_owner()
-    async def sync(self, interaction: discord.Interaction) -> None:
+    async def sync(self, interaction: discord.Interaction, cleanup: bool = False) -> None:
+        """コマンドはグローバルにのみ登録する。
+
+        グローバルとギルドの両方に同じコマンドを登録すると、Discord は
+        それぞれを別枠で表示するため「コマンドが2つずつ見える」状態になる。
+        ``cleanup`` はその原因となるギルド専用登録をすべて削除する。
+        """
         bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
         await interaction.response.defer(ephemeral=True, thinking=True)
         results: list[str] = []
         try:
             synced = await bot.tree.sync()
-            results.append(f"グローバル: {len(synced)} 件")
+            results.append(f"グローバル: **{len(synced)} 件** を登録しました")
         except (discord.HTTPException, discord.ClientException) as exc:
             results.append(f"グローバル: 失敗 ({utils.safe_error_text(exc, limit=120)})")
-        for guild in bot.guilds:
-            if not await bot.db.is_guild_allowed(guild.id):
-                continue
-            try:
-                bot.tree.copy_global_to(guild=guild)
-                guild_synced = await bot.tree.sync(guild=guild)
-                results.append(f"`{guild.id}`: {len(guild_synced)} 件")
-            except (discord.HTTPException, discord.ClientException) as exc:
-                results.append(f"`{guild.id}`: 失敗 ({utils.safe_error_text(exc, limit=80)})")
+        if cleanup:
+            summary = await bot.cleanup_guild_commands(force=True)
+            results.append(
+                f"重複削除: **{summary['removed']} 件** "
+                f"({summary['guilds']} サーバーを確認)"
+            )
+            if summary["failed"]:
+                results.append(f"⚠️ {summary['failed']} サーバーで削除に失敗しました")
+        else:
+            results.append(
+                "コマンドが二重に見える場合は `/server sync cleanup:True` を実行してください。"
+            )
         await interaction.followup.send(
             embed=ui.info_embed("🔄 コマンド同期", "\n".join(results[:25])), ephemeral=True
         )
@@ -1420,48 +1437,6 @@ class BalanceGroup(app_commands.Group):
             confirm=True,
         )
 
-    @app_commands.command(name="info", description="ユーザーの残高と変更履歴を表示します")
-    @app_commands.describe(user="対象ユーザー")
-    @app_commands.guild_only()
-    @require_admin()
-    async def info(self, interaction: discord.Interaction, user: discord.Member) -> None:
-        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        guild_id = interaction.guild.id  # type: ignore[union-attr]
-        balance = await bot.db.get_balance(guild_id, user.id)
-        summary = await bot.db.get_user_charge_summary(guild_id, user.id)
-        rank, _, total = await bot.db.get_user_rank(guild_id, user.id)
-        rows, history_total = await bot.db.list_balance_history(guild_id, user.id, limit=10)
-        user_row = await bot.db.get_user(guild_id, user.id)
-        embed = ui.info_embed(
-            f"💳 {user.display_name} の残高",
-            f"{ui.SEPARATOR}\n現在残高: **{utils.fmt_int(balance)}**",
-        )
-        embed.add_field(name="順位", value=f"{rank}位 / {total}人" if rank else "対象外", inline=True)
-        embed.add_field(name="累計チャージ", value=f"{summary['count']}回", inline=True)
-        embed.add_field(name="累計獲得", value=utils.fmt_int(summary["credited"]), inline=True)
-        embed.add_field(
-            name="凍結状態",
-            value="🧊 凍結中" if (user_row and user_row["frozen"]) else "🟢 通常",
-            inline=True,
-        )
-        if rows:
-            lines = [
-                f"{utils.format_jst(r['created_at'])} / "
-                f"{config.BALANCE_TYPE_LABELS.get(r['type'], r['type'])} / "
-                f"{'+' if r['change_amount'] >= 0 else ''}{utils.fmt_int(r['change_amount'])} → "
-                f"{utils.fmt_int(r['balance_after'])}"
-                + (f" / {utils.truncate(str(r['reason']), 40)}" if r["reason"] else "")
-                for r in rows
-            ]
-            embed.add_field(
-                name=f"残高変更履歴 (最新{len(rows)}/{history_total}件)",
-                value=utils.truncate("\n".join(lines), 1000),
-                inline=False,
-            )
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-
     @app_commands.command(name="move", description="残高を利用者間で付け替えます")
     @app_commands.describe(
         from_user="出金元", to_user="入金先", amount="付け替える残高", reason="理由 (監査ログに記録)"
@@ -2025,40 +2000,6 @@ class UserGroup(app_commands.Group):
             ),
             ephemeral=True,
         )
-
-    @app_commands.command(name="info", description="ユーザーの状態を表示します")
-    @app_commands.guild_only()
-    @require_admin()
-    async def info(self, interaction: discord.Interaction, user: discord.Member) -> None:
-        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        guild_id = interaction.guild.id  # type: ignore[union-attr]
-        row = await bot.db.get_user(guild_id, user.id)
-        balance = await bot.db.get_balance(guild_id, user.id)
-        summary = await bot.db.get_user_charge_summary(guild_id, user.id)
-        active = await bot.db.get_active_transaction(guild_id, user.id)
-        embed = ui.info_embed(
-            f"👤 {user.display_name}",
-            f"{ui.SEPARATOR}\nユーザーID: `{user.id}`",
-        )
-        embed.add_field(name="現在残高", value=utils.fmt_int(balance), inline=True)
-        embed.add_field(name="累計チャージ", value=f"{summary['count']}回", inline=True)
-        embed.add_field(
-            name="凍結", value="🧊 凍結中" if (row and row["frozen"]) else "🟢 通常", inline=True
-        )
-        if row and row["frozen"]:
-            embed.add_field(name="凍結理由", value=utils.truncate(str(row["frozen_reason"] or "-"), 500),
-                            inline=False)
-            embed.add_field(name="凍結日時", value=utils.format_jst(row["frozen_at"]), inline=True)
-        if active is not None:
-            embed.add_field(
-                name="進行中の取引",
-                value=f"`{active['id']}` / {config.STATUS_LABELS.get(active['status'], active['status'])} / "
-                      f"{utils.fmt_yen(int(active['requested_amount']))}",
-                inline=False,
-            )
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
 
 # ---------------------------------------------------------------------------
 # /maintenance, /emergency_stop (Server Admin)
@@ -5647,8 +5588,8 @@ async def setup_commands(bot: "ChargeBot") -> None:
     tree = bot.tree
     #: app_commands.Command は多相なため、まとめて回すときは Any で受ける。
     singles: tuple[Any, ...] = (
-        setup_command, charge_panel_command, charge_panels_command,
-        ranking_panel_command, ranking_panels_command, history_command,
+        setup_command, charge_panel_command, panels_command,
+        ranking_panel_command, history_command,
         stats_command, queue_command, logs_command, backup_command,
         inspect_command, admin_panel_command,
     )

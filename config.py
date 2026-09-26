@@ -12,7 +12,7 @@ from typing import Final
 # ---------------------------------------------------------------------------
 # バージョン
 # ---------------------------------------------------------------------------
-BOT_VERSION: Final[str] = "3.0.0"
+BOT_VERSION: Final[str] = "3.1.0"
 SCHEMA_VERSION: Final[int] = 3
 
 # ---------------------------------------------------------------------------
@@ -161,6 +161,8 @@ NOTIFICATION_MAX_ATTEMPTS: Final[int] = 5
 class TxStatus:
     CREATED = "CREATED"
     WAITING_LINK = "WAITING_LINK"
+    #: 請求リンクを発行し、利用者の支払いを待っている
+    WAITING_PAYMENT = "WAITING_PAYMENT"
     VALIDATING = "VALIDATING"
     QUEUED = "QUEUED"
     PROCESSING = "PROCESSING"
@@ -177,6 +179,7 @@ class TxStatus:
 ACTIVE_STATUSES: Final[tuple[str, ...]] = (
     TxStatus.CREATED,
     TxStatus.WAITING_LINK,
+    TxStatus.WAITING_PAYMENT,
     TxStatus.VALIDATING,
     TxStatus.QUEUED,
     TxStatus.PROCESSING,
@@ -207,6 +210,11 @@ DAILY_LIMIT_STATUSES: Final[tuple[str, ...]] = (
 ALLOWED_TRANSITIONS: Final[dict[str, tuple[str, ...]]] = {
     TxStatus.CREATED: (TxStatus.WAITING_LINK, TxStatus.CANCELLED, TxStatus.EXPIRED, TxStatus.FAILED),
     TxStatus.WAITING_LINK: (TxStatus.VALIDATING, TxStatus.CANCELLED, TxStatus.EXPIRED, TxStatus.FAILED),
+    # 請求リンクは Bot が発行し、支払いを確認できたら受取済みとして扱う
+    TxStatus.WAITING_PAYMENT: (
+        TxStatus.RECEIVED, TxStatus.CREDITING, TxStatus.CANCELLED,
+        TxStatus.EXPIRED, TxStatus.FAILED, TxStatus.MANUAL_REVIEW,
+    ),
     TxStatus.VALIDATING: (TxStatus.QUEUED, TxStatus.WAITING_LINK, TxStatus.FAILED, TxStatus.CANCELLED, TxStatus.EXPIRED),
     TxStatus.QUEUED: (TxStatus.PROCESSING, TxStatus.FAILED, TxStatus.CANCELLED, TxStatus.EXPIRED, TxStatus.MANUAL_REVIEW),
     TxStatus.PROCESSING: (TxStatus.RECEIVED, TxStatus.QUEUED, TxStatus.FAILED, TxStatus.MANUAL_REVIEW),
@@ -222,6 +230,7 @@ ALLOWED_TRANSITIONS: Final[dict[str, tuple[str, ...]]] = {
 STATUS_LABELS: Final[dict[str, str]] = {
     TxStatus.CREATED: "作成済み",
     TxStatus.WAITING_LINK: "リンク待ち",
+    TxStatus.WAITING_PAYMENT: "支払い待ち",
     TxStatus.VALIDATING: "検証中",
     TxStatus.QUEUED: "受取待ち",
     TxStatus.PROCESSING: "受取処理中",
@@ -237,6 +246,7 @@ STATUS_LABELS: Final[dict[str, str]] = {
 STATUS_EMOJI: Final[dict[str, str]] = {
     TxStatus.CREATED: "⚪",
     TxStatus.WAITING_LINK: "⌛",
+    TxStatus.WAITING_PAYMENT: "⌛",
     TxStatus.VALIDATING: "🔍",
     TxStatus.QUEUED: "🟡",
     TxStatus.PROCESSING: "🟡",
@@ -324,13 +334,15 @@ MANUAL_BALANCE_TYPES: Final[frozenset[str]] = frozenset({
 class TxSource:
     AUTOMATIC = "AUTOMATIC"        # Kyash の自動受取
     ADMIN_PROXY = "ADMIN_PROXY"    # 管理者の代理実績
+    KYASH_CLAIM = "KYASH_CLAIM"      # Bot 発行の請求リンクへの支払い
     MANUAL_PAYPAY = "MANUAL_PAYPAY"  # PayPay 申請の承認
     MANUAL_LTC = "MANUAL_LTC"        # Litecoin 申請の承認
 
 
 #: 取引の出自を利用者向けに表示する文言
 TX_SOURCE_LABELS: Final[dict[str, str]] = {
-    TxSource.AUTOMATIC: "Kyash (自動)",
+    TxSource.AUTOMATIC: "Kyash (送金リンク)",
+    TxSource.KYASH_CLAIM: "Kyash (請求リンク)",
     TxSource.ADMIN_PROXY: "管理者による代理登録",
     TxSource.MANUAL_PAYPAY: "PayPay (承認制)",
     TxSource.MANUAL_LTC: "Litecoin (承認制)",
@@ -343,34 +355,44 @@ TX_SOURCE_LABELS: Final[dict[str, str]] = {
 class ChargeProvider:
     """チャージ手段。DB の ``charge_requests.provider`` に保存する。"""
 
-    KYASH = "KYASH"
+    KYASH = "KYASH"              # 利用者が送金リンクを作り、Bot が受け取る
+    KYASH_CLAIM = "KYASH_CLAIM"  # Bot が請求リンクを発行し、利用者が支払う
     PAYPAY = "PAYPAY"
     LTC = "LTC"
 
 
 #: 選択メニュー・パネルに表示する名前
 PROVIDER_LABELS: Final[dict[str, str]] = {
-    ChargeProvider.KYASH: "Kyash",
+    ChargeProvider.KYASH: "Kyash (送金リンク)",
+    ChargeProvider.KYASH_CLAIM: "Kyash (請求リンク)",
     ChargeProvider.PAYPAY: "PayPay",
     ChargeProvider.LTC: "Litecoin (LTC)",
 }
 
 #: 方式の性質を一言で説明する (利用者が選ぶときの判断材料)
 PROVIDER_DESCRIPTIONS: Final[dict[str, str]] = {
-    ChargeProvider.KYASH: "送金リンクを送るとすぐ自動で反映されます",
+    ChargeProvider.KYASH: "自分で送金リンクを作って送る (自動で反映)",
+    ChargeProvider.KYASH_CLAIM: "Botが出す請求リンクを支払うだけ (自動で反映・金額ミスなし)",
     ChargeProvider.PAYPAY: "送金後に申請 → 管理者の承認で反映されます",
     ChargeProvider.LTC: "その時のレートで送金 → 申請 → 管理者の承認で反映されます",
 }
 
 PROVIDER_EMOJI: Final[dict[str, str]] = {
     ChargeProvider.KYASH: "💰",
+    ChargeProvider.KYASH_CLAIM: "🧾",
     ChargeProvider.PAYPAY: "🅿️",
     ChargeProvider.LTC: "Ł",
 }
 
 #: すべての方式 (表示順)
 ALL_PROVIDERS: Final[tuple[str, ...]] = (
-    ChargeProvider.KYASH, ChargeProvider.PAYPAY, ChargeProvider.LTC,
+    ChargeProvider.KYASH, ChargeProvider.KYASH_CLAIM,
+    ChargeProvider.PAYPAY, ChargeProvider.LTC,
+)
+
+#: Kyash の受取用アカウントを使う方式 (どちらも自動で反映される)
+KYASH_PROVIDERS: Final[tuple[str, ...]] = (
+    ChargeProvider.KYASH, ChargeProvider.KYASH_CLAIM,
 )
 
 #: 管理者承認が必要な方式
@@ -378,6 +400,8 @@ MANUAL_PROVIDERS: Final[tuple[str, ...]] = (ChargeProvider.PAYPAY, ChargeProvide
 
 #: 承認時に作る取引の source
 PROVIDER_TX_SOURCE: Final[dict[str, str]] = {
+    ChargeProvider.KYASH: TxSource.AUTOMATIC,
+    ChargeProvider.KYASH_CLAIM: TxSource.KYASH_CLAIM,
     ChargeProvider.PAYPAY: TxSource.MANUAL_PAYPAY,
     ChargeProvider.LTC: TxSource.MANUAL_LTC,
 }
@@ -432,6 +456,14 @@ REQUEST_REVIEW_SECONDS: Final[int] = 72 * 3600
 MAX_OPEN_REQUESTS_PER_USER: Final[int] = 3
 #: 申請が未処理のまま この時間を超えたら Owner へ催促する (秒)
 REVIEW_REMIND_SECONDS: Final[int] = 6 * 3600
+
+# --- Kyash 請求リンク ---
+#: 請求リンクを発行してから支払いを待つ時間 (秒)
+CLAIM_WAIT_SECONDS: Final[int] = 20 * 60
+#: 支払い確認を自動で回す間隔 (秒)
+TASK_CLAIM_INTERVAL: Final[int] = 45
+#: 請求リンクに載せるメッセージ (Kyash アプリに表示される)
+CLAIM_LINK_MESSAGE: Final[str] = "チャージ"
 
 # --- Litecoin ---
 #: LTC の最小単位 (1 litoshi = 1e-8 LTC)
@@ -618,6 +650,8 @@ class ErrorCode:
     PRICE_UNAVAILABLE = "PRICE_UNAVAILABLE"
     ASSET_AMOUNT_TOO_SMALL = "ASSET_AMOUNT_TOO_SMALL"
     REVIEW_CHANNEL_NOT_SET = "REVIEW_CHANNEL_NOT_SET"
+    CLAIM_LINK_FAILED = "CLAIM_LINK_FAILED"
+    PAYMENT_NOT_FOUND = "PAYMENT_NOT_FOUND"
     UNKNOWN_ERROR = "UNKNOWN_ERROR"
 
 
@@ -671,6 +705,8 @@ USER_ERROR_MESSAGES: Final[dict[str, str]] = {
     ErrorCode.PRICE_UNAVAILABLE: "レートを取得できないため、現在この方法は利用できません。",
     ErrorCode.ASSET_AMOUNT_TOO_SMALL: "金額が小さすぎます。もう少し大きい金額でお試しください。",
     ErrorCode.REVIEW_CHANNEL_NOT_SET: "この方法はまだ利用できる状態になっていません。",
+    ErrorCode.CLAIM_LINK_FAILED: "請求リンクを発行できませんでした。時間をおいてお試しください。",
+    ErrorCode.PAYMENT_NOT_FOUND: "まだ支払いを確認できていません。",
 }
 
 #: 利用者向けの「次にどうすればよいか」。エラー表示に添えて迷わせない。
@@ -723,6 +759,8 @@ USER_ERROR_NEXT_ACTIONS: Final[dict[str, str]] = {
     ErrorCode.PRICE_UNAVAILABLE: "別のチャージ方法を選ぶか、しばらくしてからもう一度お試しください。",
     ErrorCode.ASSET_AMOUNT_TOO_SMALL: "表示された最低金額以上でもう一度お試しください。",
     ErrorCode.REVIEW_CHANNEL_NOT_SET: "別のチャージ方法を選んでください (管理者の設定待ちです)。",
+    ErrorCode.CLAIM_LINK_FAILED: "少し待ってから、もう一度 `💰 チャージ` を試してください。別の方法でもチャージできます。",
+    ErrorCode.PAYMENT_NOT_FOUND: "Kyash アプリで支払いが完了しているか確認し、30秒ほど待って `🔄 支払いを確認` をもう一度押してください。自動でも確認しています。",
 }
 
 #: 再試行してはいけないエラー

@@ -340,6 +340,10 @@ def proof_hash(provider: str, proof_ref: str) -> str:
 # 送金リンク
 # ---------------------------------------------------------------------------
 
+#: Kyash のリンク URL 前置詞
+KYASH_LINK_PREFIX: Final[str] = "https://kyash.me/payments/"
+
+
 class LinkParseError(ValueError):
     """送金リンクとして解釈できない入力。"""
 
@@ -374,7 +378,16 @@ def normalize_kyash_link(raw: str) -> tuple[str, str]:
         if not _BARE_ID_RE.match(candidate):
             raise LinkParseError("Kyash の送金リンクを検出できません")
         link_id = candidate
-    return f"https://kyash.me/payments/{link_id}", link_id
+    return f"{KYASH_LINK_PREFIX}{link_id}", link_id
+
+
+def kyash_link_url(link_id: str) -> str:
+    """リンク識別子から Kyash のリンク URL を組み立てる。
+
+    Bot が発行した請求リンクを再表示するために使う。
+    利用者の送金リンクには使わない (完全なURLを保存しないため組み立てられない)。
+    """
+    return f"{KYASH_LINK_PREFIX}{link_id}"
 
 
 def link_hash(link_id: str) -> str:
@@ -386,10 +399,18 @@ def link_hash(link_id: str) -> str:
 # 秘密情報マスキング
 # ---------------------------------------------------------------------------
 
+#: 値を1つだけマスクする鍵名 (JSON のフィールドなど)
 _SECRET_KEY_HINTS = (
-    "token", "password", "passwd", "secret", "authorization", "cookie",
-    "x-auth", "otp", "verificationcode", "refreshtoken", "card", "pan", "cvv",
+    "token", "password", "passwd", "secret", "otp", "verificationcode",
+    "refreshtoken", "card", "pan", "cvv",
 )
+
+#: ヘッダ名。値はスペースを含み得るため **行末までまとめて** マスクする
+#: (``Authorization: Bearer <token>`` の token 部分を残さないため)
+_SECRET_HEADER_HINTS = ("authorization", "cookie", "set-cookie", "x-auth", "x-api-key")
+
+#: JWT / ドット区切りトークン風の文字列
+_JWT_RE = re.compile(r"\b[A-Za-z0-9_\-]{6,}(?:\.[A-Za-z0-9_\-]{4,}){2,}")
 
 
 def mask_secret(value: Any, *, keep: int = 2) -> str:
@@ -425,6 +446,21 @@ def sanitize_for_log(text: Any, *, limit: int = 500) -> str:
         return ""
     s = str(text)
     s = _PAYMENT_PATH_RE.sub(lambda m: f"payments/{mask_identifier(m.group(1), keep=4)}", s)
+    # 1) 認証スキーム付きの値は、スキームごと行末までマスクする。
+    #    先にここで潰さないと、後続の鍵名マスクが "Bearer" だけを消して
+    #    トークン本体を残してしまう。
+    s = re.sub(
+        r"\b(Bearer|Basic|Token|Digest)\s+\S+", r"\1 ***", s, flags=re.IGNORECASE
+    )
+    # 2) ヘッダ名は値にスペースを含み得るため行末までマスクする
+    for hint in _SECRET_HEADER_HINTS:
+        s = re.sub(
+            rf'((?:"|\')?{re.escape(hint)}(?:"|\')?\s*[:=]\s*)[^\r\n]+',
+            lambda m: m.group(1) + "***",
+            s,
+            flags=re.IGNORECASE,
+        )
+    # 3) JSON のフィールドなどは値を1つだけマスクする
     for hint in _SECRET_KEY_HINTS:
         s = re.sub(
             rf'((?:"|\')?{re.escape(hint)}(?:"|\')?\s*[:=]\s*)(?:"|\')?([^\s,;"\'}}\)]+)',
@@ -432,8 +468,8 @@ def sanitize_for_log(text: Any, *, limit: int = 500) -> str:
             s,
             flags=re.IGNORECASE,
         )
-    s = re.sub(r"(Bearer\s+)\S+", r"\1***", s, flags=re.IGNORECASE)
-    # 長いトークン風の連続文字列
+    # 4) JWT 風 (ドット区切り) とトークン風の長い連続文字列
+    s = _JWT_RE.sub("***", s)
     s = re.sub(r"\b[A-Za-z0-9_\-]{40,}\b", "***", s)
     return truncate(s, limit)
 

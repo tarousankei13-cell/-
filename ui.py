@@ -742,6 +742,23 @@ def error_embed(
     return embed
 
 
+def copy_block(value: str, *, hint: str | None = None) -> str:
+    """値をコピーしやすい形で返す。
+
+    Discord のコードブロックは PC ではホバーでコピーボタンが出て、
+    スマートフォンでは長押しで選択できる。ブロック内に値だけを置くことで、
+    余分な文字が混ざらないようにする。
+    """
+    text = f"```\n{value}\n```"
+    if hint:
+        text += hint
+    return text
+
+
+#: コピー方法の案内 (端末によって操作が違うため両方書く)
+COPY_HINT: Final[str] = "📋 PC はブロック右上のボタン、スマホは長押しでコピーできます。"
+
+
 #: Kyash (自動) の手順は 3 段階。利用者が「今どこにいるか」を常に示す。
 CHARGE_STEPS: Final[int] = 3
 #: PayPay / LTC (承認制) は「方式選択」が入るため 4 段階。
@@ -1157,18 +1174,18 @@ def deposit_embed(quote: dict[str, Any]) -> discord.Embed:
     if is_ltc:
         embed.add_field(
             name="① 送る数量 (この数量をそのまま)",
-            value=f"```\n{utils.fmt_asset(asset_amount, unit='')}\n```",
+            value=copy_block(utils.fmt_asset(asset_amount, unit="")),
             inline=False,
         )
     else:
         embed.add_field(
             name="① 送る金額",
-            value=f"```\n{amount}\n```",
+            value=copy_block(str(amount)),
             inline=False,
         )
     embed.add_field(
         name=f"② 送り先 ({destination['label'] or '受取先'})",
-        value=f"```\n{destination['address']}\n```",
+        value=copy_block(str(destination["address"]), hint=COPY_HINT),
         inline=False,
     )
     detail = [
@@ -1213,6 +1230,98 @@ def deposit_embed(quote: dict[str, Any]) -> discord.Embed:
         warn.append(f"・{utils.truncate(str(destination['note']), 300)}")
     embed.add_field(name="⚠️ 注意", value="\n".join(warn), inline=False)
     embed.set_footer(text=f"申請ID: #{quote['request_id']}")
+    return embed
+
+
+def claim_link_embed(quote: dict[str, Any], *, resumed: bool = False) -> discord.Embed:
+    """請求リンクの支払い案内 (ステップ 2/2)。
+
+    Bot が金額を指定して発行するため、送金リンク方式と違い
+    金額の打ち間違いが起きない。
+    """
+    embed = discord.Embed(
+        title=("⌛ 支払いをお待ちしています" if resumed
+               else "🧾 このリンクを支払ってください"),
+        description=(
+            f"{step_line(2, 2)}\n{SEPARATOR}\n"
+            + ("前回発行したリンクがまだ有効です。\n" if resumed else "")
+            + "**リンクを開いて支払うだけ**で、自動で残高に反映されます。\n"
+            f"{SEPARATOR}"
+        ),
+        color=config.Color.WARNING if resumed else config.Color.ACCENT,
+    )
+    embed.add_field(
+        name="🔗 タップして支払う",
+        value=f"{quote['url']}",
+        inline=False,
+    )
+    embed.add_field(
+        name="📋 コピー用",
+        value=copy_block(str(quote["url"]), hint=COPY_HINT),
+        inline=False,
+    )
+    embed.add_field(
+        name="この取引の内容",
+        value=(
+            f"支払う金額: **{utils.fmt_yen(int(quote['amount']))}**\n"
+            f"チャージ率: **{utils.fmt_rate(quote['charge_rate'])}**"
+            + (f" (<@&{int(quote['role_id'])}>)" if quote.get("role_id") else "") + "\n"
+            f"もらえる残高: **{utils.fmt_int(int(quote['credited']))}**"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="期限",
+        value=utils.discord_ts(quote.get("expires_at"), "R"),
+        inline=True,
+    )
+    embed.add_field(
+        name="▶ やること",
+        value=(
+            "**1.** 上のリンクを開く (Kyash アプリが開きます)\n"
+            "**2.** 表示された金額をそのまま支払う\n"
+            "**3.** 自動で確認して残高に反映します (最大1分ほど)\n"
+            "　　急ぐときは `🔄 支払いを確認` を押してください"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="⚠️ 注意",
+        value=(
+            "・**支払いは1回だけ**にしてください (2回払っても残高は1回分です)\n"
+            "・このリンクは**あなた専用**です。他の人に渡さないでください\n"
+            "・金額は Bot が指定しているので、変更する必要はありません\n"
+            "・期限を過ぎるとリンクは無効になります"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"取引ID: {quote['tx_id']}")
+    return embed
+
+
+def claim_pending_embed(*, tx_id: str, amount: int) -> discord.Embed:
+    """支払いをまだ確認できないときの案内。"""
+    embed = discord.Embed(
+        title="⌛ まだ支払いを確認できていません",
+        description=(
+            f"{SEPARATOR}\n"
+            "Kyash 側の反映に少し時間がかかることがあります。\n"
+            f"{SEPARATOR}"
+        ),
+        color=config.Color.WARNING,
+    )
+    embed.add_field(name="金額", value=f"**{utils.fmt_yen(amount)}**", inline=True)
+    embed.add_field(
+        name="▶ 次にどうすればいいですか？",
+        value=(
+            "**1.** Kyash アプリで支払いが完了しているか確認する\n"
+            "**2.** 30秒ほど待ってから `🔄 支払いを確認` をもう一度押す\n"
+            "**3.** Bot も自動で確認しているので、そのまま待っても反映されます\n\n"
+            "まだ支払っていない場合は、上のリンクから支払ってください。"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"取引ID: {tx_id}")
     return embed
 
 
@@ -1309,7 +1418,7 @@ def review_card_embed(
     )
     if request["proof_ref"]:
         label = config.PROVIDER_PROOF_LABELS.get(provider, "証拠")
-        value = f"```\n{utils.truncate(str(request['proof_ref']), 200)}\n```"
+        value = copy_block(utils.truncate(str(request["proof_ref"]), 200))
         if provider == config.ChargeProvider.LTC:
             value += (
                 "エクスプローラで着金・数量・承認数を確認してください。\n"
@@ -1372,13 +1481,13 @@ def review_detail_embed(
     if request["proof_ref"]:
         embed.add_field(
             name=config.PROVIDER_PROOF_LABELS.get(provider, "証拠"),
-            value=f"```\n{utils.truncate(str(request['proof_ref']), 300)}\n```",
+            value=copy_block(utils.truncate(str(request["proof_ref"]), 300)),
             inline=False,
         )
     if request["destination"]:
         embed.add_field(
             name="入金先",
-            value=f"```\n{utils.truncate(str(request['destination']), 200)}\n```",
+            value=copy_block(utils.truncate(str(request["destination"]), 200)),
             inline=False,
         )
     amounts = [
@@ -1668,12 +1777,24 @@ def invite_link_embed(
         title="🔗 あなた専用の招待リンク",
         description=(
             f"{SEPARATOR}\n"
-            f"```\n{url}\n```\n"
-            + ("新しく発行しました。" if created else "すでに発行済みのリンクです (同じものを使い続けてください)。")
+            + ("新しく発行しました。" if created
+               else "すでに発行済みのリンクです (同じものを使い続けてください)。")
             + "\n**このリンク経由の参加だけ**が報酬の対象になります。\n"
             f"{SEPARATOR}"
         ),
         color=config.Color.ACCENT,
+    )
+    # コードブロック = 正確にコピーできる / 素のURL = タップして共有できる
+    # (コードブロック内の URL はリンク化されないため、両方を出す)
+    embed.add_field(
+        name="📋 コピー用",
+        value=copy_block(url),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔗 タップして共有",
+        value=f"{url}\n{COPY_HINT}",
+        inline=False,
     )
     embed.add_field(
         name="現在の招待状況",
@@ -2165,6 +2286,33 @@ class RequestProofModal(discord.ui.Modal):
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
         logger.error("申請Modalでエラー: %s", utils.safe_error_text(error))
         await safe_respond(interaction, embed=error_embed(config.ErrorCode.UNKNOWN_ERROR))
+
+
+class ClaimPaymentView(discord.ui.View):
+    """請求リンクの支払い確認 (Ephemeral・一時 View)。"""
+
+    def __init__(self, tx_id: str, *, owner_id: int, timeout: float) -> None:
+        super().__init__(timeout=max(30.0, timeout))
+        self.tx_id = tx_id
+        self.owner_id = int(owner_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:  # type: ignore[override]
+        if interaction.user.id != self.owner_id:
+            await safe_respond(
+                interaction,
+                embed=info_embed("操作できません", "この画面を開いた本人のみ操作できます。"),
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="支払いを確認", emoji="🔄", style=discord.ButtonStyle.success)
+    async def check(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await bot_of(interaction).on_claim_check(interaction, self.tx_id)
+
+    @discord.ui.button(label="やめる", emoji="✖️", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await bot_of(interaction).on_claim_cancel(interaction, self.tx_id)
+        self.stop()
 
 
 class ReviewCardView(discord.ui.View):

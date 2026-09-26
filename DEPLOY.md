@@ -18,6 +18,18 @@ Bot は管理者が登録した **受取用 Kyash アカウント** でリンク
 - トークン失効の事前警告 / 受取アカウント残高しきい値 / 連続失敗クールダウン
 - 死活監視 (ハートビート) / バックアップの外部保存 / GitHub Actions による自動テスト
 
+**v3.1 の追加機能・修正**
+- **Kyash 請求リンク**でのチャージを追加。Bot が金額入りの請求リンクを発行し、
+  利用者は**開いて支払うだけ**。金額の打ち間違いが原理的に起きず、承認も不要
+- 招待リンク / LTC アドレス / PayPay ID を**コピー用ブロック + タップできる素のリンク**の
+  両方で表示 (コードブロック内の URL はタップできないため)
+- **コマンドが2つずつ表示される問題を修正** (グローバルとギルドの二重登録)。
+  既に登録済みの重複は起動時に自動削除します
+- 重複・冗長なコマンドを整理 (118 → 115)
+- **請求リンクで他人の支払いを自分のものと誤認する不具合を修正**
+  (残高差分ではなく履歴の一致を必須にした)
+- **`Authorization: Bearer <token>` がログでマスクされない不具合を修正**
+
 **v3.0 の追加機能 (PayPay / Litecoin チャージ)**
 - **PayPay** と **Litecoin (LTC)** でもチャージできるようになりました
   (どちらも「利用者が申請 → 管理者が承認」の承認制)
@@ -41,7 +53,7 @@ Bot は管理者が登録した **受取用 Kyash アカウント** でリンク
 - Embed が Discord の上限を超えたときに無言で失敗しないよう、送信前に自動で切り詰め
 - 静的解析 (mypy) を 0 エラーにし、同種の引数ミスを検出できるようにしました
 
-- Bot バージョン: `3.0.0` / DB スキーマ: `v3` (v1 / v2 の DB は起動時に自動移行)
+- Bot バージョン: `3.1.0` / DB スキーマ: `v3` (v1 / v2 の DB は起動時に自動移行)
 - 想定環境: Python 3.11+ / discord.py 2.x / SQLite (WAL) / Linux VPS + systemd
 - Kyash 連携: 同梱の添付モジュール `vendor/Kyasher` (Kyasher 1.5.0) のみを使用
 - PayPay / LTC: **外部 API は使いません** (LTC の価格取得のみ CoinGecko を参照)。
@@ -70,6 +82,7 @@ discord-charge-bot/
 │   ├── test_v2_features.py     # 統合テスト: ショップ/招待/残高操作/実績投稿 (88項目)
 │   ├── test_migration.py       # 旧DBの自動移行 (19項目)
 │   ├── test_providers.py       # PayPay / LTC の申請・承認 (75項目)
+│   ├── test_claim_link.py      # Kyash 請求リンクの支払い (56項目)
 │   ├── test_ui_render.py       # 全 Embed の描画と文字数上限 (155項目)
 │   └── test_commands_smoke.py  # 全コマンド/全ボタンの実行と権限 (167項目)
 ├── .github/workflows/test.yml  # CI (lint + 起動前チェック + 全テスト)
@@ -234,9 +247,8 @@ journalctl -u discord-charge-bot -p err        # エラーのみ
 | `/setup` | 初期設定チェックリスト |
 | `/config` | 現在の設定一覧 (チャージ設定とランキング設定を分けて表示) |
 | `/charge_panel` | チャージパネルを新規設置 (既存は削除しない・複数設置可) |
-| `/charge_panels [disable_message_id]` | チャージパネル一覧 / 指定パネルの無効化 |
+| `/panels <type> [disable_message_id]` | パネルの一覧 / 無効化 (チャージ・ランキング・ショップ・招待・管理) |
 | `/ranking_panel [channel]` | ランキングパネルを新規設置 (複数設置可) |
-| `/ranking_panels [disable_message_id]` | ランキングパネル一覧 / 指定パネルの無効化 |
 | `/settings charge_rate <率>` | チャージ率 (例 `130` / `130.5`) |
 | `/settings charge_min <円>` / `charge_max <円>` | 金額制限 |
 | `/settings daily_limit <円>` | 日次上限 (ユーザー単位・0で無制限) |
@@ -251,10 +263,8 @@ journalctl -u discord-charge-bot -p err        # エラーのみ
 | `/balance add <user> <amount> <reason>` | 残高加算 |
 | `/balance remove <user> <amount> <reason>` | 残高減算 (確認ボタン・0未満にはならない) |
 | `/balance set <user> <amount> <reason>` | 残高設定 (確認ボタン) |
-| `/balance info <user>` | 残高・順位・残高変更履歴 |
 | `/user freeze <user> <reason>` | 凍結 (チャージ不可・ランキング対象外・残高確認は可) |
 | `/user unfreeze <user>` | 凍結解除 |
-| `/user info <user>` | 利用者の状態・進行中の取引 |
 | `/history [user] [transaction_id] [status] [date] [amount_min] [amount_max] [page]` | 取引検索 |
 | `/transaction info <tx_id>` | 取引の詳細 |
 | `/transaction verify <tx_id>` | Kyash 側の受取状態を再確認 |
@@ -344,6 +354,20 @@ journalctl -u discord-charge-bot -p err        # エラーのみ
 | 📊 自分の招待状況 | 確定/保留/要確認/無効の件数と獲得報酬 |
 | 🏆 招待ランキング | 確定した招待数のランキング |
 
+### 値のコピーについて
+
+宛先や招待リンクは**コピー用のコードブロック**と、**タップできる素のリンク**の
+両方で表示します (コードブロック内の URL は Discord ではリンクにならず
+タップできないため)。
+
+| 表示 | 用途 |
+|---|---|
+| 📋 コピー用 (コードブロック) | PC はブロック右上のボタン、スマホは長押しで正確にコピー |
+| 🔗 タップして共有 / 支払う | そのまま開く・共有シートへ渡す |
+
+対象: 招待リンク / LTC アドレス / PayPay ID / 送金する金額と数量 /
+請求リンク / 審査カードの取引ID・txid。
+
 ### チャージ方法が複数あるとき
 
 `💰 チャージ` を押すと方法の選択メニューが出ます (使えない方法は理由つきで表示)。
@@ -351,7 +375,8 @@ journalctl -u discord-charge-bot -p err        # エラーのみ
 
 | 方法 | 反映 | 手順 |
 |---|---|---|
-| 💰 Kyash | **自動** (10〜60秒) | 送金リンクを貼るだけ |
+| 💰 Kyash (送金リンク) | **自動** (10〜60秒) | 自分で送金リンクを作って貼る |
+| 🧾 Kyash (請求リンク) | **自動** (最大1分) | Bot が出すリンクを開いて支払うだけ |
 | 🅿️ PayPay | 管理者の承認後 | 送金 → 取引ID を申請 |
 | Ł Litecoin (LTC) | 管理者の承認後 | 表示された数量を送金 → txid を申請 |
 
@@ -406,7 +431,7 @@ journalctl -u discord-charge-bot -p err        # エラーのみ
 
 - 同じサーバーの複数チャンネルへ設置可能 (`#ranking` と `#balance-ranking` など)。
   すべて同じサーバーのランキングを表示します。
-- 既存パネルは削除されません。無効化は `/ranking_panels disable_message_id:<ID>`。
+- 既存パネルは削除されません。無効化は `/panels type:🏆\ ランキングパネル disable_message_id:<ID>`。
 - DB は `ranking_panels` テーブルで `panels` (チャージパネル) とは別管理です。
 - 表示内容: そのサーバーの **現在の内部残高** (`balances` が Source of Truth) を高い順に表示。
   - 並び順: `balance DESC, user_id ASC` (同額でも順位が安定します)
@@ -428,13 +453,14 @@ journalctl -u discord-charge-bot -p err        # エラーのみ
 
 ```bash
 cd /opt/discord-charge-bot
-./venv/bin/python3 tests/test_charge_flow.py     #  87 件  Kyash チャージの本流と異常系
+./venv/bin/python3 tests/test_charge_flow.py     #  91 件  Kyash 送金リンクの本流と異常系
+./venv/bin/python3 tests/test_claim_link.py     #  56 件  Kyash 請求リンクの支払い
 ./venv/bin/python3 tests/test_v2_features.py    #  88 件  ショップ・招待・残高操作・実績投稿
 ./venv/bin/python3 tests/test_migration.py      #  19 件  旧DBの自動移行 (v1 → v3)
 ./venv/bin/python3 tests/test_providers.py      #  75 件  PayPay / LTC の申請・承認
-./venv/bin/python3 tests/test_ui_render.py      # 155 件  全 Embed の描画と文字数上限
-./venv/bin/python3 tests/test_commands_smoke.py # 167 件  全コマンド・全ボタンの実行
-# → 合計 591 件成功 / 0 件失敗
+./venv/bin/python3 tests/test_ui_render.py      # 165 件  全 Embed の描画と文字数上限
+./venv/bin/python3 tests/test_commands_smoke.py # 175 件  全コマンド・全ボタンの実行
+# → 合計 669 件成功 / 0 件失敗
 ```
 
 静的解析も併せて実行できます (どちらも 0 件が正常)。
@@ -534,6 +560,28 @@ cd /opt/discord-charge-bot
 利用者が「レートを取得できないため利用できません」と言われる場合は、
 CoinGecko へ到達できていません。上の「価格が取得できないとき」を参照してください。
 
+### 請求リンクで支払ったのに反映されない
+
+1. `🔄 支払いを確認` を押す (履歴の反映に時間差があります)
+2. それでも反映されない場合、Bot は **45 秒ごとに自動確認**しているので少し待つ
+3. 20 分の期限を過ぎると失敗扱いになります。その場合は管理者へ取引IDを添えて連絡
+
+Bot は「受取用アカウントの残高が増えた」だけでは付与しません。
+**履歴にそのリンクの識別子が現れること**を条件にしているため、
+他人の支払いで誤って付与されることはありません。
+
+### コマンドが2つずつ表示される
+
+v3.1 で修正済みです。起動時に重複したギルド専用コマンドを自動削除します。
+それでも残る場合は手動で削除できます。
+
+```bash
+/server sync cleanup:True
+```
+
+コマンドは**グローバルにのみ登録**する方針です (ギルドへも登録すると
+Discord が両方を別枠で表示するため二重に見えます)。
+
 ### 申請が承認できない
 
 | メッセージ | 原因 |
@@ -566,7 +614,7 @@ Bot を再起動しても同じ投稿を更新し続けます。手動で消し�
 ### ランキングが更新されない
 
 - `/settings ranking_enabled true` を確認
-- `/ranking_panels` でパネルが 🟢 有効か確認 (メッセージ削除時は自動で無効化されます)
+- `/panels type:🏆\ ランキングパネル` でパネルが 🟢 有効か確認 (メッセージ削除時は自動で無効化されます)
 - **表示内容が前回と同じ場合は意図的に更新しません**。🔄 更新ボタンで強制再取得できます。
 
 ### DB / データ
@@ -675,6 +723,54 @@ sudo systemctl start discord-charge-bot
 Kyash は Bot が自動で受け取りますが、**PayPay と LTC は「利用者が申請 → 管理者が承認」**
 という流れです。外部の決済 API を使わないので、規約リスクも API 障害もありません。
 その代わり、**入金が実際に届いているかは管理者が自分の目で確認**します。
+
+## Kyash 請求リンク (推奨・自動)
+
+**Bot が金額入りの請求リンクを発行し、利用者は開いて支払うだけ**です。
+送金リンク方式と違い、利用者がリンクを作る必要がなく、**金額の打ち間違いが
+原理的に起きません**。管理者の承認も不要で、自動で残高に反映されます。
+
+```
+[1/2] 💰 チャージ → 🧾 Kyash (請求リンク) を選ぶ → 金額を入力
+[2/2] Bot が請求リンクを出す → 開いて支払う
+        → 自動で確認して残高に反映 (最大1分ほど)
+        → 急ぐときは `🔄 支払いを確認` を押す
+```
+
+設定は方式ごとのレートと同じコマンドで行います (入金先の登録は不要)。
+
+```bash
+/provider rate provider:Kyash\ (請求リンク) charge_rate:130
+/provider limits provider:Kyash\ (請求リンク) minimum:100 maximum:50000
+/provider enable provider:Kyash\ (請求リンク) enabled:true
+```
+
+### 送金リンク方式との違い
+
+| | 💰 Kyash (送金リンク) | 🧾 Kyash (請求リンク) |
+|---|---|---|
+| リンクを作る人 | 利用者 | **Bot** |
+| 金額の指定 | 利用者 (打ち間違いが起きる) | **Bot (一致は保証)** |
+| 手順 | 3 ステップ | **2 ステップ** |
+| 反映 | 自動 | 自動 |
+| 受取操作 | Bot が受け取る | 利用者が支払う (受取操作なし) |
+
+### 安全性
+
+| 仕組み | 内容 |
+|---|---|
+| 発行の検証 | 発行直後にリンクを読み直し、**請求リンクであること**と**金額が一致すること**を確認。違えば取引を作らずリンクを破棄します |
+| 支払いの確認 | **履歴に自分のリンク識別子が現れたときだけ**付与します。受取用アカウントの残高が増えただけでは付与しません (他人の支払いを自分のものと誤認しないため) |
+| 二重付与 | 状態遷移と `UNIQUE` 制約で、同じ取引では一度しか付与されません (同時実行でも検証済み) |
+| リンクの再利用 | 支払い確認後・取消後・期限切れ後は**リンクを無効化**します |
+| 同時進行 | 1 人が同時に持てる請求リンクは 1 本まで |
+| 期限 | 発行から 20 分。期限切れの直前に支払われていた場合も取りこぼしません |
+
+> ⚠️ 請求リンクは Kyash の仕様上「繰り返し支払える」形で発行されます。
+> そのため Bot は**支払いを確認した時点でリンクを無効化**し、画面にも
+> 「支払いは1回だけ」と明記しています。
+
+---
 
 ## 利用者から見た流れ (4 ステップ)
 
@@ -947,7 +1043,7 @@ PayPay は PayPay 側の操作で対応してください (Bot は内部残高�
 | `/balance repair <user> <mode>` | 不一致の**修復** (Owner 限定・2段階確認) |
 | `/balance distribution` | 分布分析 (中位値・上位10%占有率・発行/消費総額) |
 | `/balance bulk <role> <operation>` | ロール保持者へ**一括操作** (既定はドライラン) |
-| `/balance info <user>` | 残高・順位・変更履歴 |
+| `/inspect <user>` | 残高・順位・取引・招待・購入をまとめて確認 |
 | `/transaction refund <tx_id>` | **完了済みチャージの取消** (原取引に紐づく逆仕訳 + 利用者へ通知) |
 
 ### 残高操作ログチャンネル

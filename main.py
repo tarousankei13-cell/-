@@ -31,6 +31,7 @@ import logging
 import signal
 import sqlite3
 import sys
+from decimal import Decimal
 from typing import Any
 
 import discord
@@ -246,14 +247,81 @@ class ChargeBot(commands.Bot):
         from commands import setup_commands
 
         await setup_commands(self)
+        # コマンドはグローバルにのみ登録する。
+        # グローバルとギルドの両方に同じコマンドを登録すると、Discord は
+        # それぞれを別枠で表示するため「コマンドが2つずつ見える」状態になる。
         try:
             synced = await self.tree.sync()
-            logger.info("スラッシュコマンドを同期しました (%s 件)", len(synced))
+            logger.info("スラッシュコマンドを同期しました (%s 件・グローバル)", len(synced))
         except (discord.HTTPException, discord.ClientException) as exc:
             logger.error("コマンド同期に失敗しました: %s", utils.safe_error_text(exc))
 
         # 11) バックグラウンドタスク開始
         self.tasks.start_all()
+
+    #: ギルド専用コマンドの掃除を実施したバージョンを記録するキー
+    GUILD_COMMAND_CLEANUP_KEY = "guild_command_cleanup_version"
+
+    async def clear_guild_commands(self, guild: discord.abc.Snowflake) -> int:
+        """そのサーバーに登録されたギルド専用コマンドを削除する。
+
+        このBotはコマンドをグローバルにのみ登録する。過去のバージョンは
+        サーバー許可時にギルドへもコピーしていたため、グローバル分と合わせて
+        すべてのコマンドが二重に表示されていた。その残骸を消す。
+
+        Returns:
+            削除した件数。もともと無ければ 0 (API への書き込みもしない)。
+        """
+        try:
+            existing = await self.tree.fetch_commands(guild=guild)
+        except (discord.HTTPException, discord.ClientException) as exc:
+            logger.warning("ギルドコマンドの取得に失敗しました guild=%s: %s",
+                           getattr(guild, "id", "?"), utils.safe_error_text(exc))
+            return 0
+        if not existing:
+            return 0
+        self.tree.clear_commands(guild=guild)
+        try:
+            await self.tree.sync(guild=guild)
+        except (discord.HTTPException, discord.ClientException) as exc:
+            logger.warning("ギルドコマンドの削除に失敗しました guild=%s: %s",
+                           getattr(guild, "id", "?"), utils.safe_error_text(exc))
+            return 0
+        logger.info("ギルド専用コマンド %s 件を削除しました guild=%s",
+                    len(existing), getattr(guild, "id", "?"))
+        return len(existing)
+
+    async def cleanup_guild_commands(self, *, force: bool = False) -> dict[str, int]:
+        """参加中の全サーバーからギルド専用コマンドを削除する。
+
+        起動ごとに全サーバーへ問い合わせるのは無駄なので、実施したバージョンを
+        記録して一度だけ走らせる。``force=True`` (``/server sync cleanup:True``)
+        では記録を無視して必ず実行する。
+
+        Returns:
+            ``{"guilds": 確認数, "removed": 削除した総数, "failed": 失敗数}``
+        """
+        if not force:
+            done = await self.db.get_system_value(self.GUILD_COMMAND_CLEANUP_KEY)
+            if done == config.BOT_VERSION:
+                return {"guilds": 0, "removed": 0, "failed": 0}
+        removed = 0
+        failed = 0
+        guilds = list(self.guilds)
+        for guild in guilds:
+            try:
+                removed += await self.clear_guild_commands(guild)
+            except Exception:  # noqa: BLE001
+                failed += 1
+                logger.exception("ギルドコマンドの掃除に失敗しました guild=%s", guild.id)
+        await self.db.set_system_value(self.GUILD_COMMAND_CLEANUP_KEY, config.BOT_VERSION)
+        if removed:
+            logger.warning(
+                "重複していたギルド専用コマンドを %s 件削除しました "
+                "(%s サーバーを確認)。コマンドはグローバル登録のみになります。",
+                removed, len(guilds),
+            )
+        return {"guilds": len(guilds), "removed": removed, "failed": failed}
 
     async def on_ready(self) -> None:
         """Discord 接続完了 (再接続時にも呼ばれるため冪等に保つ)。"""
@@ -261,6 +329,20 @@ class ChargeBot(commands.Bot):
             "ログインしました: %s (ID: %s) / 参加サーバー数 %s",
             self.user, self.user.id if self.user else "?", len(self.guilds),
         )
+        # 旧バージョンが残した「ギルド専用コマンド」を掃除する。
+        # これが残っているとグローバル分と合わせて全コマンドが二重に見える。
+        try:
+            cleanup = await self.cleanup_guild_commands()
+            if cleanup["removed"]:
+                await self.alert_owner(
+                    f"**コマンドの重複を解消しました**\n"
+                    f"ギルド専用に登録されていたコマンド {cleanup['removed']} 件を削除しました "
+                    f"({cleanup['guilds']} サーバーを確認)。\n"
+                    "以後コマンドはグローバル登録のみになります。Discord の表示が"
+                    "更新されるまで少し時間がかかることがあります。"
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception("ギルドコマンドの掃除に失敗しました")
         for guild in self.guilds:
             allowed = await self.db.is_guild_allowed(guild.id)
             logger.info("  - %s (%s) 許可=%s", guild.name, guild.id, allowed)
@@ -599,6 +681,17 @@ class ChargeBot(commands.Bot):
         if provider == config.ChargeProvider.KYASH:
             await self._begin_kyash_charge(interaction, settings)
             return
+        if provider == config.ChargeProvider.KYASH_CLAIM:
+            active = await self.db.get_active_transaction(guild.id, interaction.user.id)
+            if active is not None and str(active["status"]) == config.TxStatus.WAITING_PAYMENT:
+                await self._show_claim_link(interaction, active, resumed=True)
+                return
+            await interaction.response.send_modal(
+                ui.ManualAmountModal(provider, settings, await self.charge.provider_limits(
+                    guild.id, provider, settings
+                ))
+            )
+            return
         await interaction.response.send_modal(
             ui.ManualAmountModal(provider, settings, await self.charge.provider_limits(
                 guild.id, provider, settings
@@ -619,6 +712,10 @@ class ChargeBot(commands.Bot):
         guild = self._require_guild(interaction)
         active = await self.db.get_active_transaction(guild.id, interaction.user.id)
         if active is not None:
+            # 請求リンクの支払い待ちなら、そのリンクを出し直す
+            if str(active["status"]) == config.TxStatus.WAITING_PAYMENT:
+                await self._show_claim_link(interaction, active, resumed=True)
+                return
             if active["status"] == config.TxStatus.WAITING_LINK and (
                 not active["expires_at"] or active["expires_at"] > utils.now_ts()
             ):
@@ -774,6 +871,9 @@ class ChargeBot(commands.Bot):
         if guild is None:
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
+        if provider == config.ChargeProvider.KYASH_CLAIM:
+            await self._start_claim_charge(interaction, guild.id, raw_amount)
+            return
         try:
             quote = await self.charge.start_manual_charge(
                 guild.id, interaction.user.id, provider, raw_amount
@@ -807,6 +907,135 @@ class ChargeBot(commands.Bot):
                 timeout=float(config.QUOTE_WAIT_SECONDS),
             ),
             ephemeral=True,
+        )
+
+    async def _start_claim_charge(
+        self, interaction: discord.Interaction, guild_id: int, raw_amount: str
+    ) -> None:
+        """請求リンクを発行して案内する (ステップ 2/2)。"""
+        try:
+            quote = await self.charge.start_claim_charge(
+                guild_id, interaction.user.id, raw_amount
+            )
+        except ChargeError as exc:
+            embed = ui.error_embed(exc.code)
+            if exc.code in (
+                config.ErrorCode.AMOUNT_BELOW_MIN, config.ErrorCode.AMOUNT_ABOVE_MAX
+            ):
+                settings = await self.db.get_settings(guild_id)
+                low, high = await self.charge.provider_limits(
+                    guild_id, config.ChargeProvider.KYASH_CLAIM, settings
+                )
+                embed.add_field(
+                    name="ご案内",
+                    value=f"受付範囲: {utils.fmt_yen(low)} 〜 {utils.fmt_yen(high)}",
+                    inline=False,
+                )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception("請求リンクの発行で予期しない例外が発生しました")
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.UNKNOWN_ERROR), ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            embed=ui.claim_link_embed(quote),
+            view=ui.ClaimPaymentView(
+                str(quote["tx_id"]), owner_id=interaction.user.id,
+                timeout=float(config.CLAIM_WAIT_SECONDS),
+            ),
+            ephemeral=True,
+        )
+
+    async def _show_claim_link(
+        self, interaction: discord.Interaction, row: Any, *, resumed: bool
+    ) -> None:
+        """発行済みの請求リンクを再表示する (中断からの再開)。"""
+        link_id = str(row["claim_link_id"] or "")
+        if not link_id:
+            await ui.safe_respond(
+                interaction, embed=ui.error_embed(config.ErrorCode.ACTIVE_TRANSACTION_EXISTS)
+            )
+            return
+        amount = int(row["requested_amount"])
+        rate = utils.to_decimal(row["charge_rate"]) or Decimal(config.DEFAULT_CHARGE_RATE)
+        remaining = max(30, int(row["expires_at"] or 0) - utils.now_ts())
+        quote = {
+            "tx_id": str(row["id"]),
+            "amount": amount,
+            "charge_rate": rate,
+            "role_id": None,
+            "credited": utils.calc_credited_amount(amount, rate),
+            "url": utils.kyash_link_url(link_id),
+            "expires_at": row["expires_at"],
+        }
+        await interaction.response.send_message(
+            embed=ui.claim_link_embed(quote, resumed=resumed),
+            view=ui.ClaimPaymentView(
+                str(row["id"]), owner_id=interaction.user.id, timeout=float(remaining)
+            ),
+            ephemeral=True,
+        )
+
+    async def on_claim_check(self, interaction: discord.Interaction, tx_id: str) -> None:
+        """🔄 支払いを確認。"""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await self.charge.check_claim_payment(
+                tx_id, user_id=interaction.user.id
+            )
+        except ChargeError as exc:
+            await interaction.followup.send(
+                embed=ui.error_embed(exc.code, admin_detail=None), ephemeral=True
+            )
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception("請求リンクの確認で予期しない例外が発生しました tx=%s", tx_id)
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.UNKNOWN_ERROR), ephemeral=True
+            )
+            return
+        row = await self.db.get_transaction(tx_id)
+        if result in ("CREDITED", "DONE") and row is not None:
+            await interaction.followup.send(
+                embed=ui.success_embed(
+                    "🟢 支払いを確認しました",
+                    f"付与: **{utils.fmt_int(int(row['credited_amount'] or 0))}**\n"
+                    f"残高: **{utils.fmt_int(int(row['balance_after'] or 0))}**\n"
+                    f"取引ID: `{tx_id}`",
+                ),
+                ephemeral=True,
+            )
+            return
+        if result == "REVIEW":
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.MANUAL_REVIEW), ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            embed=ui.claim_pending_embed(
+                tx_id=tx_id,
+                amount=int(row["requested_amount"]) if row else 0,
+            ),
+            ephemeral=True,
+        )
+
+    async def on_claim_cancel(self, interaction: discord.Interaction, tx_id: str) -> None:
+        """請求リンクの取り消し。"""
+        try:
+            await self.charge.cancel_claim_transaction(tx_id, interaction.user.id)
+        except ChargeError as exc:
+            await ui.safe_respond(interaction, embed=ui.error_embed(exc.code))
+            return
+        await ui.safe_respond(
+            interaction,
+            embed=ui.info_embed(
+                "キャンセルしました",
+                "請求リンクを無効にしました。まだ支払っていない場合は支払わないでください。\n"
+                "すでに支払ってしまった場合はサーバーの管理者へお問い合わせください。",
+                color=config.Color.NEUTRAL,
+            ),
         )
 
     async def handle_request_submit(
