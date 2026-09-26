@@ -12,7 +12,7 @@ from typing import Final
 # ---------------------------------------------------------------------------
 # バージョン
 # ---------------------------------------------------------------------------
-BOT_VERSION: Final[str] = "2.0.0"
+BOT_VERSION: Final[str] = "2.1.0"
 SCHEMA_VERSION: Final[int] = 2
 
 # ---------------------------------------------------------------------------
@@ -346,6 +346,10 @@ PURCHASE_STATUS_LABELS: Final[dict[str, str]] = {
 SHOP_PRICE_MIN: Final[int] = 1
 SHOP_PRICE_MAX: Final[int] = 1_000_000_000
 SHOP_DURATION_MAX_DAYS: Final[int] = 3650
+#: 商品名・説明・キャンペーン名の保存長。Embed の上限内に必ず収まる値にする。
+SHOP_NAME_MAX_LEN: Final[int] = 100
+SHOP_DESC_MAX_LEN: Final[int] = 500
+CAMPAIGN_NAME_MAX_LEN: Final[int] = 100
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +512,47 @@ USER_ERROR_MESSAGES: Final[dict[str, str]] = {
     ErrorCode.UNKNOWN_ERROR: "予期しないエラーが発生しました。管理者にお問い合わせください。",
 }
 
+#: 利用者向けの「次にどうすればよいか」。エラー表示に添えて迷わせない。
+USER_ERROR_NEXT_ACTIONS: Final[dict[str, str]] = {
+    ErrorCode.INVALID_AMOUNT: "もう一度 `💰 チャージ` を押して、半角数字だけで金額を入力してください。",
+    ErrorCode.AMOUNT_BELOW_MIN: "パネルに表示されている最低チャージ額以上の金額で、もう一度お試しください。",
+    ErrorCode.AMOUNT_ABOVE_MAX: "パネルに表示されている最大チャージ額以下に分けて、もう一度お試しください。",
+    ErrorCode.AMOUNT_MISMATCH: "入力した金額と**同じ金額**の送金リンクを作り直し、最初からやり直してください。",
+    ErrorCode.DAILY_LIMIT_EXCEEDED: "日付が変わると上限がリセットされます。明日以降にお試しください。",
+    ErrorCode.GUILD_DAILY_LIMIT_EXCEEDED: "サーバー全体の上限です。時間をおいてお試しください。",
+    ErrorCode.INVALID_LINK: "Kyash アプリで**送金リンクを新しく作成**し、URL をそのまま貼ってください。",
+    ErrorCode.LINK_IS_CLAIM: "「送る」から作成した**送金リンク**を使ってください (請求リンクは使えません)。",
+    ErrorCode.LINK_EXPIRED: "Kyash アプリで新しい送金リンクを作成してください。",
+    ErrorCode.LINK_ALREADY_USED: "新しい送金リンクを作成して、もう一度お試しください。",
+    ErrorCode.KYASH_TIMEOUT: "この取引はまだ有効です。少し待ってから同じリンクを再送信できます。",
+    ErrorCode.KYASH_NETWORK_ERROR: "この取引はまだ有効です。少し待ってから同じリンクを再送信できます。",
+    ErrorCode.KYASH_AUTH_ERROR: "復旧までしばらくお待ちください。送金リンクはまだ使えます。",
+    ErrorCode.KYASH_UNAVAILABLE: "受付が再開されるまでお待ちください。",
+    ErrorCode.WALLET_LIMIT: "受付が再開されるまでお待ちください。管理者が対応します。",
+    ErrorCode.MAINTENANCE: "メンテナンス終了までお待ちください。残高と履歴はいつでも確認できます。",
+    ErrorCode.EMERGENCY_STOP: "復旧までお待ちください。残高は保持されています。",
+    ErrorCode.TRANSACTION_EXPIRED: "もう一度 `💰 チャージ` から始めてください。",
+    ErrorCode.ACTIVE_TRANSACTION_EXISTS: "`💰 チャージ` を押すと進行中の手続きを再開できます。",
+    ErrorCode.RATE_LIMITED: "1分ほど待ってから、もう一度お試しください。",
+    ErrorCode.COOLDOWN: "時間をおいてから再度お試しください。解除は管理者に依頼できます。",
+    ErrorCode.MANUAL_REVIEW: "確認が終わると DM でお知らせします。そのままお待ちください。",
+    ErrorCode.MAX_BALANCE_EXCEEDED: "残高を使ってから、もう一度お試しください。",
+    ErrorCode.INSUFFICIENT_BALANCE: "チャージして残高を増やしてから、もう一度お試しください。",
+    ErrorCode.SHOP_ALREADY_OWNED: "すでに所持しているため購入は不要です。",
+    ErrorCode.SHOP_OUT_OF_STOCK: "在庫が補充されるまでお待ちください。",
+    ErrorCode.SHOP_LIMIT_REACHED: "この商品はこれ以上購入できません。",
+    ErrorCode.ROLE_ASSIGN_FAILED: "残高は返金済みです。管理者へお問い合わせください。",
+    ErrorCode.CAMPAIGN_NOT_ACTIVE: "キャンペーンが始まるまでお待ちください。",
+    ErrorCode.USER_FROZEN: "サーバーの管理者へお問い合わせください。",
+    ErrorCode.KYASH_REJECTED: "新しい送金リンクを作成して、もう一度お試しください。",
+    ErrorCode.SHOP_ITEM_UNAVAILABLE: "他の商品をお試しいただくか、管理者へお問い合わせください。",
+    ErrorCode.INVITE_NOT_AVAILABLE: "サーバーの管理者へお問い合わせください。",
+    ErrorCode.NOT_ALLOWED: "このサーバーではまだ使えません。サーバーの管理者に有効化を依頼してください。",
+    ErrorCode.GUILD_DISABLED: "このサーバーの利用が停止されています。サーバーの管理者にお問い合わせください。",
+    ErrorCode.DATABASE_ERROR: "時間をおいてもう一度お試しください。続く場合は管理者にお知らせください。",
+    ErrorCode.UNKNOWN_ERROR: "時間をおいてもう一度お試しください。続く場合は取引IDを添えて管理者にお知らせください。",
+}
+
 #: 再試行してはいけないエラー
 NON_RETRYABLE_ERRORS: Final[frozenset[str]] = frozenset({
     ErrorCode.INVALID_AMOUNT,
@@ -549,7 +594,6 @@ RANK_MEDALS: Final[dict[int, str]] = {1: "🥇", 2: "🥈", 3: "🥉"}
 class CustomID:
     CHARGE_START = "chargebot:charge:start"
     SHOP_OPEN = "chargebot:shop:open"
-    SHOP_SELECT = "chargebot:shop:select"
     SHOP_MYITEMS = "chargebot:shop:myitems"
     INVITE_GET = "chargebot:invite:get"
     INVITE_STATUS = "chargebot:invite:status"
@@ -564,6 +608,13 @@ class CustomID:
     CHARGE_REFRESH = "chargebot:charge:refresh"
     RANKING_REFRESH = "chargebot:ranking:refresh"
     RANKING_MYRANK = "chargebot:ranking:myrank"
+
+
+#: 実績チャンネルへ投稿する種別
+class AchievementKind:
+    CHARGE = "CHARGE"
+    SHOP = "SHOP"
+    INVITE = "INVITE"
 
 
 PANEL_TYPE_CHARGE: Final[str] = "CHARGE"

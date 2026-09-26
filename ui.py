@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Final, Sequence, cast
 
 import discord
 
@@ -19,10 +19,21 @@ import utils
 
 if TYPE_CHECKING:  # 実行時の循環 import を避ける
     from database import GuildSettings
+    from main import ChargeBot
 
 logger = logging.getLogger(config.LOGGER_BOT)
 
 SEPARATOR = "───────────────────────"
+
+
+def bot_of(interaction: discord.Interaction) -> "ChargeBot":
+    """Interaction から Bot 本体を型付きで取得する。
+
+    ``interaction.client`` は discord.py 上では ``Client`` 型のため、
+    そのまま呼ぶとハンドラ名や引数の誤りを静的解析で検出できない。
+    このヘルパ経由に統一することで mypy が呼び出しを検査できる。
+    """
+    return cast("ChargeBot", interaction.client)
 
 
 # ---------------------------------------------------------------------------
@@ -30,15 +41,25 @@ SEPARATOR = "──────────────────────�
 # ---------------------------------------------------------------------------
 
 def charge_panel_embed(settings: "GuildSettings", *, kyash_ready: bool) -> discord.Embed:
-    """常設チャージパネルの Embed。"""
+    """常設チャージパネルの Embed。
+
+    「何ができるか」「どう操作するか」「いくら増えるか」が
+    パネルを見るだけで分かるようにする。
+    """
     if settings.emergency_stop:
-        state = "🔴 緊急停止中"
+        state = "🔴 **緊急停止中** — 現在チャージを受け付けていません"
     elif settings.maintenance:
-        state = "🟠 メンテナンス中"
+        state = "🟠 **メンテナンス中** — 残高・履歴の確認はできます"
     elif not kyash_ready:
-        state = "🟠 一時停止中"
+        state = "🟠 **一時停止中** — 復旧までお待ちください"
     else:
-        state = "🟢 通常受付中"
+        state = "🟢 **受付中** — いつでもチャージできます"
+
+    # 具体例で「いくら増えるか」を示す
+    example_base = max(settings.minimum_charge, 1000)
+    if example_base > settings.maximum_charge:
+        example_base = settings.maximum_charge
+    example_credit = utils.calc_credited_amount(example_base, settings.charge_rate)
 
     embed = discord.Embed(
         title=settings.panel_title or "💰 チャージシステム",
@@ -46,18 +67,45 @@ def charge_panel_embed(settings: "GuildSettings", *, kyash_ready: bool) -> disco
             f"{SEPARATOR}\n"
             + (
                 settings.panel_description
-                or "下のボタンからチャージを開始できます。\n"
-                   "金額を入力したあと、Kyashの**送金リンク**を送信してください。"
+                or "Kyash で送金すると、このサーバーで使える**内部残高**が増えます。"
             )
             + f"\n{SEPARATOR}"
         ),
         color=settings.accent_color if settings.accent_color is not None else config.Color.BASE,
     )
-    embed.add_field(name="現在のチャージ率", value=f"**{utils.fmt_rate(settings.charge_rate)}**", inline=True)
-    embed.add_field(name="最低チャージ額", value=f"**{utils.fmt_yen(settings.minimum_charge)}**", inline=True)
-    embed.add_field(name="最大チャージ額", value=f"**{utils.fmt_yen(settings.maximum_charge)}**", inline=True)
-    embed.add_field(name="現在の状態", value=state, inline=False)
-    embed.set_footer(text="サーバー内部残高システム / 現金化・出金には対応していません")
+    embed.add_field(
+        name="📈 チャージ率",
+        value=f"**{utils.fmt_rate(settings.charge_rate)}**\n"
+              f"例) {utils.fmt_yen(example_base)} → **{utils.fmt_int(example_credit)}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="💵 1回の金額",
+        value=f"**{utils.fmt_yen(settings.minimum_charge)}** 〜\n"
+              f"**{utils.fmt_yen(settings.maximum_charge)}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="📅 1日の上限",
+        value=f"**{utils.fmt_yen(settings.daily_limit)}**" if settings.daily_limit
+        else "**無制限**",
+        inline=True,
+    )
+    embed.add_field(
+        name="🪜 チャージの手順",
+        value=(
+            "**1.** 下の `💰 チャージ` を押して**金額を入力**\n"
+            "**2.** Kyash アプリで**同じ金額**の送金リンクを作成\n"
+            "**3.** `🔗 送金リンクを送信` を押して URL を貼る\n"
+            "**4.** 自動で受け取り → 残高が増え、DM が届きます"
+        ),
+        inline=False,
+    )
+    embed.add_field(name="状態", value=state, inline=False)
+    embed.set_footer(
+        text="送金リンクは公開チャンネルに貼らないでください / "
+             "内部残高は現金化・出金できません"
+    )
     return embed
 
 
@@ -97,6 +145,11 @@ def ranking_embed(
         config.RankingType.MONTHLY: "今月の獲得残高",
         config.RankingType.INVITE: "確定した招待数",
     }.get(ranking_type, "ランキング")
+    embed.add_field(
+        name="\u200b",
+        value="🔄 最新の順位に更新　📜 自分の順位を確認 (自分にだけ表示されます)",
+        inline=False,
+    )
     embed.set_footer(
         text=f"{basis} TOP {settings.ranking_limit} / 最終更新 {utils.format_jst(updated_at)}"
     )
@@ -114,94 +167,193 @@ def ranking_disabled_embed() -> discord.Embed:
     return embed
 
 
-def balance_embed(user: discord.abc.User, balance: int, summary: dict[str, int]) -> discord.Embed:
+def balance_embed(
+    user: discord.abc.User,
+    balance: int,
+    summary: dict[str, int],
+    *,
+    rank: int | None = None,
+    rank_total: int = 0,
+    shop_available: bool = False,
+    spent: int = 0,
+) -> discord.Embed:
     """残高確認 (Ephemeral)。"""
     embed = discord.Embed(
         title="💳 あなたの残高",
-        description=SEPARATOR,
+        description=f"{SEPARATOR}\n現在の残高は **{utils.fmt_int(balance)}** です。\n{SEPARATOR}",
         color=config.Color.INFO,
     )
-    embed.add_field(name="現在残高", value=f"**{utils.fmt_int(balance)}**", inline=False)
-    embed.add_field(name="累計チャージ", value=f"{utils.fmt_int(summary['count'])}回", inline=True)
-    embed.add_field(name="累計送金額", value=utils.fmt_yen(summary["sent"]), inline=True)
-    embed.add_field(name="累計獲得", value=utils.fmt_int(summary["credited"]), inline=True)
-    embed.set_footer(text=f"{user.display_name} / このサーバー内の残高です")
+    embed.add_field(
+        name="📊 これまでの実績",
+        value=(
+            f"チャージ回数: **{utils.fmt_int(summary['count'])}回**\n"
+            f"送金した合計: **{utils.fmt_yen(summary['sent'])}**\n"
+            f"獲得した残高: **{utils.fmt_int(summary['credited'])}**"
+            + (f"\n使った残高: **{utils.fmt_int(spent)}**" if spent else "")
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="🏆 順位",
+        value=(
+            f"**{rank}位** / {utils.fmt_int(rank_total)}人" if rank
+            else "まだ順位はありません\n(残高が増えるとランクインします)"
+        ),
+        inline=True,
+    )
+    uses = ["`💰 チャージ` で残高を増やす"]
+    if shop_available:
+        uses.append("ショップパネルでロールと交換する")
+    uses.append("`📜 履歴` で明細を確認する")
+    embed.add_field(
+        name="▶ できること",
+        value="\n".join(f"・{u}" for u in uses),
+        inline=False,
+    )
+    embed.set_footer(text=f"{user.display_name} / この残高はこのサーバー内でのみ使えます")
     return embed
 
 
 def history_embed(
     rows: Sequence[Any], *, page: int, total_pages: int, total: int
 ) -> discord.Embed:
-    """チャージ履歴 (Ephemeral / ページング)。"""
+    """チャージ履歴 (Ephemeral / ページング)。
+
+    日時は Discord のタイムスタンプ表記にして、閲覧者のローカル時刻で表示する。
+    """
     embed = discord.Embed(
         title="📜 チャージ履歴",
-        description=f"{SEPARATOR}\n全 {utils.fmt_int(total)} 件" if total else f"{SEPARATOR}\n履歴はまだありません。",
+        description=(
+            f"{SEPARATOR}\n全 **{utils.fmt_int(total)}** 件のうち "
+            f"{len(rows)} 件を表示しています。\n{SEPARATOR}"
+            if total else
+            f"{SEPARATOR}\nまだ履歴がありません。\n"
+            "`💰 チャージ` から最初のチャージをしてみましょう。\n"
+            f"{SEPARATOR}"
+        ),
         color=config.Color.NEUTRAL,
     )
     for row in rows:
-        status = row["status"]
+        status = str(row["status"])
         emoji = config.STATUS_EMOJI.get(status, "⚪")
         label = config.STATUS_LABELS.get(status, status)
-        received = row["received_amount"] if row["received_amount"] is not None else row["requested_amount"]
+        received = (
+            row["received_amount"] if row["received_amount"] is not None
+            else row["requested_amount"]
+        )
         credited = row["credited_amount"]
-        value_lines = [
-            f"送金額: {utils.fmt_yen(received)}",
-            f"チャージ率: {utils.fmt_rate(row['charge_rate'])}",
-            f"獲得残高: {utils.fmt_int(credited) if credited is not None else '-'}",
-            f"状態: {emoji} {label}",
-            f"ID: `{row['id']}`",
+        lines = [
+            f"送金 **{utils.fmt_yen(received)}** × {utils.fmt_rate(row['charge_rate'])} "
+            f"→ 獲得 **{utils.fmt_int(credited) if credited is not None else '-'}**",
+            f"{utils.discord_ts(row['created_at'])} ({utils.discord_ts(row['created_at'], 'R')})",
+            f"取引ID `{row['id']}`",
         ]
+        if row["refunded_at"]:
+            lines.append(f"⚠️ 取消済み ({utils.discord_ts(row['refunded_at'], 'R')})")
+        embed.add_field(name=f"{emoji} {label}", value="\n".join(lines), inline=False)
+    if rows:
         embed.add_field(
-            name=utils.format_jst(row["created_at"]),
-            value="\n".join(value_lines),
+            name="状態の意味",
+            value=(
+                "🟢 完了 = 残高に反映済み / ⌛ リンク待ち = 送金リンクの送信待ち\n"
+                "🟡 受取待ち・処理中 = 自動処理中 / 🟠 確認中 = 管理者が確認中\n"
+                "🔴 失敗・⚫ 期限切れ = 残高は増えていません"
+            ),
             inline=False,
         )
-    embed.set_footer(text=f"ページ {page}/{max(1, total_pages)}")
+    embed.set_footer(text=f"ページ {page}/{max(1, total_pages)} / ◀️ ▶️ で移動できます")
     return embed
 
 
-def help_embed(settings: "GuildSettings") -> discord.Embed:
-    """ヘルプ (Ephemeral)。"""
+def help_embed(
+    settings: "GuildSettings",
+    *,
+    shop_available: bool = False,
+    campaign_name: str | None = None,
+    example_amount: int | None = None,
+) -> discord.Embed:
+    """ヘルプ (Ephemeral)。何ができて、どう操作するかを順番に示す。"""
+    base = example_amount or max(settings.minimum_charge, 1000)
+    if base > settings.maximum_charge:
+        base = settings.maximum_charge
+    credit = utils.calc_credited_amount(base, settings.charge_rate)
+
     embed = discord.Embed(
         title="❓ ヘルプ",
         description=(
             f"{SEPARATOR}\n"
-            "このBotは、このサーバー内だけで使える**内部残高**を管理します。\n"
-            "現金や外部サービスとの交換・出金には対応していません。\n"
+            "このサーバーで使える**内部残高**のしくみです。\n"
+            "Kyash で送金すると、チャージ率を掛けた残高が受け取れます。\n"
             f"{SEPARATOR}"
         ),
         color=config.Color.INFO,
     )
     embed.add_field(
-        name="チャージのしかた",
+        name="① チャージのしかた",
         value=(
-            "1. `💰 チャージ` を押す\n"
-            "2. チャージしたい金額を入力する\n"
-            "3. Kyashアプリで**同じ金額**の送金リンクを作る\n"
-            "4. `🔗 送金リンクを送信` を押してリンクを貼る\n"
-            "5. 自動で受け取り、残高が加算されます"
+            "**1.** `💰 チャージ` を押す\n"
+            "**2.** チャージしたい金額を入力する\n"
+            "**3.** Kyash アプリで「送る」→ **リンクで送る** で\n"
+            "　　**同じ金額**の送金リンクを作る\n"
+            "**4.** `🔗 送金リンクを送信` を押して URL を貼る\n"
+            "**5.** 自動で受け取り、残高が増えます (結果は DM でお知らせ)"
         ),
         inline=False,
     )
-    embed.add_field(name="チャージ率", value=utils.fmt_rate(settings.charge_rate), inline=True)
-    embed.add_field(name="最低 / 最大", value=f"{utils.fmt_yen(settings.minimum_charge)} / {utils.fmt_yen(settings.maximum_charge)}", inline=True)
-    embed.add_field(name="1日の上限", value=utils.fmt_yen(settings.daily_limit), inline=True)
     embed.add_field(
-        name="注意事項",
+        name="② いくら増えますか？",
+        value=(
+            f"チャージ率は **{utils.fmt_rate(settings.charge_rate)}** です。\n"
+            f"例) **{utils.fmt_yen(base)}** 送金 → **{utils.fmt_int(credit)}** 獲得\n"
+            "※ 端数は四捨五入します"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="③ 金額の条件",
+        value=(
+            f"1回: **{utils.fmt_yen(settings.minimum_charge)}** 〜 "
+            f"**{utils.fmt_yen(settings.maximum_charge)}**\n"
+            + (f"1日: **{utils.fmt_yen(settings.daily_limit)}** まで"
+               if settings.daily_limit else "1日の上限: なし")
+            + (f"\n残高上限: **{utils.fmt_int(settings.max_balance)}**"
+               if settings.max_balance else "")
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="④ 残高の使い道",
+        value=(
+            ("・ショップパネルからロールと交換できます\n" if shop_available else "")
+            + ("・招待キャンペーンでも残高がもらえます "
+               f"({campaign_name})\n" if campaign_name else "")
+            + "・`💳 残高` `📜 履歴` でいつでも確認できます\n"
+            "・現金化・出金・外部サービスとの交換はできません"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="⑤ 気をつけること",
         value=(
             "・入力した金額と送金リンクの金額が**一致**していないと受け取れません\n"
-            "・請求リンクではなく**送金リンク**を作成してください\n"
-            "・リンクの入力期限は約15分です\n"
-            "・処理の目安は通常10〜60秒程度です (混雑時は順番待ちになります)"
+            "・**請求リンクではなく送金リンク**を作成してください\n"
+            "・リンクの入力期限は約 "
+            f"{config.LINK_WAIT_SECONDS // 60} 分です\n"
+            "・一度使ったリンクは再利用できません\n"
+            "・送金リンクは**公開チャンネルに貼らないでください** (入力欄は非公開です)"
         ),
         inline=False,
     )
     embed.add_field(
-        name="うまくいかないとき",
-        value="結果はDMでお知らせします。解決しない場合はサーバーの管理者へお問い合わせください。",
+        name="⑥ 処理時間 / うまくいかないとき",
+        value=(
+            "通常 10〜60 秒ほどで完了します (混雑時は順番待ちになります)。\n"
+            "結果は必ず DM でお知らせします。DM が届かない設定の場合は履歴で確認してください。\n"
+            "解決しないときは、**取引ID**を添えてサーバーの管理者へお問い合わせください。"
+        ),
         inline=False,
     )
-    embed.set_footer(text="送金リンクは公開チャンネルに貼らないでください")
+    embed.set_footer(text="内部残高システム / このサーバー専用の数値です")
     return embed
 
 
@@ -240,8 +392,84 @@ def achievement_embed(
         inline=True,
     )
     embed.add_field(name="状態", value=state_text, inline=True)
-    embed.add_field(name="日時", value=utils.format_jst(timestamp), inline=True)
+    embed.add_field(name="日時", value=utils.discord_ts(timestamp), inline=True)
     embed.add_field(name="取引ID", value=f"`{tx_id}`", inline=True)
+    embed.set_footer(text="内部残高システム")
+    return embed
+
+
+def shop_achievement_embed(
+    *,
+    user_mention: str,
+    item_name: str,
+    role_id: int,
+    price: int,
+    balance_after: int,
+    expires_at: int | None,
+    purchase_id: int,
+    timestamp: int,
+    status: str = config.PurchaseStatus.ACTIVE,
+) -> discord.Embed:
+    """ショップ購入の実績 (実績チャンネルへ投稿)。
+
+    チャージ実績とデザインを揃え、残高以外の秘密情報は載せない。
+    """
+    if status == config.PurchaseStatus.ACTIVE:
+        state_text, color = "🟢 購入完了", config.Color.SUCCESS
+    elif status == config.PurchaseStatus.EXPIRED:
+        state_text, color = "⚫ 期限切れ", config.Color.NEUTRAL
+    elif status in (config.PurchaseStatus.REFUNDED, config.PurchaseStatus.FAILED):
+        state_text, color = "↩️ 返金済み", config.Color.WARNING
+    else:
+        state_text, color = "🟡 処理中", config.Color.WARNING
+
+    embed = discord.Embed(title="🛒 ショップ購入実績", description=SEPARATOR, color=color)
+    embed.add_field(name="ユーザー", value=user_mention, inline=False)
+    embed.add_field(name="商品", value=f"**{item_name}**", inline=True)
+    embed.add_field(name="ロール", value=f"<@&{role_id}>", inline=True)
+    embed.add_field(name="支払い", value=f"**{utils.fmt_int(price)}**", inline=True)
+    embed.add_field(name="状態", value=state_text, inline=True)
+    embed.add_field(
+        name="有効期限",
+        value=utils.discord_ts(expires_at) if expires_at else "無期限",
+        inline=True,
+    )
+    embed.add_field(name="日時", value=utils.discord_ts(timestamp), inline=True)
+    embed.add_field(name="購入後の残高", value=f"**{utils.fmt_int(balance_after)}**", inline=True)
+    embed.add_field(name="購入ID", value=f"`{purchase_id}`", inline=True)
+    embed.set_footer(text="内部残高システム")
+    return embed
+
+
+def invite_achievement_embed(
+    *,
+    inviter_mention: str | None,
+    invited_mention: str,
+    inviter_reward: int,
+    invited_reward: int,
+    campaign_name: str,
+    record_id: int,
+    timestamp: int,
+) -> discord.Embed:
+    """招待報酬の確定実績 (実績チャンネルへ投稿)。"""
+    embed = discord.Embed(
+        title="🤝 招待実績",
+        description=f"{SEPARATOR}\n**{campaign_name}**\n{SEPARATOR}",
+        color=config.Color.ACCENT,
+    )
+    embed.add_field(name="招待した人", value=inviter_mention or "-", inline=True)
+    embed.add_field(name="参加した人", value=invited_mention, inline=True)
+    embed.add_field(name="状態", value="🟢 報酬確定", inline=True)
+    embed.add_field(
+        name="報酬",
+        value=(
+            f"招待した人: **{utils.fmt_int(inviter_reward)}**\n"
+            f"参加した人: **{utils.fmt_int(invited_reward)}**"
+        ),
+        inline=True,
+    )
+    embed.add_field(name="日時", value=utils.discord_ts(timestamp), inline=True)
+    embed.add_field(name="記録ID", value=f"`{record_id}`", inline=True)
     embed.set_footer(text="内部残高システム")
     return embed
 
@@ -256,51 +484,99 @@ def dm_success_embed(
     tx_id: str,
     timestamp: int,
 ) -> discord.Embed:
+    """チャージ完了の DM。"""
     embed = discord.Embed(
-        title="✅ チャージ完了",
-        description=f"{SEPARATOR}\n**{guild_name}** でのチャージが完了しました。\n{SEPARATOR}",
+        title="✅ チャージが完了しました",
+        description=(
+            f"{SEPARATOR}\n**{guild_name}**\n"
+            f"残高が **+{utils.fmt_int(credited_amount)}** 増えました。\n"
+            f"{SEPARATOR}"
+        ),
         color=config.Color.SUCCESS,
     )
-    embed.add_field(name="送金額", value=utils.fmt_yen(received_amount), inline=True)
-    embed.add_field(name="チャージ率", value=utils.fmt_rate(charge_rate), inline=True)
-    embed.add_field(name="獲得残高", value=f"**{utils.fmt_int(credited_amount)}**", inline=True)
-    embed.add_field(name="チャージ後残高", value=f"**{utils.fmt_int(balance_after)}**", inline=False)
-    embed.add_field(name="取引ID", value=f"`{tx_id}`", inline=True)
-    embed.add_field(name="日時", value=utils.format_jst(timestamp), inline=True)
+    embed.add_field(
+        name="内訳",
+        value=(
+            f"送金額: **{utils.fmt_yen(received_amount)}**\n"
+            f"チャージ率: **{utils.fmt_rate(charge_rate)}**\n"
+            f"獲得残高: **{utils.fmt_int(credited_amount)}**"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="チャージ後の残高",
+        value=f"**{utils.fmt_int(balance_after)}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="取引情報",
+        value=f"取引ID: `{tx_id}`\n日時: {utils.discord_ts(timestamp)}",
+        inline=False,
+    )
+    embed.set_footer(text="残高はサーバーのパネルから確認できます")
     return embed
 
 
 def dm_failure_embed(
-    *, guild_name: str, tx_id: str, error_code: str, timestamp: int, requested_amount: int | None = None
+    *, guild_name: str, tx_id: str, error_code: str, timestamp: int,
+    requested_amount: int | None = None,
 ) -> discord.Embed:
-    """失敗通知 (利用者には安全な一般向けメッセージのみ表示する)。"""
-    message = config.USER_ERROR_MESSAGES.get(error_code, config.USER_ERROR_MESSAGES[config.ErrorCode.UNKNOWN_ERROR])
+    """失敗通知 (利用者には安全な一般向けメッセージと次の行動のみ)。"""
+    message = config.USER_ERROR_MESSAGES.get(
+        error_code, config.USER_ERROR_MESSAGES[config.ErrorCode.UNKNOWN_ERROR]
+    )
+    action = config.USER_ERROR_NEXT_ACTIONS.get(error_code)
     embed = discord.Embed(
         title="⚠️ チャージを完了できませんでした",
         description=f"{SEPARATOR}\n**{guild_name}**\n{message}\n{SEPARATOR}",
         color=config.Color.DANGER,
     )
-    if requested_amount is not None:
-        embed.add_field(name="申請額", value=utils.fmt_yen(requested_amount), inline=True)
-    embed.add_field(name="取引ID", value=f"`{tx_id}`", inline=True)
-    embed.add_field(name="日時", value=utils.format_jst(timestamp), inline=True)
-    embed.set_footer(text="送金リンクが未使用の場合は、Kyashアプリからキャンセルできます")
+    if action:
+        embed.add_field(name="▶ 次にどうすればいいですか？", value=action, inline=False)
+    embed.add_field(
+        name="この取引の情報",
+        value=(
+            (f"申請額: {utils.fmt_yen(requested_amount)}\n"
+             if requested_amount is not None else "")
+            + f"取引ID: `{tx_id}`\n日時: {utils.discord_ts(timestamp)}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="残高について",
+        value="**残高は増えていません。** 送金リンクが未使用の場合は Kyash アプリからキャンセルできます。",
+        inline=False,
+    )
+    embed.set_footer(text="解決しない場合は取引IDを添えて管理者へお問い合わせください")
     return embed
 
 
 def dm_review_embed(*, guild_name: str, tx_id: str, timestamp: int) -> discord.Embed:
+    """確認中の通知。"""
     embed = discord.Embed(
         title="🔎 処理結果を確認しています",
         description=(
             f"{SEPARATOR}\n**{guild_name}**\n"
-            "現在、受け取り結果の確認を行っています。\n"
-            "確認が完了ししだい結果をお知らせしますので、そのままお待ちください。\n"
+            "受け取り結果の確認に時間がかかっています。\n"
+            "**二重に受け取ることはありません**のでご安心ください。\n"
             f"{SEPARATOR}"
         ),
         color=config.Color.WARNING,
     )
-    embed.add_field(name="取引ID", value=f"`{tx_id}`", inline=True)
-    embed.add_field(name="日時", value=utils.format_jst(timestamp), inline=True)
+    embed.add_field(
+        name="▶ どうすればいいですか？",
+        value=(
+            "・**そのままお待ちください** (確認が終わり次第 DM でお知らせします)\n"
+            "・同じ送金リンクを再送信する必要はありません\n"
+            "・新しくチャージをやり直さないでください"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="この取引の情報",
+        value=f"取引ID: `{tx_id}`\n日時: {utils.discord_ts(timestamp)}",
+        inline=False,
+    )
     return embed
 
 
@@ -310,16 +586,28 @@ def log_embed(
 ) -> discord.Embed:
     """ログチャンネル向け Embed (秘密情報は渡さないこと)。"""
     embed = discord.Embed(
-        title=title, description=utils.truncate(description, 3800), color=color
+        title=utils.truncate(title, EMBED_TITLE_MAX),
+        description=utils.truncate(description, 3800),
+        color=color,
     )
-    for name, value, inline in fields:
-        embed.add_field(name=utils.truncate(name, 250), value=utils.truncate(str(value), 1000), inline=inline)
+    for name, value, inline in list(fields)[:EMBED_FIELDS_MAX]:
+        embed.add_field(
+            name=utils.truncate(name, 250),
+            value=utils.truncate(str(value), 1000) or "-",
+            inline=inline,
+        )
     embed.timestamp = discord.utils.utcnow()
-    return embed
+    return clamp_embed(embed)
 
 
-def error_embed(error_code: str, *, admin_detail: str | None = None) -> discord.Embed:
-    """利用者向けエラー表示 (内部詳細は含めない)。"""
+def error_embed(
+    error_code: str, *, admin_detail: str | None = None, next_action: str | None = None
+) -> discord.Embed:
+    """利用者向けエラー表示。
+
+    内部詳細やスタックトレースは出さず、「何が起きたか」と
+    「次にどうすればよいか」をセットで示す。
+    """
     embed = discord.Embed(
         title="⚠️ 実行できませんでした",
         description=config.USER_ERROR_MESSAGES.get(
@@ -327,17 +615,171 @@ def error_embed(error_code: str, *, admin_detail: str | None = None) -> discord.
         ),
         color=config.Color.DANGER,
     )
+    action = next_action or config.USER_ERROR_NEXT_ACTIONS.get(error_code)
+    if action:
+        embed.add_field(name="▶ 次にどうすればいいですか？", value=action, inline=False)
     if admin_detail:
         embed.add_field(name="詳細 (管理者向け)", value=utils.truncate(admin_detail, 900), inline=False)
+    embed.set_footer(text=f"エラーコード: {error_code}")
+    return embed
+
+
+#: チャージの手順は 3 段階。利用者が「今どこにいるか」を常に示す。
+CHARGE_STEPS: Final[int] = 3
+
+
+def step_line(current: int, total: int = CHARGE_STEPS) -> str:
+    """「ステップ 2 / 3 ●●○」の形で進行状況を返す。"""
+    dots = "".join("●" if i < current else "○" for i in range(total))
+    return f"`ステップ {current} / {total}`　{dots}"
+
+
+def link_wait_embed(
+    *,
+    tx_id: str,
+    amount: int,
+    rate: Decimal,
+    credited: int,
+    expires_at: int | None = None,
+    resumed: bool = False,
+) -> discord.Embed:
+    """ステップ2: 送金リンクの送信を待っている状態。"""
+    embed = discord.Embed(
+        title=("⌛ 送金リンクの送信をお待ちしています" if resumed
+               else "🔗 次に「送金リンク」を送信してください"),
+        description=(
+            f"{step_line(2)}\n{SEPARATOR}\n"
+            + ("前回の申請がまだ有効です。そのまま続けて送信できます。"
+               if resumed else "Kyash アプリで送金リンクを作り、下のボタンから送ってください。")
+            + f"\n{SEPARATOR}"
+        ),
+        color=config.Color.WARNING if resumed else config.Color.ACCENT,
+    )
+    embed.add_field(
+        name="この取引の内容",
+        value=(
+            f"送る金額: **{utils.fmt_yen(amount)}**\n"
+            f"チャージ率: **{utils.fmt_rate(rate)}**\n"
+            f"もらえる残高: **{utils.fmt_int(credited)}**"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="期限",
+        value=(utils.discord_ts(expires_at, "R") if expires_at
+               else f"約 {config.LINK_WAIT_SECONDS // 60} 分"),
+        inline=True,
+    )
+    embed.add_field(
+        name="▶ やること",
+        value=(
+            f"**1.** Kyash アプリで **{utils.fmt_yen(amount)}** ちょうどの送金リンクを作る\n"
+            "**2.** 下の `🔗 リンクを送信` を押す\n"
+            "**3.** 出てきた入力欄にリンクを貼って送信する"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="⚠️ 注意",
+        value=(
+            "・金額が **1円でも違う**と受け付けられません\n"
+            "・リンクを**公開チャンネルへ貼らない**でください (この画面はあなただけに見えています)\n"
+            "・期限が切れたら最初からやり直してください"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"取引ID: {tx_id}")
+    return embed
+
+
+def link_accepted_embed(*, tx_id: str, amount: int, waiting: int) -> discord.Embed:
+    """ステップ3: 受け取り処理待ち。"""
+    embed = discord.Embed(
+        title="✅ 送金リンクを受け付けました",
+        description=(
+            f"{step_line(3)}\n{SEPARATOR}\n"
+            "あとは**自動で受け取り処理**を行います。操作は不要です。\n"
+            f"{SEPARATOR}"
+        ),
+        color=config.Color.SUCCESS,
+    )
+    embed.add_field(name="金額", value=f"**{utils.fmt_yen(amount)}**", inline=True)
+    embed.add_field(
+        name="順番待ち",
+        value=("**あなたが次です**" if waiting <= 0 else f"あなたの前に **{waiting} 件**"),
+        inline=True,
+    )
+    embed.add_field(
+        name="この後の流れ",
+        value=(
+            "**1.** Bot が受け取り処理をします (通常は数十秒)\n"
+            "**2.** 完了すると **DM** でお知らせします\n"
+            "**3.** `💳 残高` で反映を確認できます\n\n"
+            "DM が届かない場合は、サーバーからの DM を許可しているか確認してください。"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"取引ID: {tx_id}")
+    return embed
+
+
+# Discord の Embed 上限。超えると送信が 400 で失敗し「Bot が無言になる」ため、
+# 動的な文字列を載せる入口で必ず切り詰める。
+EMBED_TITLE_MAX: Final[int] = 256
+EMBED_DESC_MAX: Final[int] = 4096
+EMBED_FIELDS_MAX: Final[int] = 25
+EMBED_FIELD_NAME_MAX: Final[int] = 256
+EMBED_FIELD_VALUE_MAX: Final[int] = 1024
+EMBED_FOOTER_MAX: Final[int] = 2048
+EMBED_TOTAL_MAX: Final[int] = 6000
+
+
+def clamp_embed(embed: discord.Embed) -> discord.Embed:
+    """Embed を Discord の上限内に収める (送信失敗を確実に防ぐ最後の砦)。"""
+    if embed.title and len(embed.title) > EMBED_TITLE_MAX:
+        embed.title = utils.truncate(embed.title, EMBED_TITLE_MAX)
+    if embed.description and len(embed.description) > EMBED_DESC_MAX:
+        embed.description = utils.truncate(embed.description, EMBED_DESC_MAX)
+    if embed.footer and embed.footer.text and len(embed.footer.text) > EMBED_FOOTER_MAX:
+        embed.set_footer(text=utils.truncate(embed.footer.text, EMBED_FOOTER_MAX))
+    fields = list(embed.fields)
+    if any(
+        len(f.name or "") > EMBED_FIELD_NAME_MAX
+        or len(f.value or "") > EMBED_FIELD_VALUE_MAX
+        for f in fields
+    ) or len(fields) > EMBED_FIELDS_MAX:
+        embed.clear_fields()
+        for f in fields[:EMBED_FIELDS_MAX]:
+            embed.add_field(
+                name=utils.truncate(f.name or "-", EMBED_FIELD_NAME_MAX),
+                value=utils.truncate(f.value or "-", EMBED_FIELD_VALUE_MAX),
+                inline=bool(f.inline),
+            )
+    # それでも合計が超える場合は末尾のフィールドから落とす
+    while len(embed) > EMBED_TOTAL_MAX and embed.fields:
+        embed.remove_field(len(embed.fields) - 1)
+    if len(embed) > EMBED_TOTAL_MAX and embed.description:
+        over = len(embed) - EMBED_TOTAL_MAX
+        embed.description = utils.truncate(
+            embed.description, max(1, len(embed.description) - over)
+        )
     return embed
 
 
 def info_embed(title: str, description: str, *, color: int = config.Color.INFO) -> discord.Embed:
-    return discord.Embed(title=title, description=description, color=color)
+    return discord.Embed(
+        title=utils.truncate(title, EMBED_TITLE_MAX),
+        description=utils.truncate(description, EMBED_DESC_MAX),
+        color=color,
+    )
 
 
 def success_embed(title: str, description: str = "") -> discord.Embed:
-    return discord.Embed(title=title, description=description, color=config.Color.SUCCESS)
+    return discord.Embed(
+        title=utils.truncate(title, EMBED_TITLE_MAX),
+        description=utils.truncate(description, EMBED_DESC_MAX),
+        color=config.Color.SUCCESS,
+    )
 
 
 def shop_panel_embed(settings: "GuildSettings", items: Sequence[Any]) -> discord.Embed:
@@ -346,35 +788,54 @@ def shop_panel_embed(settings: "GuildSettings", items: Sequence[Any]) -> discord
         title="🛒 ロールショップ",
         description=(
             f"{SEPARATOR}\n"
-            "内部残高でロールを購入できます。\n"
-            "下のボタンから商品を選んでください。\n"
+            "チャージで増えた**内部残高**でロールを購入できます。\n"
             f"{SEPARATOR}"
         ),
         color=settings.accent_color if settings.accent_color is not None else config.Color.ACCENT,
     )
     if not settings.shop_enabled:
-        embed.add_field(name="状態", value="⚫ 現在ショップは停止中です", inline=False)
+        embed.add_field(
+            name="状態", value="⚫ 現在ショップは停止中です (購入できません)", inline=False
+        )
         return embed
     if not items:
-        embed.add_field(name="商品", value="現在購入できる商品はありません。", inline=False)
+        embed.add_field(
+            name="商品",
+            value="現在購入できる商品はありません。追加されるまでお待ちください。",
+            inline=False,
+        )
         return embed
     for item in list(items)[:10]:
         duration = int(item["duration_days"])
         stock = int(item["stock"])
-        details = [f"価格: **{utils.fmt_int(int(item['price']))}**"]
-        details.append("期間: " + (f"{duration}日" if duration > 0 else "無期限"))
+        limit = int(item["purchase_limit"])
+        lines = [
+            f"💰 **{utils.fmt_int(int(item['price']))}**",
+            f"⏳ {f'{duration}日間' if duration > 0 else '無期限 (買い切り)'}",
+        ]
         if stock >= 0:
-            details.append(f"在庫: {stock}")
-        if int(item["purchase_limit"]) > 0:
-            details.append(f"購入上限: {item['purchase_limit']}回")
+            lines.append(f"📦 残り **{stock}** 個" if stock else "📦 **在庫切れ**")
+        if limit > 0:
+            lines.append(f"🔒 1人 {limit} 回まで")
+        detail = "　".join(lines)
         if item["description"]:
-            details.append(utils.truncate(str(item["description"]), 200))
+            detail += f"\n{utils.truncate(str(item['description']), 180)}"
         embed.add_field(
-            name=f"<@&{int(item['role_id'])}> {item['name']}",
-            value="\n".join(details),
+            name=f"🎫 {item['name']} → <@&{int(item['role_id'])}>",
+            value=detail,
             inline=False,
         )
-    embed.set_footer(text="購入すると内部残高が消費され、ロールが付与されます")
+    embed.add_field(
+        name="▶ 購入のしかた",
+        value=(
+            "**1.** `🛒 ショップを開く` を押す\n"
+            "**2.** 商品を選ぶ (残高も表示されます)\n"
+            "**3.** 内容を確認して `購入する` を押す\n"
+            "→ 残高が引かれ、ロールがすぐに付与されます"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="購入後のキャンセルは管理者へご相談ください")
     return embed
 
 
@@ -384,19 +845,104 @@ def purchase_success_embed(
 ) -> discord.Embed:
     embed = discord.Embed(
         title="✅ 購入が完了しました",
-        description=f"{SEPARATOR}\n<@&{role_id}> を付与しました。\n{SEPARATOR}",
+        description=(
+            f"{SEPARATOR}\n<@&{role_id}> を付与しました。\n"
+            f"残高が **-{utils.fmt_int(price)}** されました。\n{SEPARATOR}"
+        ),
         color=config.Color.SUCCESS,
     )
-    embed.add_field(name="商品", value=item_name, inline=True)
-    embed.add_field(name="支払い", value=utils.fmt_int(price), inline=True)
-    embed.add_field(name="残高", value=f"**{utils.fmt_int(balance_after)}**", inline=True)
+    embed.add_field(name="商品", value=f"**{item_name}**", inline=True)
+    embed.add_field(name="購入後の残高", value=f"**{utils.fmt_int(balance_after)}**", inline=True)
     embed.add_field(
         name="有効期限",
-        value=utils.format_jst(expires_at) if expires_at else "無期限",
+        value=(
+            f"{utils.discord_ts(expires_at)}\n({utils.discord_ts(expires_at, 'R')})"
+            if expires_at else "無期限 (買い切り)"
+        ),
         inline=True,
     )
     embed.add_field(name="購入ID", value=f"`{purchase_id}`", inline=True)
+    if expires_at:
+        embed.add_field(
+            name="ご注意",
+            value="有効期限が切れると**ロールは自動で外れます**。",
+            inline=False,
+        )
+    embed.set_footer(text="購入履歴は 📦 ボタンから確認できます")
     return embed
+
+
+def purchase_confirm_embed(
+    *,
+    item: Any,
+    balance: int,
+    owned: int,
+    already_has_role: bool,
+) -> tuple[discord.Embed, str | None]:
+    """購入前の確認画面。
+
+    Returns:
+        ``(embed, blocker)``。``blocker`` が None でなければ購入できない理由。
+        先に理由を示すことで「押したのに失敗した」を避ける。
+    """
+    price = int(item["price"])
+    duration = int(item["duration_days"])
+    stock = int(item["stock"])
+    limit = int(item["purchase_limit"])
+
+    blocker: str | None = None
+    if duration == 0 and already_has_role:
+        blocker = "すでにこのロールを持っています。"
+    elif stock == 0:
+        blocker = "在庫がありません。"
+    elif limit > 0 and owned >= limit:
+        blocker = f"購入できる回数の上限 ({limit}回) に達しています。"
+    elif balance < price:
+        blocker = (
+            f"残高が **{utils.fmt_int(price - balance)}** 足りません。\n"
+            "`💰 チャージ` で残高を増やしてから、もう一度お試しください。"
+        )
+
+    embed = discord.Embed(
+        title="🛒 購入の確認" if blocker is None else "⚠️ いま購入できません",
+        description=(
+            f"{SEPARATOR}\n"
+            + ("下の `購入する` を押すと**すぐに残高から引き落とし**、ロールが付きます。\n"
+               if blocker is None else f"{blocker}\n")
+            + SEPARATOR
+        ),
+        color=config.Color.ACCENT if blocker is None else config.Color.WARNING,
+    )
+    embed.add_field(name="商品", value=f"**{item['name']}**", inline=True)
+    embed.add_field(name="もらえるロール", value=f"<@&{int(item['role_id'])}>", inline=True)
+    embed.add_field(name="価格", value=f"**{utils.fmt_int(price)}**", inline=True)
+    embed.add_field(
+        name="有効期間",
+        value=(f"**{duration}日間** (期限が来ると自動で外れます)" if duration > 0 else "**無期限**"),
+        inline=False,
+    )
+    embed.add_field(name="いまの残高", value=f"**{utils.fmt_int(balance)}**", inline=True)
+    embed.add_field(
+        name="購入後の残高",
+        value=(f"**{utils.fmt_int(balance - price)}**" if balance >= price
+               else f"不足 **{utils.fmt_int(price - balance)}**"),
+        inline=True,
+    )
+    if limit > 0:
+        embed.add_field(
+            name="購入回数", value=f"{owned} / {limit} 回", inline=True
+        )
+    if stock >= 0:
+        embed.add_field(name="残り在庫", value=f"{stock} 個", inline=True)
+    if item["description"]:
+        embed.add_field(
+            name="説明", value=utils.truncate(str(item["description"]), 900), inline=False
+        )
+    embed.set_footer(
+        text="購入後の返金は管理者の操作が必要です" if blocker is None
+        else "条件を満たすと購入できるようになります"
+    )
+    return embed, blocker
 
 
 def my_items_embed(rows: Sequence[Any]) -> discord.Embed:
@@ -413,8 +959,12 @@ def my_items_embed(rows: Sequence[Any]) -> discord.Embed:
             value=(
                 f"ロール: <@&{int(row['role_id'])}>\n"
                 f"価格: {utils.fmt_int(int(row['price']))}\n"
-                f"購入: {utils.format_jst(int(row['created_at']))}\n"
-                + (f"期限: {utils.format_jst(row['expires_at'])}\n" if row["expires_at"] else "")
+                f"購入: {utils.discord_ts(int(row['created_at']))}\n"
+                + (
+                    f"期限: {utils.discord_ts(row['expires_at'])} "
+                    f"({utils.discord_ts(row['expires_at'], 'R')})\n"
+                    if row["expires_at"] else "期限: 無期限\n"
+                )
                 + f"購入ID: `{row['id']}`"
             ),
             inline=False,
@@ -427,70 +977,115 @@ def invite_panel_embed(settings: "GuildSettings", campaign: Any | None) -> disco
     if campaign is None:
         return discord.Embed(
             title="🤝 招待キャンペーン",
-            description=f"{SEPARATOR}\n現在開催中のキャンペーンはありません。\n{SEPARATOR}",
+            description=(
+                f"{SEPARATOR}\n現在開催中のキャンペーンはありません。\n"
+                "次の開催をお待ちください。\n"
+                f"{SEPARATOR}"
+            ),
             color=config.Color.NEUTRAL,
         )
     conditions: list[str] = []
     if campaign["require_charge"]:
-        conditions.append("招待した人が**チャージを1回完了**したら確定")
+        conditions.append("招待した人が**チャージを1回完了**したとき")
     if int(campaign["require_days"] or 0) > 0:
-        conditions.append(f"参加から**{campaign['require_days']}日**の滞在で確定")
+        conditions.append(f"参加から**{campaign['require_days']}日**サーバーに残ったとき")
     if not conditions:
-        conditions.append("参加が確認できた時点で確定")
+        conditions.append("参加が確認できたとき")
+
     embed = discord.Embed(
         title=f"🤝 {campaign['name']}",
         description=(
             f"{SEPARATOR}\n"
-            "あなた専用の招待リンクで友達を招待すると、内部残高がもらえます。\n"
+            "あなた専用の招待リンクで友達を招待すると、**内部残高がもらえます**。\n"
             f"{SEPARATOR}"
         ),
         color=settings.accent_color if settings.accent_color is not None else config.Color.ACCENT,
     )
     embed.add_field(
-        name="報酬",
+        name="🎁 もらえる残高",
         value=(
             f"招待した人: **{utils.fmt_int(int(campaign['inviter_reward']))}**\n"
             f"招待された人: **{utils.fmt_int(int(campaign['invited_reward']))}**"
         ),
         inline=True,
     )
-    embed.add_field(name="確定条件", value="\n".join(f"・{c}" for c in conditions), inline=True)
-    limits = [
-        f"アカウント作成から{campaign['min_account_age_days']}日以上",
-        f"1日あたり{campaign['daily_limit']}人まで" if int(campaign["daily_limit"] or 0) > 0 else "1日の上限なし",
-        f"累計{campaign['total_limit']}人まで" if int(campaign["total_limit"] or 0) > 0 else "累計上限なし",
-    ]
-    embed.add_field(name="条件・上限", value="\n".join(f"・{x}" for x in limits), inline=False)
     embed.add_field(
-        name="注意事項",
+        name="✅ 報酬が確定する条件",
+        value="\n".join(f"・{c}" for c in conditions),
+        inline=True,
+    )
+    embed.add_field(
+        name="▶ 参加のしかた",
         value=(
-            "・自分自身の招待、再入場、Botアカウントは無効です\n"
-            "・一度サーバーに参加したことがある人は対象外です\n"
-            "・不自然な招待は保留され、管理者が確認します"
+            "**1.** `🔗 招待リンクを取得` を押す (あなた専用のリンクが出ます)\n"
+            "**2.** そのリンクを友達に送る\n"
+            "**3.** 友達が参加し、条件を満たすと自動で残高が入ります\n"
+            "**4.** `📊 自分の招待状況` で進行状況を確認できます"
+        ),
+        inline=False,
+    )
+    limits = [
+        f"Discord アカウント作成から **{campaign['min_account_age_days']}日**以上",
+        (f"1日 **{campaign['daily_limit']}人**まで"
+         if int(campaign["daily_limit"] or 0) > 0 else "1日の上限なし"),
+        (f"累計 **{campaign['total_limit']}人**まで"
+         if int(campaign["total_limit"] or 0) > 0 else "累計上限なし"),
+    ]
+    embed.add_field(
+        name="📋 条件・上限",
+        value="\n".join(f"・{x}" for x in limits),
+        inline=False,
+    )
+    embed.add_field(
+        name="⚠️ 対象にならない招待",
+        value=(
+            "・自分自身の招待\n"
+            "・**一度このサーバーに参加したことがある人** (退出して再参加した場合も対象外)\n"
+            "・Bot アカウント\n"
+            "・招待リンク以外 (サーバー検索など) からの参加\n"
+            "※ 不自然な招待は保留され、管理者が確認します"
         ),
         inline=False,
     )
     if campaign["ends_at"]:
-        embed.set_footer(text=f"終了予定 {utils.format_jst(int(campaign['ends_at']))}")
+        embed.set_footer(
+            text=f"終了予定 {utils.format_jst(int(campaign['ends_at']))}"
+        )
+    else:
+        embed.set_footer(text="終了時期は未定です")
     return embed
 
 
-def invite_link_embed(*, url: str, code: str, summary: dict[str, int], created: bool) -> discord.Embed:
+def invite_link_embed(
+    *, url: str, code: str, summary: dict[str, int], created: bool
+) -> discord.Embed:
     embed = discord.Embed(
-        title="🔗 あなたの招待リンク",
+        title="🔗 あなた専用の招待リンク",
         description=(
-            f"{SEPARATOR}\n{url}\n{SEPARATOR}\n"
-            + ("新しく発行しました。" if created else "既に発行済みのリンクです。")
-            + "\nこのリンク経由の参加だけが報酬の対象になります。"
+            f"{SEPARATOR}\n"
+            f"```\n{url}\n```\n"
+            + ("新しく発行しました。" if created else "すでに発行済みのリンクです (同じものを使い続けてください)。")
+            + "\n**このリンク経由の参加だけ**が報酬の対象になります。\n"
+            f"{SEPARATOR}"
         ),
         color=config.Color.ACCENT,
     )
-    embed.add_field(name="確定", value=f"{summary['confirmed']}人", inline=True)
-    embed.add_field(name="保留中", value=f"{summary['pending']}人", inline=True)
-    embed.add_field(name="要確認", value=f"{summary['hold']}人", inline=True)
-    embed.add_field(name="無効", value=f"{summary['rejected']}人", inline=True)
-    embed.add_field(name="獲得報酬", value=utils.fmt_int(summary["reward"]), inline=True)
-    embed.set_footer(text=f"招待コード: {code}")
+    embed.add_field(
+        name="現在の招待状況",
+        value=(
+            f"🟢 確定: **{summary['confirmed']}人**\n"
+            f"⌛ 保留中: {summary['pending']}人 (条件待ち)\n"
+            f"🟠 要確認: {summary['hold']}人\n"
+            f"🔴 無効: {summary['rejected']}人"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="獲得した報酬",
+        value=f"**{utils.fmt_int(summary['reward'])}**",
+        inline=True,
+    )
+    embed.set_footer(text=f"招待コード: {code} / リンクは他の人に渡しても構いません")
     return embed
 
 
@@ -737,7 +1332,7 @@ async def safe_respond(
     """応答済みかどうかに応じて response / followup を使い分ける。"""
     kwargs: dict[str, Any] = {}
     if embed is not None:
-        kwargs["embed"] = embed
+        kwargs["embed"] = clamp_embed(embed)
     if content is not None:
         kwargs["content"] = content
     if view is not None:
@@ -755,11 +1350,11 @@ async def safe_respond(
 # Modal
 # ---------------------------------------------------------------------------
 
-class AmountModal(discord.ui.Modal, title="チャージ金額の入力"):
+class AmountModal(discord.ui.Modal, title="ステップ1 / 3 ・ 金額の入力"):
     """チャージ金額を入力する Modal。"""
 
     amount: discord.ui.TextInput = discord.ui.TextInput(
-        label="チャージ金額 (円)",
+        label="Kyash で送る金額 (円・半角数字のみ)",
         placeholder="例: 1000",
         required=True,
         min_length=1,
@@ -773,14 +1368,14 @@ class AmountModal(discord.ui.Modal, title="チャージ金額の入力"):
         )
 
     async def on_submit(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
-        await interaction.client.handle_amount_submit(interaction, str(self.amount.value))
+        await bot_of(interaction).handle_amount_submit(interaction, str(self.amount.value))
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
         logger.error("金額入力Modalでエラー: %s", utils.safe_error_text(error))
         await safe_respond(interaction, embed=error_embed(config.ErrorCode.UNKNOWN_ERROR))
 
 
-class LinkModal(discord.ui.Modal, title="送金リンクの送信"):
+class LinkModal(discord.ui.Modal, title="ステップ2 / 3 ・ リンクの送信"):
     """Kyash 送金リンクを入力する Modal (公開チャンネルへ平文を出さない)。"""
 
     link: discord.ui.TextInput = discord.ui.TextInput(
@@ -799,7 +1394,7 @@ class LinkModal(discord.ui.Modal, title="送金リンクの送信"):
         raw = str(self.link.value)
         # 入力値はできるだけ早く破棄する
         self.link.default = None
-        await interaction.client.handle_link_submit(interaction, self._tx_id, raw)
+        await bot_of(interaction).handle_link_submit(interaction, self._tx_id, raw)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
         logger.error("リンク入力Modalでエラー: %s", utils.safe_error_text(error))
@@ -823,7 +1418,7 @@ class KyashLoginModal(discord.ui.Modal, title="受取用Kyashアカウントの�
         email = str(self.email.value).strip()
         password = str(self.password.value)
         self.password.default = None
-        await interaction.client.handle_kyash_login(interaction, email, password)
+        await bot_of(interaction).handle_kyash_login(interaction, email, password)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
         logger.error("Kyashログの入力でエラー: %s", utils.safe_error_text(error))
@@ -843,7 +1438,7 @@ class KyashOtpModal(discord.ui.Modal, title="SMS認証コードの入力"):
     async def on_submit(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
         code = str(self.otp.value).strip()
         self.otp.default = None
-        await interaction.client.handle_kyash_otp(interaction, code)
+        await bot_of(interaction).handle_kyash_otp(interaction, code)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
         logger.error("OTP入力でエラー: %s", utils.safe_error_text(error))
@@ -868,35 +1463,35 @@ class ChargePanelView(discord.ui.View):
         custom_id=config.CustomID.CHARGE_START, row=0,
     )
     async def charge(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.client.on_charge_button(interaction)
+        await bot_of(interaction).on_charge_button(interaction)
 
     @discord.ui.button(
         label="残高", emoji="💳", style=discord.ButtonStyle.secondary,
         custom_id=config.CustomID.CHARGE_BALANCE, row=0,
     )
     async def balance(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.client.on_balance_button(interaction)
+        await bot_of(interaction).on_balance_button(interaction)
 
     @discord.ui.button(
         label="履歴", emoji="📜", style=discord.ButtonStyle.secondary,
         custom_id=config.CustomID.CHARGE_HISTORY, row=1,
     )
     async def history(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.client.on_history_button(interaction)
+        await bot_of(interaction).on_history_button(interaction)
 
     @discord.ui.button(
         label="ヘルプ", emoji="❓", style=discord.ButtonStyle.secondary,
         custom_id=config.CustomID.CHARGE_HELP, row=1,
     )
     async def help(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.client.on_help_button(interaction)
+        await bot_of(interaction).on_help_button(interaction)
 
     @discord.ui.button(
         label="更新", emoji="🔄", style=discord.ButtonStyle.secondary,
         custom_id=config.CustomID.CHARGE_REFRESH, row=1,
     )
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.client.on_panel_refresh_button(interaction)
+        await bot_of(interaction).on_panel_refresh_button(interaction)
 
 
 class RankingPanelView(discord.ui.View):
@@ -910,14 +1505,14 @@ class RankingPanelView(discord.ui.View):
         custom_id=config.CustomID.RANKING_REFRESH, row=0,
     )
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.client.on_ranking_refresh_button(interaction)
+        await bot_of(interaction).on_ranking_refresh_button(interaction)
 
     @discord.ui.button(
         label="自分の順位", emoji="📜", style=discord.ButtonStyle.secondary,
         custom_id=config.CustomID.RANKING_MYRANK, row=0,
     )
     async def my_rank(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.client.on_my_rank_button(interaction)
+        await bot_of(interaction).on_my_rank_button(interaction)
 
 
 class LinkSubmitView(discord.ui.View):
@@ -940,7 +1535,7 @@ class LinkSubmitView(discord.ui.View):
 
     @discord.ui.button(label="キャンセル", emoji="✖️", style=discord.ButtonStyle.danger)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.client.handle_charge_cancel(interaction, self._tx_id)
+        await bot_of(interaction).handle_charge_cancel(interaction, self._tx_id)
         self.stop()
 
 
@@ -964,12 +1559,12 @@ class HistoryView(discord.ui.View):
     @discord.ui.button(label="前へ", emoji="◀️", style=discord.ButtonStyle.secondary)
     async def previous(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.page = max(1, self.page - 1)
-        await interaction.client.render_history(interaction, self, edit=True)
+        await bot_of(interaction).render_history(interaction, self, edit=True)
 
     @discord.ui.button(label="次へ", emoji="▶️", style=discord.ButtonStyle.secondary)
     async def next(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.page += 1
-        await interaction.client.render_history(interaction, self, edit=True)
+        await bot_of(interaction).render_history(interaction, self, edit=True)
 
 
 class ConfirmView(discord.ui.View):
@@ -1064,59 +1659,70 @@ class ShopPanelView(discord.ui.View):
         custom_id=config.CustomID.SHOP_OPEN, row=0,
     )
     async def open_shop(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.client.on_shop_open_button(interaction)
+        await bot_of(interaction).on_shop_open_button(interaction)
 
     @discord.ui.button(
         label="購入履歴", emoji="📦", style=discord.ButtonStyle.secondary,
         custom_id=config.CustomID.SHOP_MYITEMS, row=0,
     )
     async def my_items(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.client.on_shop_myitems_button(interaction)
+        await bot_of(interaction).on_shop_myitems_button(interaction)
 
 
-class ShopSelectView(discord.ui.View):
-    """商品選択 (Ephemeral)。在庫や価格が変わるため都度生成する。"""
+class ShopSelect(discord.ui.Select["ShopSelectView"]):
+    """商品の選択メニュー (在庫や価格が変わるため都度生成する)。"""
 
-    def __init__(self, items: Sequence[Any], *, owner_id: int) -> None:
-        super().__init__(timeout=180)
-        self._owner_id = owner_id
+    def __init__(self, items: Sequence[Any]) -> None:
         options: list[discord.SelectOption] = []
         for item in list(items)[:25]:
             duration = int(item["duration_days"])
             stock = int(item["stock"])
-            description = (
-                f"{utils.fmt_int(int(item['price']))} / "
-                + (f"{duration}日" if duration > 0 else "無期限")
-                + (f" / 在庫{stock}" if stock >= 0 else "")
-            )
+            details = [f"{utils.fmt_int(int(item['price']))}"]
+            details.append(f"{duration}日間" if duration > 0 else "無期限")
+            if stock >= 0:
+                details.append(f"残り{stock}個")
             options.append(
                 discord.SelectOption(
                     label=utils.truncate(str(item["name"]), 90),
                     value=str(int(item["id"])),
-                    description=utils.truncate(description, 90),
+                    description=utils.truncate(" / ".join(details), 90),
+                    emoji="🎫",
                 )
             )
-        self.select.options = options or [
-            discord.SelectOption(label="購入できる商品がありません", value="none")
-        ]
+        # 都度生成する一時 View なので custom_id は固定しない (永続 View ではない)
+        super().__init__(
+            placeholder="購入する商品を選んでください" if options else "購入できる商品がありません",
+            min_values=1,
+            max_values=1,
+            options=options or [
+                discord.SelectOption(label="購入できる商品がありません", value="none")
+            ],
+            disabled=not options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        value = self.values[0]
+        if value == "none":
+            await safe_respond(
+                interaction, embed=info_embed("商品がありません", "現在購入できる商品はありません。")
+            )
+            return
+        await bot_of(interaction).on_shop_select(interaction, int(value))
+
+
+class ShopSelectView(discord.ui.View):
+    """商品選択 (Ephemeral)。"""
+
+    def __init__(self, items: Sequence[Any], *, owner_id: int) -> None:
+        super().__init__(timeout=180)
+        self._owner_id = owner_id
+        self.add_item(ShopSelect(items))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:  # type: ignore[override]
         if interaction.user.id != self._owner_id:
             await safe_respond(interaction, embed=error_embed(config.ErrorCode.NOT_ALLOWED))
             return False
         return True
-
-    @discord.ui.select(placeholder="購入する商品を選択してください", min_values=1, max_values=1)
-    async def select(
-        self, interaction: discord.Interaction, select: discord.ui.Select
-    ) -> None:
-        value = select.values[0]
-        if value == "none":
-            await safe_respond(
-                interaction, embed=info_embed("商品がありません", "現在購入できる商品はありません。")
-            )
-            return
-        await interaction.client.on_shop_select(interaction, int(value))
 
 
 class InvitePanelView(discord.ui.View):
@@ -1130,21 +1736,21 @@ class InvitePanelView(discord.ui.View):
         custom_id=config.CustomID.INVITE_GET, row=0,
     )
     async def get_link(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.client.on_invite_get_button(interaction)
+        await bot_of(interaction).on_invite_get_button(interaction)
 
     @discord.ui.button(
         label="自分の招待状況", emoji="📊", style=discord.ButtonStyle.secondary,
         custom_id=config.CustomID.INVITE_STATUS, row=0,
     )
     async def status(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.client.on_invite_status_button(interaction)
+        await bot_of(interaction).on_invite_status_button(interaction)
 
     @discord.ui.button(
         label="招待ランキング", emoji="🏆", style=discord.ButtonStyle.secondary,
         custom_id=config.CustomID.INVITE_RANK, row=0,
     )
     async def ranking(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.client.on_invite_rank_button(interaction)
+        await bot_of(interaction).on_invite_rank_button(interaction)
 
 
 class AdminPanelView(discord.ui.View):
@@ -1158,7 +1764,7 @@ class AdminPanelView(discord.ui.View):
         custom_id=config.CustomID.ADMIN_REFRESH, row=0,
     )
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.client.on_admin_refresh_button(interaction)
+        await bot_of(interaction).on_admin_refresh_button(interaction)
 
     @discord.ui.button(
         label="メンテ切替", emoji="🛠", style=discord.ButtonStyle.secondary,
@@ -1167,18 +1773,18 @@ class AdminPanelView(discord.ui.View):
     async def maintenance(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        await interaction.client.on_admin_maintenance_button(interaction)
+        await bot_of(interaction).on_admin_maintenance_button(interaction)
 
     @discord.ui.button(
         label="キュー", emoji="🗃", style=discord.ButtonStyle.secondary,
         custom_id=config.CustomID.ADMIN_QUEUE, row=1,
     )
     async def queue(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.client.on_admin_queue_button(interaction)
+        await bot_of(interaction).on_admin_queue_button(interaction)
 
     @discord.ui.button(
         label="要確認", emoji="🟠", style=discord.ButtonStyle.danger,
         custom_id=config.CustomID.ADMIN_REVIEW, row=1,
     )
     async def review(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.client.on_admin_review_button(interaction)
+        await bot_of(interaction).on_admin_review_button(interaction)

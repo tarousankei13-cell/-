@@ -283,6 +283,21 @@ def _sync_get_history(client: Kyash, limit: int) -> list[Any]:
     return list(timelines) if isinstance(timelines, (list, tuple)) else []
 
 
+def _attr_text(node: Any, name: str) -> str:
+    """BeautifulSoup の属性値を文字列として取り出す。
+
+    複数値属性ではリストが返ることがあるため、その場合は先頭要素を使う。
+    """
+    value = node.get(name)
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return str(value[0]) if value else ""
+    return str(value)
+
+
 def _scrape_link_page(client: Kyash, url: str) -> tuple[int, str, bool]:
     """送金 / 請求リンクのページから (金額, リンクUUID, 受取リンクか) を取得する。
 
@@ -299,7 +314,7 @@ def _scrape_link_page(client: Kyash, url: str) -> tuple[int, str, bool]:
     send_amount = soup.find(class_="amountText text_send")
     send_button = soup.find(class_="btn_send")
     if send_amount is not None and send_button is not None:
-        raw_uuid = send_button.get("data-href-app") or ""
+        raw_uuid = _attr_text(send_button, "data-href-app")
         link_uuid = raw_uuid.replace("kyash://claim/", "").strip()
         amount = utils.parse_money_text(send_amount.text)
         send_to_me = True
@@ -308,7 +323,7 @@ def _scrape_link_page(client: Kyash, url: str) -> tuple[int, str, bool]:
         request_button = soup.find(class_="btn_request")
         if request_amount is None or request_button is None:
             raise LinkInvalidError("受取可能な送金リンクではありません (処理済みの可能性があります)")
-        raw_uuid = request_button.get("data-href-app") or ""
+        raw_uuid = _attr_text(request_button, "data-href-app")
         link_uuid = raw_uuid.replace("kyash://request/u/", "").strip()
         amount = utils.parse_money_text(request_amount.text)
         send_to_me = False

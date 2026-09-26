@@ -246,7 +246,7 @@ class ChargeBot(commands.Bot):
         try:
             synced = await self.tree.sync()
             logger.info("スラッシュコマンドを同期しました (%s 件)", len(synced))
-        except discord.HTTPException as exc:
+        except (discord.HTTPException, discord.ClientException) as exc:
             logger.error("コマンド同期に失敗しました: %s", utils.safe_error_text(exc))
 
         # 11) バックグラウンドタスク開始
@@ -504,7 +504,11 @@ class ChargeBot(commands.Bot):
     async def _guard_user_action(
         self, interaction: discord.Interaction, *, need_charge: bool = False
     ) -> Any:
-        """パネル操作の共通チェック。問題があれば応答して None を返す。"""
+        """パネル操作の共通チェック。問題があれば応答して None を返す。
+
+        戻り値が None でない場合、``interaction.guild`` は必ず存在する
+        (呼び出し側は ``_require_guild`` で取り出す)。
+        """
         if interaction.guild is None:
             await ui.safe_respond(interaction, embed=ui.error_embed(config.ErrorCode.NOT_ALLOWED))
             return None
@@ -519,24 +523,53 @@ class ChargeBot(commands.Bot):
             await ui.safe_respond(interaction, embed=ui.error_embed(exc.code))
             return None
 
+    @staticmethod
+    def _member_of(interaction: discord.Interaction) -> discord.Member | None:
+        """Interaction の実行者を Member として取得する。
+
+        サーバー内の Interaction では ``interaction.user`` は Member だが、
+        キャッシュ状況によっては User のことがあるため、その場合は
+        サーバーから解決する。
+        """
+        if isinstance(interaction.user, discord.Member):
+            return interaction.user
+        if interaction.guild is None:
+            return None
+        return interaction.guild.get_member(interaction.user.id)
+
+    @staticmethod
+    def _require_guild(interaction: discord.Interaction) -> discord.Guild:
+        """ガード済みの Interaction からサーバーを取り出す。
+
+        ``_guard_user_action`` / ``_guard_admin_action`` を通過した後に使う。
+        """
+        guild = interaction.guild
+        if guild is None:  # pragma: no cover - ガード済みのため到達しない
+            raise RuntimeError("サーバー外の操作です")
+        return guild
+
     async def on_charge_button(self, interaction: discord.Interaction) -> None:
         """💰 チャージ → 金額入力 Modal (進行中の取引があれば再開)。"""
         settings = await self._guard_user_action(interaction, need_charge=True)
         if settings is None:
             return
-        active = await self.db.get_active_transaction(interaction.guild.id, interaction.user.id)
+        guild = self._require_guild(interaction)
+        active = await self.db.get_active_transaction(guild.id, interaction.user.id)
         if active is not None:
             if active["status"] == config.TxStatus.WAITING_LINK and (
                 not active["expires_at"] or active["expires_at"] > utils.now_ts()
             ):
                 remaining = max(30, int(active["expires_at"] or 0) - utils.now_ts())
+                amount = int(active["requested_amount"])
+                rate = utils.to_decimal(active["charge_rate"]) or settings.charge_rate
                 await interaction.response.send_message(
-                    embed=ui.info_embed(
-                        "⌛ 送金リンクの送信をお待ちしています",
-                        f"申請額: **{utils.fmt_yen(int(active['requested_amount']))}**\n"
-                        f"取引ID: `{active['id']}`\n\n"
-                        "Kyash で同じ金額の**送金リンク**を作成し、下のボタンから送信してください。",
-                        color=config.Color.WARNING,
+                    embed=ui.link_wait_embed(
+                        tx_id=str(active["id"]),
+                        amount=amount,
+                        rate=rate,
+                        credited=utils.calc_credited_amount(amount, rate),
+                        expires_at=int(active["expires_at"] or 0) or None,
+                        resumed=True,
                     ),
                     view=ui.LinkSubmitView(
                         str(active["id"]), owner_id=interaction.user.id, timeout=remaining
@@ -555,19 +588,20 @@ class ChargeBot(commands.Bot):
 
     async def handle_amount_submit(self, interaction: discord.Interaction, raw_amount: str) -> None:
         """金額入力の確定 → Transaction 作成 → リンク送信を案内。"""
-        if interaction.guild is None:
+        guild = interaction.guild
+        if guild is None:
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             tx_id, amount, settings = await self.charge.start_charge(
-                interaction.guild.id, interaction.user.id, raw_amount
+                guild.id, interaction.user.id, raw_amount
             )
         except ChargeError as exc:
             detail = None
             if exc.code in (
                 config.ErrorCode.AMOUNT_BELOW_MIN, config.ErrorCode.AMOUNT_ABOVE_MAX
             ):
-                guild_settings = await self.db.get_settings(interaction.guild.id)
+                guild_settings = await self.db.get_settings(guild.id)
                 detail = (
                     f"受付範囲: {utils.fmt_yen(guild_settings.minimum_charge)} 〜 "
                     f"{utils.fmt_yen(guild_settings.maximum_charge)}"
@@ -584,18 +618,12 @@ class ChargeBot(commands.Bot):
             )
             return
 
-        embed = ui.info_embed(
-            "🔗 送金リンクを送信してください",
-            f"{ui.SEPARATOR}\n"
-            f"申請額: **{utils.fmt_yen(amount)}**\n"
-            f"チャージ率: **{utils.fmt_rate(settings.charge_rate)}**\n"
-            f"獲得予定: **{utils.fmt_int(utils.calc_credited_amount(amount, settings.charge_rate))}**\n"
-            f"取引ID: `{tx_id}`\n{ui.SEPARATOR}\n"
-            f"Kyash アプリで **{utils.fmt_yen(amount)}** の送金リンクを作成し、"
-            "下のボタンから送信してください。\n"
-            f"※ 有効期限は約 {config.LINK_WAIT_SECONDS // 60} 分です。\n"
-            "※ 送金リンクは公開チャンネルへ貼らないでください。",
-            color=config.Color.ACCENT,
+        embed = ui.link_wait_embed(
+            tx_id=tx_id,
+            amount=amount,
+            rate=settings.charge_rate,
+            credited=utils.calc_credited_amount(amount, settings.charge_rate),
+            expires_at=utils.now_ts() + config.LINK_WAIT_SECONDS,
         )
         await interaction.followup.send(
             embed=embed,
@@ -645,14 +673,10 @@ class ChargeBot(commands.Bot):
         queue_counts = await self.db.count_queue()
         waiting = queue_counts.get(config.TxStatus.QUEUED, 0)
         await interaction.followup.send(
-            embed=ui.info_embed(
-                "✅ 送金リンクを受け付けました",
-                f"{ui.SEPARATOR}\n"
-                f"金額: **{utils.fmt_yen(result['amount'])}**\n"
-                f"取引ID: `{result['tx_id']}`\n"
-                f"順番待ち: **{max(0, waiting - 1)} 件**\n{ui.SEPARATOR}\n"
-                "自動で受け取り処理を行います。完了後に DM でお知らせします。",
-                color=config.Color.SUCCESS,
+            embed=ui.link_accepted_embed(
+                tx_id=str(result["tx_id"]),
+                amount=int(result["amount"]),
+                waiting=max(0, waiting - 1),
             ),
             ephemeral=True,
         )
@@ -681,17 +705,37 @@ class ChargeBot(commands.Bot):
         if await self._guard_user_action(interaction) is None:
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        balance = await self.db.get_balance(interaction.guild.id, interaction.user.id)
-        summary = await self.db.get_user_charge_summary(interaction.guild.id, interaction.user.id)
+        guild = self._require_guild(interaction)
+        balance = await self.db.get_balance(guild.id, interaction.user.id)
+        summary = await self.db.get_user_charge_summary(guild.id, interaction.user.id)
+        rank, _rank_balance, rank_total = await self.db.get_user_rank(
+            guild.id, interaction.user.id
+        )
+        spent = await self.db.get_user_spend_total(guild.id, interaction.user.id)
+        settings = await self.db.get_settings(guild.id)
+        shop_available = bool(
+            settings.shop_enabled and await self.db.list_shop_items(guild.id)
+        )
         await interaction.followup.send(
-            embed=ui.balance_embed(interaction.user, balance, summary), ephemeral=True
+            embed=ui.balance_embed(
+                interaction.user,
+                balance,
+                summary,
+                rank=rank,
+                rank_total=rank_total,
+                shop_available=shop_available,
+                spent=spent,
+            ),
+            ephemeral=True,
         )
 
     async def on_history_button(self, interaction: discord.Interaction) -> None:
         """📜 履歴 (Ephemeral / ページング)。"""
         if await self._guard_user_action(interaction) is None:
             return
-        view = ui.HistoryView(owner_id=interaction.user.id, guild_id=interaction.guild.id)
+        view = ui.HistoryView(
+            owner_id=interaction.user.id, guild_id=self._require_guild(interaction).id
+        )
         await interaction.response.defer(ephemeral=True, thinking=True)
         await self.render_history(interaction, view, edit=False)
 
@@ -723,8 +767,20 @@ class ChargeBot(commands.Bot):
         settings = await self._guard_user_action(interaction)
         if settings is None:
             return
-        await interaction.response.send_message(
-            embed=ui.help_embed(settings), ephemeral=True
+        guild = self._require_guild(interaction)
+        # DB を読むため、3秒の応答期限に間に合うよう先に defer する
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        shop_available = bool(
+            settings.shop_enabled and await self.db.list_shop_items(guild.id)
+        )
+        campaign = await self.db.get_active_campaign(guild.id)
+        await interaction.followup.send(
+            embed=ui.help_embed(
+                settings,
+                shop_available=shop_available,
+                campaign_name=str(campaign["name"]) if campaign else None,
+            ),
+            ephemeral=True,
         )
 
     async def on_panel_refresh_button(self, interaction: discord.Interaction) -> None:
@@ -742,11 +798,12 @@ class ChargeBot(commands.Bot):
 
     async def on_ranking_refresh_button(self, interaction: discord.Interaction) -> None:
         """🔄 ランキングを DB から再取得して更新する。"""
-        if interaction.guild is None:
+        guild = interaction.guild
+        if guild is None:
             return
         try:
             self.charge.check_button_rate_limit(interaction.user.id)
-            settings = await self.charge.ensure_usable_guild(interaction.guild.id)
+            settings = await self.charge.ensure_usable_guild(guild.id)
         except ChargeError as exc:
             await ui.safe_respond(interaction, embed=ui.error_embed(exc.code))
             return
@@ -757,7 +814,7 @@ class ChargeBot(commands.Bot):
                 ephemeral=True,
             )
             return
-        updated = await self.charge.refresh_ranking_panels(interaction.guild.id, force=True)
+        updated = await self.charge.refresh_ranking_panels(guild.id, force=True)
         await interaction.followup.send(
             embed=ui.info_embed(
                 "🔄 ランキングを更新しました",
@@ -773,14 +830,13 @@ class ChargeBot(commands.Bot):
             return
         try:
             self.charge.check_button_rate_limit(interaction.user.id)
-            await self.charge.ensure_usable_guild(interaction.guild.id)
+            await self.charge.ensure_usable_guild(interaction.guild.id)  # noqa: F841
         except ChargeError as exc:
             await ui.safe_respond(interaction, embed=ui.error_embed(exc.code))
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        rank, balance, total = await self.db.get_user_rank(
-            interaction.guild.id, interaction.user.id
-        )
+        guild = self._require_guild(interaction)
+        rank, balance, total = await self.db.get_user_rank(guild.id, interaction.user.id)
         if rank is None:
             description = (
                 f"現在残高: **{utils.fmt_int(balance)}**\n"
@@ -811,8 +867,9 @@ class ChargeBot(commands.Bot):
                 ephemeral=True,
             )
             return
-        items = await self.db.list_shop_items(interaction.guild.id)
-        balance = await self.db.get_balance(interaction.guild.id, interaction.user.id)
+        guild = self._require_guild(interaction)
+        items = await self.db.list_shop_items(guild.id)
+        balance = await self.db.get_balance(guild.id, interaction.user.id)
         embed = ui.shop_panel_embed(settings, items)
         embed.add_field(name="あなたの残高", value=f"**{utils.fmt_int(balance)}**", inline=False)
         await interaction.followup.send(
@@ -823,7 +880,8 @@ class ChargeBot(commands.Bot):
 
     async def on_shop_select(self, interaction: discord.Interaction, item_id: int) -> None:
         """商品を選択 → 確認 → 購入。"""
-        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        member = self._member_of(interaction)
+        if interaction.guild is None or member is None:
             return
         item = await self.db.get_shop_item(item_id, interaction.guild.id)
         if item is None or not item["active"]:
@@ -831,31 +889,28 @@ class ChargeBot(commands.Bot):
                 interaction, embed=ui.error_embed(config.ErrorCode.SHOP_ITEM_UNAVAILABLE)
             )
             return
-        balance = await self.db.get_balance(interaction.guild.id, interaction.user.id)
-        duration = int(item["duration_days"])
+        balance = await self.db.get_balance(interaction.guild.id, member.id)
+        owned = await self.db.count_user_purchases(interaction.guild.id, member.id, item_id)
+        role = interaction.guild.get_role(int(item["role_id"]))
+        embed, blocker = ui.purchase_confirm_embed(
+            item=item,
+            balance=balance,
+            owned=owned,
+            already_has_role=bool(role is not None and role in member.roles),
+        )
+        # 購入できない理由があるときは確認ボタンを出さず、理由だけを示す
+        if blocker is not None:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
         view = ui.ConfirmView(
             owner_id=interaction.user.id, confirm_label="購入する", danger=False, timeout=90
         )
-        await interaction.response.send_message(
-            embed=ui.info_embed(
-                "🛒 購入の確認",
-                f"{ui.SEPARATOR}\n"
-                f"商品: **{item['name']}**\n"
-                f"ロール: <@&{int(item['role_id'])}>\n"
-                f"価格: **{utils.fmt_int(int(item['price']))}**\n"
-                f"期間: {f'{duration}日' if duration > 0 else '無期限'}\n"
-                f"購入後の残高: **{utils.fmt_int(balance - int(item['price']))}**\n"
-                f"{ui.SEPARATOR}",
-                color=config.Color.ACCENT,
-            ),
-            view=view,
-            ephemeral=True,
-        )
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         await view.wait()
         if not view.value:
             return
         try:
-            result = await self.charge.purchase_shop_item(interaction.user, item_id)
+            result = await self.charge.purchase_shop_item(member, item_id)
         except ChargeError as exc:
             logger.info("購入を拒否しました user=%s code=%s", interaction.user.id, exc.code)
             await interaction.followup.send(
@@ -883,7 +938,9 @@ class ChargeBot(commands.Bot):
         if await self._guard_user_action(interaction) is None:
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        rows = await self.db.list_user_purchases(interaction.guild.id, interaction.user.id)
+        rows = await self.db.list_user_purchases(
+            self._require_guild(interaction).id, interaction.user.id
+        )
         await interaction.followup.send(embed=ui.my_items_embed(rows), ephemeral=True)
 
     # ------------------------------------------------------------------
@@ -893,11 +950,12 @@ class ChargeBot(commands.Bot):
         """🔗 個人専用の招待リンクを取得 (Ephemeral)。"""
         if await self._guard_user_action(interaction) is None:
             return
-        if not isinstance(interaction.user, discord.Member):
+        member = self._member_of(interaction)
+        if member is None:
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            result = await self.charge.issue_invite_code(interaction.user)
+            result = await self.charge.issue_invite_code(member)
         except ChargeError as exc:
             await interaction.followup.send(embed=ui.error_embed(exc.code), ephemeral=True)
             return
@@ -920,7 +978,7 @@ class ChargeBot(commands.Bot):
         if await self._guard_user_action(interaction) is None:
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        guild_id = interaction.guild.id
+        guild_id = self._require_guild(interaction).id
         summary = await self.db.get_invite_summary(guild_id, interaction.user.id)
         rank, _, total = await self.db.get_invite_rank(guild_id, interaction.user.id)
         records, _ = await self.db.list_invite_records(
@@ -939,12 +997,13 @@ class ChargeBot(commands.Bot):
         if settings is None:
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = self._require_guild(interaction)
         entries = await self.charge.build_ranking_entries(
-            interaction.guild.id, settings, config.RankingType.INVITE
+            guild.id, settings, config.RankingType.INVITE
         )
         await interaction.followup.send(
             embed=ui.ranking_embed(
-                interaction.guild, entries, settings, updated_at=utils.now_ts(),
+                guild, entries, settings, updated_at=utils.now_ts(),
                 ranking_type=config.RankingType.INVITE,
             ),
             ephemeral=True,
@@ -965,7 +1024,7 @@ class ChargeBot(commands.Bot):
     async def on_admin_refresh_button(self, interaction: discord.Interaction) -> None:
         if not await self._guard_admin_action(interaction):
             return
-        embed = await self.charge.build_admin_panel_embed(interaction.guild.id)
+        embed = await self.charge.build_admin_panel_embed(self._require_guild(interaction).id)
         try:
             await interaction.response.edit_message(embed=embed, view=ui.AdminPanelView())
         except discord.HTTPException:
@@ -975,7 +1034,7 @@ class ChargeBot(commands.Bot):
         if not await self._guard_admin_action(interaction):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        guild_id = interaction.guild.id
+        guild_id = self._require_guild(interaction).id
         settings = await self.db.get_settings(guild_id)
         new_value = not settings.maintenance
         await self.db.update_settings(guild_id, maintenance=1 if new_value else 0)
@@ -1020,7 +1079,7 @@ class ChargeBot(commands.Bot):
         if not await self._guard_admin_action(interaction):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        guild_id = interaction.guild.id
+        guild_id = self._require_guild(interaction).id
         rows, total = await self.db.search_transactions(
             guild_id=guild_id, status=config.TxStatus.MANUAL_REVIEW, limit=10
         )

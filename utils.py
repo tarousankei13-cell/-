@@ -67,6 +67,20 @@ def jst_month_start(ts: int | None = None) -> int:
     return int(start.timestamp())
 
 
+def discord_ts(ts: int | None, style: str = "f") -> str:
+    """Discord のタイムスタンプ記法を返す。
+
+    ``<t:1234567890:f>`` 形式で、閲覧者のローカル時刻で表示される。
+    利用者向けの表示に使う (管理者向けは JST 固定の ``format_jst`` を使う)。
+
+    Args:
+        style: ``f``=日時 / ``F``=曜日つき日時 / ``R``=相対 / ``t``=時刻 / ``d``=日付
+    """
+    if not ts:
+        return "-"
+    return f"<t:{int(ts)}:{style}>"
+
+
 def format_duration(seconds: int | float) -> str:
     """秒数を「1d 02:03:04」形式へ整形する。"""
     seconds = int(max(0, seconds))

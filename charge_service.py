@@ -95,6 +95,11 @@ class ChargeService:
     def processing_transaction_id(self) -> str | None:
         return self._processing_tx
 
+    def guild_name(self, guild_id: int) -> str:
+        """通知文に使うサーバー名 (キャッシュに無い場合は ID を表示)。"""
+        guild = self.bot.get_guild(guild_id)
+        return guild.name if guild else f"サーバー {guild_id}"
+
     def check_button_rate_limit(self, user_id: int) -> None:
         if not self._button_rate_limiter.check(f"btn:{user_id}"):
             raise ChargeError(config.ErrorCode.RATE_LIMITED)
@@ -1224,8 +1229,7 @@ class ChargeService:
             return
         if status == config.TxStatus.CANCELLED:
             return  # 利用者自身の操作のため DM しない
-        guild = self.bot.get_guild(int(row["guild_id"]))
-        guild_name = guild.name if guild else f"サーバー {row['guild_id']}"
+        guild_name = self.guild_name(int(row["guild_id"]))
         if status == config.TxStatus.COMPLETED:
             embed = ui.dm_success_embed(
                 guild_name=guild_name,
@@ -1251,9 +1255,8 @@ class ChargeService:
         row = await self.db.get_transaction(tx_id)
         if row is None:
             return
-        guild = self.bot.get_guild(int(row["guild_id"]))
         embed = ui.dm_review_embed(
-            guild_name=guild.name if guild else f"サーバー {row['guild_id']}",
+            guild_name=self.guild_name(int(row["guild_id"])),
             tx_id=tx_id,
             timestamp=utils.now_ts(),
         )
@@ -1361,6 +1364,86 @@ class ChargeService:
             proxy=row["source"] == config.TxSource.ADMIN_PROXY,
         )
 
+    async def post_generic_achievement(
+        self, guild_id: int, embed: discord.Embed
+    ) -> tuple[int, int] | None:
+        """実績チャンネルへ任意の実績を投稿する。
+
+        Returns:
+            ``(channel_id, message_id)``。投稿できなかった場合は None。
+        """
+        settings = await self.db.get_settings(guild_id)
+        if not settings.achievement_channel_id:
+            return None
+        channel = await self._resolve_channel(
+            guild_id, settings.achievement_channel_id, "achievement_channel_id"
+        )
+        if channel is None:
+            return None
+        try:
+            message = await channel.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning("実績の投稿に失敗しました guild=%s: %s",
+                           guild_id, utils.safe_error_text(exc))
+            return None
+        return channel.id, message.id
+
+    async def update_generic_achievement(
+        self, guild_id: int, channel_id: int | None, message_id: int | None,
+        embed: discord.Embed,
+    ) -> bool:
+        """投稿済みの実績 Embed を更新する (状態が変わったとき)。"""
+        if not channel_id or not message_id:
+            return False
+        channel = await self._resolve_channel(guild_id, int(channel_id), "achievement_channel_id")
+        if channel is None:
+            return False
+        try:
+            message = await channel.fetch_message(int(message_id))
+            await message.edit(embed=embed)
+            return True
+        except discord.NotFound:
+            return False
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning("実績の更新に失敗しました guild=%s message=%s: %s",
+                           guild_id, message_id, utils.safe_error_text(exc))
+            return False
+
+    async def post_shop_achievement(
+        self, purchase_id: int, *, post_if_missing: bool = True
+    ) -> None:
+        """ショップ購入の実績を投稿・更新する。"""
+        purchase = await self.db.get_purchase(purchase_id)
+        if purchase is None:
+            return
+        guild_id = int(purchase["guild_id"])
+        balance = await self.db.get_balance(guild_id, int(purchase["user_id"]))
+        embed = ui.shop_achievement_embed(
+            user_mention=f"<@{int(purchase['user_id'])}>",
+            item_name=str(purchase["item_name"]),
+            role_id=int(purchase["role_id"]),
+            price=int(purchase["price"]),
+            balance_after=balance,
+            expires_at=purchase["expires_at"],
+            purchase_id=purchase_id,
+            timestamp=int(purchase["created_at"]),
+            status=str(purchase["status"]),
+        )
+        if purchase["achievement_message_id"]:
+            if await self.update_generic_achievement(
+                guild_id, purchase["achievement_channel_id"],
+                purchase["achievement_message_id"], embed,
+            ):
+                return
+            if not post_if_missing:
+                return
+        result = await self.post_generic_achievement(guild_id, embed)
+        if result is not None:
+            channel_id, message_id = result
+            await self.db.set_purchase_achievement(
+                purchase_id, channel_id=channel_id, message_id=message_id
+            )
+
     async def log_event(
         self,
         guild_id: int | None,
@@ -1403,7 +1486,7 @@ class ChargeService:
 
     async def _resolve_channel(
         self, guild_id: int, channel_id: int, setting_name: str
-    ) -> discord.abc.Messageable | None:
+    ) -> discord.TextChannel | discord.Thread | None:
         """チャンネルを解決する。削除済みなら設定を無効化して警告する。"""
         guild = self.bot.get_guild(guild_id)
         if guild is None:
@@ -1423,14 +1506,16 @@ class ChargeService:
                 f"`{channel_id}` が見つからないため、設定を解除しました。"
             )
             return None
-        permissions = channel.permissions_for(guild.me) if isinstance(
-            channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)
-        ) else None
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            logger.warning("テキストチャンネルではないため使用しません guild=%s channel=%s",
+                           guild_id, channel_id)
+            return None
+        permissions = channel.permissions_for(guild.me) if guild.me else None
         if permissions is not None and not (permissions.send_messages and permissions.embed_links):
             logger.warning("チャンネルへの送信権限がありません guild=%s channel=%s",
                            guild_id, channel_id)
             return None
-        return channel  # type: ignore[return-value]
+        return channel
 
     # ==================================================================
     # ランキング (チャージパネルとは完全に独立)
@@ -1577,7 +1662,7 @@ class ChargeService:
 
     async def _resolve_message_channel(
         self, guild_id: int, channel_id: int
-    ) -> discord.abc.Messageable | None:
+    ) -> discord.TextChannel | discord.Thread | None:
         guild = self.bot.get_guild(guild_id)
         if guild is None:
             return None
@@ -1587,7 +1672,9 @@ class ChargeService:
                 channel = await self.bot.fetch_channel(channel_id)  # type: ignore[assignment]
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 return None
-        return channel  # type: ignore[return-value]
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return None
+        return channel
 
     async def refresh_charge_panels(self, guild_id: int) -> int:
         """チャージパネルへ最新の設定値を反映する。"""
@@ -1823,6 +1910,7 @@ class ChargeService:
             await self.db.activate_purchase(purchase_id)
 
         self.metrics["purchases"] += 1
+        await self._safe(self.post_shop_achievement(purchase_id), context="購入実績")
         await self.db.add_audit_log(
             actor_id=member.id, action="SHOP_PURCHASE", guild_id=guild.id,
             target_user_id=member.id,
@@ -1871,6 +1959,10 @@ class ChargeService:
         await self._remove_purchase_role(guild_id, user_id, int(result["role_id"]),
                                          reason=f"購入返金 #{purchase_id}")
         self.metrics["purchase_refunds"] += 1
+        await self._safe(
+            self.post_shop_achievement(purchase_id, post_if_missing=False),
+            context="返金実績の更新",
+        )
         await self.db.add_audit_log(
             actor_id=operator_id, action="SHOP_REFUND", guild_id=guild_id,
             target_user_id=user_id,
@@ -1935,6 +2027,10 @@ class ChargeService:
         for row in rows:
             purchase_id = int(row["id"])
             await self.db.mark_purchase_expired(purchase_id)
+            await self._safe(
+                self.post_shop_achievement(purchase_id, post_if_missing=False),
+                context="期限切れ実績の更新",
+            )
             await self._remove_purchase_role(
                 int(row["guild_id"]), int(row["user_id"]), int(row["role_id"]),
                 reason=f"購入期限切れ #{purchase_id}",
@@ -2299,14 +2395,28 @@ class ChargeService:
                 self._send_dm(
                     user_id,
                     ui.invite_reward_embed(
-                        guild_name=(self.bot.get_guild(guild_id).name
-                                    if self.bot.get_guild(guild_id) else str(guild_id)),
+                        guild_name=self.guild_name(guild_id),
                         label=label, amount=amount, balance_after=balance,
                         campaign_name=str(result.get("campaign_name") or ""),
                     ),
                 ),
                 context="招待報酬DM",
             )
+        await self._safe(
+            self.post_generic_achievement(
+                guild_id,
+                ui.invite_achievement_embed(
+                    inviter_mention=f"<@{inviter_id}>" if inviter_id else None,
+                    invited_mention=f"<@{invited_id}>",
+                    inviter_reward=int(result["reward_inviter"]),
+                    invited_reward=int(result["reward_invited"]),
+                    campaign_name=str(result.get("campaign_name") or "招待キャンペーン"),
+                    record_id=record_id,
+                    timestamp=utils.now_ts(),
+                ),
+            ),
+            context="招待実績",
+        )
         await self._safe(self.log_event(
             guild_id, "🎉 招待報酬を付与しました",
             fields=(
@@ -2549,8 +2659,7 @@ class ChargeService:
             self._send_dm(
                 user_id,
                 ui.refund_notice_embed(
-                    guild_name=(self.bot.get_guild(guild_id).name
-                                if self.bot.get_guild(guild_id) else str(guild_id)),
+                    guild_name=self.guild_name(guild_id),
                     tx_id=tx_id, amount=int(result["credited_amount"]),
                     balance_after=int(result["balance_after"]), reason=reason,
                 ),
@@ -2606,8 +2715,7 @@ class ChargeService:
         summary = await self.db.get_period_summary(guild_id, start=start, end=end)
         distribution = await self.db.get_balance_distribution(guild_id)
         embed = ui.daily_summary_embed(
-            guild_name=(self.bot.get_guild(guild_id).name
-                        if self.bot.get_guild(guild_id) else str(guild_id)),
+            guild_name=self.guild_name(guild_id),
             start=start, end=end, summary=summary, distribution=distribution,
         )
         try:
@@ -2683,9 +2791,8 @@ class ChargeService:
         reviews = await self.db.list_transactions_by_status(
             [config.TxStatus.MANUAL_REVIEW], limit=100
         )
-        guild = self.bot.get_guild(guild_id)
         return ui.admin_panel_embed(
-            guild_name=guild.name if guild else str(guild_id),
+            guild_name=self.guild_name(guild_id),
             settings=settings,
             kyash=self.kyash.status_snapshot(),
             queue=queue,

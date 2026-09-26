@@ -118,12 +118,23 @@ async def _confirm(
     description: str,
     confirm_label: str = "実行する",
     stages: int = 1,
+    danger: bool = True,
 ) -> bool:
-    """確認ボタンを表示し、承認されたかどうかを返す。"""
+    """確認ボタンを表示し、承認されたかどうかを返す。
+
+    Args:
+        stages: 2 以上にすると「最終確認」を挟む (取り消せない操作向け)。
+        danger: False にすると警告色ではなく通常色で表示する
+            (キャンペーン開始など、危険ではない確認用)。
+    """
     view = ui.ConfirmView(
-        owner_id=interaction.user.id, confirm_label=confirm_label, stages=stages
+        owner_id=interaction.user.id, confirm_label=confirm_label, stages=stages,
+        danger=danger,
     )
-    embed = ui.info_embed(title, description, color=config.Color.DANGER)
+    embed = ui.info_embed(
+        title, description,
+        color=config.Color.DANGER if danger else config.Color.ACCENT,
+    )
     if interaction.response.is_done():
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
     else:
@@ -132,7 +143,9 @@ async def _confirm(
     return bool(view.value)
 
 
-def _channel_writable(channel: discord.abc.GuildChannel, me: discord.Member) -> bool:
+def _channel_writable(
+    channel: discord.TextChannel | discord.Thread, me: discord.Member
+) -> bool:
     """Bot がそのチャンネルへ Embed 付きメッセージを送れるか。"""
     perms = channel.permissions_for(me)
     return bool(perms.view_channel and perms.send_messages and perms.embed_links)
@@ -545,7 +558,8 @@ class ServerGroup(app_commands.Group):
             try:
                 bot.tree.copy_global_to(guild=guild)
                 synced = len(await bot.tree.sync(guild=guild))
-            except discord.HTTPException as exc:
+            except (discord.HTTPException, discord.ClientException) as exc:
+                # application_id 未設定 (起動直後) などでも許可自体は成立させる
                 logger.warning("ギルドコマンド同期に失敗しました guild=%s: %s",
                                target_id, utils.safe_error_text(exc))
         await interaction.followup.send(
@@ -681,7 +695,7 @@ class ServerGroup(app_commands.Group):
         try:
             synced = await bot.tree.sync()
             results.append(f"グローバル: {len(synced)} 件")
-        except discord.HTTPException as exc:
+        except (discord.HTTPException, discord.ClientException) as exc:
             results.append(f"グローバル: 失敗 ({utils.safe_error_text(exc, limit=120)})")
         for guild in bot.guilds:
             if not await bot.db.is_guild_allowed(guild.id):
@@ -690,7 +704,7 @@ class ServerGroup(app_commands.Group):
                 bot.tree.copy_global_to(guild=guild)
                 guild_synced = await bot.tree.sync(guild=guild)
                 results.append(f"`{guild.id}`: {len(guild_synced)} 件")
-            except discord.HTTPException as exc:
+            except (discord.HTTPException, discord.ClientException) as exc:
                 results.append(f"`{guild.id}`: 失敗 ({utils.safe_error_text(exc, limit=80)})")
         await interaction.followup.send(
             embed=ui.info_embed("🔄 コマンド同期", "\n".join(results[:25])), ephemeral=True
@@ -3523,6 +3537,9 @@ class ShopGroup(app_commands.Group):
     ) -> None:
         """商品を追加する。Bot がそのロールを付与できるか事前に検証する。"""
         bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        # 入口で長さを揃える。DB・Embed・ログで同じ値を使い、表示の食い違いを防ぐ。
+        name = name.strip()[:config.SHOP_NAME_MAX_LEN]
+        description = (description.strip()[:config.SHOP_DESC_MAX_LEN] or None) if description else None
         await interaction.response.defer(ephemeral=True, thinking=True)
         guild = interaction.guild
         assert guild is not None
@@ -3534,10 +3551,10 @@ class ShopGroup(app_commands.Group):
             )
             return
         item_id = await bot.db.add_shop_item(
-            guild_id=guild.id, role_id=role.id, name=name.strip()[:100], price=int(price),
+            guild_id=guild.id, role_id=role.id, name=name, price=int(price),
             duration_days=int(duration_days), stock=int(stock),
             purchase_limit=int(purchase_limit),
-            description=description.strip()[:500] if description else None,
+            description=description,
             sort_order=int(sort_order), created_by=interaction.user.id,
         )
         op_id = await _audit(
@@ -3602,9 +3619,9 @@ class ShopGroup(app_commands.Group):
         if active is not None:
             values["active"] = 1 if active else 0
         if name is not None:
-            values["name"] = name.strip()[:100]
+            values["name"] = name.strip()[:config.SHOP_NAME_MAX_LEN]
         if description is not None:
-            values["description"] = description.strip()[:500] or None
+            values["description"] = description.strip()[:config.SHOP_DESC_MAX_LEN] or None
         if not values:
             await interaction.followup.send(
                 embed=ui.info_embed("変更項目がありません", "変更したい項目を指定してください。"),
@@ -3905,6 +3922,15 @@ class CampaignGroup(app_commands.Group):
         bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
         guild = interaction.guild
         assert guild is not None
+        # 入口で長さを揃える (確認画面・ログ・DB で同じ値になるようにする)
+        name = name.strip()[:config.CAMPAIGN_NAME_MAX_LEN]
+        if not name:
+            await interaction.response.send_message(
+                embed=ui.info_embed("入力が不正です", "キャンペーン名を入力してください。",
+                                    color=config.Color.DANGER),
+                ephemeral=True,
+            )
+            return
         preset_key = preset.value if preset else config.DEFAULT_CAMPAIGN_PRESET
         values = config.CAMPAIGN_PRESETS[preset_key]
         condition = confirm_condition.value if confirm_condition else "CHARGE"
@@ -3957,7 +3983,7 @@ class CampaignGroup(app_commands.Group):
         if not approved:
             return
         campaign_id = await bot.db.create_campaign(
-            guild_id=guild.id, name=name.strip()[:100], inviter_reward=int(inviter_reward),
+            guild_id=guild.id, name=name, inviter_reward=int(inviter_reward),
             invited_reward=int(invited_reward),
             min_account_age_days=int(values["min_account_age_days"]),
             daily_limit=int(values["daily_limit"]), total_limit=int(values["total_limit"]),
@@ -4862,12 +4888,14 @@ class GlobalGroup(app_commands.Group):
 async def setup_commands(bot: "ChargeBot") -> None:
     """すべてのスラッシュコマンドをツリーへ登録する。"""
     tree = bot.tree
-    for command in (
+    #: app_commands.Command は多相なため、まとめて回すときは Any で受ける。
+    singles: tuple[Any, ...] = (
         setup_command, charge_panel_command, charge_panels_command,
         ranking_panel_command, ranking_panels_command, history_command,
         stats_command, queue_command, logs_command, backup_command,
         inspect_command, admin_panel_command,
-    ):
+    )
+    for command in singles:
         tree.add_command(command)
     for group in (
         ServerGroup(), KyashGroup(), SettingsGroup(), BalanceGroup(), UserGroup(),

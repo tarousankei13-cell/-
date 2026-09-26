@@ -128,12 +128,36 @@ class StubInvite:
         self.url = f"https://discord.gg/{code}"
 
 
+class FakeHTTPResponse:
+    """discord.NotFound を組み立てるための最小限のレスポンス。"""
+
+    status = 404
+    reason = "Not Found"
+
+
+class StubMessage:
+    """送信済みメッセージ (実績 Embed の更新を検証するために編集を記録する)。"""
+
+    def __init__(self, message_id: int, channel: "StubChannel", embed: discord.Embed) -> None:
+        self.id = message_id
+        self.channel = channel
+        self.embeds = [embed]
+        self.edits: list[discord.Embed] = []
+
+    async def edit(self, *, embed: discord.Embed | None = None, **kwargs: object) -> "StubMessage":
+        if embed is not None:
+            self.embeds = [embed]
+            self.edits.append(embed)
+        return self
+
+
 class StubChannel:
     def __init__(self, channel_id: int, guild: "StubGuild") -> None:
         self.id = channel_id
         self.guild = guild
         self.mention = f"<#{channel_id}>"
         self.sent: list[discord.Embed] = []
+        self.messages: dict[int, StubMessage] = {}
 
     def permissions_for(self, member: object) -> StubPermissions:
         return StubPermissions()
@@ -144,10 +168,20 @@ class StubChannel:
         self.guild.invite_objects.append(invite)
         return invite
 
-    async def send(self, *, embed: discord.Embed | None = None, **kwargs: object) -> object:
+    async def send(
+        self, *, embed: discord.Embed | None = None, **kwargs: object
+    ) -> StubMessage:
         if embed is not None:
             self.sent.append(embed)
-        return object()
+        message = StubMessage(700_000 + len(self.messages) + 1, self, embed or discord.Embed())
+        self.messages[message.id] = message
+        return message
+
+    async def fetch_message(self, message_id: int) -> StubMessage:
+        message = self.messages.get(int(message_id))
+        if message is None:
+            raise discord.NotFound(FakeHTTPResponse(), "not found")  # type: ignore[arg-type]
+        return message
 
 
 class StubGuild:
@@ -304,7 +338,7 @@ async def main() -> None:
     await bot.db.update_settings(
         G, charge_rate="130", minimum_charge=100, maximum_charge=50_000,
         daily_limit=1_000_000, balance_log_channel_id=balance_log_channel.id,
-        balance_log_scope="ALL",
+        balance_log_scope="ALL", achievement_channel_id=guild.channel.id,
     )
     client = kyash_service.Kyash(access_token="t")
     bot.kyash._client = client
@@ -363,6 +397,19 @@ async def main() -> None:
     check(purchase["status"] == config.PurchaseStatus.ACTIVE, "購入が有効化された")
     rate, role_id = await bot.charge.resolve_charge_rate(G, buyer.id, settings)
     check(rate == Decimal("150"), "購入したロールでチャージ率が上がる")
+    shop_posts = [e for e in guild.channel.sent if "ショップ購入実績" in (e.title or "")]
+    check(len(shop_posts) == 1, f"購入が実績チャンネルへ投稿された ({len(shop_posts)}件)")
+    check(
+        any("🟢 購入完了" in (f.value or "") for f in shop_posts[0].fields),
+        "実績に購入完了の状態が載っている",
+    )
+    stored = await bot.db.get_purchase(purchase_id)
+    check(
+        stored["achievement_channel_id"] == guild.channel.id
+        and stored["achievement_message_id"] is not None,
+        "投稿したメッセージIDを購入レコードに保存した",
+    )
+    achievement_message_id = int(stored["achievement_message_id"])
     try:
         await bot.charge.purchase_shop_item(buyer, item_id)
         check(False, "購入上限が効いていない")
@@ -410,6 +457,16 @@ async def main() -> None:
     )
     item = await bot.db.get_shop_item(item_id)
     check(int(item["stock"]) == 2, f"在庫が復元された ({item['stock']})")
+    posted = guild.channel.messages[achievement_message_id]
+    check(len(posted.edits) >= 1, f"実績を新規投稿ではなく更新した ({len(posted.edits)}回)")
+    check(
+        any("↩️ 返金済み" in (f.value or "") for f in posted.embeds[0].fields),
+        "更新後の実績が返金済みになっている",
+    )
+    check(
+        len([e for e in guild.channel.sent if "ショップ購入実績" in (e.title or "")]) == 1,
+        "返金で実績を重複投稿しない",
+    )
 
     print("\n=== 6. 招待キャンペーン: 正常フロー ===")
     preset = config.CAMPAIGN_PRESETS["STANDARD"]
@@ -444,9 +501,19 @@ async def main() -> None:
     check(await bot.db.get_balance(G, inviter.id) == 500, "招待者へ報酬 500")
     invited_balance = await bot.db.get_balance(G, invited.id)
     check(invited_balance == 1300 + 300, f"参加者はチャージ1300+報酬300 ({invited_balance})")
+    invite_posts = [e for e in guild.channel.sent if "招待実績" in (e.title or "")]
+    check(len(invite_posts) == 1, f"招待確定が実績チャンネルへ投稿された ({len(invite_posts)}件)")
+    check(
+        any(f"<@{inviter.id}>" in (f.value or "") for f in invite_posts[0].fields),
+        "招待実績に招待者が載っている",
+    )
     result = await bot.db.confirm_invite_and_reward(int(record["id"]))
     check(result["already_confirmed"] and await bot.db.get_balance(G, inviter.id) == 500,
           "報酬の二重付与を防止")
+    check(
+        len([e for e in guild.channel.sent if "招待実績" in (e.title or "")]) == 1,
+        "二重確定で実績を重複投稿しない",
+    )
 
     print("\n=== 7. 招待キャンペーン: 不正対策 ===")
     async def join_with(code_index: int, member_obj: StubMember) -> dict:

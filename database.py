@@ -407,6 +407,8 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         refunded_at   INTEGER,
         refund_reason TEXT,
         operator_id   INTEGER,
+        achievement_channel_id INTEGER,
+        achievement_message_id INTEGER,
         created_at    INTEGER NOT NULL DEFAULT 0,
         updated_at    INTEGER NOT NULL DEFAULT 0
     )
@@ -1509,6 +1511,15 @@ class Database:
             "credited": int(row["credited"]) if row else 0,
         }
 
+    async def get_user_spend_total(self, guild_id: int, user_id: int) -> int:
+        """その利用者が内部残高から使った累計 (ショップ購入など)。"""
+        row = await self.fetchone(
+            "SELECT COALESCE(SUM(-change_amount),0) AS s FROM balance_history "
+            "WHERE guild_id=? AND user_id=? AND change_amount < 0",
+            (guild_id, user_id),
+        )
+        return int(row["s"] or 0) if row else 0
+
     # ------------------------------------------------------------------
     # キュー
     # ------------------------------------------------------------------
@@ -1588,7 +1599,7 @@ class Database:
                 "created_at, updated_at) VALUES(?,?,?,?,1,?,?)",
                 (guild_id, channel_id, message_id, panel_type, now, now),
             )
-            return int(cur.lastrowid)
+            return _lastrowid(cur)
 
         return await self.run(_fn, write=True)
 
@@ -1664,7 +1675,7 @@ class Database:
                 "ranking_type, created_at, updated_at) VALUES(?,?,?,1,?,?,?)",
                 (guild_id, channel_id, message_id, ranking_type, now, now),
             )
-            return int(cur.lastrowid)
+            return _lastrowid(cur)
 
         return await self.run(_fn, write=True)
 
@@ -1861,7 +1872,7 @@ class Database:
                     utils.safe_json_dumps(payload, limit=3500), 0, now + delay, "PENDING", now, now,
                 ),
             )
-            return int(cur.lastrowid)
+            return _lastrowid(cur)
 
         return await self.run(_fn, write=True)
 
@@ -2142,7 +2153,7 @@ class Database:
                 (guild_id, role_id, name, description, price, duration_days, stock,
                  purchase_limit, sort_order, created_by, now, now),
             )
-            return int(cur.lastrowid)
+            return _lastrowid(cur)
 
         return await self.run(_fn, write=True)
 
@@ -2244,7 +2255,7 @@ class Database:
                 (guild_id, user_id, item_id, item["name"], int(item["role_id"]), price,
                  config.PurchaseStatus.PENDING, expires_at, now, now),
             )
-            purchase_id = int(cur.lastrowid)
+            purchase_id = _lastrowid(cur)
             conn.execute(
                 "INSERT INTO users(guild_id, user_id, created_at, updated_at) VALUES(?,?,?,?) "
                 "ON CONFLICT(guild_id, user_id) DO NOTHING",
@@ -2355,6 +2366,16 @@ class Database:
 
         return await self.run(_fn, write=True)
 
+    async def set_purchase_achievement(
+        self, purchase_id: int, *, channel_id: int, message_id: int
+    ) -> None:
+        """購入実績のメッセージIDを保存する (返金・期限切れ時に更新するため)。"""
+        await self.execute(
+            "UPDATE shop_purchases SET achievement_channel_id=?, achievement_message_id=?, "
+            "updated_at=? WHERE id=?",
+            (channel_id, message_id, utils.now_ts(), purchase_id),
+        )
+
     async def get_purchase(self, purchase_id: int) -> sqlite3.Row | None:
         return await self.fetchone("SELECT * FROM shop_purchases WHERE id=?", (purchase_id,))
 
@@ -2453,7 +2474,7 @@ class Database:
                  require_days, 1 if require_review else 0, starts_at, ends_at, created_by,
                  now, now),
             )
-            return int(cur.lastrowid)
+            return _lastrowid(cur)
 
         return await self.run(_fn, write=True)
 
@@ -2550,16 +2571,17 @@ class Database:
         code: str | None,
         status: str,
         reason: str | None,
-    ) -> tuple[int | None, bool]:
+    ) -> tuple[int, bool]:
         """招待を記録する。
 
         Returns:
             ``(record_id, created)``。同一サーバーで既に被招待者として記録されている
-            場合は ``created=False`` を返し、新しい記録は作らない (周回防止)。
+            場合は既存の record_id と ``created=False`` を返し、新しい記録は作らない
+            (退出→再入場による報酬の周回を防ぐ)。
         """
         now = utils.now_ts()
 
-        def _fn(conn: sqlite3.Connection) -> tuple[int | None, bool]:
+        def _fn(conn: sqlite3.Connection) -> tuple[int, bool]:
             existing = conn.execute(
                 "SELECT id FROM invite_records WHERE guild_id=? AND invited_id=?",
                 (guild_id, invited_id),
@@ -2572,7 +2594,7 @@ class Database:
                 (campaign_id, guild_id, inviter_id, invited_id, code, status,
                  reason, now, now, now),
             )
-            return int(cur.lastrowid), True
+            return _lastrowid(cur), True
 
         return await self.run(_fn, write=True)
 
@@ -3014,7 +3036,7 @@ class Database:
                  history_id, now),
             )
             return {
-                "undo_history_id": int(cur.lastrowid),
+                "undo_history_id": _lastrowid(cur),
                 "user_id": user_id,
                 "original_type": row["type"],
                 "original_change": original_change,
@@ -3451,6 +3473,8 @@ _FORWARD_COMPAT_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("balance_history", "undo_of", "INTEGER"),
     ("ranking_panels", "ranking_type", "TEXT NOT NULL DEFAULT 'BALANCE'"),
     ("kyash_account", "token_issued_at", "INTEGER"),
+    ("shop_purchases", "achievement_channel_id", "INTEGER"),
+    ("shop_purchases", "achievement_message_id", "INTEGER"),
     ("guild_settings", "guild_daily_limit", "INTEGER NOT NULL DEFAULT 0"),
     ("guild_settings", "ranking_hide_absent", "INTEGER NOT NULL DEFAULT 0"),
     ("charge_transactions", "wallet_before", "INTEGER"),
@@ -3461,6 +3485,18 @@ _FORWARD_COMPAT_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("ranking_panels", "last_updated_at", "INTEGER"),
     ("admin_audit_logs", "operation_id", "TEXT"),
 )
+
+
+def _lastrowid(cursor: sqlite3.Cursor) -> int:
+    """INSERT 直後の rowid を返す。
+
+    ``sqlite3.Cursor.lastrowid`` は理論上 None を返し得るため、
+    暗黙に ``int(None)`` で落ちるのではなく明示的なエラーにする。
+    """
+    rowid = cursor.lastrowid
+    if rowid is None:
+        raise DatabaseError("INSERT 後の rowid を取得できませんでした")
+    return int(rowid)
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
