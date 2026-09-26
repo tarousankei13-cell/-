@@ -107,7 +107,7 @@ export function HubBar() {
   const gate = useGates();
   const unread = useGame((s) => s.unread);
   const section = sectionFor(pathname);
-  const ref = useRef<HTMLDivElement>(null);
+  const ref = useRef<HTMLElement>(null);
 
   useEffect(() => {
     ref.current?.querySelector<HTMLElement>("a.active")?.scrollIntoView({ inline: "center", block: "nearest", behavior: "smooth" });
@@ -117,7 +117,7 @@ export function HubBar() {
   if (items.length < 2) return null;
 
   return (
-    <div className="hub-bar" ref={ref} aria-label={`${section.label}のページ`}>
+    <nav className="hub-bar" ref={ref} aria-label={`${section.label}のページ`}>
       {items.map((i) => {
         const g = gate(i);
         // The page you are already on never wears a lock: the page itself
@@ -134,7 +134,7 @@ export function HubBar() {
           </NavLink>
         );
       })}
-    </div>
+    </nav>
   );
 }
 

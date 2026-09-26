@@ -235,6 +235,8 @@ button, input, select, textarea { font-family: inherit; font-size: inherit; colo
 @media (pointer: coarse) {
   .btn.sm { min-height: var(--tap); padding-inline: 15px; }
   .btn.xs { min-height: var(--tap); }
+  .hub-link { min-height: var(--tap); }
+  button.chip, a.chip, label.chip { min-height: var(--tap); }
 }
 .btn.block { width: 100%; }
 .btn.active { border-color: var(--accent); background: linear-gradient(180deg, rgba(120, 160, 255, 0.5), rgba(60, 80, 180, 0.55)); }
