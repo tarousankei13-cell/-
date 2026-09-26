@@ -12,7 +12,7 @@ type Guild = {
   id: number; name: string; tag: string; description: string; owner_id: number; is_open: boolean;
   members: number; max_members: number; weekly_rolls: number; member_list?: Member[]; online_now?: number;
 };
-type Bonus = { per_member_pct: number; min_online: number; cap: number };
+type Bonus = { per_member_pct: number; min_online: number; cap: number; max_pct?: number };
 type Mine = { guild: Guild | null; role?: string; bonus: Bonus; terms?: Bonus };
 
 function BonusLine({ bonus, online }: { bonus: Bonus; online: number }) {

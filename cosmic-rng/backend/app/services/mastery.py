@@ -12,7 +12,7 @@ from ..content.registry import get_registry
 from ..core.errors import AppError, NotFound
 from ..core.timeutil import utcnow
 from ..db import upsert as insert
-from ..models import ActiveEffect, Collection, ItemInstance, Roll, RollBatch, SetClaim, User, UserStats
+from ..models import ActiveEffect, Collection, ItemInstance, Roll, RollBatch, SetClaim, Showcase, User, UserStats
 from . import effects as effects_svc
 from . import feed as feed_svc
 from . import progress as progress_svc
@@ -43,19 +43,28 @@ async def shards_state(db: AsyncSession, user_id: int) -> dict[str, Any]:
 
 
 async def _dup_candidates(db: AsyncSession, user_id: int) -> list[ItemInstance]:
-    """Every owned copy beyond the first of each item — unlocked, unlisted."""
+    """Every owned copy beyond the first of each item.
+
+    Conversion destroys what it takes, so anything the player has signalled
+    they care about is off the table: locked copies, a starred copy, an item
+    marked favourite, anything listed or mid-trade, and anything currently on
+    display in their showcase.
+    """
     rows = (await db.execute(
         select(ItemInstance).where(ItemInstance.owner_id == user_id, ItemInstance.state == "owned",
-                                   ItemInstance.locked.is_(False))
+                                   ItemInstance.locked.is_(False), ItemInstance.favorite.is_(False))
         .order_by(ItemInstance.item_id, ItemInstance.id))).scalars().all()
     fav = await _favorites(db, user_id)
+    shown = {r[0] for r in (await db.execute(
+        select(Showcase.instance_id).where(Showcase.user_id == user_id))).all()}
     out: list[ItemInstance] = []
     seen: set[int] = set()
     for r in rows:
         if r.item_id in fav:
             continue
         if r.item_id in seen:
-            out.append(r)
+            if r.id not in shown:
+                out.append(r)
         else:
             seen.add(r.item_id)
     return out

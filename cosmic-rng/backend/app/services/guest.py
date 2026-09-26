@@ -108,7 +108,10 @@ async def carry_over(db: AsyncSession, user: Any, raw: str | None) -> int:
         if d is None or d.kind == "procedural_slot":
             continue
         await inv_svc.create_instances(db, user.id, item_id, n, "guest", tier=d.tier)
-        await collection_upsert(db, user.id, item_id, n)
+        # These are the account's first discoveries, same as if it had rolled
+        # them itself — the collection count has to agree with the book.
+        if await collection_upsert(db, user.id, item_id, n) and item_id in snap.collectible_ids:
+            stats.discovered_count += 1
         note_best_item(stats, item_id, float(d.odds or 0))
         granted += n
     stats.items_obtained += granted

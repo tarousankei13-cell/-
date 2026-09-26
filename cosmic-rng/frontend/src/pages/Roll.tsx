@@ -136,7 +136,7 @@ function EventStrip() {
 
 function ShareButton({ roll }: { roll: RollResult }) {
   const toast = useGame((s) => s.toast);
-  const url = (roll as any).share_url as string | undefined;
+  const url = roll.share_url;
   if (!url) return null;
   const share = async () => {
     const text = `${roll.item.name_ja || roll.item.name} (${fmtOdds(roll.odds)}) を引き当てました！`;

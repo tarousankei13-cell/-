@@ -484,3 +484,71 @@ async def test_retention_dashboard_reports_the_funnel(admin: Player) -> None:
 async def test_retention_dashboard_is_invisible_to_players(player: Player) -> None:
     r = await player.get("/api/admin/retention")
     assert r.status_code == 404, r.text
+
+
+# ---------------------------------------------------------------------------
+# Scheduler jobs
+# ---------------------------------------------------------------------------
+async def test_community_goal_completes_and_pays_everyone(player: Player) -> None:
+    """A goal that the server's own roll count has already passed must finish
+    on the next check, publish a luck window, and never fire twice."""
+    from sqlalchemy import select
+
+    from app.content.registry import get_registry
+    from app.db import session_scope
+    from app.models import GameEvent
+    from app.services import engagement as engagement_svc
+
+    await player.roll()
+    async with session_scope() as db:
+        db.add(GameEvent(key="test_goal", name="テスト世界目標", description="", type="community_goal",
+                         params={"target": 1, "reward_mult": 2.0, "reward_hours": 1}, is_active=True))
+        await db.commit()
+        await get_registry().reload(db)
+
+    async with session_scope() as db:
+        await engagement_svc.check_community_goals(db)  # seeds the baseline
+        await db.commit()
+    await player.roll()
+    async with session_scope() as db:
+        await engagement_svc.check_community_goals(db)  # crosses the target
+        await db.commit()
+
+    async with session_scope() as db:
+        goal = (await db.execute(select(GameEvent).where(GameEvent.key == "test_goal"))).scalar_one()
+        assert goal.params.get("completed") is True
+        rewards = (await db.execute(select(GameEvent).where(GameEvent.type == "luck_multiplier",
+                                                            GameEvent.key.like("test_goal_reward%")))).scalars().all()
+        assert len(rewards) == 1
+        await engagement_svc.check_community_goals(db)
+        await db.commit()
+        again = (await db.execute(select(GameEvent).where(GameEvent.type == "luck_multiplier",
+                                                          GameEvent.key.like("test_goal_reward%")))).scalars().all()
+        assert len(again) == 1, "a completed goal must not pay out twice"
+
+    async with session_scope() as db:
+        await db.delete((await db.execute(select(GameEvent).where(GameEvent.key == "test_goal"))).scalar_one())
+        for r in (await db.execute(select(GameEvent).where(GameEvent.key.like("test_goal_reward%")))).scalars().all():
+            await db.delete(r)
+        await db.commit()
+        await get_registry().reload(db)
+
+
+async def test_scheduled_backup_runs_once_per_day() -> None:
+    from sqlalchemy import select
+
+    from app.db import session_scope
+    from app.models import Backup
+    from app.tasks.scheduler import Scheduler
+
+    s = Scheduler()
+    s.is_leader = True
+    await s._auto_backup()
+    async with session_scope() as db:
+        rows = (await db.execute(select(Backup).where(Backup.kind == "scheduled"))).scalars().all()
+    assert len(rows) == 1 and rows[0].status == "done", [r.status for r in rows]
+
+    await s._auto_backup()
+    async with session_scope() as db:
+        rows = (await db.execute(select(Backup).where(Backup.kind == "scheduled"))).scalars().all()
+    assert len(rows) == 1, "a second run on the same day must be a no-op"

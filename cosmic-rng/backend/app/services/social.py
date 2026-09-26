@@ -277,7 +277,9 @@ _online_cache: dict[int, tuple[float, int]] = {}
 
 
 def bonus_terms() -> dict[str, Any]:
-    return {"per_member": BONUS_PER_MEMBER, "min_online": BONUS_MIN_ONLINE, "cap": BONUS_CAP_MEMBERS}
+    """The rule, in the units the screen shows it in (percent, not a fraction)."""
+    return {"per_member_pct": round(BONUS_PER_MEMBER * 100, 2), "min_online": BONUS_MIN_ONLINE,
+            "cap": BONUS_CAP_MEMBERS, "max_pct": round(BONUS_PER_MEMBER * BONUS_CAP_MEMBERS * 100, 2)}
 
 
 async def guild_luck(db: AsyncSession, user_id: int) -> tuple[float, int]:

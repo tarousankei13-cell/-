@@ -6,6 +6,7 @@
  * after starting on a laptop is not taught the game twice.
  */
 import { useState } from "react";
+import { useLocation } from "react-router-dom";
 import { useGame } from "../store/game";
 
 const STEPS = [
@@ -17,10 +18,14 @@ const STEPS = [
 export function Tutorial() {
   const me = useGame((s) => s.me);
   const saveSettings = useGame((s) => s.saveSettings);
+  const { pathname } = useLocation();
   const [step, setStep] = useState(0);
   const [done, setDone] = useState(false);
 
-  if (!me || done || me.settings.ui.tutorial_done) return null;
+  // Only over the roll screen. It teaches the roll button, and a full-screen
+  // overlay on a page it does not describe — the market, the admin panel —
+  // is just something in the way.
+  if (!me || done || me.settings.ui.tutorial_done || pathname !== "/roll") return null;
 
   const finish = () => {
     setDone(true);

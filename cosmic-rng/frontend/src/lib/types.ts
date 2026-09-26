@@ -214,6 +214,8 @@ export interface RollResult {
   preview_used: boolean;
   xp: number;
   cosmic_eye: { top: { name: string; rarity: RarityKey; p: number }[]; table_size: number } | null;
+  /** Signed public page for this roll — only minted for 伝説級 and above. */
+  share_url?: string | null;
   progress: ProgressResult;
 }
 
