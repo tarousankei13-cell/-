@@ -117,6 +117,12 @@ class LinkIsClaimError(KyashServiceError):
     error_code = config.ErrorCode.LINK_IS_CLAIM
 
 
+class WalletLimitError(KyashServiceError):
+    """受取用アカウントの残高がしきい値を超えており、これ以上受け取れない。"""
+
+    error_code = config.ErrorCode.WALLET_LIMIT
+
+
 # ---------------------------------------------------------------------------
 # データモデル
 # ---------------------------------------------------------------------------
@@ -376,8 +382,13 @@ class KyashService:
         self._db = db
         self._cipher = cipher
         self._client: Kyash | None = None
-        self._lock = asyncio.Lock()
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kyash")
+        # 受取 (link_receive) は必ず1件ずつ直列化する。
+        # 参照系 (リンク検証・残高照会・履歴) は別系統にして、
+        # 遅いページ取得が受取キュー全体を止めないようにする。
+        self._receive_lock = asyncio.Lock()
+        self._receive_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kyash-recv")
+        self._read_lock = asyncio.Lock()
+        self._read_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kyash-read")
         self._pending_logins: dict[int, PendingLogin] = {}
         self._status: str = config.KyashAccountStatus.UNCONFIGURED
         self._last_error: str | None = None
@@ -385,6 +396,8 @@ class KyashService:
         self._username: str | None = None
         self._wallet_uuid: str | None = None
         self._last_wallet_balance: int | None = None
+        self._token_issued_at: int | None = None
+        self._wallet_threshold: int = config.DEFAULT_WALLET_ALERT_THRESHOLD
         # 添付モジュールは timeout を指定しないため、socket 側で上限を強制する
         if socket.getdefaulttimeout() is None:
             socket.setdefaulttimeout(config.KYASH_SOCKET_TIMEOUT)
@@ -402,6 +415,68 @@ class KyashService:
     def is_usable(self) -> bool:
         """新規チャージを受け付けてよい状態か。"""
         return self._client is not None and self._status == config.KyashAccountStatus.ACTIVE
+
+    @property
+    def token_issued_at(self) -> int | None:
+        return self._token_issued_at
+
+    @property
+    def token_expires_at(self) -> int | None:
+        """アクセストークンの推定失効時刻 (発行から KYASH_TOKEN_LIFETIME_DAYS 後)。"""
+        if not self._token_issued_at:
+            return None
+        return self._token_issued_at + config.KYASH_TOKEN_LIFETIME_DAYS * 86400
+
+    @property
+    def token_days_left(self) -> float | None:
+        """トークンの残り日数 (負なら失効済みの見込み)。"""
+        expires = self.token_expires_at
+        if expires is None:
+            return None
+        return (expires - utils.now_ts()) / 86400
+
+    @property
+    def token_expiring_soon(self) -> bool:
+        """失効が近いか (事前警告の判定)。"""
+        days = self.token_days_left
+        return days is not None and days <= config.KYASH_TOKEN_WARN_DAYS
+
+    @property
+    def wallet_threshold(self) -> int:
+        """受取用アカウントの残高しきい値 (0=無効)。"""
+        return self._wallet_threshold
+
+    @property
+    def wallet_limit_reached(self) -> bool:
+        """残高しきい値に達しているか (新規チャージを止める判定)。"""
+        if self._wallet_threshold <= 0 or self._last_wallet_balance is None:
+            return False
+        return self._last_wallet_balance >= self._wallet_threshold
+
+    def wallet_headroom(self) -> int | None:
+        """しきい値までの余裕額 (しきい値未設定なら None)。"""
+        if self._wallet_threshold <= 0 or self._last_wallet_balance is None:
+            return None
+        return max(0, self._wallet_threshold - self._last_wallet_balance)
+
+    async def set_wallet_threshold(self, threshold: int) -> None:
+        """残高しきい値を設定して永続化する。"""
+        self._wallet_threshold = max(0, int(threshold))
+        await self._db.set_system_value("kyash_wallet_threshold", str(self._wallet_threshold))
+
+    def check_wallet_capacity(self, amount: int) -> None:
+        """受け取り予定額を加えてもしきい値を超えないか確認する。
+
+        Raises:
+            WalletLimitError: しきい値を超える見込みの場合。
+        """
+        if self._wallet_threshold <= 0 or self._last_wallet_balance is None:
+            return
+        if self._last_wallet_balance + max(0, amount) > self._wallet_threshold:
+            raise WalletLimitError(
+                f"受取用アカウントの残高しきい値に達します "
+                f"(現在 {self._last_wallet_balance} + {amount} > {self._wallet_threshold})"
+            )
 
     @property
     def last_error(self) -> str | None:
@@ -434,17 +509,31 @@ class KyashService:
             "last_error": self._last_error,
             "module_version": KYASH_MODULE_VERSION,
             "pending_logins": len(self._pending_logins),
+            "token_issued_at": self._token_issued_at,
+            "token_expires_at": self.token_expires_at,
+            "token_days_left": self.token_days_left,
+            "wallet_threshold": self._wallet_threshold,
+            "wallet_balance": self._last_wallet_balance,
+            "wallet_headroom": self.wallet_headroom(),
         }
 
     # ------------------------------------------------------------------
     # 実行基盤
     # ------------------------------------------------------------------
     async def _call(self, fn: Callable[[], Any], *, context: str,
-                    budget: float | None = None) -> Any:
-        """同期処理を専用スレッドで直列実行する (無限待機を禁止)。"""
+                    budget: float | None = None, exclusive: bool = False) -> Any:
+        """同期処理を専用スレッドで直列実行する (無限待機を禁止)。
+
+        Args:
+            exclusive: True の場合は受取系の専用ロック/スレッドを使う
+                (受取・ログインなどクライアント状態を変える操作)。
+                False の場合は参照系の系統を使い、受取キューをブロックしない。
+        """
         loop = asyncio.get_running_loop()
-        async with self._lock:
-            future = loop.run_in_executor(self._executor, fn)
+        lock = self._receive_lock if exclusive else self._read_lock
+        executor = self._receive_executor if exclusive else self._read_executor
+        async with lock:
+            future = loop.run_in_executor(executor, fn)
             try:
                 return await asyncio.wait_for(
                     asyncio.shield(future), timeout=budget or config.KYASH_CALL_BUDGET
@@ -500,6 +589,10 @@ class KyashService:
         record = await self._db.get_kyash_account()
         self._username = record.username
         self._wallet_uuid = record.wallet_uuid
+        self._token_issued_at = record.token_issued_at
+        threshold_raw = await self._db.get_system_value("kyash_wallet_threshold")
+        if threshold_raw and threshold_raw.isdigit():
+            self._wallet_threshold = int(threshold_raw)
         if not record.access_token_enc:
             self._status = config.KyashAccountStatus.UNCONFIGURED
             return self._status
@@ -521,7 +614,7 @@ class KyashService:
             return client
 
         try:
-            client = await self._call(_build, context="セッション復元")
+            client = await self._call(_build, context="セッション復元", exclusive=True)
         except KyashServiceError as exc:
             await self._set_status(config.KyashAccountStatus.ERROR, error=str(exc))
             return self._status
@@ -554,7 +647,9 @@ class KyashService:
                 return Kyash(email, password, client_uuid, installation_uuid)
             return Kyash(email, password)
 
-        client = await self._call(_build, context="ログイン開始", budget=config.KYASH_CALL_BUDGET)
+        client = await self._call(
+            _build, context="ログイン開始", budget=config.KYASH_CALL_BUDGET, exclusive=True
+        )
         # 認証情報をメモリに残さない
         try:
             client.password = None
@@ -603,7 +698,7 @@ class KyashService:
             client.login(otp)
 
         try:
-            await self._call(_verify, context="OTP検証")
+            await self._call(_verify, context="OTP検証", exclusive=True)
         finally:
             # 成否に関わらず OTP を保持しない
             otp = ""  # noqa: F841
@@ -640,6 +735,7 @@ class KyashService:
         except KyashServiceError as exc:
             logger.warning("ログイン直後の残高照会に失敗しました: %s", exc)
 
+        issued_at = utils.now_ts()
         await self._db.save_kyash_account(
             email=email,
             client_uuid=getattr(client, "client_uuid", None),
@@ -648,7 +744,9 @@ class KyashService:
             status=config.KyashAccountStatus.ACTIVE,
             username=profile.username,
             wallet_uuid=wallet_uuid,
+            token_issued_at=issued_at,
         )
+        self._token_issued_at = issued_at
         self._username = profile.username
         self._wallet_uuid = wallet_uuid
         self._status = config.KyashAccountStatus.ACTIVE
@@ -669,6 +767,7 @@ class KyashService:
         self._username = None
         self._wallet_uuid = None
         self._last_wallet_balance = None
+        self._token_issued_at = None
         await self._db.clear_kyash_account()
         self._status = config.KyashAccountStatus.UNCONFIGURED
         self._last_error = None
@@ -749,7 +848,7 @@ class KyashService:
         """
         client = self._require_client()
         return await self._call(
-            lambda: _sync_link_receive(client, link_uuid), context="リンク受取"
+            lambda: _sync_link_receive(client, link_uuid), context="リンク受取", exclusive=True
         )
 
     async def verify_receipt(
@@ -816,5 +915,6 @@ class KyashService:
         """セッション情報をメモリから破棄し、スレッドプールを停止する。"""
         self._pending_logins.clear()
         self._client = None
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._receive_executor.shutdown(wait=False, cancel_futures=True)
+        self._read_executor.shutdown(wait=False, cancel_futures=True)
         logger.info("Kyash サービスを停止しました")

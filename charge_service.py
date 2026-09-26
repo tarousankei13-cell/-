@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+import time
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -25,7 +26,13 @@ import config
 import kyash_service
 import ui
 import utils
-from database import AlreadyCredited, Database, GuildSettings, IllegalStateTransition
+from database import (
+    AlreadyCredited,
+    Database,
+    GuildSettings,
+    IllegalStateTransition,
+    ShopError,
+)
 
 if TYPE_CHECKING:
     from main import ChargeBot
@@ -68,6 +75,18 @@ class ChargeService:
         self._user_locks = utils.KeyedLocks()
         self._ranking_tasks: dict[int, asyncio.Task[None]] = {}
         self._processing_tx: str | None = None
+        #: 連続失敗によるクールダウン {(guild_id, user_id): [失敗時刻, ...]}
+        self._failures: dict[tuple[int, int], list[float]] = {}
+        self._cooldowns: dict[tuple[int, int], float] = {}
+        #: 招待の帰属判定用キャッシュ {guild_id: {code: uses}}
+        self._invite_cache: dict[int, dict[str, int]] = {}
+        #: 運用メトリクス (/system で参照。永続化しない)
+        self.metrics: dict[str, float] = {
+            "charges_completed": 0, "charges_failed": 0, "manual_reviews": 0,
+            "receive_count": 0, "receive_seconds": 0.0, "purchases": 0,
+            "purchase_refunds": 0, "invites_confirmed": 0, "invites_rejected": 0,
+            "invites_hold": 0,
+        }
 
     # ==================================================================
     # 事前チェック
@@ -79,6 +98,47 @@ class ChargeService:
     def check_button_rate_limit(self, user_id: int) -> None:
         if not self._button_rate_limiter.check(f"btn:{user_id}"):
             raise ChargeError(config.ErrorCode.RATE_LIMITED)
+
+    # ------------------------------------------------------------------
+    # 連続失敗によるクールダウン (不正探索・いたずら対策)
+    # ------------------------------------------------------------------
+    def record_failure(self, guild_id: int, user_id: int) -> bool:
+        """失敗を記録し、クールダウンへ入ったかどうかを返す。"""
+        key = (guild_id, user_id)
+        now = time.monotonic()
+        history = [t for t in self._failures.get(key, [])
+                   if now - t <= config.FAILURE_COOLDOWN_WINDOW]
+        history.append(now)
+        self._failures[key] = history
+        if len(history) >= config.FAILURE_COOLDOWN_THRESHOLD:
+            self._cooldowns[key] = now + config.FAILURE_COOLDOWN_SECONDS
+            self._failures[key] = []
+            logger.warning(
+                "連続失敗によりクールダウンを適用しました guild=%s user=%s (%s秒)",
+                guild_id, user_id, config.FAILURE_COOLDOWN_SECONDS,
+            )
+            return True
+        return False
+
+    def clear_failures(self, guild_id: int, user_id: int) -> None:
+        """成功時に失敗カウントを消去する。"""
+        self._failures.pop((guild_id, user_id), None)
+
+    def cooldown_remaining(self, guild_id: int, user_id: int) -> int:
+        """クールダウンの残り秒数 (0なら制限なし)。"""
+        until = self._cooldowns.get((guild_id, user_id))
+        if until is None:
+            return 0
+        remaining = int(until - time.monotonic())
+        if remaining <= 0:
+            self._cooldowns.pop((guild_id, user_id), None)
+            return 0
+        return remaining
+
+    def clear_cooldown(self, guild_id: int, user_id: int) -> None:
+        """管理者によるクールダウン解除。"""
+        self._cooldowns.pop((guild_id, user_id), None)
+        self._failures.pop((guild_id, user_id), None)
 
     async def ensure_usable_guild(self, guild_id: int) -> GuildSettings:
         """サーバーが許可されているか確認し、設定を返す。"""
@@ -96,20 +156,49 @@ class ChargeService:
             raise ChargeError(config.ErrorCode.MAINTENANCE)
         if await self.db.is_frozen(guild_id, user_id):
             raise ChargeError(config.ErrorCode.USER_FROZEN)
+        remaining = self.cooldown_remaining(guild_id, user_id)
+        if remaining > 0:
+            raise ChargeError(
+                config.ErrorCode.COOLDOWN, f"クールダウン中です (残り {remaining} 秒)"
+            )
         if not self.kyash.is_usable:
             raise ChargeError(
                 config.ErrorCode.KYASH_UNAVAILABLE,
                 f"受取用Kyashアカウントの状態: {self.kyash.status}",
             )
+        if self.kyash.wallet_limit_reached:
+            raise ChargeError(
+                config.ErrorCode.WALLET_LIMIT,
+                f"受取用アカウントの残高しきい値に到達 (しきい値 {self.kyash.wallet_threshold})",
+            )
 
     async def _check_limits(
-        self, guild_id: int, user_id: int, amount: int, settings: GuildSettings
+        self,
+        guild_id: int,
+        user_id: int,
+        amount: int,
+        settings: GuildSettings,
+        *,
+        charge_rate: Decimal | None = None,
     ) -> None:
-        """金額制限と日次上限の確認。"""
+        """金額制限・日次上限・残高上限・受取用アカウントの余裕を確認する。"""
         if amount < settings.minimum_charge:
             raise ChargeError(config.ErrorCode.AMOUNT_BELOW_MIN)
         if amount > settings.maximum_charge:
             raise ChargeError(config.ErrorCode.AMOUNT_ABOVE_MAX)
+        if settings.max_balance > 0:
+            current = await self.db.get_balance(guild_id, user_id)
+            expected = utils.calc_credited_amount(amount, charge_rate or settings.charge_rate)
+            if current + expected > settings.max_balance:
+                raise ChargeError(
+                    config.ErrorCode.MAX_BALANCE_EXCEEDED,
+                    f"残高上限 {settings.max_balance} に対し {current} + {expected} となります",
+                )
+        try:
+            # 受取用アカウントの残高しきい値を超えないか (受取前に止める)
+            self.kyash.check_wallet_capacity(amount)
+        except kyash_service.WalletLimitError as exc:
+            raise ChargeError(config.ErrorCode.WALLET_LIMIT, str(exc)) from exc
         day_start = utils.jst_day_start()
         if settings.daily_limit > 0:
             used = await self.db.sum_daily_charge(guild_id, user_id, day_start)
@@ -129,6 +218,33 @@ class ChargeService:
     # ==================================================================
     # チャージ開始
     # ==================================================================
+    async def resolve_charge_rate(
+        self, guild_id: int, user_id: int, settings: GuildSettings
+    ) -> tuple[Decimal, int | None]:
+        """利用者に適用するチャージ率を解決する。
+
+        ロール別レート (VIP 等) が設定されていて、利用者がそのロールを持つ場合は
+        優先度の高いレートを採用する。該当がなければサーバー既定のレートを使う。
+
+        Returns:
+            ``(charge_rate, role_id or None)``
+        """
+        rows = await self.db.list_role_rates(guild_id)
+        if not rows:
+            return settings.charge_rate, None
+        guild = self.bot.get_guild(guild_id)
+        member = guild.get_member(user_id) if guild else None
+        if member is None:
+            return settings.charge_rate, None
+        member_role_ids = {role.id for role in getattr(member, "roles", [])}
+        for row in rows:  # 優先度降順に評価
+            role_id = int(row["role_id"])
+            if role_id in member_role_ids:
+                rate = utils.to_decimal(row["charge_rate"])
+                if rate is not None:
+                    return rate, role_id
+        return settings.charge_rate, None
+
     async def start_charge(
         self, guild_id: int, user_id: int, raw_amount: str
     ) -> tuple[str, int, GuildSettings]:
@@ -148,20 +264,26 @@ class ChargeService:
 
         async with self._user_locks.acquire(f"{guild_id}:{user_id}"):
             await self.preflight(guild_id, user_id, settings)
-            if await self.db.count_active_transactions(guild_id, user_id) > 0:
+            active = await self.db.count_active_transactions(
+                guild_id, user_id, exclude_manual_review=settings.manual_review_allow_new
+            )
+            if active > 0:
                 raise ChargeError(config.ErrorCode.ACTIVE_TRANSACTION_EXISTS)
-            await self._check_limits(guild_id, user_id, amount, settings)
+            charge_rate, role_id = await self.resolve_charge_rate(guild_id, user_id, settings)
+            await self._check_limits(
+                guild_id, user_id, amount, settings, charge_rate=charge_rate
+            )
             await self.db.ensure_user(guild_id, user_id)
             tx_id = await self.db.create_transaction(
                 guild_id=guild_id,
                 user_id=user_id,
                 requested_amount=amount,
-                charge_rate=settings.charge_rate,
+                charge_rate=charge_rate,
                 expires_at=utils.now_ts() + config.LINK_WAIT_SECONDS,
             )
         logger.info(
-            "チャージを開始しました tx=%s guild=%s user=%s amount=%s rate=%s",
-            tx_id, guild_id, user_id, amount, settings.charge_rate,
+            "チャージを開始しました tx=%s guild=%s user=%s amount=%s rate=%s role=%s",
+            tx_id, guild_id, user_id, amount, charge_rate, role_id,
         )
         await self._safe(self.log_event(
             guild_id,
@@ -170,6 +292,11 @@ class ChargeService:
                 ("利用者", f"<@{user_id}>", True),
                 ("申請額", utils.fmt_yen(amount), True),
                 ("取引ID", f"`{tx_id}`", True),
+                (
+                    "適用レート",
+                    utils.fmt_rate(charge_rate) + (f" (<@&{role_id}>)" if role_id else ""),
+                    True,
+                ),
             ),
             color=config.Color.WARNING,
         ), context="開始ログ")
@@ -238,6 +365,7 @@ class ChargeService:
         try:
             canonical_url, link_id = utils.normalize_kyash_link(raw_link)
         except utils.LinkParseError as exc:
+            self._note_user_failure(guild_id, user_id, config.ErrorCode.INVALID_LINK)
             raise ChargeError(config.ErrorCode.INVALID_LINK, str(exc)) from exc
         finally:
             raw_link = ""  # 入力値の参照を破棄
@@ -255,6 +383,7 @@ class ChargeService:
                 await self._fail(tx_id, config.ErrorCode.LINK_ALREADY_USED,
                                  f"既存取引 {duplicate['id']} と同じリンク",
                                  expected=(config.TxStatus.WAITING_LINK,))
+                self._note_user_failure(guild_id, user_id, config.ErrorCode.LINK_ALREADY_USED)
                 raise ChargeError(config.ErrorCode.LINK_ALREADY_USED)
 
             await self.db.transition_status(
@@ -265,10 +394,12 @@ class ChargeService:
             except kyash_service.LinkIsClaimError as exc:
                 await self._fail(tx_id, config.ErrorCode.LINK_IS_CLAIM, str(exc),
                                  expected=(config.TxStatus.VALIDATING,))
+                self._note_user_failure(guild_id, user_id, config.ErrorCode.LINK_IS_CLAIM)
                 raise ChargeError(config.ErrorCode.LINK_IS_CLAIM) from exc
             except kyash_service.LinkInvalidError as exc:
                 await self._fail(tx_id, config.ErrorCode.INVALID_LINK, str(exc),
                                  expected=(config.TxStatus.VALIDATING,))
+                self._note_user_failure(guild_id, user_id, config.ErrorCode.INVALID_LINK)
                 raise ChargeError(config.ErrorCode.INVALID_LINK) from exc
             except kyash_service.KyashAuthError as exc:
                 # セッション異常: 受取は行われていないため、再入力できる状態へ戻す
@@ -309,6 +440,7 @@ class ChargeService:
                     expected=(config.TxStatus.VALIDATING,),
                 )
                 await self._safe(self.notify_result(tx_id), context="金額不一致DM")
+                self._note_user_failure(guild_id, user_id, config.ErrorCode.AMOUNT_MISMATCH)
                 raise ChargeError(config.ErrorCode.AMOUNT_MISMATCH)
 
             try:
@@ -353,6 +485,15 @@ class ChargeService:
             logger.warning("WAITING_LINK への復帰に失敗しました tx=%s: %s", tx_id,
                            utils.safe_error_text(exc))
 
+    def _note_user_failure(self, guild_id: int, user_id: int, code: str) -> None:
+        """利用者起因の失敗を記録する (連続失敗でクールダウン)。"""
+        if code in (
+            config.ErrorCode.INVALID_LINK, config.ErrorCode.LINK_IS_CLAIM,
+            config.ErrorCode.AMOUNT_MISMATCH, config.ErrorCode.LINK_ALREADY_USED,
+            config.ErrorCode.LINK_EXPIRED,
+        ):
+            self.record_failure(guild_id, user_id)
+
     async def _fail(
         self,
         tx_id: str,
@@ -368,6 +509,8 @@ class ChargeService:
                 tx_id, status, expected=expected, error_code=code,
                 error_message=utils.sanitize_for_log(detail),
             )
+            if status == config.TxStatus.FAILED:
+                self.metrics["charges_failed"] += 1
         except Exception as exc:  # noqa: BLE001
             logger.error("失敗状態への更新に失敗しました tx=%s: %s", tx_id, utils.safe_error_text(exc))
 
@@ -453,8 +596,11 @@ class ChargeService:
         queue_logger.info("受取処理を開始します tx=%s uuid=%s amount=%s",
                           tx_id, utils.mask_identifier(link_uuid), expected_amount)
 
+        receive_started = time.monotonic()
         try:
             await self.kyash.link_receive(link_uuid)
+            self.metrics["receive_count"] += 1
+            self.metrics["receive_seconds"] += time.monotonic() - receive_started
         except kyash_service.KyashRejectedError as exc:
             # Kyash が受取を拒否 (使用済み・無効など)。実状態を確認してから判断する。
             await self._resolve_after_rejection(
@@ -610,6 +756,7 @@ class ChargeService:
 
     async def _to_manual_review(self, tx_id: str, code: str, detail: str) -> None:
         """MANUAL_REVIEW へ移行する (勝手に再受取しない)。"""
+        self.metrics["manual_reviews"] += 1
         try:
             await self.db.transition_status(
                 tx_id, config.TxStatus.MANUAL_REVIEW,
@@ -714,7 +861,27 @@ class ChargeService:
                 tx_id, result["guild_id"], result["user_id"], received,
                 result["credited_amount"], result["balance_before"], result["balance_after"],
             )
+        self.metrics["charges_completed"] += 1
+        self.clear_failures(int(result["guild_id"]), int(result["user_id"]))
         # ここから先の失敗はチャージ結果に影響させない (すべて _safe 経由)
+        await self._safe(
+            self.log_balance_change(
+                int(result["guild_id"]),
+                change_type=config.BalanceChangeType.CHARGE,
+                user_id=int(result["user_id"]),
+                balance_before=int(result["balance_before"]),
+                balance_after=int(result["balance_after"]),
+                change=int(result["credited_amount"]),
+                reason=f"チャージ完了 (送金 {received}円 / 率 {utils.fmt_rate(row['charge_rate'])})",
+                transaction_id=tx_id,
+            ),
+            context="残高ログ",
+        )
+        # 招待キャンペーン: 被招待者の初回チャージで報酬を確定する
+        await self._safe(
+            self.confirm_invite_after_charge(int(result["guild_id"]), int(result["user_id"])),
+            context="招待確定",
+        )
         await self._safe(self.notify_result(tx_id), context="完了DM")
         await self._safe(self.update_achievement(tx_id), context="実績更新")
         try:
@@ -872,6 +1039,10 @@ class ChargeService:
             },
         )
         self.request_ranking_refresh(guild_id)
+        await self._log_balance_from_history(
+            guild_id, user_id, change_type=change_type, fallback=result,
+            operator_id=operator_id, reason=reason, operation_id=op_id,
+        )
         await self.log_event(
             guild_id,
             f"🛠 残高操作 ({config.BALANCE_TYPE_LABELS.get(change_type, change_type)})",
@@ -1285,22 +1456,42 @@ class ChargeService:
             self._ranking_tasks.pop(guild_id, None)
 
     async def build_ranking_entries(
-        self, guild_id: int, settings: GuildSettings
+        self,
+        guild_id: int,
+        settings: GuildSettings,
+        ranking_type: str = config.RankingType.BALANCE,
     ) -> list[tuple[int, int, str]]:
         """ランキング表示用エントリを構築する。
 
-        * Source of Truth は ``balances`` の現在値 (履歴の合計では計算しない)
+        * 残高ランキングの Source of Truth は ``balances`` の現在値
+          (履歴の合計では計算しない)
+        * 週間・月間は ``charge_transactions`` の完了分 (取消済みは除外) を集計
+        * 招待ランキングは確定した招待数を集計
         * Bot ユーザーは対象外 / 凍結ユーザーは DB 側で除外済み
         * 退会済みユーザーは取得できる範囲で表示 (設定により非表示)
         """
         limit = max(config.RANKING_LIMIT_MIN, min(config.RANKING_LIMIT_MAX, settings.ranking_limit))
         # Bot・退会ユーザーの除外で件数が減るため、多めに取得してから絞り込む
-        rows = await self.db.get_ranking(guild_id, limit * 3 + 10)
+        fetch = limit * 3 + 10
+        if ranking_type == config.RankingType.WEEKLY:
+            rows = await self.db.get_charge_ranking(
+                guild_id, since=utils.now_ts() - 7 * 86400, limit=fetch
+            )
+        elif ranking_type == config.RankingType.MONTHLY:
+            rows = await self.db.get_charge_ranking(
+                guild_id, since=utils.jst_month_start(), limit=fetch
+            )
+        elif ranking_type == config.RankingType.INVITE:
+            rows = await self.db.get_invite_ranking(guild_id, limit=fetch)
+        else:
+            rows = await self.db.get_ranking(guild_id, fetch)
         guild = self.bot.get_guild(guild_id)
         entries: list[tuple[int, int, str]] = []
+        keys = rows[0].keys() if rows else []
+        value_key = "balance" if "balance" in keys else "total"
         for row in rows:
             user_id = int(row["user_id"])
-            balance = int(row["balance"])
+            balance = int(row[value_key])
             member = guild.get_member(user_id) if guild else None
             if member is not None:
                 if member.bot:
@@ -1334,16 +1525,30 @@ class ChargeService:
             return 0
         settings = await self.db.get_settings(guild_id)
         guild = self.bot.get_guild(guild_id)
-        if settings.ranking_enabled:
-            entries = await self.build_ranking_entries(guild_id, settings)
-            signature = self.ranking_signature(entries)
-            embed = ui.ranking_embed(guild, entries, settings, updated_at=utils.now_ts())
-        else:
-            signature = "DISABLED"
-            embed = ui.ranking_disabled_embed()
+        # 集計方式ごとに1回だけ計算する
+        cache: dict[str, tuple[str, discord.Embed]] = {}
+
+        async def render(ranking_type: str) -> tuple[str, discord.Embed]:
+            if ranking_type in cache:
+                return cache[ranking_type]
+            if not settings.ranking_enabled:
+                result = ("DISABLED", ui.ranking_disabled_embed())
+            else:
+                entries = await self.build_ranking_entries(guild_id, settings, ranking_type)
+                result = (
+                    f"{ranking_type}|" + self.ranking_signature(entries),
+                    ui.ranking_embed(
+                        guild, entries, settings, updated_at=utils.now_ts(),
+                        ranking_type=ranking_type,
+                    ),
+                )
+            cache[ranking_type] = result
+            return result
 
         updated = 0
         for panel in panels:
+            panel_type = str(panel["ranking_type"] or config.RankingType.BALANCE)
+            signature, embed = await render(panel_type)
             if not force and panel["last_signature"] == signature:
                 continue  # 内容が変わっていないので Discord API を呼ばない
             channel = await self._resolve_message_channel(guild_id, int(panel["channel_id"]))
@@ -1386,7 +1591,7 @@ class ChargeService:
 
     async def refresh_charge_panels(self, guild_id: int) -> int:
         """チャージパネルへ最新の設定値を反映する。"""
-        panels = await self.db.list_panels(guild_id)
+        panels = await self.db.list_panels(guild_id, panel_type=config.PANEL_TYPE_CHARGE)
         if not panels:
             return 0
         settings = await self.db.get_settings(guild_id)
@@ -1435,6 +1640,1070 @@ class ChargeService:
         self._ranking_tasks.clear()
         if pending:
             logger.info("保留中のランキング更新 %s 件を破棄しました", len(pending))
+
+    # ==================================================================
+    # 残高操作ログ (指定チャンネルへ送信)
+    # ==================================================================
+    async def log_balance_change(
+        self,
+        guild_id: int,
+        *,
+        change_type: str,
+        user_id: int,
+        balance_before: int,
+        balance_after: int,
+        change: int,
+        reason: str = "",
+        operator_id: int | None = None,
+        operation_id: str | None = None,
+        transaction_id: str | None = None,
+        history_id: int | None = None,
+        audit_hash: str | None = None,
+    ) -> None:
+        """残高の変動を専用チャンネルへ記録する。
+
+        ``balance_log_scope`` が ``MANUAL`` の場合は管理者の手動操作のみを送信し、
+        ``ALL`` の場合はチャージ・招待報酬・ショップ購入などの自動変動も送信する。
+        送信に失敗しても残高操作そのものには影響させない。
+        """
+        settings = await self.db.get_settings(guild_id)
+        if not settings.balance_log_channel_id:
+            return
+        if settings.balance_log_scope != "ALL" and change_type not in config.MANUAL_BALANCE_TYPES:
+            return
+        channel = await self._resolve_channel(
+            guild_id, settings.balance_log_channel_id, "balance_log_channel_id"
+        )
+        if channel is None:
+            return
+        label = config.BALANCE_TYPE_LABELS.get(change_type, change_type)
+        sign = "+" if change > 0 else ""
+        color = (
+            config.Color.SUCCESS if change > 0
+            else config.Color.DANGER if change < 0 else config.Color.NEUTRAL
+        )
+        fields: list[tuple[str, str, bool]] = [
+            ("対象", f"<@{user_id}> (`{user_id}`)", True),
+            ("種別", label, True),
+            ("変動", f"**{sign}{utils.fmt_int(change)}**", True),
+            ("変更前 → 変更後",
+             f"{utils.fmt_int(balance_before)} → **{utils.fmt_int(balance_after)}**", True),
+        ]
+        if operator_id:
+            fields.append(("操作者", f"<@{operator_id}> (`{operator_id}`)", True))
+        if transaction_id:
+            fields.append(("取引ID", f"`{transaction_id}`", True))
+        if history_id is not None:
+            fields.append(("履歴ID", f"`{history_id}`", True))
+        if operation_id:
+            fields.append(("操作ID", f"`{operation_id}`", True))
+        if reason:
+            fields.append(("理由", utils.truncate(reason, 400), False))
+        if audit_hash:
+            fields.append(("監査ハッシュ", f"`{audit_hash}`", False))
+        embed = ui.log_embed(
+            f"💳 残高変更: {label}", color=color, fields=tuple(fields)
+        )
+        try:
+            await channel.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning("残高ログの送信に失敗しました guild=%s: %s",
+                           guild_id, utils.safe_error_text(exc))
+
+    async def _log_balance_from_history(
+        self, guild_id: int, user_id: int, *, change_type: str, fallback: dict[str, Any],
+        operator_id: int | None = None, reason: str = "", operation_id: str | None = None,
+        transaction_id: str | None = None,
+    ) -> None:
+        """直近の履歴行を引いて残高ログを送る (履歴IDを併記するため)。"""
+        history_id = None
+        try:
+            rows, _ = await self.db.list_balance_history_filtered(
+                guild_id, user_id=user_id, types=(change_type,), limit=1
+            )
+            if rows:
+                history_id = int(rows[0]["id"])
+        except Exception:  # noqa: BLE001
+            history_id = None
+        await self._safe(
+            self.log_balance_change(
+                guild_id,
+                change_type=change_type,
+                user_id=user_id,
+                balance_before=int(fallback.get("balance_before", 0)),
+                balance_after=int(fallback.get("balance_after", 0)),
+                change=int(fallback.get("change", fallback.get("balance_after", 0)
+                                        - fallback.get("balance_before", 0))),
+                reason=reason,
+                operator_id=operator_id,
+                operation_id=operation_id,
+                transaction_id=transaction_id,
+                history_id=history_id,
+            ),
+            context="残高ログ",
+        )
+
+    # ==================================================================
+    # ショップ (内部残高でロールを購入)
+    # ==================================================================
+    async def purchase_shop_item(
+        self, member: discord.Member, item_id: int
+    ) -> dict[str, Any]:
+        """内部残高で商品 (ロール) を購入する。
+
+        残高の引き落としは単一トランザクションで確定させ、その後ロールを付与する。
+        ロール付与に失敗した場合は自動で返金し、利用者へ明示する。
+        """
+        guild = member.guild
+        settings = await self.ensure_usable_guild(guild.id)
+        if not settings.shop_enabled:
+            raise ChargeError(config.ErrorCode.SHOP_ITEM_UNAVAILABLE, "ショップが無効です")
+        if settings.emergency_stop:
+            raise ChargeError(config.ErrorCode.EMERGENCY_STOP)
+        if await self.db.is_frozen(guild.id, member.id):
+            raise ChargeError(config.ErrorCode.USER_FROZEN)
+
+        item = await self.db.get_shop_item(item_id, guild.id)
+        if item is None or not item["active"]:
+            raise ChargeError(config.ErrorCode.SHOP_ITEM_UNAVAILABLE)
+        role = guild.get_role(int(item["role_id"]))
+        if role is None:
+            raise ChargeError(
+                config.ErrorCode.SHOP_ITEM_UNAVAILABLE, "商品のロールが存在しません"
+            )
+        me = guild.me
+        if me is None or not me.guild_permissions.manage_roles or role >= me.top_role \
+                or role.managed or role.is_default():
+            raise ChargeError(
+                config.ErrorCode.ROLE_ASSIGN_FAILED,
+                "Bot がこのロールを付与できません (ロールの位置・権限を確認してください)",
+            )
+        duration = int(item["duration_days"])
+        if duration == 0 and role in member.roles:
+            raise ChargeError(config.ErrorCode.SHOP_ALREADY_OWNED)
+
+        async with self._user_locks.acquire(f"shop:{guild.id}:{member.id}"):
+            try:
+                result = await self.db.purchase_shop_item(
+                    guild_id=guild.id, user_id=member.id, item_id=item_id
+                )
+            except ShopError as exc:
+                raise ChargeError(exc.code, exc.detail) from exc
+
+            purchase_id = int(result["purchase_id"])
+            try:
+                await member.add_roles(
+                    role, reason=f"ショップ購入 #{purchase_id} ({item['name']})"
+                )
+            except Exception as exc:  # noqa: BLE001 - 付与失敗時は必ず返金する
+                logger.error(
+                    "ロール付与に失敗したため返金します purchase=%s: %s",
+                    purchase_id, utils.safe_error_text(exc),
+                )
+                try:
+                    refund = await self.db.refund_purchase(
+                        purchase_id, operator_id=None,
+                        reason="ロール付与に失敗したため自動返金",
+                        status=config.PurchaseStatus.FAILED,
+                    )
+                    await self._log_balance_from_history(
+                        guild.id, member.id,
+                        change_type=config.BalanceChangeType.SPEND_REFUND,
+                        fallback=refund, reason="ロール付与失敗による自動返金",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("自動返金に失敗しました purchase=%s", purchase_id)
+                    await self.alert_admins(
+                        guild.id, "ショップの自動返金に失敗",
+                        f"購入 `#{purchase_id}` のロール付与と返金の両方に失敗しました。"
+                        "手動で `/shop refund` を実行してください。",
+                    )
+                raise ChargeError(config.ErrorCode.ROLE_ASSIGN_FAILED) from exc
+
+            await self.db.activate_purchase(purchase_id)
+
+        self.metrics["purchases"] += 1
+        await self.db.add_audit_log(
+            actor_id=member.id, action="SHOP_PURCHASE", guild_id=guild.id,
+            target_user_id=member.id,
+            detail={
+                "purchase_id": purchase_id, "item_id": item_id, "item": item["name"],
+                "price": result["price"], "role_id": role.id,
+                "expires_at": result["expires_at"],
+            },
+        )
+        await self._log_balance_from_history(
+            guild.id, member.id, change_type=config.BalanceChangeType.SPEND,
+            fallback=result, reason=f"ショップ購入: {item['name']}",
+            transaction_id=f"SHOP-{purchase_id}",
+        )
+        await self._safe(self.log_event(
+            guild.id, "🛒 ショップ購入",
+            fields=(
+                ("利用者", member.mention, True),
+                ("商品", str(item["name"]), True),
+                ("価格", utils.fmt_int(result["price"]), True),
+                ("ロール", role.mention, True),
+                ("期限", utils.format_jst(result["expires_at"]) if result["expires_at"] else "無期限", True),
+                ("残高", f"{utils.fmt_int(result['balance_before'])} → "
+                         f"{utils.fmt_int(result['balance_after'])}", True),
+            ),
+            color=config.Color.ACCENT,
+        ), context="購入ログ")
+        self.request_ranking_refresh(guild.id)
+        return {**result, "role_id": role.id, "role_name": role.name}
+
+    async def refund_shop_purchase(
+        self, purchase_id: int, *, operator_id: int, reason: str
+    ) -> dict[str, Any]:
+        """購入を返金し、付与したロールを剥奪する。"""
+        purchase = await self.db.get_purchase(purchase_id)
+        if purchase is None:
+            raise ChargeError(config.ErrorCode.UNKNOWN_ERROR, "購入記録が見つかりません")
+        try:
+            result = await self.db.refund_purchase(
+                purchase_id, operator_id=operator_id, reason=reason
+            )
+        except ShopError as exc:
+            raise ChargeError(exc.code, exc.detail) from exc
+        guild_id = int(result["guild_id"])
+        user_id = int(result["user_id"])
+        await self._remove_purchase_role(guild_id, user_id, int(result["role_id"]),
+                                         reason=f"購入返金 #{purchase_id}")
+        self.metrics["purchase_refunds"] += 1
+        await self.db.add_audit_log(
+            actor_id=operator_id, action="SHOP_REFUND", guild_id=guild_id,
+            target_user_id=user_id,
+            detail={"purchase_id": purchase_id, "price": result["price"],
+                    "reason": utils.truncate(reason, 300)},
+        )
+        await self._log_balance_from_history(
+            guild_id, user_id, change_type=config.BalanceChangeType.SPEND_REFUND,
+            fallback=result, operator_id=operator_id, reason=f"購入返金: {reason}",
+            transaction_id=f"SHOP-{purchase_id}",
+        )
+        await self._safe(self.log_event(
+            guild_id, "↩️ ショップ返金",
+            fields=(
+                ("対象", f"<@{user_id}>", True),
+                ("商品", str(result["item_name"]), True),
+                ("返金額", utils.fmt_int(result["price"]), True),
+                ("操作者", f"<@{operator_id}>", True),
+                ("理由", utils.truncate(reason, 200), False),
+            ),
+            color=config.Color.WARNING,
+        ), context="返金ログ")
+        self.request_ranking_refresh(guild_id)
+        return result
+
+    async def _remove_purchase_role(
+        self, guild_id: int, user_id: int, role_id: int, *, reason: str
+    ) -> bool:
+        """購入で付与したロールを剥奪する (他の有効な購入が残る場合は剥奪しない)。"""
+        remaining = await self.db.list_active_purchases_for_role(guild_id, user_id, role_id)
+        if remaining:
+            logger.info(
+                "他に有効な購入が残っているためロールを維持します guild=%s user=%s role=%s",
+                guild_id, user_id, role_id,
+            )
+            return False
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return False
+        member = guild.get_member(user_id)
+        role = guild.get_role(role_id)
+        if member is None or role is None:
+            return False
+        if role not in member.roles:
+            return True
+        try:
+            await member.remove_roles(role, reason=utils.truncate(reason, 400))
+            return True
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning("ロール剥奪に失敗しました guild=%s user=%s role=%s: %s",
+                           guild_id, user_id, role_id, utils.safe_error_text(exc))
+            await self.alert_admins(
+                guild_id, "ロールの剥奪に失敗",
+                f"<@{user_id}> の <@&{role_id}> を剥奪できませんでした。手動で外してください。",
+            )
+            return False
+
+    async def expire_shop_purchases(self) -> int:
+        """期限切れの購入ロールを剥奪する。"""
+        rows = await self.db.list_expired_purchases()
+        handled = 0
+        for row in rows:
+            purchase_id = int(row["id"])
+            await self.db.mark_purchase_expired(purchase_id)
+            await self._remove_purchase_role(
+                int(row["guild_id"]), int(row["user_id"]), int(row["role_id"]),
+                reason=f"購入期限切れ #{purchase_id}",
+            )
+            await self._safe(self.log_event(
+                int(row["guild_id"]), "⌛ ロールの有効期限が切れました",
+                fields=(
+                    ("対象", f"<@{row['user_id']}>", True),
+                    ("商品", str(row["item_name"]), True),
+                    ("ロール", f"<@&{row['role_id']}>", True),
+                ),
+                color=config.Color.NEUTRAL,
+            ), context="期限切れログ")
+            handled += 1
+        if handled:
+            logger.info("期限切れの購入 %s 件を処理しました", handled)
+        return handled
+
+    # ==================================================================
+    # 招待キャンペーン
+    # ==================================================================
+    async def sync_invite_cache(self, guild: discord.Guild) -> bool:
+        """招待の使用回数をキャッシュする (帰属判定の基準)。
+
+        Returns:
+            取得できた場合 True。「サーバー管理」権限がない場合は False。
+        """
+        try:
+            invites = await guild.invites()
+        except discord.Forbidden:
+            logger.info(
+                "招待一覧を取得できません (サーバー管理権限が必要) guild=%s", guild.id
+            )
+            return False
+        except discord.HTTPException as exc:
+            logger.warning("招待一覧の取得に失敗しました guild=%s: %s",
+                           guild.id, utils.safe_error_text(exc))
+            return False
+        self._invite_cache[guild.id] = {
+            invite.code: int(invite.uses or 0) for invite in invites
+        }
+        return True
+
+    async def detect_used_invite(self, guild: discord.Guild) -> tuple[str | None, bool]:
+        """参加時に使われた招待コードを特定する。
+
+        Returns:
+            ``(code, ambiguous)``。``code`` が None のときは特定できなかったことを表し、
+            ``ambiguous`` が True なら複数候補があり判定を保留すべきことを表す。
+
+        バニティURL・サーバー発見経由の参加は Discord の仕様上特定できない。
+        """
+        before = self._invite_cache.get(guild.id, {})
+        try:
+            invites = await guild.invites()
+        except (discord.Forbidden, discord.HTTPException):
+            return None, False
+        after = {invite.code: int(invite.uses or 0) for invite in invites}
+        self._invite_cache[guild.id] = after
+        increased = [code for code, uses in after.items() if uses > before.get(code, 0)]
+        if len(increased) == 1:
+            return increased[0], False
+        if len(increased) > 1:
+            return None, True
+        # 使い切りで削除された招待を推定する
+        disappeared = [code for code in before if code not in after]
+        if len(disappeared) == 1:
+            return disappeared[0], False
+        return None, len(disappeared) > 1
+
+    async def issue_invite_code(self, member: discord.Member) -> dict[str, Any]:
+        """利用者専用の招待リンクを発行する (既存があれば再利用)。"""
+        guild = member.guild
+        await self.ensure_usable_guild(guild.id)
+        campaign = await self.db.get_active_campaign(guild.id)
+        if campaign is None:
+            raise ChargeError(config.ErrorCode.CAMPAIGN_NOT_ACTIVE)
+        if await self.db.is_invite_blacklisted(guild.id, member.id):
+            raise ChargeError(config.ErrorCode.NOT_ALLOWED, "招待の利用が制限されています")
+
+        existing = await self.db.get_invite_code_for_user(guild.id, member.id)
+        if existing is not None and existing["url"]:
+            # 招待が Discord 側で削除されていないか確認する
+            code_alive = True
+            try:
+                invites = await guild.invites()
+                code_alive = any(inv.code == existing["code"] for inv in invites)
+            except (discord.Forbidden, discord.HTTPException):
+                code_alive = True  # 確認できない場合は既存を返す
+            if code_alive:
+                summary = await self.db.get_invite_summary(guild.id, member.id)
+                return {"code": existing["code"], "url": existing["url"],
+                        "created": False, "summary": summary, "campaign": campaign}
+
+        channel = self._pick_invite_channel(guild)
+        if channel is None:
+            raise ChargeError(
+                config.ErrorCode.INVITE_NOT_AVAILABLE,
+                "招待を作成できるチャンネルがありません (Bot に「招待を作成」権限が必要です)",
+            )
+        try:
+            invite = await channel.create_invite(
+                max_age=0, max_uses=0, unique=True,
+                reason=f"招待キャンペーン: {member} ({member.id})",
+            )
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning("招待リンクの作成に失敗しました guild=%s: %s",
+                           guild.id, utils.safe_error_text(exc))
+            raise ChargeError(config.ErrorCode.INVITE_NOT_AVAILABLE) from exc
+
+        await self.db.save_invite_code(guild.id, member.id, invite.code, invite.url)
+        # 発行直後にキャッシュへ反映し、初回の参加を取りこぼさない
+        self._invite_cache.setdefault(guild.id, {})[invite.code] = 0
+        summary = await self.db.get_invite_summary(guild.id, member.id)
+        logger.info("招待リンクを発行しました guild=%s user=%s", guild.id, member.id)
+        return {"code": invite.code, "url": invite.url, "created": True,
+                "summary": summary, "campaign": campaign}
+
+    def _pick_invite_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
+        """招待を作成できるチャンネルを選ぶ。"""
+        me = guild.me
+        if me is None:
+            return None
+        candidates: list[discord.TextChannel] = []
+        if isinstance(guild.rules_channel, discord.TextChannel):
+            candidates.append(guild.rules_channel)
+        if isinstance(guild.system_channel, discord.TextChannel):
+            candidates.append(guild.system_channel)
+        candidates.extend(guild.text_channels)
+        for channel in candidates:
+            perms = channel.permissions_for(me)
+            if perms.create_instant_invite and perms.view_channel:
+                return channel
+        return None
+
+    async def handle_member_join(self, member: discord.Member) -> None:
+        """参加イベントを処理し、招待の帰属と不正判定を行う。"""
+        guild = member.guild
+        if not await self.db.is_guild_allowed(guild.id):
+            return
+        history = await self.db.record_member_join(guild.id, member.id)
+        code, ambiguous = await self.detect_used_invite(guild)
+        inviter_id = (
+            await self.db.get_invite_code_owner(guild.id, code) if code else None
+        )
+        if code:
+            await self.db.increment_invite_code_uses(guild.id, code)
+
+        campaign = await self.db.get_active_campaign(guild.id)
+        if campaign is None:
+            return
+        status, reason = await self._judge_invite(
+            member, campaign, history, inviter_id, ambiguous
+        )
+        record_id, created = await self.db.record_invite(
+            guild_id=guild.id,
+            campaign_id=int(campaign["id"]),
+            inviter_id=inviter_id,
+            invited_id=member.id,
+            code=code,
+            status=status,
+            reason=reason,
+        )
+        if not created:
+            logger.info(
+                "既に招待記録が存在するためスキップします guild=%s user=%s record=%s",
+                guild.id, member.id, record_id,
+            )
+            return
+        if status == config.InviteStatus.REJECTED:
+            self.metrics["invites_rejected"] += 1
+        elif status == config.InviteStatus.HOLD:
+            self.metrics["invites_hold"] += 1
+
+        reason_label = config.INVITE_REASON_LABELS.get(reason or "", reason or "-")
+        await self._safe(self.log_event(
+            guild.id,
+            f"🤝 招待を記録しました ({config.INVITE_STATUS_LABELS.get(status, status)})",
+            fields=(
+                ("参加者", f"{member.mention} (`{member.id}`)", True),
+                ("招待者", f"<@{inviter_id}>" if inviter_id else "不明", True),
+                ("アカウント作成", utils.format_jst(int(member.created_at.timestamp())), True),
+                ("判定理由", reason_label, True),
+                ("記録ID", f"`{record_id}`", True),
+            ),
+            color=(
+                config.Color.SUCCESS if status == config.InviteStatus.PENDING
+                else config.Color.WARNING if status == config.InviteStatus.HOLD
+                else config.Color.NEUTRAL
+            ),
+        ), context="招待ログ")
+
+        if status == config.InviteStatus.HOLD:
+            await self.alert_admins(
+                guild.id, "招待の確認が必要です",
+                f"参加者 <@{member.id}> / 招待者 <@{inviter_id}> の招待を保留しました。\n"
+                f"理由: {reason_label}\n"
+                f"`/campaign review` で承認または却下できます (記録ID `{record_id}`)。",
+            )
+        elif status == config.InviteStatus.PENDING and not campaign["require_charge"] \
+                and int(campaign["require_days"] or 0) == 0:
+            # 条件がない設定では即時確定する
+            await self._confirm_invite(record_id)
+
+    async def _judge_invite(
+        self,
+        member: discord.Member,
+        campaign: sqlite3.Row,
+        history: dict[str, Any],
+        inviter_id: int | None,
+        ambiguous: bool,
+    ) -> tuple[str, str | None]:
+        """招待の有効性を判定する。
+
+        Returns:
+            ``(status, reason)``
+        """
+        guild_id = member.guild.id
+        if member.bot:
+            return config.InviteStatus.REJECTED, config.InviteRejectReason.BOT_ACCOUNT
+        if history.get("rejoin"):
+            # 退出→再入場による報酬の周回を防ぐ
+            return config.InviteStatus.REJECTED, config.InviteRejectReason.REJOIN
+        if inviter_id is None:
+            return config.InviteStatus.REJECTED, (
+                config.InviteRejectReason.AMBIGUOUS if ambiguous
+                else config.InviteRejectReason.UNKNOWN_INVITER
+            )
+        if inviter_id == member.id:
+            return config.InviteStatus.REJECTED, config.InviteRejectReason.SELF_INVITE
+        if await self.db.is_invite_blacklisted(guild_id, inviter_id):
+            return config.InviteStatus.REJECTED, config.InviteRejectReason.BLACKLISTED
+
+        now = utils.now_ts()
+        account_age_days = (now - int(member.created_at.timestamp())) / 86400
+        if account_age_days < int(campaign["min_account_age_days"] or 0):
+            return config.InviteStatus.REJECTED, config.InviteRejectReason.ACCOUNT_TOO_NEW
+
+        daily_limit = int(campaign["daily_limit"] or 0)
+        if daily_limit > 0:
+            today = await self.db.count_invites(
+                guild_id, inviter_id, since=utils.jst_day_start()
+            )
+            if today >= daily_limit:
+                return config.InviteStatus.REJECTED, config.InviteRejectReason.DAILY_LIMIT
+        total_limit = int(campaign["total_limit"] or 0)
+        if total_limit > 0:
+            total = await self.db.count_invites(guild_id, inviter_id)
+            if total >= total_limit:
+                return config.InviteStatus.REJECTED, config.InviteRejectReason.TOTAL_LIMIT
+
+        # --- 不審パターンは却下せず保留にして管理者が判断する ---
+        recent = await self.db.count_recent_invites_by_inviter(
+            guild_id, inviter_id, now - config.INVITE_BURST_WINDOW
+        )
+        if recent >= config.INVITE_BURST_COUNT:
+            return config.InviteStatus.HOLD, config.InviteRejectReason.SUSPICIOUS_BURST
+
+        inviter = member.guild.get_member(inviter_id)
+        if inviter is not None:
+            delta_days = abs(
+                int(member.created_at.timestamp()) - int(inviter.created_at.timestamp())
+            ) / 86400
+            if delta_days <= config.INVITE_AGE_PROXIMITY_DAYS:
+                return config.InviteStatus.HOLD, config.InviteRejectReason.SUSPICIOUS_AGE
+
+        if campaign["require_review"]:
+            return config.InviteStatus.HOLD, None
+        return config.InviteStatus.PENDING, None
+
+    async def handle_member_leave(self, guild_id: int, user_id: int) -> None:
+        """退出を記録する (再入場の検知に使う)。"""
+        try:
+            await self.db.record_member_leave(guild_id, user_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("退出の記録に失敗しました guild=%s user=%s", guild_id, user_id)
+
+    async def confirm_invite_after_charge(self, guild_id: int, user_id: int) -> None:
+        """チャージ完了をトリガーに招待報酬を確定する。"""
+        record = await self.db.list_pending_invites_for_user(guild_id, user_id)
+        if record is None:
+            return
+        campaign = await self.db.get_campaign(int(record["campaign_id"] or 0))
+        if campaign is None or campaign["status"] != config.CampaignStatus.ACTIVE:
+            return
+        if not campaign["require_charge"]:
+            return
+        require_days = int(campaign["require_days"] or 0)
+        if require_days > 0:
+            elapsed = (utils.now_ts() - int(record["joined_at"])) / 86400
+            if elapsed < require_days:
+                logger.info(
+                    "滞在日数の条件を満たしていないため確定を保留します record=%s", record["id"]
+                )
+                return
+        await self._confirm_invite(int(record["id"]))
+
+    async def confirm_invites_by_days(self) -> int:
+        """滞在日数の条件を満たした招待を確定する (チャージ条件なしの設定)。"""
+        rows = await self.db.list_invites_awaiting_days()
+        confirmed = 0
+        now = utils.now_ts()
+        for row in rows:
+            require_days = int(row["require_days"] or 0)
+            if require_days <= 0:
+                continue
+            if (now - int(row["joined_at"])) / 86400 < require_days:
+                continue
+            guild = self.bot.get_guild(int(row["guild_id"]))
+            if guild is not None and guild.get_member(int(row["invited_id"])) is None:
+                # 既に退出している場合は確定しない
+                await self.db.set_invite_status(
+                    int(row["id"]), config.InviteStatus.REJECTED,
+                    reason=config.InviteRejectReason.REJOIN,
+                )
+                continue
+            if await self._confirm_invite(int(row["id"])):
+                confirmed += 1
+        return confirmed
+
+    async def _confirm_invite(self, record_id: int) -> bool:
+        """招待を確定して報酬を付与し、関係者へ通知する。"""
+        try:
+            result = await self.db.confirm_invite_and_reward(record_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("招待の確定に失敗しました record=%s", record_id)
+            await self.alert_admins(
+                None, "招待報酬の付与に失敗",
+                f"記録ID `{record_id}` の確定に失敗しました: {utils.safe_error_text(exc, limit=200)}",
+            )
+            return False
+        if result.get("already_confirmed"):
+            return False
+        guild_id = int(result["guild_id"])
+        inviter_id = result.get("inviter_id")
+        invited_id = int(result["invited_id"])
+        self.metrics["invites_confirmed"] += 1
+        logger.info(
+            "招待報酬を付与しました record=%s guild=%s inviter=%s invited=%s",
+            record_id, guild_id, inviter_id, invited_id,
+        )
+        for user_id, amount, label in (
+            (inviter_id, int(result["reward_inviter"]), "招待報酬"),
+            (invited_id, int(result["reward_invited"]), "参加ボーナス"),
+        ):
+            if not user_id or amount <= 0:
+                continue
+            balance = await self.db.get_balance(guild_id, user_id)
+            await self._safe(
+                self.log_balance_change(
+                    guild_id,
+                    change_type=config.BalanceChangeType.INVITE_REWARD,
+                    user_id=user_id,
+                    balance_before=balance - amount,
+                    balance_after=balance,
+                    change=amount,
+                    reason=f"{label} (記録ID {record_id})",
+                ),
+                context="招待報酬の残高ログ",
+            )
+            await self._safe(
+                self._send_dm(
+                    user_id,
+                    ui.invite_reward_embed(
+                        guild_name=(self.bot.get_guild(guild_id).name
+                                    if self.bot.get_guild(guild_id) else str(guild_id)),
+                        label=label, amount=amount, balance_after=balance,
+                        campaign_name=str(result.get("campaign_name") or ""),
+                    ),
+                ),
+                context="招待報酬DM",
+            )
+        await self._safe(self.log_event(
+            guild_id, "🎉 招待報酬を付与しました",
+            fields=(
+                ("招待者", f"<@{inviter_id}>" if inviter_id else "-", True),
+                ("参加者", f"<@{invited_id}>", True),
+                ("招待者報酬", utils.fmt_int(result["reward_inviter"]), True),
+                ("参加者報酬", utils.fmt_int(result["reward_invited"]), True),
+                ("記録ID", f"`{record_id}`", True),
+            ),
+            color=config.Color.SUCCESS,
+        ), context="招待確定ログ")
+        self.request_ranking_refresh(guild_id)
+        return True
+
+    async def review_invite(
+        self, record_id: int, *, approve: bool, operator_id: int, reason: str
+    ) -> dict[str, Any]:
+        """保留中の招待を管理者が承認・却下する。"""
+        record = await self.db.get_invite_record(record_id)
+        if record is None:
+            raise ChargeError(config.ErrorCode.UNKNOWN_ERROR, "招待記録が見つかりません")
+        if record["status"] not in (config.InviteStatus.HOLD, config.InviteStatus.PENDING):
+            raise ChargeError(
+                config.ErrorCode.UNKNOWN_ERROR,
+                f"確認できない状態です ({record['status']})",
+            )
+        guild_id = int(record["guild_id"])
+        if approve:
+            campaign = await self.db.get_campaign(int(record["campaign_id"] or 0))
+            requires_more = bool(
+                campaign and campaign["require_charge"]
+                and record["status"] == config.InviteStatus.HOLD
+            )
+            if requires_more:
+                # 承認後もチャージ条件の判定を継続させる
+                await self.db.set_invite_status(
+                    record_id, config.InviteStatus.PENDING,
+                    reason="管理者承認 (チャージ条件の判定を継続)", reviewed_by=operator_id,
+                )
+                confirmed = False
+            else:
+                confirmed = await self._confirm_invite(record_id)
+        else:
+            await self.db.set_invite_status(
+                record_id, config.InviteStatus.REJECTED,
+                reason=utils.truncate(f"管理者却下: {reason}", 300), reviewed_by=operator_id,
+            )
+            confirmed = False
+        op_id = await self.db.add_audit_log(
+            actor_id=operator_id,
+            action="INVITE_APPROVE" if approve else "INVITE_REJECT",
+            guild_id=guild_id,
+            target_user_id=int(record["invited_id"]),
+            detail={"record_id": record_id, "inviter_id": record["inviter_id"],
+                    "reason": utils.truncate(reason, 300)},
+        )
+        return {"operation_id": op_id, "confirmed": confirmed}
+
+    # ==================================================================
+    # 残高の詳細操作 (管理者向けラッパ)
+    # ==================================================================
+    async def move_balance(
+        self,
+        *,
+        guild_id: int,
+        from_user_id: int,
+        to_user_id: int,
+        amount: int,
+        operator_id: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        """残高を利用者間で付け替える。"""
+        result = await self.db.move_balance(
+            guild_id=guild_id, from_user_id=from_user_id, to_user_id=to_user_id,
+            amount=amount, operator_id=operator_id, reason=reason,
+        )
+        await self.db.add_audit_log(
+            actor_id=operator_id, action="BALANCE_MOVE", guild_id=guild_id,
+            target_user_id=to_user_id,
+            detail={"from": from_user_id, "to": to_user_id, "amount": amount,
+                    "operation_id": result["operation_id"],
+                    "reason": utils.truncate(reason, 300)},
+        )
+        for user_id, before, after, change, change_type in (
+            (from_user_id, result["from_before"], result["from_after"], -amount,
+             config.BalanceChangeType.ADMIN_MOVE_OUT),
+            (to_user_id, result["to_before"], result["to_after"], amount,
+             config.BalanceChangeType.ADMIN_MOVE_IN),
+        ):
+            await self._safe(
+                self.log_balance_change(
+                    guild_id, change_type=change_type, user_id=user_id,
+                    balance_before=before, balance_after=after, change=change,
+                    reason=reason, operator_id=operator_id,
+                    operation_id=result["operation_id"],
+                ),
+                context="付け替えの残高ログ",
+            )
+        self.request_ranking_refresh(guild_id)
+        await self._safe(self.log_event(
+            guild_id, "🔀 残高の付け替え",
+            fields=(
+                ("出金元", f"<@{from_user_id}>", True),
+                ("入金先", f"<@{to_user_id}>", True),
+                ("金額", utils.fmt_int(amount), True),
+                ("操作者", f"<@{operator_id}>", True),
+                ("理由", utils.truncate(reason, 200), False),
+                ("操作ID", f"`{result['operation_id']}`", True),
+            ),
+            color=config.Color.ACCENT,
+        ), context="付け替えログ")
+        return result
+
+    async def undo_balance_change(
+        self, *, guild_id: int, history_id: int, operator_id: int, reason: str
+    ) -> dict[str, Any]:
+        """残高変更履歴1件を逆仕訳で取り消す。"""
+        result = await self.db.undo_balance_history(
+            history_id, guild_id=guild_id, operator_id=operator_id, reason=reason
+        )
+        op_id = await self.db.add_audit_log(
+            actor_id=operator_id, action="BALANCE_UNDO", guild_id=guild_id,
+            target_user_id=int(result["user_id"]),
+            detail={"history_id": history_id, "original_type": result["original_type"],
+                    "original_change": result["original_change"],
+                    "applied_change": result["applied_change"],
+                    "reason": utils.truncate(reason, 300)},
+        )
+        await self._safe(
+            self.log_balance_change(
+                guild_id, change_type=config.BalanceChangeType.UNDO,
+                user_id=int(result["user_id"]),
+                balance_before=int(result["balance_before"]),
+                balance_after=int(result["balance_after"]),
+                change=int(result["applied_change"]),
+                reason=f"履歴ID {history_id} の取消: {reason}",
+                operator_id=operator_id, operation_id=op_id,
+                history_id=int(result["undo_history_id"]),
+            ),
+            context="取消の残高ログ",
+        )
+        self.request_ranking_refresh(guild_id)
+        await self._safe(self.log_event(
+            guild_id, "↩️ 残高操作の取消",
+            fields=(
+                ("対象", f"<@{result['user_id']}>", True),
+                ("取消した履歴", f"`{history_id}` ({result['original_type']})", True),
+                ("適用差分", utils.fmt_int(result["applied_change"]), True),
+                ("残高", f"{utils.fmt_int(result['balance_before'])} → "
+                         f"{utils.fmt_int(result['balance_after'])}", True),
+                ("操作者", f"<@{operator_id}>", True),
+                ("理由", utils.truncate(reason, 200), False),
+            ),
+            color=config.Color.WARNING,
+        ), context="取消ログ")
+        return {**result, "operation_id": op_id}
+
+    async def repair_balance(
+        self, *, guild_id: int, user_id: int, operator_id: int, reason: str, mode: str
+    ) -> dict[str, Any]:
+        """残高と履歴合計の不一致を修復する。"""
+        result = await self.db.repair_balance(
+            guild_id=guild_id, user_id=user_id, operator_id=operator_id,
+            reason=reason, mode=mode,
+        )
+        if not result.get("repaired"):
+            return result
+        op_id = await self.db.add_audit_log(
+            actor_id=operator_id, action="BALANCE_REPAIR", guild_id=guild_id,
+            target_user_id=user_id,
+            detail={"mode": mode, "actual": result["actual"], "expected": result["expected"],
+                    "diff": result["diff"], "reason": utils.truncate(reason, 300)},
+        )
+        await self._safe(
+            self.log_balance_change(
+                guild_id, change_type=config.BalanceChangeType.RECONCILE, user_id=user_id,
+                balance_before=int(result["actual"]),
+                balance_after=int(result["expected"]) if mode == "balance"
+                else int(result["actual"]),
+                change=0 if mode == "balance" else int(result["diff"]),
+                reason=f"突合修復 (mode={mode}): {reason}",
+                operator_id=operator_id, operation_id=op_id,
+            ),
+            context="修復の残高ログ",
+        )
+        if mode == "balance":
+            self.request_ranking_refresh(guild_id)
+        await self.alert_admins(
+            guild_id, "残高の突合修復を実行しました",
+            f"対象: <@{user_id}>\nmode: `{mode}`\n"
+            f"残高 {result['actual']} / 履歴合計 {result['expected']} (差分 {result['diff']})\n"
+            f"操作者: <@{operator_id}> / 操作ID `{op_id}`",
+        )
+        return {**result, "operation_id": op_id}
+
+    async def refund_charge_transaction(
+        self, tx_id: str, *, operator_id: int, reason: str
+    ) -> dict[str, Any]:
+        """完了済みチャージを取り消して残高を回収する。"""
+        result = await self.db.refund_transaction(
+            tx_id, operator_id=operator_id, reason=reason
+        )
+        guild_id = int(result["guild_id"])
+        user_id = int(result["user_id"])
+        await self.db.add_audit_log(
+            actor_id=operator_id, action="TX_REFUND", guild_id=guild_id,
+            target_user_id=user_id,
+            detail={"transaction_id": tx_id, "credited_amount": result["credited_amount"],
+                    "applied_change": result["applied_change"],
+                    "operation_id": result["operation_id"],
+                    "reason": utils.truncate(reason, 300)},
+        )
+        await self._safe(
+            self.log_balance_change(
+                guild_id, change_type=config.BalanceChangeType.REVERSAL, user_id=user_id,
+                balance_before=int(result["balance_before"]),
+                balance_after=int(result["balance_after"]),
+                change=int(result["applied_change"]),
+                reason=f"チャージ取消: {reason}", operator_id=operator_id,
+                operation_id=result["operation_id"], transaction_id=tx_id,
+            ),
+            context="取消の残高ログ",
+        )
+        self.request_ranking_refresh(guild_id)
+        await self._safe(self.update_achievement(tx_id), context="実績更新")
+        await self._safe(self.log_event(
+            guild_id, "🚫 チャージの取消",
+            fields=(
+                ("対象", f"<@{user_id}>", True),
+                ("取引ID", f"`{tx_id}`", True),
+                ("回収額", utils.fmt_int(result["credited_amount"]), True),
+                ("残高", f"{utils.fmt_int(result['balance_before'])} → "
+                         f"{utils.fmt_int(result['balance_after'])}", True),
+                ("操作者", f"<@{operator_id}>", True),
+                ("理由", utils.truncate(reason, 200), False),
+            ),
+            color=config.Color.DANGER,
+        ), context="取消ログ")
+        await self._safe(
+            self._send_dm(
+                user_id,
+                ui.refund_notice_embed(
+                    guild_name=(self.bot.get_guild(guild_id).name
+                                if self.bot.get_guild(guild_id) else str(guild_id)),
+                    tx_id=tx_id, amount=int(result["credited_amount"]),
+                    balance_after=int(result["balance_after"]), reason=reason,
+                ),
+            ),
+            context="取消DM",
+        )
+        return result
+
+    # ==================================================================
+    # MANUAL_REVIEW のエスカレーション
+    # ==================================================================
+    async def escalate_manual_reviews(self) -> int:
+        """長時間解決されない MANUAL_REVIEW を管理者へ再通知する。"""
+        threshold = utils.now_ts() - config.MANUAL_REVIEW_ESCALATION_SECONDS
+        rows = await self.db.list_stale_manual_reviews(threshold)
+        if not rows:
+            return 0
+        by_guild: dict[int, list[Any]] = {}
+        for row in rows:
+            by_guild.setdefault(int(row["guild_id"]), []).append(row)
+        for guild_id, items in by_guild.items():
+            lines = [
+                f"・`{r['id']}` <@{r['user_id']}> "
+                f"{utils.fmt_yen(int(r['received_amount'] or r['requested_amount']))} "
+                f"({utils.format_jst(int(r['updated_at']))} から未解決)"
+                for r in items[:10]
+            ]
+            await self.alert_admins(
+                guild_id, f"手動確認が {len(items)} 件 未解決です",
+                "\n".join(lines) + "\n`/transaction verify` → `/transaction resolve` で確定してください。",
+            )
+            # 再通知の間隔を空けるため updated_at を更新する
+            for row in items:
+                await self.db.execute(
+                    "UPDATE charge_transactions SET updated_at=? WHERE id=? AND status=?",
+                    (utils.now_ts(), str(row["id"]), config.TxStatus.MANUAL_REVIEW),
+                )
+        return len(rows)
+
+    # ==================================================================
+    # 日次サマリ
+    # ==================================================================
+    async def post_daily_summary(self, guild_id: int, *, start: int, end: int) -> bool:
+        """前日の実績サマリをサマリチャンネルへ投稿する。"""
+        settings = await self.db.get_settings(guild_id)
+        if not settings.summary_enabled or not settings.summary_channel_id:
+            return False
+        channel = await self._resolve_channel(
+            guild_id, settings.summary_channel_id, "summary_channel_id"
+        )
+        if channel is None:
+            return False
+        summary = await self.db.get_period_summary(guild_id, start=start, end=end)
+        distribution = await self.db.get_balance_distribution(guild_id)
+        embed = ui.daily_summary_embed(
+            guild_name=(self.bot.get_guild(guild_id).name
+                        if self.bot.get_guild(guild_id) else str(guild_id)),
+            start=start, end=end, summary=summary, distribution=distribution,
+        )
+        try:
+            await channel.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning("日次サマリの投稿に失敗しました guild=%s: %s",
+                           guild_id, utils.safe_error_text(exc))
+            return False
+        return True
+
+    def metrics_snapshot(self) -> dict[str, Any]:
+        """運用メトリクスのスナップショット (/system 表示用)。"""
+        receives = self.metrics.get("receive_count", 0)
+        avg = (self.metrics.get("receive_seconds", 0.0) / receives) if receives else 0.0
+        return {
+            **{k: int(v) if isinstance(v, (int, float)) and k != "receive_seconds" else v
+               for k, v in self.metrics.items()},
+            "receive_avg_seconds": round(avg, 2),
+            "cooldowns": len(self._cooldowns),
+        }
+
+    async def _update_panels(
+        self,
+        guild_id: int,
+        panel_type: str,
+        embed: discord.Embed,
+        view: discord.ui.View,
+    ) -> int:
+        """指定種類のパネルメッセージを一括更新する。"""
+        panels = await self.db.list_panels(guild_id, panel_type=panel_type)
+        updated = 0
+        for panel in panels:
+            channel = await self._resolve_message_channel(guild_id, int(panel["channel_id"]))
+            if channel is None:
+                await self.db.deactivate_panel(message_id=int(panel["message_id"]))
+                continue
+            try:
+                message = await channel.fetch_message(int(panel["message_id"]))
+                await message.edit(embed=embed, view=view)
+                updated += 1
+            except discord.NotFound:
+                logger.info("パネルが削除されていたため無効化します type=%s message=%s",
+                            panel_type, panel["message_id"])
+                await self.db.deactivate_panel(message_id=int(panel["message_id"]))
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.warning("パネル更新に失敗しました type=%s message=%s: %s",
+                               panel_type, panel["message_id"], utils.safe_error_text(exc))
+        return updated
+
+    async def refresh_shop_panels(self, guild_id: int) -> int:
+        """ショップパネルへ最新の商品情報を反映する。"""
+        settings = await self.db.get_settings(guild_id)
+        items = await self.db.list_shop_items(guild_id)
+        return await self._update_panels(
+            guild_id, config.PANEL_TYPE_SHOP,
+            ui.shop_panel_embed(settings, items), ui.ShopPanelView(),
+        )
+
+    async def refresh_invite_panels(self, guild_id: int) -> int:
+        """招待パネルへ最新のキャンペーン情報を反映する。"""
+        settings = await self.db.get_settings(guild_id)
+        campaign = await self.db.get_active_campaign(guild_id)
+        return await self._update_panels(
+            guild_id, config.PANEL_TYPE_INVITE,
+            ui.invite_panel_embed(settings, campaign), ui.InvitePanelView(),
+        )
+
+    async def build_admin_panel_embed(self, guild_id: int) -> discord.Embed:
+        """管理ダッシュボードの Embed を構築する。"""
+        settings = await self.db.get_settings(guild_id)
+        stats = await self.db.get_statistics(guild_id)
+        queue = await self.db.count_queue()
+        reviews = await self.db.list_transactions_by_status(
+            [config.TxStatus.MANUAL_REVIEW], limit=100
+        )
+        guild = self.bot.get_guild(guild_id)
+        return ui.admin_panel_embed(
+            guild_name=guild.name if guild else str(guild_id),
+            settings=settings,
+            kyash=self.kyash.status_snapshot(),
+            queue=queue,
+            stats=stats,
+            metrics=self.metrics_snapshot(),
+            review_count=len([r for r in reviews if int(r["guild_id"]) == guild_id]),
+            updated_at=utils.now_ts(),
+        )
+
+    async def refresh_admin_panels(self, guild_id: int) -> int:
+        """管理ダッシュボードを更新する。"""
+        panels = await self.db.list_panels(guild_id, panel_type=config.PANEL_TYPE_ADMIN)
+        if not panels:
+            return 0
+        embed = await self.build_admin_panel_embed(guild_id)
+        return await self._update_panels(
+            guild_id, config.PANEL_TYPE_ADMIN, embed, ui.AdminPanelView()
+        )
 
     # ==================================================================
     # 通知キューの再送

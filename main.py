@@ -217,11 +217,19 @@ class ChargeBot(commands.Bot):
         # 5-7) Persistent View の再登録 (チャージパネル / ランキングパネル)
         self.add_view(ui.ChargePanelView())
         self.add_view(ui.RankingPanelView())
-        charge_panels = await self.db.list_panels()
+        self.add_view(ui.ShopPanelView())
+        self.add_view(ui.InvitePanelView())
+        self.add_view(ui.AdminPanelView())
+        charge_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_CHARGE)
+        shop_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_SHOP)
+        invite_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_INVITE)
+        admin_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_ADMIN)
         ranking_panels = await self.db.list_ranking_panels()
         logger.info(
-            "Persistent View を登録しました (チャージパネル %s 件 / ランキングパネル %s 件)",
-            len(charge_panels), len(ranking_panels),
+            "Persistent View を登録しました (チャージ %s / ランキング %s / ショップ %s / "
+            "招待 %s / 管理 %s)",
+            len(charge_panels), len(ranking_panels), len(shop_panels),
+            len(invite_panels), len(admin_panels),
         )
 
         # 10) Kyash セッションの復元と状態確認
@@ -253,6 +261,15 @@ class ChargeBot(commands.Bot):
         for guild in self.guilds:
             allowed = await self.db.is_guild_allowed(guild.id)
             logger.info("  - %s (%s) 許可=%s", guild.name, guild.id, allowed)
+            if allowed:
+                # 招待キャンペーンの帰属判定に使う使用回数をキャッシュする
+                if await self.charge.sync_invite_cache(guild):
+                    logger.info("    招待キャッシュを同期しました")
+                elif await self.db.get_active_campaign(guild.id) is not None:
+                    logger.warning(
+                        "    招待一覧を取得できないため招待者を特定できません "
+                        "(Bot に「サーバー管理」権限が必要です)"
+                    )
         try:
             await self.change_presence(
                 activity=discord.Activity(
@@ -292,6 +309,35 @@ class ChargeBot(commands.Bot):
             "残高・履歴は保持されています。削除する場合は `/data delete` を使用してください。"
         )
 
+    async def on_member_join(self, member: discord.Member) -> None:
+        """参加イベント: 招待の帰属判定と不正チェックを行う。"""
+        try:
+            await self.charge.handle_member_join(member)
+        except Exception:  # noqa: BLE001 - 参加処理で Bot を落とさない
+            logger.exception("参加処理に失敗しました guild=%s user=%s",
+                             member.guild.id, member.id)
+
+    async def on_member_remove(self, member: discord.Member) -> None:
+        """退出イベント: 再入場の検知のため記録する。"""
+        try:
+            await self.charge.handle_member_leave(member.guild.id, member.id)
+        except Exception:  # noqa: BLE001
+            logger.exception("退出処理に失敗しました guild=%s user=%s",
+                             member.guild.id, member.id)
+
+    async def on_invite_create(self, invite: discord.Invite) -> None:
+        """招待が作成されたらキャッシュへ反映する (取りこぼし防止)。"""
+        if invite.guild is None:
+            return
+        cache = self.charge._invite_cache.setdefault(invite.guild.id, {})
+        cache[invite.code] = int(invite.uses or 0)
+
+    async def on_invite_delete(self, invite: discord.Invite) -> None:
+        """招待が削除されたらキャッシュから除く。"""
+        if invite.guild is None:
+            return
+        self.charge._invite_cache.get(invite.guild.id, {}).pop(invite.code, None)
+
     async def on_guild_role_delete(self, role: discord.Role) -> None:
         """管理者ロールが削除された場合は設定を解除して警告する。"""
         settings = await self.db.get_settings(role.guild.id)
@@ -308,6 +354,22 @@ class ChargeBot(commands.Bot):
                 "管理者ロール設定を解除しました。`/settings admin_role` で再設定してください。",
                 color=config.Color.DANGER,
             )
+        # ロール別チャージ率・ショップ商品からも取り除く
+        removed_rate = await self.db.remove_role_rate(role.guild.id, role.id)
+        items = [
+            item for item in await self.db.list_shop_items(role.guild.id, active_only=False)
+            if int(item["role_id"]) == role.id
+        ]
+        for item in items:
+            await self.db.update_shop_item(int(item["id"]), role.guild.id, active=0)
+        if removed_rate or items:
+            await self.charge.log_event(
+                role.guild.id, "⚠️ ロールが削除されました",
+                f"`{role.name}` の削除に伴い、ロール別チャージ率 {removed_rate} 件と"
+                f"ショップ商品 {len(items)} 件を無効化しました。",
+                color=config.Color.WARNING,
+            )
+            await self.charge.refresh_shop_panels(role.guild.id)
 
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
         """実績 / ログチャンネルが削除された場合は設定を無効化する。"""
@@ -317,6 +379,10 @@ class ChargeBot(commands.Bot):
             updates["achievement_channel_id"] = None
         if settings.log_channel_id == channel.id:
             updates["log_channel_id"] = None
+        if settings.balance_log_channel_id == channel.id:
+            updates["balance_log_channel_id"] = None
+        if settings.summary_channel_id == channel.id:
+            updates["summary_channel_id"] = None
         if updates:
             await self.db.update_settings(channel.guild.id, **updates)
             logger.warning("設定チャンネルが削除されました guild=%s channel=%s",
@@ -397,6 +463,30 @@ class ChargeBot(commands.Bot):
         if member is None:
             return False
         return bool(member.guild_permissions.manage_guild)
+
+    async def send_backup_to_owner(self, path: Any) -> bool:
+        """バックアップファイルを Bot Owner の DM へ送信する。
+
+        残高台帳と暗号化済みの Kyash トークンを含むため、送信先は Owner の DM のみ。
+        """
+        try:
+            owner = self.get_user(BOT_OWNER_ID) or await self.fetch_user(BOT_OWNER_ID)
+            await owner.send(
+                embed=ui.log_embed(
+                    "💾 DB バックアップ",
+                    f"`{path.name}`\n"
+                    "残高台帳を含みます。取り扱いに注意してください。\n"
+                    "※ Kyash のアクセストークンは暗号化されており、`data/secret.key` が"
+                    "ないと復号できません。リストアには鍵も必要です。",
+                    color=config.Color.INFO,
+                ),
+                file=discord.File(str(path), filename=path.name),
+            )
+            logger.info("バックアップを Owner へ送信しました: %s", path.name)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("バックアップの送信に失敗しました: %s", utils.safe_error_text(exc))
+            return False
 
     async def alert_owner(self, message: str) -> None:
         """Bot Owner へ DM で通知する (秘密情報は含めない)。"""
@@ -705,6 +795,265 @@ class ChargeBot(commands.Bot):
             embed=ui.info_embed("📜 あなたの順位", description, color=config.Color.RANKING),
             ephemeral=True,
         )
+
+    # ------------------------------------------------------------------
+    # ショップ操作ハンドラ
+    # ------------------------------------------------------------------
+    async def on_shop_open_button(self, interaction: discord.Interaction) -> None:
+        """🛒 ショップを開く → 商品選択 (Ephemeral)。"""
+        settings = await self._guard_user_action(interaction)
+        if settings is None:
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not settings.shop_enabled:
+            await interaction.followup.send(
+                embed=ui.info_embed("ショップは停止中です", "現在は購入できません。"),
+                ephemeral=True,
+            )
+            return
+        items = await self.db.list_shop_items(interaction.guild.id)
+        balance = await self.db.get_balance(interaction.guild.id, interaction.user.id)
+        embed = ui.shop_panel_embed(settings, items)
+        embed.add_field(name="あなたの残高", value=f"**{utils.fmt_int(balance)}**", inline=False)
+        await interaction.followup.send(
+            embed=embed,
+            view=ui.ShopSelectView(items, owner_id=interaction.user.id),
+            ephemeral=True,
+        )
+
+    async def on_shop_select(self, interaction: discord.Interaction, item_id: int) -> None:
+        """商品を選択 → 確認 → 購入。"""
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            return
+        item = await self.db.get_shop_item(item_id, interaction.guild.id)
+        if item is None or not item["active"]:
+            await ui.safe_respond(
+                interaction, embed=ui.error_embed(config.ErrorCode.SHOP_ITEM_UNAVAILABLE)
+            )
+            return
+        balance = await self.db.get_balance(interaction.guild.id, interaction.user.id)
+        duration = int(item["duration_days"])
+        view = ui.ConfirmView(
+            owner_id=interaction.user.id, confirm_label="購入する", danger=False, timeout=90
+        )
+        await interaction.response.send_message(
+            embed=ui.info_embed(
+                "🛒 購入の確認",
+                f"{ui.SEPARATOR}\n"
+                f"商品: **{item['name']}**\n"
+                f"ロール: <@&{int(item['role_id'])}>\n"
+                f"価格: **{utils.fmt_int(int(item['price']))}**\n"
+                f"期間: {f'{duration}日' if duration > 0 else '無期限'}\n"
+                f"購入後の残高: **{utils.fmt_int(balance - int(item['price']))}**\n"
+                f"{ui.SEPARATOR}",
+                color=config.Color.ACCENT,
+            ),
+            view=view,
+            ephemeral=True,
+        )
+        await view.wait()
+        if not view.value:
+            return
+        try:
+            result = await self.charge.purchase_shop_item(interaction.user, item_id)
+        except ChargeError as exc:
+            logger.info("購入を拒否しました user=%s code=%s", interaction.user.id, exc.code)
+            await interaction.followup.send(
+                embed=ui.error_embed(exc.code), ephemeral=True
+            )
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception("購入処理で予期しない例外が発生しました item=%s", item_id)
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.UNKNOWN_ERROR), ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            embed=ui.purchase_success_embed(
+                item_name=str(result["item_name"]), role_id=int(result["role_id"]),
+                price=int(result["price"]), balance_after=int(result["balance_after"]),
+                expires_at=result["expires_at"], purchase_id=int(result["purchase_id"]),
+            ),
+            ephemeral=True,
+        )
+        await self.charge.refresh_shop_panels(interaction.guild.id)
+
+    async def on_shop_myitems_button(self, interaction: discord.Interaction) -> None:
+        """📦 購入履歴 (Ephemeral)。"""
+        if await self._guard_user_action(interaction) is None:
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        rows = await self.db.list_user_purchases(interaction.guild.id, interaction.user.id)
+        await interaction.followup.send(embed=ui.my_items_embed(rows), ephemeral=True)
+
+    # ------------------------------------------------------------------
+    # 招待キャンペーン操作ハンドラ
+    # ------------------------------------------------------------------
+    async def on_invite_get_button(self, interaction: discord.Interaction) -> None:
+        """🔗 個人専用の招待リンクを取得 (Ephemeral)。"""
+        if await self._guard_user_action(interaction) is None:
+            return
+        if not isinstance(interaction.user, discord.Member):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await self.charge.issue_invite_code(interaction.user)
+        except ChargeError as exc:
+            await interaction.followup.send(embed=ui.error_embed(exc.code), ephemeral=True)
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception("招待リンクの発行で例外が発生しました user=%s", interaction.user.id)
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.INVITE_NOT_AVAILABLE), ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            embed=ui.invite_link_embed(
+                url=result["url"], code=result["code"],
+                summary=result["summary"], created=result["created"],
+            ),
+            ephemeral=True,
+        )
+
+    async def on_invite_status_button(self, interaction: discord.Interaction) -> None:
+        """📊 自分の招待状況 (Ephemeral)。"""
+        if await self._guard_user_action(interaction) is None:
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild_id = interaction.guild.id
+        summary = await self.db.get_invite_summary(guild_id, interaction.user.id)
+        rank, _, total = await self.db.get_invite_rank(guild_id, interaction.user.id)
+        records, _ = await self.db.list_invite_records(
+            guild_id, inviter_id=interaction.user.id, limit=10
+        )
+        await interaction.followup.send(
+            embed=ui.invite_status_embed(
+                summary=summary, rank=rank, total=total, records=records
+            ),
+            ephemeral=True,
+        )
+
+    async def on_invite_rank_button(self, interaction: discord.Interaction) -> None:
+        """🏆 招待ランキング (Ephemeral)。"""
+        settings = await self._guard_user_action(interaction)
+        if settings is None:
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        entries = await self.charge.build_ranking_entries(
+            interaction.guild.id, settings, config.RankingType.INVITE
+        )
+        await interaction.followup.send(
+            embed=ui.ranking_embed(
+                interaction.guild, entries, settings, updated_at=utils.now_ts(),
+                ranking_type=config.RankingType.INVITE,
+            ),
+            ephemeral=True,
+        )
+
+    # ------------------------------------------------------------------
+    # 管理ダッシュボード操作ハンドラ (押下時に毎回権限を確認)
+    # ------------------------------------------------------------------
+    async def _guard_admin_action(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            await ui.safe_respond(interaction, embed=ui.error_embed(config.ErrorCode.NOT_ALLOWED))
+            return False
+        if not await self.is_server_admin(interaction):
+            await ui.safe_respond(interaction, embed=ui.error_embed(config.ErrorCode.NOT_ALLOWED))
+            return False
+        return True
+
+    async def on_admin_refresh_button(self, interaction: discord.Interaction) -> None:
+        if not await self._guard_admin_action(interaction):
+            return
+        embed = await self.charge.build_admin_panel_embed(interaction.guild.id)
+        try:
+            await interaction.response.edit_message(embed=embed, view=ui.AdminPanelView())
+        except discord.HTTPException:
+            await ui.safe_respond(interaction, embed=embed)
+
+    async def on_admin_maintenance_button(self, interaction: discord.Interaction) -> None:
+        if not await self._guard_admin_action(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild_id = interaction.guild.id
+        settings = await self.db.get_settings(guild_id)
+        new_value = not settings.maintenance
+        await self.db.update_settings(guild_id, maintenance=1 if new_value else 0)
+        await self.db.add_audit_log(
+            actor_id=interaction.user.id,
+            action="MAINTENANCE_ON" if new_value else "MAINTENANCE_OFF",
+            guild_id=guild_id, detail={"source": "admin_panel"},
+        )
+        if not new_value:
+            self.charge.queue_wakeup.set()
+        await self.charge.refresh_charge_panels(guild_id)
+        await self.charge.refresh_admin_panels(guild_id)
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                f"{'🟠' if new_value else '🟢'} メンテナンスを{'開始' if new_value else '解除'}しました",
+                "チャージパネルの表示も更新しました。",
+            ),
+            ephemeral=True,
+        )
+
+    async def on_admin_queue_button(self, interaction: discord.Interaction) -> None:
+        if not await self._guard_admin_action(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        items = await self.db.list_queue(limit=15)
+        now = utils.now_ts()
+        lines = [
+            f"{config.STATUS_EMOJI.get(str(i['tx_status']), '⚪')} `{i['transaction_id']}` "
+            f"<@{i['user_id']}> {utils.fmt_yen(int(i['requested_amount']))} "
+            f"/ 待機 {utils.format_duration(now - int(i['enqueued_at']))} / 再試行 {i['attempts']}"
+            for i in items
+        ]
+        await interaction.followup.send(
+            embed=ui.info_embed(
+                "🗃 受取キュー",
+                f"{ui.SEPARATOR}\n" + ("\n".join(lines) if lines else "キューは空です。"),
+            ),
+            ephemeral=True,
+        )
+
+    async def on_admin_review_button(self, interaction: discord.Interaction) -> None:
+        if not await self._guard_admin_action(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild_id = interaction.guild.id
+        rows, total = await self.db.search_transactions(
+            guild_id=guild_id, status=config.TxStatus.MANUAL_REVIEW, limit=10
+        )
+        lines = [
+            f"`{r['id']}` <@{r['user_id']}> "
+            f"{utils.fmt_yen(int(r['received_amount'] or r['requested_amount']))} "
+            f"/ `{r['error_code']}` / {utils.format_jst(int(r['updated_at']))}"
+            for r in rows
+        ]
+        invite_holds, hold_total = await self.db.list_invite_records(
+            guild_id, status=config.InviteStatus.HOLD, limit=5
+        )
+        embed = ui.info_embed(
+            f"🟠 要確認 ({total} 件)",
+            f"{ui.SEPARATOR}\n" + ("\n".join(lines) if lines else "手動確認が必要な取引はありません。"),
+            color=config.Color.WARNING if total else config.Color.SUCCESS,
+        )
+        if invite_holds:
+            embed.add_field(
+                name=f"招待の確認待ち ({hold_total} 件)",
+                value="\n".join(
+                    f"`{r['id']}` <@{r['invited_id']}> ← <@{r['inviter_id']}> "
+                    f"({config.INVITE_REASON_LABELS.get(str(r['reason']), str(r['reason'] or '-'))})"
+                    for r in invite_holds
+                ),
+                inline=False,
+            )
+        embed.add_field(
+            name="操作",
+            value="`/transaction verify` → `/transaction resolve` / `/campaign review`",
+            inline=False,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ------------------------------------------------------------------
     # Kyash ログインハンドラ (Bot Owner 専用)

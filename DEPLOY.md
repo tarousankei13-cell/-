@@ -6,8 +6,19 @@ Bot は管理者が登録した **受取用 Kyash アカウント** でリンク
 サーバーごとのチャージ率を適用して内部残高を付与します。
 
 > 内部残高は Discord サーバー内の数値です。現金化・出金・外部商品との交換には対応しません。
+> サーバー内のロール購入 (VIP など) と招待キャンペーンの報酬にのみ使用します。
 
-- Bot バージョン: `1.0.0` / DB スキーマ: `v1`
+**v2 の主な追加機能**
+- VIP ロールショップ (内部残高で購入 → ロール付与 → **そのロールでチャージ率が上がる**)
+- 招待キャンペーン (Bot 発行の個人専用リンク / チャージ完了で報酬確定 / 多層の不正対策)
+- 管理者向けの詳細な残高操作 (付け替え・操作取消・突合・修復・一括・台帳検索)
+- 残高操作ログチャンネル / 監査 CSV 出力 / 日次サマリ自動投稿
+- 管理ダッシュボード (常設・自動更新) / 統合調査ビュー `/inspect`
+- 期間別ランキング (週間・月間・招待) / 設定の入出力 / 期限付きサーバー許可
+- トークン失効の事前警告 / 受取アカウント残高しきい値 / 連続失敗クールダウン
+- 死活監視 (ハートビート) / バックアップの外部保存 / GitHub Actions による自動テスト
+
+- Bot バージョン: `2.0.0` / DB スキーマ: `v2`
 - 想定環境: Python 3.11+ / discord.py 2.x / SQLite (WAL) / Linux VPS + systemd
 - Kyash 連携: 同梱の添付モジュール `vendor/Kyasher` (Kyasher 1.5.0) のみを使用
 
@@ -22,14 +33,17 @@ discord-charge-bot/
 ├── utils.py                    # 金額(Decimal)・リンク正規化/ハッシュ・マスキング・レート制限・トークン暗号化
 ├── database.py                 # SQLite スキーマ / マイグレーション / 全クエリ / 冪等な残高付与
 ├── kyash_service.py            # 添付モジュールの安全な抽象化 (直列化・タイムアウト・受取確認)
-├── charge_service.py           # チャージのライフサイクル・キュー処理・通知・ランキング更新
+├── charge_service.py           # チャージ・ショップ・招待・残高操作・通知・ランキング
 ├── ui.py                       # Embed / Persistent View / Modal
 ├── commands.py                 # スラッシュコマンド (Owner / Admin)
 ├── tasks.py                    # バックグラウンドタスク (キューワーカー等) + 自己復旧監視
 ├── requirements.txt
 ├── discord-charge-bot.service  # systemd unit
 ├── tests/
-│   └── test_charge_flow.py     # 統合テスト (Kyash の HTTP のみモック / 79項目)
+│   ├── test_charge_flow.py     # 統合テスト: チャージ本体 (87項目)
+│   ├── test_v2_features.py     # 統合テスト: ショップ/招待/残高操作 (79項目)
+│   └── test_migration.py       # v1 → v2 スキーマ移行 (13項目)
+├── .github/workflows/test.yml  # CI (lint + 起動前チェック + 全テスト)
 ├── vendor/
 │   └── Kyasher/                # 添付モジュール (無変更で同梱・監査用)
 └── data/                       # 実行時に生成 (DB / バックアップ / 暗号化キー)
@@ -173,9 +187,16 @@ journalctl -u discord-charge-bot -p err        # エラーのみ
 | `/kyash login` | 受取用アカウントへログイン (Modal → 必要なら SMS 認証コード) |
 | `/kyash logout` | ログアウト (確認ボタン・保存済み認証情報を削除) |
 | `/kyash reconnect` | 保存情報でセッションを再確認し受取を再開 |
+| `/server suspend <guild_id> <until>` | 期限付き許可 (期限切れで自動的に利用不可) |
 | `/data delete [guild_id]` | サーバーデータの完全削除 (**2段階確認** + 削除前バックアップ) |
 | `/backup` | DB バックアップの手動実行 |
 | `/stats global_scope:True` | Bot 全体の統計 |
+| `/global overview` | 全サーバー横断の状況一覧 |
+| `/global stats` | Bot 全体の統計とメトリクス |
+| `/kyash threshold <amount>` | 受取用アカウントの残高しきい値 |
+| `/system heartbeat <url>` | 死活監視URLの設定 |
+| `/system backup_remote <mode> [directory]` | バックアップの外部保存 |
+| `/balance repair <user> <mode> <reason>` | 残高の突合修復 (2段階確認) |
 
 ### Server Admin (管理者ロール / サーバーオーナー / Bot Owner)
 
@@ -217,6 +238,28 @@ journalctl -u discord-charge-bot -p err        # エラーのみ
 | `/maintenance on` / `off` | メンテナンス (新規チャージ停止・読み取り機能は継続) |
 | `/emergency_stop on` / `off` | 緊急停止 (新規チャージ + 新規受取を停止・確認ボタン) |
 | `/achievement proxy <user> <amount> <reason> [charge_rate] [credited_amount]` | 代理実績 (確認ボタン) |
+| `/config show` / `export` / `import` / `reset` | 設定の確認・JSON入出力・初期化 |
+| `/system status` | システム状態 (旧 `/system`) |
+| `/inspect <user>` | 統合調査ビュー (残高・取引・招待・購入・注意点) |
+| `/admin_panel [channel]` | 管理ダッシュボードを設置 (常設・自動更新) |
+| `/rate set <role> <rate> [priority]` / `remove` / `list` | ロール別チャージ率 (VIP優遇) |
+| `/shop add/edit/remove/list/log/refund/panel` | ロールショップの管理 |
+| `/campaign create/edit/end/list/review/stats/blacklist/panel` | 招待キャンペーンの管理 |
+| `/balance move <from> <to> <amount> <reason>` | 残高の付け替え (確認ボタン) |
+| `/balance ledger [user] [type] [date] [operator]` | 残高台帳の検索 |
+| `/balance undo <history_id> <reason>` | 残高操作1件の取消 (確認ボタン) |
+| `/balance audit <user>` | 残高と履歴合計の突合 |
+| `/balance distribution` | 残高の分布分析 |
+| `/balance bulk <role> <operation> <amount> <reason>` | 一括残高操作 (既定はドライラン) |
+| `/transaction refund <tx_id> <reason>` | 完了済みチャージの取消 (確認ボタン) |
+| `/export transactions/balances/ledger/audit` | CSV 出力 |
+| `/user cooldown <user>` | 連続失敗クールダウンの解除 |
+| `/settings max_balance <amount>` | 1ユーザーの残高上限 |
+| `/settings manual_review_allow_new <bool>` | 確認中でも新規チャージを許可 |
+| `/settings balance_log_channel <ch>` / `balance_log_scope` | 残高操作ログ |
+| `/settings summary_channel <ch>` / `summary_enabled` | 日次サマリ |
+| `/settings shop_enabled <bool>` | ショップの有効/無効 |
+| `/settings panel_title` / `panel_description` / `accent_color` | パネルのブランディング |
 
 ---
 
@@ -231,6 +274,21 @@ journalctl -u discord-charge-bot -p err        # エラーのみ
 | 📜 履歴 | 自分の履歴のみ・ページング (Ephemeral) |
 | ❓ ヘルプ | チャージ方法・チャージ率・上限・注意事項 (Ephemeral) |
 | 🔄 更新 | パネル表示を最新の設定値に更新 |
+
+ショップパネル (`/shop panel` で設置):
+
+| ボタン | 内容 |
+|---|---|
+| 🛒 ショップを開く | 商品を選んで購入 (確認 → 残高から支払い → ロール付与) |
+| 📦 購入履歴 | 自分の購入履歴と有効期限 (Ephemeral) |
+
+招待パネル (`/campaign panel` で設置):
+
+| ボタン | 内容 |
+|---|---|
+| 🔗 招待リンクを取得 | 自分専用の招待リンクを発行 (Ephemeral) |
+| 📊 自分の招待状況 | 確定/保留/要確認/無効の件数と獲得報酬 |
+| 🏆 招待ランキング | 確定した招待数のランキング |
 
 ### チャージの流れ
 
@@ -280,8 +338,10 @@ journalctl -u discord-charge-bot -p err        # エラーのみ
 
 ```bash
 cd /opt/discord-charge-bot
-./venv/bin/python3 tests/test_charge_flow.py
-# → 結果: 79 件成功 / 0 件失敗
+./venv/bin/python3 tests/test_charge_flow.py   # 87 件
+./venv/bin/python3 tests/test_v2_features.py  # 79 件
+./venv/bin/python3 tests/test_migration.py    # 13 件
+# → 合計 179 件成功 / 0 件失敗
 ```
 
 検証内容: 金額検証 / 正常チャージ (130%→1300) / 二重付与防止 / 同一リンク再利用拒否 /
@@ -449,3 +509,196 @@ sudo systemctl start discord-charge-bot
 - **Discord 通知の失敗でチャージを巻き戻さない**: 通知・ランキング更新はすべて例外を吸収します。
 - **graceful shutdown**: SIGTERM/SIGINT で新規受付停止 → タスク停止 → セッション破棄 → DB commit → 切断。
 - **自己復旧**: 停止したバックグラウンドタスクを定期タスクが相互監視して再開します。
+
+---
+
+# v2 追加機能ガイド
+
+## VIP ロールショップ
+
+内部残高でロールを購入でき、購入したロールで**チャージ率が上がる**循環を作れます。
+
+```bash
+# 1) ロール別チャージ率を設定 (VIP を持つ人は 150%)
+/rate set role:@VIP charge_rate:150 priority:10
+
+# 2) そのロールを商品として販売
+/shop add role:@VIP name:VIPロール price:5000 duration_days:30 stock:10 purchase_limit:1
+
+# 3) ショップパネルを設置 (利用者はボタンから購入)
+/shop panel channel:#shop
+```
+
+- **購入フロー**: 残高の引き落としと購入記録を**単一トランザクション**で確定 → ロール付与 →
+  付与に失敗した場合は**自動で全額返金**します (残高が消えて終わることはありません)。
+- **前提条件**: Bot に「ロールの管理」権限が必要で、**Bot のロールが販売するロールより上**にある
+  必要があります。`/shop add` 実行時に検証し、満たない場合は登録を拒否します。
+- **期限付きロール**: `duration_days` を設定すると期限切れで自動剥奪します
+  (`TASK_SHOP_EXPIRY_INTERVAL` = 5分ごとに確認)。同じロールの有効な購入が他に残っている場合は剥奪しません。
+- **管理**: `/shop list` `/shop edit` `/shop remove` `/shop log` `/shop refund`
+- 適用されたチャージ率は Transaction 作成時に保存されるため、**後でレートを変えても過去の取引は変わりません**。
+
+## 招待キャンペーン
+
+### 開始手順
+
+```bash
+# 1) Bot に「サーバー管理」権限を付与する (招待者の特定に必須)
+# 2) キャンペーンを開始
+/campaign create name:春キャンペーン inviter_reward:500 invited_reward:300 \
+    preset:標準 confirm_condition:チャージ完了で確定
+
+# 3) 招待パネルを設置
+/campaign panel channel:#invite
+
+# 4) 招待ランキングパネル (任意)
+/ranking_panel channel:#ranking type:招待ランキング
+```
+
+### 不正対策の仕組み (多層)
+
+| 層 | 対策 |
+|---|---|
+| 帰属判定 | Bot が**個人専用の招待リンク**を発行し、参加時に招待の使用回数差分で招待者を特定 |
+| 報酬の確定 | 参加時点では **PENDING (保留)**。条件 (既定: 招待された人のチャージ完了) を満たして初めて確定 |
+| 冪等性 | `UNIQUE(guild_id, invited_id)` と `balance_history(transaction_id, type)` の UNIQUE 制約で**二重報酬を不可能に** |
+| 自己招待 | 招待者と参加者が同一なら無効 |
+| 再入場 | `guild_member_history` に初回参加を永続記録。**退出→再入場による周回は無効** |
+| 捨てアカウント | Discord アカウント作成からの経過日数が条件未満なら無効 (標準: 7日) |
+| 量産 | 招待者ごとの日次上限 (標準5人) / 累計上限 (標準50人)。**保留中も上限を消費** |
+| Bot | Bot アカウントは無効 |
+| 帰属不能 | バニティURL・サーバー発見経由は「招待者不明」として無効 (Discord の仕様上特定できません) |
+| 曖昧 | 同時に複数の招待が使われた場合は保留 |
+| 不審パターン | 短時間の大量参加 (5分に4件以上) / 招待者と参加者の**アカウント作成日が2日以内**は**保留 → 管理者レビュー** |
+| ブラックリスト | `/campaign blacklist add` で招待報酬の対象外に |
+
+> **却下と保留を分けています。** 明確な違反は自動で無効化し、「疑わしいが断定できない」ケースは
+> 自動で剥奪せず保留し、`/campaign review` で管理者が判断します。
+
+### 管理
+
+```bash
+/campaign review                    # 保留中の一覧
+/campaign review record_id:12 approve:True reason:確認済み
+/campaign stats                     # 確定/保留/無効の内訳と招待ランキング
+/campaign blacklist action:追加 user:@spammer reason:不正招待
+/campaign edit daily_limit:3        # 開催中に上限を変更
+/campaign end                       # 終了
+```
+
+## 管理者による詳細な残高操作
+
+| コマンド | 内容 |
+|---|---|
+| `/balance add/remove/set` | 加算・減算・設定 (減算と設定は確認ボタン) |
+| `/balance move <from> <to> <amount>` | **利用者間の付け替え** (誤付与の是正。両者を単一トランザクションで更新) |
+| `/balance ledger [user] [type] [date] [operator]` | **残高台帳の検索** (種別・期間・操作者で絞り込み) |
+| `/balance undo <history_id>` | **残高操作1件を逆仕訳で取消** (元の履歴は書き換えず、二重取消も不可) |
+| `/balance audit <user>` | 残高と履歴合計の**突合** (種別ごとの内訳つき) |
+| `/balance repair <user> <mode>` | 不一致の**修復** (Owner 限定・2段階確認) |
+| `/balance distribution` | 分布分析 (中位値・上位10%占有率・発行/消費総額) |
+| `/balance bulk <role> <operation>` | ロール保持者へ**一括操作** (既定はドライラン) |
+| `/balance info <user>` | 残高・順位・変更履歴 |
+| `/transaction refund <tx_id>` | **完了済みチャージの取消** (原取引に紐づく逆仕訳 + 利用者へ通知) |
+
+### 残高操作ログチャンネル
+
+```bash
+/settings balance_log_channel channel:#balance-log
+/settings balance_log_scope scope:管理者の手動操作のみ   # または「すべての残高変動」
+```
+
+- 記録内容: 種別・対象・操作者・**変更前→変更後**・差分・理由・操作ID・履歴ID・取引ID
+- **@everyone が閲覧できるチャンネルを指定すると確認を求めます** (他人の残高が見えるため)
+- 送信に失敗しても残高操作自体は成功したまま維持されます
+- `repair` を実行すると Owner へも通知されます
+
+### 修復モードの違い
+
+| mode | 動作 | 使いどころ |
+|---|---|---|
+| `history` | 履歴に差分行 (RECONCILE) を追記。**残高は変えない** | 残高が正しく、履歴が欠けている場合 |
+| `balance` | 残高を履歴合計へ戻す。経済的増減なしとして記録 (change=0) | 履歴が正しく、残高が壊れた場合 |
+
+## 管理ダッシュボード / 調査ビュー
+
+```bash
+/admin_panel channel:#admin      # 常設パネル (60秒ごとに自動更新)
+/inspect user:@someone           # 1画面での統合調査
+```
+
+- ダッシュボード: キュー滞留・Kyash 状態・**トークン残り日数**・要確認件数・本日の統計・メトリクス
+  ＋ボタン (更新 / メンテ切替 / キュー / 要確認)。**ボタン押下時にも毎回権限を確認**します。
+- `/inspect`: 残高・突合結果・チャージ実績・凍結・クールダウン・**適用レート**・アカウント作成日・
+  参加/退出回数・進行中取引・直近取引・招待実績・購入履歴・**注意すべき点の自動抽出**
+
+## 運用の安全装置 (v2)
+
+| 機能 | 設定 | 内容 |
+|---|---|---|
+| トークン失効の事前警告 | 自動 | 残り5日を切ると Owner へ**1日1回**通知 (自動更新はしません) |
+| 受取残高しきい値 | `/kyash threshold amount:` | 到達で**新規チャージを停止**し Owner へ通知。受取前に判定するため取りこぼしません |
+| 残高上限 | `/settings max_balance` | 上限を超えるチャージを**送金前に拒否** |
+| 連続失敗クールダウン | 自動 | 5回連続失敗で10分制限。`/user cooldown` で解除 |
+| 確認中のロック緩和 | `/settings manual_review_allow_new` | 手動確認待ちでも新規チャージを許可できる (既定は安全側で不可) |
+| 手動確認の再通知 | 自動 | 30分以上未解決の案件を管理者へ再通知 |
+| 死活監視 | `/system heartbeat url:` | `data/heartbeat` の更新＋外部URLへ定期通知 (クラッシュループの検知) |
+| バックアップ外部保存 | `/system backup_remote` | Owner DM 送信 / 別ディレクトリへコピー |
+| 期限付きサーバー許可 | `/server suspend guild_id: until:` | 期限を過ぎると自動で利用不可に |
+| 日次サマリ | `/settings summary_channel` | 毎日 JST 00:05 に前日分を自動投稿 |
+| 設定の入出力 | `/config export` / `import` / `reset` | 複数サーバーの初期構築を高速化 |
+| CSV 出力 | `/export transactions|balances|ledger|audit` | 監査・経理用 (Excel 互換の BOM 付き UTF-8) |
+
+## 期間別ランキング
+
+同じサーバーに複数の集計方式のパネルを同時設置できます (すべて独立)。
+
+```bash
+/ranking_panel channel:#ranking type:残高ランキング
+/ranking_panel channel:#weekly  type:週間チャージランキング
+/ranking_panel channel:#monthly type:月間チャージランキング
+/ranking_panel channel:#invite  type:招待ランキング
+```
+
+- 週間 = 直近7日 / 月間 = 当月 (JST) の**獲得残高**を集計。**取消済みチャージは除外**します。
+- 招待 = 確定した招待数。
+- 表示内容が前回と同じ場合は Discord API を呼びません (集計方式ごとに署名を比較)。
+
+## v2 で必要になる Discord 権限
+
+| 権限 | 用途 | 必須か |
+|---|---|---|
+| View Channel / Send Messages / Embed Links / Read Message History | 基本機能 | 必須 |
+| **Manage Roles** | ショップのロール付与・剥奪 | ショップを使う場合 |
+| **Create Invite** | 個人専用招待リンクの発行 | 招待キャンペーンを使う場合 |
+| **Manage Server** | 招待の使用回数の取得 (**招待者の特定**) | 招待キャンペーンを使う場合 |
+
+> ショップを使う場合、**Bot のロールを販売対象のロールより上**に配置してください。
+> `/setup` で権限の状態も確認できます。
+
+## v1 からのアップグレード
+
+```bash
+sudo systemctl stop discord-charge-bot
+cd /opt/discord-charge-bot
+sudo -u chargebot cp data/charge_bot.db data/charge_bot.db.pre-v2   # 念のため
+# v2 のファイル一式を配置 (main.py の3項目は書き換え直してください)
+sudo -u chargebot ./venv/bin/pip install -r requirements.txt
+sudo systemctl start discord-charge-bot
+journalctl -u discord-charge-bot -n 50
+```
+
+- スキーマは**起動時に自動で v1 → v2 へ移行**します (テーブル作成 → 列追加 → インデックス作成の順)。
+- 残高・履歴・取引・パネル・設定はすべて保持されます (`tests/test_migration.py` で検証済み)。
+- 移行後、追加設定は既定値 (残高上限=無制限 / 残高ログ=未設定 / ショップ=有効) になります。
+- ダウングレードはできません (v2 の DB を v1 のコードで開くと起動時に安全停止します)。
+
+## テスト
+
+```bash
+python3 tests/test_charge_flow.py    # チャージ本体 (87項目)
+python3 tests/test_v2_features.py    # ショップ/招待/残高操作 (79項目)
+python3 tests/test_migration.py      # v1 → v2 移行 (13項目)
+```
+
+GitHub Actions (`.github/workflows/test.yml`) で push 時に lint + 起動前チェック + 全テストを実行します。
