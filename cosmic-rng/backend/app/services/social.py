@@ -44,7 +44,7 @@ async def request_friend(db: AsyncSession, me: int, other_id: int) -> dict[str, 
             raise AppError("申請済みです", code="already_requested")
         # They asked first — treat my request as an accept.
         existing.status = "accepted"
-        return {"ok": True, "accepted": True}
+        return {"ok": True, "accepted": True, "status": "accepted"}
     accepted = (await db.execute(select(func.count()).select_from(Friendship).where(
         or_(Friendship.user_id == me, Friendship.friend_id == me), Friendship.status == "accepted"))).scalar_one()
     if accepted >= MAX_FRIENDS:
@@ -58,7 +58,7 @@ async def request_friend(db: AsyncSession, me: int, other_id: int) -> dict[str, 
 
     sender = await db.get(User, me)
     await feed_svc.notify_user(db, other_id, "friend_request", f"{sender.display_name} からフレンド申請が届きました")
-    return {"ok": True, "accepted": False}
+    return {"ok": True, "accepted": False, "status": "pending"}
 
 
 async def respond_friend(db: AsyncSession, me: int, other_id: int, accept: bool) -> dict[str, Any]:
@@ -152,8 +152,10 @@ async def create_guild(db: AsyncSession, user_id: int, name: str, tag: str, desc
     db.add(g)
     await db.flush()
     db.add(GuildMember(user_id=user_id, guild_id=g.id, role="owner"))
+    await db.flush()
     _online_cache.pop(g.id, None)
-    return {"ok": True, "guild_id": g.id, "stardust": user.stardust}
+    return {"ok": True, "guild_id": g.id, "guild": await _guild_public(db, g, with_members=True),
+            "stardust": user.stardust}
 
 
 async def join_guild(db: AsyncSession, user_id: int, guild_id: int) -> dict[str, Any]:

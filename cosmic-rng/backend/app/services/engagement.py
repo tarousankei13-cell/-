@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..content.registry import get_registry
-from ..core.errors import AppError, NotFound
+from ..core.errors import AppError, Conflict, NotFound
 from ..core.timeutil import utcnow
 from ..db import greatest, upsert as insert
 from ..models import GameEvent, SeasonPassClaim, User, UserStats, WeeklyStats
@@ -59,7 +59,7 @@ async def daily_status(db: AsyncSession, user_id: int) -> dict[str, Any]:
     cycle = (next_streak - 1) % len(LOGIN_BONUS)
     return {
         "available": available, "streak": stats.login_streak, "next_streak": next_streak,
-        "cycle_day": cycle, "days": LOGIN_BONUS, "today": today,
+        "cycle_day": cycle, "reward": LOGIN_BONUS[cycle], "days": LOGIN_BONUS, "today": today,
     }
 
 
@@ -68,7 +68,7 @@ async def claim_daily(db: AsyncSession, user_id: int) -> dict[str, Any]:
     stats = await users_svc.lock_stats(db, user_id)
     today = local_day()
     if stats.last_bonus_day == today:
-        raise AppError("本日のボーナスは受け取り済みです", code="already_claimed")
+        raise Conflict("本日のボーナスは受け取り済みです", code="already_claimed")
     yesterday = (utcnow().astimezone(_tz()).date() - timedelta(days=1)).isoformat()
     stats.login_streak = stats.login_streak + 1 if stats.last_bonus_day == yesterday else 1
     stats.last_bonus_day = today

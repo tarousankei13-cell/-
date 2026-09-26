@@ -820,3 +820,85 @@ async def bulk_operation(db: AsyncSession, principal: Principal, op: str, p: dic
     await db.commit()
     queue_event(db, "all", "admin_event", {"kind": "bulk", "op": op})
     return {"ok": True, **detail}
+
+
+# ---------------------------------------------------------------------------
+# Retention
+# ---------------------------------------------------------------------------
+async def retention(db: AsyncSession, days: int = 14) -> dict[str, Any]:
+    """Daily actives, new-account cohorts and the first-session funnel.
+
+    Everything here is derived from rows the game already writes, so no extra
+    tracking is collected. Cohorts only count days that have fully elapsed:
+    a D7 number for an account created yesterday would be meaningless.
+    """
+    now = utcnow()
+    days = max(1, min(int(days), 90))
+    since = now - timedelta(days=days)
+    date_expr = "date(created_at)" if is_sqlite() else "created_at::date"
+    seen_expr = "date(last_seen_at)" if is_sqlite() else "last_seen_at::date"
+
+    dau_rows = (await db.execute(text(
+        f"SELECT {date_expr} AS d, count(DISTINCT user_id) AS n FROM rolls WHERE created_at > :cut GROUP BY d ORDER BY d"
+    ), {"cut": since})).all()
+    new_rows = (await db.execute(text(
+        f"SELECT {date_expr} AS d, count(*) AS n FROM users WHERE created_at > :cut GROUP BY d ORDER BY d"
+    ), {"cut": since})).all()
+    seen_rows = (await db.execute(text(
+        f"SELECT {seen_expr} AS d, count(*) AS n FROM users WHERE last_seen_at > :cut GROUP BY d ORDER BY d"
+    ), {"cut": since})).all()
+
+    # Cohort retention: of the accounts created on day D, how many rolled on
+    # day D+1 (D1) and on any of days D+7..D+8 (D7)?
+    cohorts: list[dict[str, Any]] = []
+    for offset in range(days, 0, -1):
+        start = (now - timedelta(days=offset)).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        size = int((await db.execute(select(func.count()).select_from(m.User).where(
+            m.User.created_at >= start, m.User.created_at < end))).scalar_one())
+        if not size:
+            continue
+        entry: dict[str, Any] = {"date": start.date().isoformat(), "new_users": size, "d1": None, "d7": None}
+        for label, lo, hi in (("d1", 1, 2), ("d7", 7, 8)):
+            w_start, w_end = start + timedelta(days=lo), start + timedelta(days=hi)
+            if w_end > now:
+                continue
+            back = int((await db.execute(text(
+                "SELECT count(DISTINCT r.user_id) FROM rolls r JOIN users u ON u.id = r.user_id "
+                "WHERE u.created_at >= :cs AND u.created_at < :ce AND r.created_at >= :ws AND r.created_at < :we"
+            ), {"cs": start, "ce": end, "ws": w_start, "we": w_end})).scalar_one())
+            entry[label] = round(back * 100.0 / size, 1)
+        cohorts.append(entry)
+
+    # First-session funnel over the window: how far do new accounts get?
+    total_new = int((await db.execute(select(func.count()).select_from(m.User).where(m.User.created_at > since))).scalar_one())
+    rolled = int((await db.execute(text(
+        "SELECT count(*) FROM users u WHERE u.created_at > :cut AND EXISTS (SELECT 1 FROM rolls r WHERE r.user_id = u.id)"
+    ), {"cut": since})).scalar_one())
+    ten_rolls = int((await db.execute(select(func.count()).select_from(m.UserStats).join(
+        m.User, m.User.id == m.UserStats.user_id).where(m.User.created_at > since, m.UserStats.total_rolls >= 10))).scalar_one())
+    level5 = int((await db.execute(select(func.count()).select_from(m.User).where(
+        m.User.created_at > since, m.User.level >= 5))).scalar_one())
+    # "came back another day": last seen at least 20 hours after signing up.
+    later = ("julianday(last_seen_at) - julianday(created_at) > 0.83" if is_sqlite()
+             else "last_seen_at > created_at + interval '20 hours'")
+    returned = int((await db.execute(text(
+        f"SELECT count(*) FROM users WHERE created_at > :cut AND {later}"), {"cut": since})).scalar_one())
+
+    def pct(n: int) -> float:
+        return round(n * 100.0 / total_new, 1) if total_new else 0.0
+
+    return {
+        "days": days,
+        "dau": [{"date": str(r[0]), "count": int(r[1])} for r in dau_rows],
+        "new_users": [{"date": str(r[0]), "count": int(r[1])} for r in new_rows],
+        "active_users": [{"date": str(r[0]), "count": int(r[1])} for r in seen_rows],
+        "cohorts": cohorts,
+        "funnel": [
+            {"step": "登録", "count": total_new, "pct": 100.0 if total_new else 0.0},
+            {"step": "1回Roll", "count": rolled, "pct": pct(rolled)},
+            {"step": "10回Roll", "count": ten_rolls, "pct": pct(ten_rolls)},
+            {"step": "Lv.5到達", "count": level5, "pct": pct(level5)},
+            {"step": "翌日以降に再訪", "count": returned, "pct": pct(returned)},
+        ],
+    }

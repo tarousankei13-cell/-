@@ -58,6 +58,12 @@ async def dashboard(principal: Principal = ADMIN, db: AsyncSession = Depends(get
     return await admin_ops.dashboard(db)
 
 
+@router.get("/retention")
+async def retention(principal: Principal = ADMIN, db: AsyncSession = Depends(get_db),
+                    days: int = Query(default=14, ge=1, le=90)) -> dict[str, Any]:
+    return await admin_ops.retention(db, days)
+
+
 # --- Users -------------------------------------------------------------------
 @router.get("/users")
 async def users(principal: Principal = ADMIN, db: AsyncSession = Depends(get_db), q: str = Query(default="", max_length=64)) -> dict[str, Any]:

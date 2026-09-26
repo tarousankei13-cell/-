@@ -166,7 +166,9 @@ async def buy(db: AsyncSession, buyer_id: int, listing_id: int) -> dict[str, Any
     bought_today = int((await db.execute(select(func.count()).select_from(MarketListing).where(
         MarketListing.buyer_id == buyer.id, MarketListing.status == "sold",
         MarketListing.sold_at > now - timedelta(days=1)))).scalar_one())
-    if bought_today >= int(reg.setting("market.daily_buy_limit") or 120):
+    raw_limit = reg.setting("market.daily_buy_limit")
+    # `or` would swallow a deliberate 0, which an admin may set to freeze buying.
+    if bought_today >= (int(raw_limit) if raw_limit is not None else 120):
         raise AppError("本日のMarket購入上限に達しています", code="market_daily_limit", status_code=429)
     inst = (await db.execute(select(ItemInstance).where(ItemInstance.id == listing.instance_id).with_for_update())).scalar_one_or_none()
     if inst is None or inst.owner_id != seller.id or inst.state != "listed":

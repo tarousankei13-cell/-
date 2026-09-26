@@ -155,8 +155,10 @@ async def _velocity_check(db: AsyncSession, a_id: int, b_id: int) -> None:
     """
     reg = get_registry()
     day = utcnow() - timedelta(days=1)
-    per_user = int(reg.setting("trade.daily_limit") or 40)
-    per_pair = int(reg.setting("trade.pair_daily_limit") or 8)
+    raw_user, raw_pair = reg.setting("trade.daily_limit"), reg.setting("trade.pair_daily_limit")
+    # A deliberate 0 means "no trading today"; `or` would turn that into the default.
+    per_user = int(raw_user) if raw_user is not None else 40
+    per_pair = int(raw_pair) if raw_pair is not None else 8
     done = Trade.status == "accepted"
     recent = Trade.completed_at > day
     for uid in (a_id, b_id):
