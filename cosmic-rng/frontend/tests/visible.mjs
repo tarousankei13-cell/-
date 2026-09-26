@@ -22,17 +22,28 @@ const BASE = (process.argv[2] || process.env.BASE_URL || "http://localhost:8000"
 const USER = process.argv[3] || process.env.TEST_USER || "admin";
 const PASS = process.argv[4] || process.env.TEST_PASSWORD || "";
 
-const ROUTES = ["roll", "inventory", "collection", "equipment", "biomes", "shop", "market",
-                "trade", "quests", "achievements", "ranking", "profile", "settings"];
+const ROUTES = ["roll", "inventory", "collection", "sets", "equipment", "biomes", "shop", "shards",
+                "market", "trade", "friends", "guild", "events", "quests", "achievements", "ranking",
+                "pass", "fortune", "profile", "settings"];
 const SAMPLE = "h1,h2,h3,label,p,td,.chip,.btn,input,.kpi,.stat";
 const MAX_PER_PAGE = Number(process.env.MAX_PER_PAGE || 8);
 
 const pass = [], fail = [];
 
-/** True when the element puts pixels on the screen. */
+/** True when the element puts pixels on the screen, null when not testable. */
 async function paints(page, handle) {
   const box = await handle.boundingBox();
   if (!box || box.width < 2 || box.height < 2) return null;
+  // The bottom navigation is fixed over the page on a phone. An element parked
+  // under it is not an invisible element — the player scrolls and there it is.
+  // Comparing its box would only measure the nav, so skip those.
+  const undernav = await page.evaluate((b) => {
+    const nav = document.querySelector(".bottom-nav");
+    if (!nav) return false;
+    const n = nav.getBoundingClientRect();
+    return n.top < innerHeight && b.y + b.height > n.top;
+  }, box);
+  if (undernav) return null;
   const clip = { x: Math.max(0, box.x), y: Math.max(0, box.y),
                  width: Math.min(box.width, 700), height: Math.min(box.height, 200) };
   // A paint is a frame: wait for the compositor to produce one after each
@@ -130,6 +141,9 @@ try {
       await page.fill('input[autocomplete="current-password"]', PASS);
       await page.click('button[type="submit"]');
       await page.waitForSelector(".roll-button", { timeout: 25000 });
+      // A brand-new account meets the tutorial first; it covers the roll screen.
+      const skip = page.getByRole("button", { name: "スキップ" });
+      if (await skip.count()) { await skip.first().click(); await page.waitForTimeout(400); }
       for (const r of ROUTES) {
         await page.goto(BASE + r, { waitUntil: "networkidle" }).catch(() => {});
         await page.waitForTimeout(900);

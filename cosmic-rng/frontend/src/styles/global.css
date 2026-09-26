@@ -71,7 +71,15 @@
 
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; }
-html { -webkit-text-size-adjust: 100%; }
+html {
+  -webkit-text-size-adjust: 100%;
+  /* Anchor jumps, focus scrolling and scrollIntoView all land inside the
+     scroll port, which on a phone runs underneath the fixed navigation and
+     the sticky header. Padding the port keeps what they scroll to visible. */
+  scroll-padding-top: 104px;
+  scroll-padding-bottom: calc(var(--nav-h) + var(--safe-b) + 12px);
+}
+@media (min-width: 900px) { html { scroll-padding-bottom: 24px; } }
 
 body {
   margin: 0;

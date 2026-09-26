@@ -114,6 +114,12 @@ function BiomeCard() {
 function EventStrip() {
   const { data, reload } = useApi<EventsData>("/api/events");
   useEffect(() => events.on("game_event", () => reload()), [reload]);
+  // The community bar fills from everyone's rolls, so it moves without this
+  // player doing anything. A slow poll keeps it honest without chattering.
+  useEffect(() => {
+    const id = window.setInterval(() => reload(true), 60000);
+    return () => window.clearInterval(id);
+  }, [reload]);
   const active = data?.active ?? [];
   const boosts = active.filter((e) => e.type === "luck_multiplier");
   const goals = active.filter((e) => e.type === "community_goal");
