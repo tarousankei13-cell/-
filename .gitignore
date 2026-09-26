@@ -1,0 +1,15 @@
+# 実行時データ (DB / バックアップ / 暗号化キー) はコミットしない
+data/*
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# エディタ / OS
+.vscode/
+.idea/
+.DS_Store

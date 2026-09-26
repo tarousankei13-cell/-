@@ -1,0 +1,55 @@
+# 高性能 Kyash 自動チャージ Discord Bot / systemd unit
+#
+# 配置:
+#   sudo cp discord-charge-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now discord-charge-bot
+#
+# User / WorkingDirectory / ExecStart のパスは実環境に合わせて書き換えてください。
+[Unit]
+Description=Kyash Auto Charge Discord Bot
+Documentation=https://github.com/taka-4602/Kyasher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chargebot
+Group=chargebot
+WorkingDirectory=/opt/discord-charge-bot
+ExecStart=/opt/discord-charge-bot/venv/bin/python3 /opt/discord-charge-bot/main.py
+
+# 異常終了時は必ず再起動する (VPS 再起動後も自動起動)
+Restart=always
+RestartSec=10
+# 起動失敗を繰り返す場合の保護
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# Graceful shutdown: SIGTERM を受けて新規受付停止 → 状態保存 → DB commit → 切断
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+# ログは journald へ (journalctl -u discord-charge-bot -f で確認)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=discord-charge-bot
+
+# Python の出力をバッファリングしない (ログが即時反映される)
+Environment=PYTHONUNBUFFERED=1
+
+# 最小権限化 (Token・DB を含むため保護を強める)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/discord-charge-bot/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
