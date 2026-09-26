@@ -1,0 +1,300 @@
+/* ===================================================================== *
+ * Reveal cinematics — the emotional centre of the game.
+ * Stage scales with rarity tier: a Common drop is a blink, a ??? drop is
+ * a 30-second sequence that takes the whole screen apart.
+ * ===================================================================== */
+
+.cut {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.cut.interactive { cursor: pointer; }
+
+/* backdrop darkening scales with tier */
+.cut-veil {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at 50% 50%, rgba(2, 3, 10, var(--veil-c, 0.5)), rgba(1, 1, 6, var(--veil-e, 0.86)));
+  opacity: 0;
+  animation: cutVeilIn var(--veil-t, 0.5s) ease forwards;
+}
+@keyframes cutVeilIn { to { opacity: 1; } }
+
+.cut-stage { position: relative; display: grid; place-items: center; width: 100%; height: 100%; }
+
+/* ------------------------------------------------------------ small tiers */
+.cut.tier-1 .cut-veil, .cut.tier-2 .cut-veil { --veil-c: 0.25; --veil-e: 0.5; }
+.cut.tier-3 .cut-veil { --veil-c: 0.4; --veil-e: 0.7; }
+
+/* ------------------------------------------------------------- the crack  */
+.crack {
+  position: absolute;
+  width: min(92vw, 1000px);
+  height: 3px;
+  background: linear-gradient(90deg, transparent, #fff, transparent);
+  filter: blur(0.4px) drop-shadow(0 0 18px var(--glow, #fff));
+  transform: scaleX(0);
+  animation: crackOpen 1.1s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+@keyframes crackOpen {
+  0% { transform: scaleX(0) scaleY(1); opacity: 0; }
+  30% { transform: scaleX(1) scaleY(1); opacity: 1; }
+  100% { transform: scaleX(1) scaleY(60); opacity: 0.15; }
+}
+.crack.vertical { width: 3px; height: min(92vh, 900px); background: linear-gradient(180deg, transparent, #fff, transparent); animation-name: crackOpenV; }
+@keyframes crackOpenV {
+  0% { transform: scaleY(0); opacity: 0; }
+  30% { transform: scaleY(1); opacity: 1; }
+  100% { transform: scaleY(1) scaleX(60); opacity: 0.15; }
+}
+
+/* --------------------------------------------------------------- the halo */
+.halo {
+  position: absolute;
+  border-radius: 50%;
+  border: 2px solid var(--glow, #fff);
+  opacity: 0;
+  animation: haloOut var(--dur, 2.2s) cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+@keyframes haloOut {
+  0% { width: 0; height: 0; opacity: 0.95; border-width: 4px; }
+  100% { width: 190vmax; height: 190vmax; opacity: 0; border-width: 0.5px; }
+}
+
+.shockwave {
+  position: absolute;
+  border-radius: 50%;
+  background: radial-gradient(circle, transparent 58%, var(--glow, #fff) 62%, transparent 68%);
+  opacity: 0;
+  animation: shock 1.4s ease-out forwards;
+}
+@keyframes shock {
+  0% { width: 0; height: 0; opacity: 0.9; }
+  100% { width: 250vmax; height: 250vmax; opacity: 0; }
+}
+
+/* ----------------------------------------------------------- the star field */
+.cut-galaxy {
+  position: absolute;
+  width: min(120vmin, 1100px);
+  height: min(120vmin, 1100px);
+  border-radius: 50%;
+  background:
+    radial-gradient(ellipse at 50% 50%, var(--glow, #fff) 0%, transparent 12%),
+    conic-gradient(from 0deg, transparent, var(--c2, #7b4dff) 25%, transparent 50%, var(--c1, #ff7bd5) 75%, transparent);
+  filter: blur(14px);
+  /* Without a mask the disc's rim reads as a hard bright arc across the page. */
+  mask-image: radial-gradient(circle, #000 0%, #000 34%, transparent 72%);
+  -webkit-mask-image: radial-gradient(circle, #000 0%, #000 34%, transparent 72%);
+  opacity: 0;
+  animation: galaxyIn 3.2s ease forwards, spin 22s linear infinite;
+}
+@keyframes galaxyIn { 0% { opacity: 0; transform: scale(0.2); } 60% { opacity: 0.85; } 100% { opacity: 0.6; transform: scale(1); } }
+
+.cut-body {
+  position: absolute;
+  border-radius: 50%;
+  /* Uses the glow (always luminous) rather than the item's raw palette, whose
+     primary can be near-black and would render the body as a white blob. */
+  background: radial-gradient(circle at 35% 30%, var(--glow, #fff), var(--c2, #6a2cff) 52%, #05030f 100%);
+  box-shadow: 0 0 120px var(--glow, #fff), inset -34px -34px 96px rgba(0, 0, 0, 0.78);
+  animation: bodyRise 4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  opacity: 0;
+}
+
+/* Once the item itself takes the stage, the backdrop recedes so the reveal is the hero. */
+.cut-stage.focus .cut-body {
+  animation: bodyRise 4s cubic-bezier(0.16, 1, 0.3, 1) forwards, bodyRecede 1.6s 0.1s ease forwards;
+  box-shadow: none;   /* the 120px bloom would survive the fade as a milky smear */
+}
+.cut-stage.focus .cut-galaxy { animation: galaxyIn 3.2s ease forwards, spin 22s linear infinite, galaxyDim 1.6s 0.1s ease forwards; }
+.cut-stage.focus .rays { opacity: 0.04; }
+@keyframes bodyRecede { to { opacity: 0; transform: scale(1.6) translateY(-4vh); } }
+@keyframes galaxyDim { to { opacity: 0.2; } }
+@keyframes bodyRise {
+  0% { width: 0; height: 0; opacity: 0; transform: translateY(40vh); }
+  100% { width: min(70vmin, 560px); height: min(70vmin, 560px); opacity: 0.92; transform: translateY(6vh); }
+}
+
+/* ------------------------------------------------------------- the item */
+.cut-item {
+  position: relative;
+  display: grid;
+  place-items: center;
+  gap: 14px;
+  text-align: center;
+  padding: 0 18px;
+  max-width: min(92vw, 620px);
+}
+.cut-icon-wrap { position: relative; display: grid; place-items: center; animation: itemIn 0.9s cubic-bezier(0.16, 1, 0.3, 1) both; }
+@keyframes itemIn { from { opacity: 0; transform: scale(0.4) rotate(-14deg); } to { opacity: 1; transform: none; } }
+
+.cut-icon-wrap.silhouette svg { filter: brightness(0) drop-shadow(0 0 22px var(--glow, #fff)) !important; opacity: 0.85; }
+.cut-icon-wrap.reveal-flash { animation: revealFlash 0.7s ease both; }
+@keyframes revealFlash {
+  0% { filter: brightness(8) saturate(0); transform: scale(1.35); }
+  40% { filter: brightness(2.2); }
+  100% { filter: none; transform: scale(1); }
+}
+
+.cut-name {
+  font-family: var(--font-display);
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  line-height: 1.15;
+  font-size: clamp(1.5rem, 6vw, 3.2rem);
+  text-shadow: 0 0 22px currentColor, 0 0 60px currentColor;
+  animation: nameIn 0.8s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@keyframes nameIn { from { opacity: 0; transform: translateY(20px) scale(0.92); letter-spacing: 0.3em; } to { opacity: 1; transform: none; letter-spacing: 0.06em; } }
+
+.cut-odds {
+  font-family: var(--font-display);
+  font-size: clamp(1.1rem, 4.2vw, 2rem);
+  font-weight: 700;
+  color: #fff;
+  text-shadow: 0 0 18px var(--glow, #fff);
+  animation: oddsIn 0.7s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@keyframes oddsIn { from { opacity: 0; transform: scale(1.6); filter: blur(8px); } to { opacity: 1; transform: none; filter: none; } }
+
+.cut-meta { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; animation: fadeIn 0.6s 0.15s both; }
+.cut-meta .chip { background: rgba(0, 0, 0, 0.45); backdrop-filter: blur(6px); }
+
+.cut-banner {
+  font-family: var(--font-display);
+  font-weight: 900;
+  letter-spacing: 0.34em;
+  font-size: clamp(0.8rem, 3.4vw, 1.5rem);
+  padding: 8px 20px;
+  border-top: 1px solid currentColor;
+  border-bottom: 1px solid currentColor;
+  animation: bannerIn 0.9s cubic-bezier(0.16, 1, 0.3, 1) both;
+  text-shadow: 0 0 20px currentColor;
+}
+@keyframes bannerIn { from { opacity: 0; transform: scaleX(0.4); letter-spacing: 1em; } to { opacity: 1; transform: none; letter-spacing: 0.34em; } }
+
+.cut-sub { color: #cdd6ff; font-size: 0.92rem; animation: fadeIn 0.8s 0.3s both; }
+
+/* ---------------------------------------------------------------- rays */
+.rays {
+  position: absolute;
+  width: 200vmax;
+  height: 200vmax;
+  background: repeating-conic-gradient(from 0deg, var(--glow, #fff) 0deg 1.2deg, transparent 1.2deg 9deg);
+  opacity: 0.09;
+  animation: spin 40s linear infinite;
+  pointer-events: none;
+  mask-image: radial-gradient(circle, #000 0%, transparent 62%);
+  -webkit-mask-image: radial-gradient(circle, #000 0%, transparent 62%);
+}
+
+/* -------------------------------------------------------------- particles */
+.cut-spark {
+  position: absolute;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--glow, #fff);
+  box-shadow: 0 0 10px var(--glow, #fff);
+  animation: sparkOut var(--d, 2s) cubic-bezier(0.16, 1, 0.3, 1) var(--delay, 0s) both;
+}
+@keyframes sparkOut {
+  0% { transform: translate(0, 0) scale(0); opacity: 0; }
+  20% { opacity: 1; transform: translate(calc(var(--tx) * 0.2), calc(var(--ty) * 0.2)) scale(1.3); }
+  100% { transform: translate(var(--tx), var(--ty)) scale(0); opacity: 0; }
+}
+
+/* ------------------------------------------------------------ glitch text */
+.glitch-text { position: relative; }
+.glitch-text::before, .glitch-text::after {
+  content: attr(data-text);
+  position: absolute; inset: 0; opacity: 0.85;
+}
+.glitch-text::before { color: #00fff0; transform: translate(-2px, 1px); mix-blend-mode: screen; animation: glitchShift 0.42s steps(2) infinite; }
+.glitch-text::after { color: #ff2e8a; transform: translate(2px, -1px); mix-blend-mode: screen; animation: glitchShift 0.31s steps(2) infinite reverse; }
+
+/* --------------------------------------------------------------- screen fx */
+.cut-scanlines {
+  position: absolute; inset: 0; pointer-events: none;
+  background: repeating-linear-gradient(0deg, rgba(0,0,0,0.22) 0 1px, transparent 1px 3px);
+  opacity: 0.4; mix-blend-mode: multiply;
+}
+.cut-grid {
+  position: absolute; inset: -50%;
+  background-image: linear-gradient(rgba(120,255,200,0.14) 1px, transparent 1px), linear-gradient(90deg, rgba(120,255,200,0.14) 1px, transparent 1px);
+  background-size: 44px 44px;
+  transform: perspective(520px) rotateX(64deg) translateY(12%);
+  animation: gridMove 4.5s linear infinite;
+  mask-image: linear-gradient(0deg, #000, transparent 72%);
+  -webkit-mask-image: linear-gradient(0deg, #000, transparent 72%);
+}
+@keyframes gridMove { to { background-position: 0 44px; } }
+
+.cut-fracture {
+  position: absolute; inset: 0; pointer-events: none;
+  background:
+    linear-gradient(112deg, transparent 49.7%, rgba(255,255,255,0.75) 50%, transparent 50.3%),
+    linear-gradient(-58deg, transparent 39.8%, rgba(255,120,240,0.6) 40%, transparent 40.2%),
+    linear-gradient(28deg, transparent 69.8%, rgba(120,230,255,0.6) 70%, transparent 70.2%);
+  opacity: 0; animation: fractureFlash 2.6s ease-out forwards;
+}
+@keyframes fractureFlash { 0% { opacity: 0; } 12% { opacity: 1; } 100% { opacity: 0; } }
+
+/* ------------------------------------------------------------- skip button */
+.cut-skip {
+  position: absolute;
+  right: max(14px, env(safe-area-inset-right, 0px));
+  bottom: max(20px, calc(14px + env(safe-area-inset-bottom, 0px)));
+  z-index: 10;
+  display: flex; gap: 8px; align-items: center;
+  padding: 7px 14px; border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.3); background: rgba(0,0,0,0.5);
+  color: #fff; font-size: 0.8rem; cursor: pointer; backdrop-filter: blur(6px);
+  animation: fadeIn 0.6s 0.4s both;
+}
+.cut-skip:hover { border-color: #fff; }
+.cut-progress { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: rgba(255,255,255,0.14); z-index: 10; }
+.cut-progress > i { display: block; height: 100%; background: var(--glow, #fff); box-shadow: 0 0 12px var(--glow, #fff); }
+
+/* ------------------------------------------------------- world-feed banner */
+.world-banner {
+  position: fixed;
+  top: max(58px, calc(48px + env(safe-area-inset-top, 0px)));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 280;
+  display: flex; align-items: center; gap: 11px;
+  padding: 9px 18px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 210, 120, 0.6);
+  background: linear-gradient(90deg, rgba(30, 14, 46, 0.95), rgba(12, 16, 38, 0.95));
+  box-shadow: 0 0 34px rgba(255, 190, 90, 0.26);
+  animation: bannerDrop 0.6s cubic-bezier(0.16, 1, 0.3, 1) both;
+  max-width: min(94vw, 620px);
+  cursor: default;
+}
+@keyframes bannerDrop { from { opacity: 0; transform: translate(-50%, -26px); } to { opacity: 1; transform: translate(-50%, 0); } }
+.world-banner .label { font-family: var(--font-display); font-size: var(--fs-xs); letter-spacing: 0.22em; color: var(--gold); }
+
+/* --------------------------------------------------------------- offline */
+.offline-list { max-height: min(46vh, 420px); overflow: auto; display: flex; flex-direction: column; gap: 6px; }
+.offline-row { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 9px; background: rgba(255,255,255,0.04); }
+
+/* The reveal is the one screen everyone reads. The English name keeps the
+   weight it earns from the type design; the Japanese sits under it so nobody
+   has to know what the English says to know what they got. */
+.cut-name-ja {
+  margin-top: 2px; text-align: center; font-size: clamp(1rem, 2.6vw, 1.5rem); font-weight: 700;
+  letter-spacing: 0.06em; color: var(--text); text-shadow: 0 0 18px rgba(0, 0, 0, 0.9), 0 2px 6px rgba(0, 0, 0, 0.8);
+  opacity: 0; animation: cutNameJa 0.5s 0.16s ease forwards;
+}
+@keyframes cutNameJa { from { opacity: 0; transform: translateY(6px); } to { opacity: 0.92; transform: none; } }
+.badge-ja { margin-left: 6px; opacity: 0.82; font-weight: 600; }
+.cut-banner-ja { margin-left: 8px; font-size: 0.82em; opacity: 0.85; }

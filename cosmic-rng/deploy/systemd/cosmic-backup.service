@@ -1,0 +1,16 @@
+[Unit]
+Description=Cosmic RNG database backup
+After=postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+User=cosmic
+Group=cosmic
+WorkingDirectory=/opt/cosmic-rng/backend
+EnvironmentFile=/opt/cosmic-rng/.env
+ExecStart=/opt/cosmic-rng/backend/.venv/bin/python -m app.cli backup --kind scheduled
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cosmic-backup
+ReadWritePaths=/var/backups/cosmic-rng

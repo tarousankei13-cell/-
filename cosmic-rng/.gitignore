@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+# Secrets / local config
+.env
+backend/.env
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/test-results/
+# Runtime state created by main.py (SQLite database, session signing key)
+data/
+*.db
+*.db-wal
+*.db-shm
+backups/
+logs/
+*.log
