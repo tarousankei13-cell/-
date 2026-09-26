@@ -30,8 +30,8 @@ jobs:
       - name: Static type check (mypy)
         run: |
           python -m mypy --ignore-missing-imports \
-            config.py utils.py database.py kyash_service.py charge_service.py \
-            ui.py commands.py tasks.py main.py
+            config.py utils.py database.py kyash_service.py price_service.py \
+            charge_service.py ui.py commands.py tasks.py main.py
 
       - name: Startup validation must fail safely without a token
         run: |
@@ -61,6 +61,11 @@ jobs:
 
       - name: UI render test (embed limits)
         run: python tests/test_ui_render.py
+
+      - name: Provider test (PayPay / LTC requests)
+        run: python tests/test_providers.py
+        env:
+          CHARGE_BOT_TEST_DIR: ${{ runner.temp }}/charge_bot_provider
 
       - name: Command smoke test (all commands and buttons)
         run: python tests/test_commands_smoke.py

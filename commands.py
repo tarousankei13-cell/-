@@ -22,9 +22,11 @@ from discord import app_commands
 
 import config
 import kyash_service
+import price_service
 import ui
 import utils
 from charge_service import ChargeError
+from database import RequestError
 
 if TYPE_CHECKING:
     from main import ChargeBot
@@ -312,7 +314,11 @@ async def charge_panel_command(interaction: discord.Interaction) -> None:
         return
 
     settings = await bot.db.get_settings(guild.id)
-    embed = ui.charge_panel_embed(settings, kyash_ready=bot.kyash.is_usable)
+    embed = ui.charge_panel_embed(
+        settings,
+        kyash_ready=bot.kyash.is_usable,
+        providers=await bot.charge.provider_availability(guild.id, settings),
+    )
     message = await channel.send(embed=embed, view=ui.ChargePanelView())
     panel_id = await bot.db.add_panel(guild.id, channel.id, message.id, config.PANEL_TYPE_CHARGE)
     op_id = await _audit(
@@ -4883,6 +4889,757 @@ class GlobalGroup(app_commands.Group):
 
 
 # ---------------------------------------------------------------------------
+# /provider (チャージ方式の設定)
+# ---------------------------------------------------------------------------
+_PROVIDER_CHOICES = [
+    app_commands.Choice(name=config.PROVIDER_LABELS[p], value=p)
+    for p in config.ALL_PROVIDERS
+]
+_MANUAL_PROVIDER_CHOICES = [
+    app_commands.Choice(name=config.PROVIDER_LABELS[p], value=p)
+    for p in config.MANUAL_PROVIDERS
+]
+
+
+class ProviderGroup(app_commands.Group):
+    """チャージ方式 (Kyash / PayPay / LTC) の設定。
+
+    入金先と審査チャンネルは Bot Owner が全サーバー共通で設定する。
+    有効/無効・チャージ率・金額上下限はサーバーごとに管理者が設定する。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(name="provider", description="チャージ方式の設定")
+
+    # --- 管理者 ---
+    @app_commands.command(name="status", description="チャージ方式の状態を表示します")
+    @app_commands.guild_only()
+    @require_admin()
+    async def status(self, interaction: discord.Interaction) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        assert guild is not None
+        entries = await bot.charge.provider_availability(guild.id)
+        price = await bot.price.status_snapshot()
+        delegated = guild.id in await bot.charge.get_delegated_guilds()
+        await interaction.followup.send(
+            embed=ui.provider_status_embed(
+                entries,
+                guild_name=guild.name,
+                review_channel_id=await bot.charge.get_review_channel_id(),
+                price=price,
+                delegated=delegated,
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="enable", description="チャージ方式の受付を切り替えます")
+    @app_commands.describe(provider="対象の方式", enabled="受け付けるかどうか")
+    @app_commands.choices(provider=_PROVIDER_CHOICES)
+    @app_commands.guild_only()
+    @require_admin()
+    async def enable(
+        self,
+        interaction: discord.Interaction,
+        provider: app_commands.Choice[str],
+        enabled: bool,
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        assert guild is not None
+        await bot.db.set_provider_settings(
+            guild.id, provider.value, enabled=enabled, updated_by=interaction.user.id
+        )
+        op_id = await _audit(
+            interaction, "PROVIDER_ENABLE",
+            detail={"provider": provider.value, "enabled": bool(enabled)},
+        )
+        await bot.charge.refresh_charge_panels(guild.id)
+        await bot.charge.log_event(
+            guild.id, "⚙️ チャージ方式の受付を変更",
+            fields=(
+                ("方式", provider.name, True),
+                ("状態", "受付中" if enabled else "停止", True),
+                ("操作ID", f"`{op_id}`", True),
+            ),
+        )
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "✅ 受付状態を変更しました",
+                f"{provider.name}: **{'受付中' if enabled else '停止'}**\n操作ID: `{op_id}`",
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="rate", description="方式ごとのチャージ率を設定します")
+    @app_commands.describe(
+        provider="対象の方式",
+        charge_rate="例: 130 / 145.5。`clear` でサーバー既定に戻します",
+    )
+    @app_commands.choices(provider=_PROVIDER_CHOICES)
+    @app_commands.guild_only()
+    @require_admin()
+    async def rate(
+        self,
+        interaction: discord.Interaction,
+        provider: app_commands.Choice[str],
+        charge_rate: str,
+    ) -> None:
+        """方式別レートはサーバー既定を置き換える。
+
+        ロール別レート (VIP 等) と併用した場合は**高い方**が適用される。
+        """
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        assert guild is not None
+        clear = charge_rate.strip().lower() in ("clear", "reset", "既定", "なし")
+        parsed = None if clear else utils.validate_charge_rate(charge_rate)
+        if not clear and parsed is None:
+            await interaction.followup.send(
+                embed=ui.info_embed(
+                    "入力が不正です",
+                    f"チャージ率は {config.MIN_CHARGE_RATE}〜{config.MAX_CHARGE_RATE} で"
+                    "指定してください (`clear` で既定に戻します)。",
+                    color=config.Color.DANGER,
+                ),
+                ephemeral=True,
+            )
+            return
+        await bot.db.set_provider_settings(
+            guild.id, provider.value, charge_rate=parsed, clear_rate=clear,
+            updated_by=interaction.user.id,
+        )
+        op_id = await _audit(
+            interaction, "PROVIDER_RATE_SET",
+            detail={"provider": provider.value,
+                    "charge_rate": None if clear else str(parsed)},
+        )
+        await bot.charge.refresh_charge_panels(guild.id)
+        settings = await bot.db.get_settings(guild.id)
+        await bot.charge.log_event(
+            guild.id, "⚙️ 方式別チャージ率を設定",
+            fields=(
+                ("方式", provider.name, True),
+                ("チャージ率",
+                 "サーバー既定に戻しました" if clear else utils.fmt_rate(parsed), True),
+                ("操作ID", f"`{op_id}`", True),
+            ),
+        )
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "✅ チャージ率を設定しました",
+                f"{provider.name}: "
+                + ("**サーバー既定** "
+                   f"({utils.fmt_rate(settings.charge_rate)}) に戻しました"
+                   if clear else f"**{utils.fmt_rate(parsed)}**")
+                + f"\n操作ID: `{op_id}`\n\n"
+                "※ ロール別レート (`/rate set`) と併用した場合は**高い方**が適用されます。",
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="limits", description="方式ごとの金額上下限を設定します")
+    @app_commands.describe(
+        provider="対象の方式",
+        minimum="最低額 (0 でサーバー既定に戻す)",
+        maximum="最大額 (0 でサーバー既定に戻す)",
+    )
+    @app_commands.choices(provider=_PROVIDER_CHOICES)
+    @app_commands.guild_only()
+    @require_admin()
+    async def limits(
+        self,
+        interaction: discord.Interaction,
+        provider: app_commands.Choice[str],
+        minimum: app_commands.Range[int, 0, 100_000_000],
+        maximum: app_commands.Range[int, 0, 100_000_000],
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        assert guild is not None
+        clear = int(minimum) == 0 and int(maximum) == 0
+        if not clear and int(minimum) > 0 and int(maximum) > 0 and minimum > maximum:
+            await interaction.followup.send(
+                embed=ui.info_embed("入力が不正です", "最低額が最大額を超えています。",
+                                    color=config.Color.DANGER),
+                ephemeral=True,
+            )
+            return
+        await bot.db.set_provider_settings(
+            guild.id, provider.value,
+            minimum_charge=int(minimum) if not clear and minimum > 0 else None,
+            maximum_charge=int(maximum) if not clear and maximum > 0 else None,
+            clear_limits=clear, updated_by=interaction.user.id,
+        )
+        op_id = await _audit(
+            interaction, "PROVIDER_LIMITS_SET",
+            detail={"provider": provider.value, "minimum": int(minimum),
+                    "maximum": int(maximum), "clear": clear},
+        )
+        settings = await bot.db.get_settings(guild.id)
+        low, high = await bot.charge.provider_limits(guild.id, provider.value, settings)
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "✅ 金額の範囲を設定しました",
+                f"{provider.name}: **{utils.fmt_yen(low)} 〜 {utils.fmt_yen(high)}**\n"
+                f"操作ID: `{op_id}`",
+            ),
+            ephemeral=True,
+        )
+
+    # --- Bot Owner ---
+    @app_commands.command(
+        name="destination", description="入金先を登録します (Bot Owner)"
+    )
+    @app_commands.describe(
+        provider="対象の方式", address="PayPay ID / LTC アドレス",
+        label="表示名 (例: 受取用)", note="利用者へ見せる注意書き",
+    )
+    @app_commands.choices(provider=_MANUAL_PROVIDER_CHOICES)
+    @require_owner()
+    async def destination(
+        self,
+        interaction: discord.Interaction,
+        provider: app_commands.Choice[str],
+        address: str,
+        label: str | None = None,
+        note: str | None = None,
+    ) -> None:
+        """入金先は全サーバー共通。承認も既定では Bot Owner のみが行う。"""
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        value = address.strip()
+        if not value or len(value) > 200:
+            await interaction.followup.send(
+                embed=ui.info_embed("入力が不正です", "入金先は 1〜200 文字で指定してください。",
+                                    color=config.Color.DANGER),
+                ephemeral=True,
+            )
+            return
+        await bot.db.set_destination(
+            provider.value, address=value,
+            label=(label.strip()[:60] if label else None),
+            note=(note.strip()[:300] if note else None),
+            updated_by=interaction.user.id,
+        )
+        op_id = await _audit(
+            interaction, "PROVIDER_DESTINATION_SET",
+            detail={"provider": provider.value,
+                    "address": utils.mask_identifier(value, keep=6)},
+        )
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "✅ 入金先を登録しました",
+                f"方式: **{provider.name}**\n"
+                f"入金先: ```\n{value}\n```\n"
+                f"操作ID: `{op_id}`\n\n"
+                "利用者にはこの値がそのまま表示されます。**間違いがないか確認してください。**",
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="destination_clear", description="入金先の登録を削除します (Bot Owner)"
+    )
+    @app_commands.describe(provider="対象の方式")
+    @app_commands.choices(provider=_MANUAL_PROVIDER_CHOICES)
+    @require_owner()
+    async def destination_clear(
+        self, interaction: discord.Interaction, provider: app_commands.Choice[str]
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        approved = await _confirm(
+            interaction,
+            title=f"{provider.name} の入金先を削除します",
+            description="削除すると、この方式でのチャージは受け付けられなくなります。",
+            confirm_label="削除する",
+        )
+        if not approved:
+            return
+        removed = await bot.db.delete_destination(provider.value)
+        op_id = await _audit(
+            interaction, "PROVIDER_DESTINATION_CLEAR", detail={"provider": provider.value}
+        )
+        await interaction.followup.send(
+            embed=ui.info_embed(
+                "削除しました" if removed else "登録されていません",
+                f"方式: {provider.name}\n操作ID: `{op_id}`",
+                color=config.Color.NEUTRAL,
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="review_channel", description="申請の審査チャンネルを設定します (Bot Owner)"
+    )
+    @app_commands.describe(channel="審査カードを投稿するチャンネル (未指定で解除)")
+    @require_owner()
+    async def review_channel(
+        self, interaction: discord.Interaction, channel: discord.TextChannel | None = None
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if channel is not None:
+            me = channel.guild.me
+            if me is None or not _channel_writable(channel, me):
+                await interaction.followup.send(
+                    embed=ui.info_embed(
+                        "そのチャンネルには投稿できません",
+                        "Bot に「メッセージを送信」と「埋め込みリンク」の権限が必要です。",
+                        color=config.Color.DANGER,
+                    ),
+                    ephemeral=True,
+                )
+                return
+        await bot.charge.set_review_channel_id(channel.id if channel else None)
+        op_id = await _audit(
+            interaction, "PROVIDER_REVIEW_CHANNEL",
+            detail={"channel_id": channel.id if channel else None},
+        )
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "✅ 審査チャンネルを設定しました" if channel else "審査チャンネルを解除しました",
+                (f"投稿先: {channel.mention}\n" if channel else "")
+                + f"操作ID: `{op_id}`\n\n"
+                + ("すべてのサーバーの申請がここへ集まります。" if channel
+                   else "解除中は PayPay / LTC のチャージを受け付けません。"),
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="delegate",
+        description="そのサーバーの管理者にも承認を許可します (Bot Owner)",
+    )
+    @app_commands.describe(guild_id="対象サーバーID (未指定で現在のサーバー)", enabled="許可するか")
+    @require_owner()
+    async def delegate(
+        self, interaction: discord.Interaction, enabled: bool, guild_id: str | None = None
+    ) -> None:
+        """入金先は Owner のものなので、承認の既定は Owner だけ。
+
+        信頼できるサーバーにだけ、Owner が明示的に承認を委任する。
+        """
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        raw = (guild_id or "").strip()
+        if raw and not raw.isdigit():
+            await interaction.followup.send(
+                embed=ui.info_embed("入力が不正です", "サーバーIDは数字で指定してください。",
+                                    color=config.Color.DANGER),
+                ephemeral=True,
+            )
+            return
+        target = int(raw) if raw else (interaction.guild.id if interaction.guild else 0)
+        if not target:
+            await interaction.followup.send(
+                embed=ui.info_embed("対象が不明です", "サーバーIDを指定してください。",
+                                    color=config.Color.DANGER),
+                ephemeral=True,
+            )
+            return
+        current = await bot.charge.set_delegated(target, enabled)
+        op_id = await _audit(
+            interaction, "PROVIDER_DELEGATE",
+            detail={"guild_id": target, "enabled": bool(enabled),
+                    "delegated_count": len(current)},
+        )
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "✅ 承認の委任を変更しました",
+                f"サーバー: `{target}`\n"
+                f"管理者による承認: **{'許可' if enabled else '不可'}**\n"
+                f"委任中のサーバー数: {len(current)}\n操作ID: `{op_id}`\n\n"
+                + ("⚠️ 入金先は Bot Owner のものです。委任したサーバーの管理者は、"
+                   "入金を確認せずに残高を発行できてしまう点に注意してください。"
+                   if enabled else ""),
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="price_source", description="LTC 価格の取得元を切り替えます (Bot Owner)"
+    )
+    @app_commands.describe(source="取得元")
+    @app_commands.choices(source=[
+        app_commands.Choice(name="CoinGecko API (自動)", value=config.PRICE_SOURCE_COINGECKO),
+        app_commands.Choice(name="管理者が設定した固定価格", value=config.PRICE_SOURCE_MANUAL),
+    ])
+    @require_owner()
+    async def price_source(
+        self, interaction: discord.Interaction, source: app_commands.Choice[str]
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await bot.price.set_source(source.value)
+        op_id = await _audit(
+            interaction, "PROVIDER_PRICE_SOURCE", detail={"source": source.value}
+        )
+        note = (
+            "API から取得できない場合は、`/provider price` で設定した固定価格へ"
+            "自動で切り替わります (どちらも無い場合は LTC チャージを受け付けません)。"
+            if source.value == config.PRICE_SOURCE_COINGECKO
+            else "`/provider price` で設定した価格のみを使います。相場との乖離に注意してください。"
+        )
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "✅ 価格の取得元を変更しました",
+                f"取得元: **{source.name}**\n操作ID: `{op_id}`\n\n{note}",
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="price", description="LTC の固定価格を設定します (Bot Owner)"
+    )
+    @app_commands.describe(jpy="1 LTC あたりの円 (0 で削除)")
+    @require_owner()
+    async def price(self, interaction: discord.Interaction, jpy: str) -> None:
+        """API 障害時のフォールバック価格。`/provider price_source manual` で常用もできる。"""
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if jpy.strip() in ("0", "clear", "reset"):
+            await bot.db.set_system_value(price_service.KEY_MANUAL_PRICE, "")
+            op_id = await _audit(interaction, "PROVIDER_PRICE_CLEAR", detail={})
+            await interaction.followup.send(
+                embed=ui.info_embed("固定価格を削除しました", f"操作ID: `{op_id}`",
+                                    color=config.Color.NEUTRAL),
+                ephemeral=True,
+            )
+            return
+        parsed = utils.validate_price_jpy(jpy)
+        if parsed is None:
+            await interaction.followup.send(
+                embed=ui.info_embed(
+                    "入力が不正です",
+                    f"1 LTC あたりの円を {config.PRICE_MIN_JPY}〜{config.PRICE_MAX_JPY} "
+                    "の範囲で指定してください。",
+                    color=config.Color.DANGER,
+                ),
+                ephemeral=True,
+            )
+            return
+        await bot.price.set_manual_price(parsed)
+        op_id = await _audit(
+            interaction, "PROVIDER_PRICE_SET", detail={"price_jpy": str(parsed)}
+        )
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "✅ 固定価格を設定しました",
+                f"1 LTC = **{utils.fmt_yen(int(parsed))}**\n操作ID: `{op_id}`\n\n"
+                "※ 相場が動いた場合、更新を忘れると差額を突かれる恐れがあります。"
+                "`/provider status` で最終更新を確認できます。",
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="price_check", description="LTC 価格を取得して確認します (Bot Owner)"
+    )
+    @require_owner()
+    async def price_check(self, interaction: discord.Interaction) -> None:
+        """実際に価格を取り、使える状態かを確かめる (設定は変えない)。"""
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            quote = await bot.price.get_price(force=True)
+        except price_service.PriceError as exc:
+            await interaction.followup.send(
+                embed=ui.info_embed(
+                    "🔴 価格を取得できませんでした",
+                    f"```\n{utils.truncate(utils.sanitize_for_log(exc.detail, limit=400), 900)}\n```\n"
+                    "この状態では LTC チャージを受け付けません。\n"
+                    "`/provider price` で固定価格を設定すると、API 障害時も受付を続けられます。",
+                    color=config.Color.DANGER,
+                ),
+                ephemeral=True,
+            )
+            return
+        sample = utils.asset_amount_for(1000, quote.price)
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "🟢 価格を取得できました",
+                f"1 LTC = **{utils.fmt_yen(int(quote.price))}**\n"
+                f"取得元: {config.PRICE_SOURCE_LABELS.get(quote.source, quote.source)}"
+                + ("  ⚠️ 代替値" if quote.stale else "") + "\n"
+                f"取得時刻: {utils.discord_ts(quote.fetched_at)}\n\n"
+                f"換算例: 1,000円 → **{utils.fmt_asset(sample)}**",
+            ),
+            ephemeral=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# /request (チャージ申請の審査)
+# ---------------------------------------------------------------------------
+_REQUEST_STATUS_CHOICES = [
+    app_commands.Choice(name=label, value=value)
+    for value, label in config.REQUEST_STATUS_LABELS.items()
+]
+
+
+class RequestGroup(app_commands.Group):
+    """チャージ申請の確認・承認・却下。
+
+    承認できるのは Bot Owner (または Owner が委任したサーバーの管理者) のみ。
+    入金先が Owner のものであるため、確認できる人だけが承認する。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(name="request", description="チャージ申請の審査")
+
+    async def _require_reviewer(self, interaction: discord.Interaction) -> bool:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild_id = interaction.guild.id if interaction.guild else 0
+        if await bot.charge.can_review(guild_id, interaction.user):
+            return True
+        await ui.safe_respond(
+            interaction,
+            embed=ui.info_embed(
+                "操作できません",
+                "申請を処理できるのは Bot Owner "
+                "(または Owner が承認を委任したサーバーの管理者) だけです。",
+                color=config.Color.DANGER,
+            ),
+        )
+        return False
+
+    @app_commands.command(name="list", description="チャージ申請を一覧表示します")
+    @app_commands.describe(
+        status="状態で絞り込み", provider="方式で絞り込み",
+        user="利用者で絞り込み", page="ページ",
+    )
+    @app_commands.choices(status=_REQUEST_STATUS_CHOICES, provider=_PROVIDER_CHOICES)
+    @require_admin()
+    async def list_requests(
+        self,
+        interaction: discord.Interaction,
+        status: app_commands.Choice[str] | None = None,
+        provider: app_commands.Choice[str] | None = None,
+        user: discord.User | None = None,
+        page: app_commands.Range[int, 1, 500] = 1,
+    ) -> None:
+        """一覧は管理者も見られる (承認はできない)。"""
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        is_owner = bot.is_bot_owner(interaction.user)
+        page_size = 10
+        rows, total = await bot.db.list_requests(
+            # Owner はすべてのサーバーを横断して見られる
+            guild_id=None if is_owner and interaction.guild is None else (
+                interaction.guild.id if interaction.guild else None
+            ),
+            user_id=user.id if user else None,
+            provider=provider.value if provider else None,
+            statuses=[status.value] if status else None,
+            offset=(int(page) - 1) * page_size,
+            limit=page_size,
+        )
+        total_pages = max(1, -(-total // page_size))
+        await interaction.followup.send(
+            embed=ui.request_list_embed(
+                rows, page=int(page), total_pages=total_pages, total=total,
+                title="📨 チャージ申請",
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="show", description="申請の詳細を表示します")
+    @app_commands.describe(request_id="申請ID")
+    @require_admin()
+    async def show(
+        self, interaction: discord.Interaction,
+        request_id: app_commands.Range[int, 1, 100_000_000],
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        is_owner = bot.is_bot_owner(interaction.user)
+        row = await bot.db.get_request(
+            int(request_id),
+            None if is_owner else (interaction.guild.id if interaction.guild else None),
+        )
+        if row is None:
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.REQUEST_NOT_FOUND), ephemeral=True
+            )
+            return
+        history, _ = await bot.db.list_requests(
+            guild_id=int(row["guild_id"]), user_id=int(row["user_id"]), limit=5
+        )
+        balance = await bot.db.get_balance(int(row["guild_id"]), int(row["user_id"]))
+        await interaction.followup.send(
+            embed=ui.review_detail_embed(request=row, history=history, balance=balance),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="approve", description="申請を承認して残高を付与します")
+    @app_commands.describe(
+        request_id="申請ID", amount="付与額を変える場合に指定 (未指定で申請どおり)",
+        note="金額を変える理由 (監査ログに残ります)",
+    )
+    @require_admin()
+    async def approve(
+        self,
+        interaction: discord.Interaction,
+        request_id: app_commands.Range[int, 1, 100_000_000],
+        amount: app_commands.Range[int, 1, 1_000_000_000] | None = None,
+        note: str | None = None,
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        if not await self._require_reviewer(interaction):
+            return
+        row = await bot.db.get_request(int(request_id))
+        if row is None:
+            await ui.safe_respond(
+                interaction, embed=ui.error_embed(config.ErrorCode.REQUEST_NOT_FOUND)
+            )
+            return
+        if amount is not None and not (note or "").strip():
+            await ui.safe_respond(
+                interaction,
+                embed=ui.info_embed(
+                    "理由が必要です",
+                    "付与額を申請と変える場合は `note` に理由を入力してください。",
+                    color=config.Color.DANGER,
+                ),
+            )
+            return
+        provider = str(row["provider"])
+        credited = int(amount) if amount is not None else int(row["estimated_credit"])
+        approved = await _confirm(
+            interaction,
+            title=f"申請 #{int(request_id)} を承認します",
+            description=(
+                f"方式: **{config.PROVIDER_LABELS.get(provider, provider)}**\n"
+                f"利用者: <@{int(row['user_id'])}>\n"
+                f"申請額: **{utils.fmt_yen(int(row['requested_amount']))}**\n"
+                + (f"送金数量: **{utils.fmt_asset(row['asset_amount'])}**\n"
+                   if row["asset_amount"] is not None else "")
+                + f"付与: **{utils.fmt_int(credited)}**"
+                + ("  (申請どおり)" if amount is None else "  ⚠️ 申請額から変更")
+                + "\n\n**入金が実際に届いていることを確認しましたか？**"
+            ),
+            confirm_label="承認する",
+            danger=False,
+        )
+        if not approved:
+            return
+        try:
+            result = await bot.charge.approve_request(
+                int(request_id), operator_id=interaction.user.id,
+                credited_amount=int(amount) if amount is not None else None,
+                note=note,
+            )
+        except ChargeError as exc:
+            await interaction.followup.send(
+                embed=ui.error_embed(exc.code, admin_detail=exc.detail), ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "🟢 承認しました",
+                f"申請ID: `#{request_id}`\n"
+                f"付与: **{utils.fmt_int(int(result['credited_amount']))}**\n"
+                f"取引ID: `{result['transaction_id']}`\n"
+                f"操作ID: `{result['operation_id']}`\n"
+                f"残高: {utils.fmt_int(int(result['balance_before']))} → "
+                f"**{utils.fmt_int(int(result['balance_after']))}**",
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="reject", description="申請を却下します (残高は動きません)")
+    @app_commands.describe(request_id="申請ID", reason="却下理由 (利用者へ通知されます)")
+    @require_admin()
+    async def reject(
+        self,
+        interaction: discord.Interaction,
+        request_id: app_commands.Range[int, 1, 100_000_000],
+        reason: str,
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        if not await self._require_reviewer(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await bot.charge.reject_request(
+                int(request_id), operator_id=interaction.user.id, reason=reason
+            )
+        except ChargeError as exc:
+            await interaction.followup.send(
+                embed=ui.error_embed(exc.code, admin_detail=exc.detail), ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            embed=ui.info_embed(
+                "🔴 却下しました",
+                f"申請ID: `#{request_id}`\n操作ID: `{result['operation_id']}`\n"
+                "残高は変更していません。利用者へ理由を DM で通知しました。",
+                color=config.Color.DANGER,
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="pending", description="未処理の申請をまとめて表示します")
+    @require_admin()
+    async def pending(self, interaction: discord.Interaction) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        rows = await bot.db.list_pending_requests(limit=25)
+        if not bot.is_bot_owner(interaction.user) and interaction.guild is not None:
+            rows = [r for r in rows if int(r["guild_id"]) == interaction.guild.id]
+        counts = await bot.db.count_requests_by_status()
+        embed = ui.request_list_embed(
+            rows, page=1, total_pages=1, total=len(rows), title="🟡 承認待ちの申請"
+        )
+        embed.add_field(
+            name="全体の集計",
+            value="\n".join(
+                f"{config.REQUEST_STATUS_LABELS.get(k, k)}: {v}件"
+                for k, v in sorted(counts.items())
+            ) or "なし",
+            inline=False,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="cancel", description="申請を取り消します (管理者)")
+    @app_commands.describe(request_id="申請ID")
+    @require_admin()
+    async def cancel(
+        self, interaction: discord.Interaction,
+        request_id: app_commands.Range[int, 1, 100_000_000],
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        if not await self._require_reviewer(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            row = await bot.db.cancel_request(int(request_id))
+        except RequestError as exc:
+            await interaction.followup.send(
+                embed=ui.error_embed(exc.code, admin_detail=exc.detail), ephemeral=True
+            )
+            return
+        op_id = await _audit(
+            interaction, "REQUEST_CANCEL",
+            target_user_id=int(row["user_id"]), detail={"request_id": int(request_id)},
+        )
+        await bot.charge.update_review_card(int(request_id))
+        await interaction.followup.send(
+            embed=ui.info_embed(
+                "取り消しました",
+                f"申請ID: `#{request_id}`\n操作ID: `{op_id}`",
+                color=config.Color.NEUTRAL,
+            ),
+            ephemeral=True,
+        )
+
+
+# ---------------------------------------------------------------------------
 # 登録
 # ---------------------------------------------------------------------------
 async def setup_commands(bot: "ChargeBot") -> None:
@@ -4902,6 +5659,7 @@ async def setup_commands(bot: "ChargeBot") -> None:
         MaintenanceGroup(), EmergencyStopGroup(), AchievementGroup(), TransactionGroup(),
         DataGroup(), ConfigGroup(), SystemGroup(), RateGroup(), ShopGroup(),
         CampaignGroup(), ExportGroup(), GlobalGroup(),
+        ProviderGroup(), RequestGroup(),
     ):
         tree.add_command(group)
 

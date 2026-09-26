@@ -24,6 +24,7 @@ import discord
 
 import config
 import kyash_service
+import price_service
 import ui
 import utils
 from database import (
@@ -31,6 +32,7 @@ from database import (
     Database,
     GuildSettings,
     IllegalStateTransition,
+    RequestError,
     ShopError,
 )
 
@@ -59,10 +61,17 @@ class ChargeError(Exception):
 class ChargeService:
     """チャージのライフサイクル管理・残高操作・通知・ランキング更新。"""
 
-    def __init__(self, bot: "ChargeBot", db: Database, kyash: kyash_service.KyashService) -> None:
+    def __init__(
+        self,
+        bot: "ChargeBot",
+        db: Database,
+        kyash: kyash_service.KyashService,
+        price: "price_service.PriceService",
+    ) -> None:
         self.bot = bot
         self.db = db
         self.kyash = kyash
+        self.price = price
         self.accepting_new = True
         self.queue_wakeup = asyncio.Event()
         self._charge_rate_limiter = utils.RateLimiter(
@@ -86,6 +95,8 @@ class ChargeService:
             "receive_count": 0, "receive_seconds": 0.0, "purchases": 0,
             "purchase_refunds": 0, "invites_confirmed": 0, "invites_rejected": 0,
             "invites_hold": 0,
+            "requests_created": 0, "requests_submitted": 0,
+            "requests_approved": 0, "requests_rejected": 0, "requests_expired": 0,
         }
 
     # ==================================================================
@@ -151,8 +162,21 @@ class ChargeService:
             raise ChargeError(config.ErrorCode.GUILD_DISABLED)
         return await self.db.get_settings(guild_id)
 
-    async def preflight(self, guild_id: int, user_id: int, settings: GuildSettings) -> None:
-        """チャージ開始前の総合チェック (安全側へ倒す)。"""
+    async def preflight(
+        self,
+        guild_id: int,
+        user_id: int,
+        settings: GuildSettings,
+        *,
+        require_kyash: bool = True,
+    ) -> None:
+        """チャージ開始前の総合チェック (安全側へ倒す)。
+
+        Args:
+            require_kyash: 受取用 Kyash アカウントが使える状態かを要求するか。
+                PayPay / LTC は Kyash を一切経由しないため False を渡す。
+                Kyash が未設定でも、これらのチャージは受け付けられる。
+        """
         if not self.accepting_new:
             raise ChargeError(config.ErrorCode.MAINTENANCE, "Bot が終了処理中です")
         if settings.emergency_stop:
@@ -166,16 +190,18 @@ class ChargeService:
             raise ChargeError(
                 config.ErrorCode.COOLDOWN, f"クールダウン中です (残り {remaining} 秒)"
             )
-        if not self.kyash.is_usable:
-            raise ChargeError(
-                config.ErrorCode.KYASH_UNAVAILABLE,
-                f"受取用Kyashアカウントの状態: {self.kyash.status}",
-            )
-        if self.kyash.wallet_limit_reached:
-            raise ChargeError(
-                config.ErrorCode.WALLET_LIMIT,
-                f"受取用アカウントの残高しきい値に到達 (しきい値 {self.kyash.wallet_threshold})",
-            )
+        if require_kyash:
+            if not self.kyash.is_usable:
+                raise ChargeError(
+                    config.ErrorCode.KYASH_UNAVAILABLE,
+                    f"受取用Kyashアカウントの状態: {self.kyash.status}",
+                )
+            if self.kyash.wallet_limit_reached:
+                raise ChargeError(
+                    config.ErrorCode.WALLET_LIMIT,
+                    f"受取用アカウントの残高しきい値に到達 "
+                    f"(しきい値 {self.kyash.wallet_threshold})",
+                )
 
     async def _check_limits(
         self,
@@ -185,12 +211,27 @@ class ChargeService:
         settings: GuildSettings,
         *,
         charge_rate: Decimal | None = None,
+        minimum: int | None = None,
+        maximum: int | None = None,
+        check_wallet: bool = True,
     ) -> None:
-        """金額制限・日次上限・残高上限・受取用アカウントの余裕を確認する。"""
-        if amount < settings.minimum_charge:
-            raise ChargeError(config.ErrorCode.AMOUNT_BELOW_MIN)
-        if amount > settings.maximum_charge:
-            raise ChargeError(config.ErrorCode.AMOUNT_ABOVE_MAX)
+        """金額制限・日次上限・残高上限・受取用アカウントの余裕を確認する。
+
+        Args:
+            minimum/maximum: 方式ごとの上下限。None ならサーバー設定を使う。
+            check_wallet: Kyash 受取用アカウントの余裕を見るか。
+                PayPay / LTC は Kyash を経由しないため False を渡す。
+        """
+        low = settings.minimum_charge if minimum is None else minimum
+        high = settings.maximum_charge if maximum is None else maximum
+        if amount < low:
+            raise ChargeError(
+                config.ErrorCode.AMOUNT_BELOW_MIN, f"最低 {low} / 入力 {amount}"
+            )
+        if amount > high:
+            raise ChargeError(
+                config.ErrorCode.AMOUNT_ABOVE_MAX, f"最大 {high} / 入力 {amount}"
+            )
         if settings.max_balance > 0:
             current = await self.db.get_balance(guild_id, user_id)
             expected = utils.calc_credited_amount(amount, charge_rate or settings.charge_rate)
@@ -199,11 +240,12 @@ class ChargeService:
                     config.ErrorCode.MAX_BALANCE_EXCEEDED,
                     f"残高上限 {settings.max_balance} に対し {current} + {expected} となります",
                 )
-        try:
-            # 受取用アカウントの残高しきい値を超えないか (受取前に止める)
-            self.kyash.check_wallet_capacity(amount)
-        except kyash_service.WalletLimitError as exc:
-            raise ChargeError(config.ErrorCode.WALLET_LIMIT, str(exc)) from exc
+        if check_wallet:
+            try:
+                # 受取用アカウントの残高しきい値を超えないか (受取前に止める)
+                self.kyash.check_wallet_capacity(amount)
+            except kyash_service.WalletLimitError as exc:
+                raise ChargeError(config.ErrorCode.WALLET_LIMIT, str(exc)) from exc
         day_start = utils.jst_day_start()
         if settings.daily_limit > 0:
             used = await self.db.sum_daily_charge(guild_id, user_id, day_start)
@@ -1201,6 +1243,627 @@ class ChargeService:
         self.queue_wakeup.set()
 
     # ==================================================================
+    # チャージ方式 (PayPay / LTC: 申請 → 管理者承認)
+    # ==================================================================
+    #: 審査チャンネル (全サーバー共通) を保存する system_settings のキー
+    REVIEW_CHANNEL_KEY = "request_review_channel_id"
+    #: サーバー管理者にも承認を許可するサーバー ID の一覧 (カンマ区切り)
+    DELEGATED_GUILDS_KEY = "request_review_delegated_guilds"
+
+    async def get_review_channel_id(self) -> int | None:
+        """申請の審査カードを投稿するチャンネル (Bot Owner が設定)。"""
+        raw = await self.db.get_system_value(self.REVIEW_CHANNEL_KEY)
+        if raw and raw.isdigit():
+            return int(raw)
+        return None
+
+    async def set_review_channel_id(self, channel_id: int | None) -> None:
+        await self.db.set_system_value(
+            self.REVIEW_CHANNEL_KEY, str(int(channel_id)) if channel_id else ""
+        )
+
+    async def get_delegated_guilds(self) -> set[int]:
+        """管理者にも承認を許可したサーバー。
+
+        入金先は Bot Owner のものなので、承認の既定は Owner だけ。
+        信頼できるサーバーにだけ Owner が明示的に委任する。
+        """
+        raw = await self.db.get_system_value(self.DELEGATED_GUILDS_KEY) or ""
+        return {int(x) for x in raw.split(",") if x.strip().isdigit()}
+
+    async def set_delegated(self, guild_id: int, enabled: bool) -> set[int]:
+        current = await self.get_delegated_guilds()
+        if enabled:
+            current.add(int(guild_id))
+        else:
+            current.discard(int(guild_id))
+        await self.db.set_system_value(
+            self.DELEGATED_GUILDS_KEY, ",".join(str(x) for x in sorted(current))
+        )
+        return current
+
+    async def can_review(self, guild_id: int, user: discord.abc.User) -> bool:
+        """その利用者が申請を承認できるか。"""
+        if self.bot.is_bot_owner(user):
+            return True
+        return int(guild_id) in await self.get_delegated_guilds()
+
+    async def resolve_provider_rate(
+        self, guild_id: int, user_id: int, provider: str, settings: GuildSettings
+    ) -> tuple[Decimal, int | None]:
+        """方式とロールの両方を見てチャージ率を決める。
+
+        方式別レートがサーバー既定を置き換え、ロール別レート (VIP 等) が
+        あればその**高い方**を採用する。こうすることで
+
+        * PayPay を低めに設定しても、その設定が効く
+        * LTC を高めに設定したとき、VIP がそれより低くならない
+
+        の両方が成り立つ。採用したレートは申請作成時に保存するため、
+        後から設定を変えても既存の申請には影響しない。
+
+        Returns:
+            ``(charge_rate, role_id or None)``。role_id はロール別レートを
+            採用した場合のみ。
+        """
+        role_rate, role_id = await self.resolve_charge_rate(guild_id, user_id, settings)
+        row = await self.db.get_provider_settings(guild_id, provider)
+        provider_rate = utils.to_decimal(row["charge_rate"]) if row else None
+        if provider_rate is None:
+            return role_rate, role_id
+        if role_id is None:
+            return provider_rate, None
+        if role_rate >= provider_rate:
+            return role_rate, role_id
+        return provider_rate, None
+
+    async def provider_limits(
+        self, guild_id: int, provider: str, settings: GuildSettings
+    ) -> tuple[int, int]:
+        """方式ごとの金額上下限 (未設定ならサーバー設定)。"""
+        row = await self.db.get_provider_settings(guild_id, provider)
+        low = settings.minimum_charge
+        high = settings.maximum_charge
+        if row is not None:
+            if row["minimum_charge"] is not None:
+                low = int(row["minimum_charge"])
+            if row["maximum_charge"] is not None:
+                high = int(row["maximum_charge"])
+        return low, max(low, high)
+
+    async def provider_availability(
+        self, guild_id: int, settings: GuildSettings | None = None
+    ) -> list[dict[str, Any]]:
+        """各方式が使えるかどうかと、使えない理由を返す。
+
+        利用者に選択肢を出す前に判定するため、「押したのに使えない」を防ぐ。
+        """
+        settings = settings or await self.db.get_settings(guild_id)
+        rows = await self.db.list_provider_settings(guild_id)
+        destinations = await self.db.list_destinations()
+        review_channel = await self.get_review_channel_id()
+        result: list[dict[str, Any]] = []
+        for provider in config.ALL_PROVIDERS:
+            row = rows.get(provider)
+            enabled = True if row is None else bool(row["enabled"])
+            reason: str | None = None
+            code: str | None = None
+            if not enabled:
+                reason = "管理者が停止しています"
+                code = config.ErrorCode.PROVIDER_DISABLED
+            elif provider == config.ChargeProvider.KYASH:
+                if not self.kyash.is_usable:
+                    reason = "受取用アカウントの準備中です"
+                    code = config.ErrorCode.KYASH_UNAVAILABLE
+            else:
+                if provider not in destinations:
+                    reason = "入金先が未登録です"
+                    code = config.ErrorCode.PROVIDER_NOT_CONFIGURED
+                elif review_channel is None:
+                    reason = "審査チャンネルが未設定です"
+                    code = config.ErrorCode.REVIEW_CHANNEL_NOT_SET
+            low, high = await self.provider_limits(guild_id, provider, settings)
+            rate, _role = await self.resolve_provider_rate(guild_id, 0, provider, settings)
+            result.append({
+                "provider": provider,
+                "available": reason is None,
+                "reason": reason,
+                "error_code": code,
+                "minimum": low,
+                "maximum": high,
+                "rate": rate,
+                "destination": destinations.get(provider),
+            })
+        return result
+
+    async def usable_providers(
+        self, guild_id: int, settings: GuildSettings | None = None
+    ) -> list[dict[str, Any]]:
+        return [p for p in await self.provider_availability(guild_id, settings) if p["available"]]
+
+    async def _ensure_provider_usable(
+        self, guild_id: int, provider: str, settings: GuildSettings
+    ) -> sqlite3.Row:
+        """方式が使える状態か確認し、入金先を返す。"""
+        row = await self.db.get_provider_settings(guild_id, provider)
+        if row is not None and not row["enabled"]:
+            raise ChargeError(config.ErrorCode.PROVIDER_DISABLED)
+        destination = await self.db.get_destination(provider)
+        if destination is None:
+            raise ChargeError(
+                config.ErrorCode.PROVIDER_NOT_CONFIGURED, f"{provider} の入金先が未登録です"
+            )
+        if await self.get_review_channel_id() is None:
+            raise ChargeError(
+                config.ErrorCode.REVIEW_CHANNEL_NOT_SET, "審査チャンネルが未設定です"
+            )
+        return destination
+
+    async def start_manual_charge(
+        self, guild_id: int, user_id: int, provider: str, raw_amount: str
+    ) -> dict[str, Any]:
+        """PayPay / LTC の申請を作る (入金先の案内まで)。
+
+        LTC はここで価格を取得して確定させる。価格が信用できない場合は
+        推測せず、チャージを拒否する。
+
+        Returns:
+            案内表示に必要な情報 (request_id / 入金先 / 送金額 / 期限 など)。
+        """
+        if provider not in config.MANUAL_PROVIDERS:
+            raise ChargeError(config.ErrorCode.UNKNOWN_ERROR, f"承認制ではない方式です: {provider}")
+        settings = await self.ensure_usable_guild(guild_id)
+        # 入力検証を先に行い、書式エラーでレート制限を消費しない
+        amount = utils.parse_user_amount(raw_amount)
+        if amount is None:
+            raise ChargeError(config.ErrorCode.INVALID_AMOUNT)
+        # 価格 API を叩く前に必ずレート制限をかける (外部 API を守る)
+        if not self._charge_rate_limiter.check(f"req:{guild_id}:{user_id}"):
+            raise ChargeError(config.ErrorCode.RATE_LIMITED)
+        # PayPay / LTC は Kyash を経由しないため、Kyash の状態は要求しない
+        await self.preflight(guild_id, user_id, settings, require_kyash=False)
+        destination = await self._ensure_provider_usable(guild_id, provider, settings)
+        charge_rate, role_id = await self.resolve_provider_rate(
+            guild_id, user_id, provider, settings
+        )
+        low, high = await self.provider_limits(guild_id, provider, settings)
+        # Kyash のウォレット残量は関係しないため確認しない
+        await self._check_limits(
+            guild_id, user_id, amount, settings,
+            charge_rate=charge_rate, minimum=low, maximum=high, check_wallet=False,
+        )
+        asset_amount: Decimal | None = None
+        quote: price_service.PriceQuote | None = None
+        if provider == config.ChargeProvider.LTC:
+            try:
+                quote = await self.price.get_price()
+            except price_service.PriceError as exc:
+                logger.warning("LTC 価格が使えないため申請を拒否しました: %s",
+                               utils.sanitize_for_log(exc.detail, limit=200))
+                raise ChargeError(config.ErrorCode.PRICE_UNAVAILABLE, exc.detail) from exc
+            asset_amount = utils.asset_amount_for(amount, quote.price)
+            if asset_amount < Decimal(config.LTC_MIN_AMOUNT):
+                raise ChargeError(
+                    config.ErrorCode.ASSET_AMOUNT_TOO_SMALL,
+                    f"{utils.fmt_asset(asset_amount)} < 最低 {config.LTC_MIN_AMOUNT} LTC",
+                )
+
+        estimated = utils.calc_credited_amount(amount, charge_rate)
+        await self.db.ensure_user(guild_id, user_id)
+        try:
+            request_id = await self.db.create_request(
+                guild_id=guild_id,
+                user_id=user_id,
+                provider=provider,
+                requested_amount=amount,
+                charge_rate=charge_rate,
+                role_id=role_id,
+                estimated_credit=estimated,
+                asset_amount=asset_amount,
+                asset_price=quote.price if quote else None,
+                price_source=quote.source if quote else None,
+                price_fetched_at=quote.fetched_at if quote else None,
+                destination=str(destination["address"]),
+            )
+        except RequestError as exc:
+            raise ChargeError(exc.code, exc.detail) from exc
+        self.metrics["requests_created"] += 1
+        logger.info(
+            "チャージ申請を作成しました request=%s guild=%s user=%s provider=%s "
+            "amount=%s rate=%s asset=%s",
+            request_id, guild_id, user_id, provider, amount, charge_rate,
+            asset_amount if asset_amount is not None else "-",
+        )
+        return {
+            "request_id": request_id,
+            "provider": provider,
+            "amount": amount,
+            "charge_rate": charge_rate,
+            "role_id": role_id,
+            "estimated_credit": estimated,
+            "asset_amount": asset_amount,
+            "asset_price": quote.price if quote else None,
+            "price_source": quote.source if quote else None,
+            "price_stale": bool(quote.stale) if quote else False,
+            "destination": destination,
+            "quote_expires_at": utils.now_ts() + config.QUOTE_WAIT_SECONDS,
+        }
+
+    async def submit_request(
+        self, request_id: int, user_id: int, raw_proof: str, raw_asset: str | None = None
+    ) -> dict[str, Any]:
+        """証拠を登録して承認待ちにし、審査チャンネルへカードを投稿する。"""
+        request = await self.db.get_request(request_id)
+        if request is None:
+            raise ChargeError(config.ErrorCode.REQUEST_NOT_FOUND)
+        provider = str(request["provider"])
+        proof_ref = (
+            utils.normalize_txid(raw_proof)
+            if provider == config.ChargeProvider.LTC
+            else utils.normalize_payment_ref(raw_proof)
+        )
+        if proof_ref is None:
+            raise ChargeError(
+                config.ErrorCode.INVALID_PROOF,
+                f"{config.PROVIDER_PROOF_LABELS.get(provider, '証拠')} の形式が不正です",
+            )
+        asset_amount: Decimal | None = None
+        if provider == config.ChargeProvider.LTC and raw_asset:
+            asset_amount = utils.parse_asset_amount(raw_asset)
+            if asset_amount is None:
+                raise ChargeError(
+                    config.ErrorCode.INVALID_PROOF, "送金した LTC 数量の形式が不正です"
+                )
+        try:
+            row = await self.db.submit_request_proof(
+                request_id,
+                user_id=user_id,
+                proof_ref=proof_ref,
+                proof_hash=utils.proof_hash(provider, proof_ref),
+                proof_note=None,
+                asset_amount=asset_amount,
+            )
+        except RequestError as exc:
+            raise ChargeError(exc.code, exc.detail) from exc
+        self.metrics["requests_submitted"] += 1
+        logger.info("チャージ申請を受け付けました request=%s provider=%s", request_id, provider)
+        await self._safe(self.post_review_card(request_id), context="審査カード投稿")
+        await self._safe(self.log_event(
+            int(row["guild_id"]),
+            f"{config.PROVIDER_EMOJI.get(provider, '💠')} "
+            f"{config.PROVIDER_LABELS.get(provider, provider)} のチャージ申請",
+            fields=(
+                ("申請ID", f"`#{request_id}`", True),
+                ("利用者", f"<@{int(row['user_id'])}>", True),
+                ("申請額", utils.fmt_yen(int(row["requested_amount"])), True),
+                ("付与予定", utils.fmt_int(int(row["estimated_credit"])), True),
+                (config.PROVIDER_PROOF_LABELS.get(provider, "証拠"),
+                 f"`{utils.truncate(proof_ref, 80)}`", False),
+            ),
+            color=config.Color.WARNING,
+        ), context="申請ログ")
+        pending = await self.db.count_requests_by_status()
+        return {
+            "request_id": request_id,
+            "provider": provider,
+            "amount": int(row["requested_amount"]),
+            "estimated_credit": int(row["estimated_credit"]),
+            "proof_ref": proof_ref,
+            "pending_total": pending.get(config.RequestStatus.PENDING, 0),
+            "expires_at": row["expires_at"],
+        }
+
+    async def approve_request(
+        self,
+        request_id: int,
+        *,
+        operator_id: int,
+        credited_amount: int | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """申請を承認し、Kyash と同じ経路で残高を付与する。
+
+        ``claim_request_for_review`` が単一トランザクションで状態を
+        遷移させるため、2人が同時に承認しても一度しか付与されない。
+        """
+        try:
+            request = await self.db.claim_request_for_review(
+                request_id, status=config.RequestStatus.APPROVED, operator_id=operator_id
+            )
+        except RequestError as exc:
+            raise ChargeError(exc.code, exc.detail) from exc
+
+        guild_id = int(request["guild_id"])
+        user_id = int(request["user_id"])
+        provider = str(request["provider"])
+        amount = int(request["requested_amount"])
+        charge_rate = utils.to_decimal(request["charge_rate"]) or Decimal(
+            config.DEFAULT_CHARGE_RATE
+        )
+        credited = (
+            int(credited_amount)
+            if credited_amount is not None
+            else int(request["estimated_credit"])
+        )
+        source = config.PROVIDER_TX_SOURCE[provider]
+        tx_id = await self.db.create_manual_transaction(
+            guild_id=guild_id, user_id=user_id, requested_amount=amount,
+            received_amount=amount, charge_rate=charge_rate, source=source,
+        )
+        result = await self.db.credit_transaction(
+            tx_id, credited,
+            change_type=config.BalanceChangeType.CHARGE,
+            reason=f"{config.PROVIDER_LABELS.get(provider, provider)} 承認 (申請 #{request_id})",
+            operator_id=operator_id,
+        )
+        op_id = await self.db.add_audit_log(
+            actor_id=operator_id,
+            action="REQUEST_APPROVE",
+            guild_id=guild_id,
+            target_user_id=user_id,
+            detail={
+                "request_id": request_id,
+                "provider": provider,
+                "transaction_id": tx_id,
+                "requested_amount": amount,
+                "charge_rate": str(charge_rate),
+                "credited_amount": credited,
+                "estimated_credit": int(request["estimated_credit"]),
+                "overridden": credited_amount is not None,
+                "asset_amount": request["asset_amount"],
+                "asset_price": request["asset_price"],
+                "proof_ref": request["proof_ref"],
+                "balance_before": result["balance_before"],
+                "balance_after": result["balance_after"],
+                "note": utils.truncate(note or "", 300),
+            },
+        )
+        await self.db.finalize_request(
+            request_id, credited_amount=credited, transaction_id=tx_id, operation_id=op_id
+        )
+        self.metrics["requests_approved"] += 1
+        self.metrics["charges_completed"] += 1
+        self.request_ranking_refresh(guild_id)
+        await self._safe(self.post_achievement(tx_id), context="実績投稿")
+        await self._safe(self.notify_result(tx_id), context="DM通知")
+        await self._safe(self.update_review_card(request_id), context="審査カード更新")
+        # 手動承認でも「チャージ完了」として招待報酬の確定判定を回す
+        await self._safe(
+            self.confirm_invite_after_charge(guild_id, user_id), context="招待確定"
+        )
+        await self._safe(self.log_event(
+            guild_id,
+            "🟢 チャージ申請を承認しました",
+            fields=(
+                ("申請ID", f"`#{request_id}`", True),
+                ("方式", config.PROVIDER_LABELS.get(provider, provider), True),
+                ("利用者", f"<@{user_id}>", True),
+                ("承認者", f"<@{operator_id}>", True),
+                ("送金額", utils.fmt_yen(amount), True),
+                ("付与", utils.fmt_int(credited)
+                 + (" (修正済み)" if credited_amount is not None else ""), True),
+                ("取引ID", f"`{tx_id}`", True),
+                ("操作ID", f"`{op_id}`", True),
+            ),
+            color=config.Color.SUCCESS,
+        ), context="承認ログ")
+        logger.info(
+            "チャージ申請を承認しました request=%s tx=%s credited=%s operator=%s",
+            request_id, tx_id, credited, operator_id,
+        )
+        return {
+            "request_id": request_id,
+            "transaction_id": tx_id,
+            "operation_id": op_id,
+            "credited_amount": credited,
+            "provider": provider,
+            "user_id": user_id,
+            "guild_id": guild_id,
+            **result,
+        }
+
+    async def reject_request(
+        self, request_id: int, *, operator_id: int, reason: str
+    ) -> dict[str, Any]:
+        """申請を却下する (残高は一切動かさない)。"""
+        reason = utils.truncate(reason.strip() or "理由の記載なし", 400)
+        try:
+            request = await self.db.claim_request_for_review(
+                request_id, status=config.RequestStatus.REJECTED, operator_id=operator_id
+            )
+        except RequestError as exc:
+            raise ChargeError(exc.code, exc.detail) from exc
+        guild_id = int(request["guild_id"])
+        user_id = int(request["user_id"])
+        provider = str(request["provider"])
+        op_id = await self.db.add_audit_log(
+            actor_id=operator_id,
+            action="REQUEST_REJECT",
+            guild_id=guild_id,
+            target_user_id=user_id,
+            detail={
+                "request_id": request_id,
+                "provider": provider,
+                "requested_amount": int(request["requested_amount"]),
+                "proof_ref": request["proof_ref"],
+                "reason": reason,
+            },
+        )
+        await self.db.finalize_request(request_id, operation_id=op_id, reject_reason=reason)
+        self.metrics["requests_rejected"] += 1
+        await self._safe(self.update_review_card(request_id), context="審査カード更新")
+        await self._safe(self._dm_request_result(request_id), context="却下DM")
+        await self._safe(self.log_event(
+            guild_id,
+            "🔴 チャージ申請を却下しました",
+            fields=(
+                ("申請ID", f"`#{request_id}`", True),
+                ("方式", config.PROVIDER_LABELS.get(provider, provider), True),
+                ("利用者", f"<@{user_id}>", True),
+                ("却下者", f"<@{operator_id}>", True),
+                ("申請額", utils.fmt_yen(int(request["requested_amount"])), True),
+                ("操作ID", f"`{op_id}`", True),
+                ("理由", reason, False),
+            ),
+            color=config.Color.DANGER,
+        ), context="却下ログ")
+        logger.info("チャージ申請を却下しました request=%s operator=%s", request_id, operator_id)
+        return {"request_id": request_id, "operation_id": op_id, "reason": reason}
+
+    async def cancel_own_request(self, request_id: int, user_id: int) -> dict[str, Any]:
+        """利用者が自分の申請を取り消す。"""
+        try:
+            row = await self.db.cancel_request(request_id, user_id=user_id)
+        except RequestError as exc:
+            raise ChargeError(exc.code, exc.detail) from exc
+        await self._safe(self.update_review_card(request_id), context="審査カード更新")
+        logger.info("チャージ申請を取り消しました request=%s user=%s", request_id, user_id)
+        return {"request_id": request_id, "provider": str(row["provider"])}
+
+    async def expire_stale_requests(self) -> int:
+        """期限切れの申請を処理し、利用者へ通知する。"""
+        rows = await self.db.expire_requests()
+        for row in rows:
+            request_id = int(row["id"])
+            self.metrics["requests_expired"] += 1
+            await self._safe(self.update_review_card(request_id), context="審査カード更新")
+            if row["status"] == config.RequestStatus.PENDING:
+                # 申請済みで放置されたものだけ通知する (送金前の失効は通知しない)
+                await self._safe(self._dm_request_result(request_id), context="期限切れDM")
+        if rows:
+            logger.info("期限切れのチャージ申請を %d 件処理しました", len(rows))
+        return len(rows)
+
+    async def _dm_request_result(self, request_id: int) -> None:
+        """却下・期限切れを利用者へ DM で知らせる。"""
+        row = await self.db.get_request(request_id)
+        if row is None:
+            return
+        status = str(row["status"])
+        if status not in (config.RequestStatus.REJECTED, config.RequestStatus.EXPIRED):
+            return
+        embed = ui.request_result_dm_embed(
+            guild_name=self.guild_name(int(row["guild_id"])),
+            request=row,
+        )
+        await self._send_dm(int(row["user_id"]), embed, queue_on_failure=True)
+
+    # --- 審査カード -------------------------------------------------
+    async def post_review_card(self, request_id: int) -> None:
+        """審査チャンネルへ承認/却下ボタン付きのカードを投稿する。"""
+        row = await self.db.get_request(request_id)
+        if row is None:
+            return
+        channel_id = await self.get_review_channel_id()
+        if channel_id is None:
+            logger.warning("審査チャンネルが未設定のためカードを投稿できません request=%s",
+                           request_id)
+            return
+        channel = await self._resolve_channel(
+            int(row["guild_id"]), channel_id, self.REVIEW_CHANNEL_KEY
+        )
+        if channel is None:
+            # 審査チャンネルは別サーバーにあり得るため、Bot 全体から解決し直す
+            channel = await self._resolve_global_channel(channel_id)
+        if channel is None:
+            await self._safe(self.bot.alert_owner(
+                f"申請 `#{request_id}` の審査カードを投稿できませんでした。"
+                "`/provider review_channel` を設定し直してください。"
+            ), context="Owner通知")
+            return
+        pending = await self.db.count_requests_by_status()
+        embed = ui.review_card_embed(
+            request=row,
+            guild_name=self.guild_name(int(row["guild_id"])),
+            pending_total=pending.get(config.RequestStatus.PENDING, 0),
+        )
+        try:
+            message = await channel.send(embed=embed, view=ui.ReviewCardView())
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning("審査カードの投稿に失敗しました request=%s: %s",
+                           request_id, utils.safe_error_text(exc))
+            return
+        await self.db.set_request_review_message(
+            request_id, channel_id=channel.id, message_id=message.id
+        )
+
+    async def update_review_card(self, request_id: int) -> None:
+        """処理済みの審査カードを更新し、ボタンを外す。"""
+        row = await self.db.get_request(request_id)
+        if row is None or not row["review_message_id"]:
+            return
+        channel = await self._resolve_global_channel(int(row["review_channel_id"] or 0))
+        if channel is None:
+            return
+        pending = await self.db.count_requests_by_status()
+        embed = ui.review_card_embed(
+            request=row,
+            guild_name=self.guild_name(int(row["guild_id"])),
+            pending_total=pending.get(config.RequestStatus.PENDING, 0),
+        )
+        done = str(row["status"]) != config.RequestStatus.PENDING
+        try:
+            message = await channel.fetch_message(int(row["review_message_id"]))
+            await message.edit(embed=embed, view=None if done else ui.ReviewCardView())
+        except discord.NotFound:
+            return
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning("審査カードの更新に失敗しました request=%s: %s",
+                           request_id, utils.safe_error_text(exc))
+
+    async def _resolve_global_channel(
+        self, channel_id: int
+    ) -> discord.TextChannel | discord.Thread | None:
+        """サーバーを問わずチャンネルを解決する (審査チャンネル用)。"""
+        if not channel_id:
+            return None
+        channel = self.bot.get_channel(int(channel_id))
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(int(channel_id))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException,
+                    discord.InvalidData, ValueError):
+                return None
+            except Exception:  # noqa: BLE001
+                # 審査カードの解決に失敗しても、承認・却下そのものは続行させる
+                logger.warning("審査チャンネルの解決に失敗しました channel=%s",
+                               channel_id, exc_info=True)
+                return None
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return None
+        me = channel.guild.me if channel.guild else None
+        if me is not None:
+            perms = channel.permissions_for(me)
+            if not (perms.send_messages and perms.embed_links):
+                logger.warning("審査チャンネルへの送信権限がありません channel=%s", channel_id)
+                return None
+        return channel
+
+    async def remind_pending_requests(self) -> int:
+        """未処理の申請が溜まっていたら Owner へ知らせる。"""
+        rows = await self.db.list_pending_requests(limit=25)
+        if not rows:
+            return 0
+        now = utils.now_ts()
+        stale = [r for r in rows
+                 if now - int(r["submitted_at"] or r["created_at"]) >= config.REVIEW_REMIND_SECONDS]
+        if not stale:
+            return 0
+        lines = [
+            f"・`#{int(r['id'])}` {config.PROVIDER_LABELS.get(str(r['provider']), r['provider'])} "
+            f"<@{int(r['user_id'])}> {utils.fmt_yen(int(r['requested_amount']))} "
+            f"({utils.format_jst(int(r['submitted_at'] or r['created_at']))} から未処理)"
+            for r in stale[:10]
+        ]
+        await self._safe(self.bot.alert_owner(
+            f"**チャージ申請が {len(stale)} 件 未処理です**\n"
+            + "\n".join(lines)
+            + "\n審査チャンネルのボタン、または `/request approve` / `/request reject` "
+              "で処理してください。"
+        ), context="申請催促")
+        return len(stale)
+
+    # ==================================================================
     # 通知 (失敗してもチャージ結果に影響させない)
     # ==================================================================
     async def _safe(self, coro: Any, *, context: str) -> None:
@@ -1682,7 +2345,11 @@ class ChargeService:
         if not panels:
             return 0
         settings = await self.db.get_settings(guild_id)
-        embed = ui.charge_panel_embed(settings, kyash_ready=self.kyash.is_usable)
+        embed = ui.charge_panel_embed(
+            settings,
+            kyash_ready=self.kyash.is_usable,
+            providers=await self.provider_availability(guild_id, settings),
+        )
         updated = 0
         for panel in panels:
             channel = await self._resolve_message_channel(guild_id, int(panel["channel_id"]))
@@ -2800,6 +3467,8 @@ class ChargeService:
             metrics=self.metrics_snapshot(),
             review_count=len([r for r in reviews if int(r["guild_id"]) == guild_id]),
             updated_at=utils.now_ts(),
+            requests=await self.db.count_requests_by_status(),
+            price=await self.price.status_snapshot(),
         )
 
     async def refresh_admin_panels(self, guild_id: int) -> int:

@@ -47,6 +47,15 @@ class ShopError(DatabaseError):
         self.detail = detail
 
 
+class RequestError(DatabaseError):
+    """チャージ申請を処理できない (利用者向けエラーコードを持つ)。"""
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        super().__init__(detail or code)
+        self.code = code
+        self.detail = detail
+
+
 # ---------------------------------------------------------------------------
 # データクラス
 # ---------------------------------------------------------------------------
@@ -516,6 +525,79 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_notify_ready ON notification_queue(status, next_attempt_at)",
+    # -- v3: チャージ方式 (PayPay / LTC の申請と承認) --
+    """
+    CREATE TABLE IF NOT EXISTS provider_settings (
+        guild_id       INTEGER NOT NULL,
+        provider       TEXT    NOT NULL,
+        enabled        INTEGER NOT NULL DEFAULT 1,
+        charge_rate    TEXT,
+        minimum_charge INTEGER,
+        maximum_charge INTEGER,
+        updated_by     INTEGER,
+        created_at     INTEGER NOT NULL DEFAULT 0,
+        updated_at     INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (guild_id, provider)
+    )
+    """,
+    # Bot Owner が登録する入金先 (全サーバー共通・方式ごとに1つ)
+    """
+    CREATE TABLE IF NOT EXISTS payment_destinations (
+        provider    TEXT PRIMARY KEY,
+        address     TEXT NOT NULL,
+        label       TEXT,
+        note        TEXT,
+        updated_by  INTEGER,
+        created_at  INTEGER NOT NULL DEFAULT 0,
+        updated_at  INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS charge_requests (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id          INTEGER NOT NULL,
+        user_id           INTEGER NOT NULL,
+        provider          TEXT    NOT NULL,
+        status            TEXT    NOT NULL DEFAULT 'QUOTED',
+        requested_amount  INTEGER NOT NULL,
+        charge_rate       TEXT    NOT NULL,
+        role_id           INTEGER,
+        estimated_credit  INTEGER NOT NULL DEFAULT 0,
+        asset_amount      TEXT,
+        asset_price       TEXT,
+        price_source      TEXT,
+        price_fetched_at  INTEGER,
+        destination       TEXT,
+        proof_ref         TEXT,
+        proof_hash        TEXT,
+        proof_note        TEXT,
+        review_channel_id INTEGER,
+        review_message_id INTEGER,
+        reviewed_by       INTEGER,
+        reviewed_at       INTEGER,
+        reject_reason     TEXT,
+        credited_amount   INTEGER,
+        transaction_id    TEXT,
+        operation_id      TEXT,
+        quote_expires_at  INTEGER,
+        expires_at        INTEGER,
+        submitted_at      INTEGER,
+        created_at        INTEGER NOT NULL DEFAULT 0,
+        updated_at        INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    # 同じ証拠 (取引ID / txid) は一度しか申請できない。
+    # 却下・取消されたものも占有し続けることで、使い回しを防ぐ。
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_proof "
+    "ON charge_requests(proof_hash) WHERE proof_hash IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_requests_status "
+    "ON charge_requests(status, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_requests_guild_user "
+    "ON charge_requests(guild_id, user_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_requests_provider "
+    "ON charge_requests(provider, status, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_requests_message "
+    "ON charge_requests(review_message_id) WHERE review_message_id IS NOT NULL",
 )
 
 
@@ -1519,6 +1601,488 @@ class Database:
             (guild_id, user_id),
         )
         return int(row["s"] or 0) if row else 0
+
+    # ------------------------------------------------------------------
+    # チャージ方式 (provider_settings / payment_destinations)
+    # ------------------------------------------------------------------
+    async def get_provider_settings(self, guild_id: int, provider: str) -> sqlite3.Row | None:
+        return await self.fetchone(
+            "SELECT * FROM provider_settings WHERE guild_id=? AND provider=?",
+            (guild_id, provider),
+        )
+
+    async def list_provider_settings(self, guild_id: int) -> dict[str, sqlite3.Row]:
+        rows = await self.fetchall(
+            "SELECT * FROM provider_settings WHERE guild_id=?", (guild_id,)
+        )
+        return {str(r["provider"]): r for r in rows}
+
+    async def set_provider_settings(
+        self,
+        guild_id: int,
+        provider: str,
+        *,
+        enabled: bool | None = None,
+        charge_rate: Decimal | None = None,
+        clear_rate: bool = False,
+        minimum_charge: int | None = None,
+        maximum_charge: int | None = None,
+        clear_limits: bool = False,
+        updated_by: int | None = None,
+    ) -> None:
+        """方式ごとの設定を更新する (指定した項目だけ変える)。"""
+        if provider not in config.ALL_PROVIDERS:
+            raise DatabaseError(f"不明なチャージ方式です: {provider}")
+        now = utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "INSERT INTO provider_settings(guild_id, provider, created_at, updated_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(guild_id, provider) DO NOTHING",
+                (guild_id, provider, now, now),
+            )
+            sets: list[str] = []
+            params: list[Any] = []
+            if enabled is not None:
+                sets.append("enabled=?")
+                params.append(1 if enabled else 0)
+            if clear_rate:
+                sets.append("charge_rate=NULL")
+            elif charge_rate is not None:
+                sets.append("charge_rate=?")
+                params.append(utils.rate_to_db(charge_rate))
+            if clear_limits:
+                sets.append("minimum_charge=NULL")
+                sets.append("maximum_charge=NULL")
+            else:
+                if minimum_charge is not None:
+                    sets.append("minimum_charge=?")
+                    params.append(int(minimum_charge))
+                if maximum_charge is not None:
+                    sets.append("maximum_charge=?")
+                    params.append(int(maximum_charge))
+            sets.append("updated_by=?")
+            params.append(updated_by)
+            sets.append("updated_at=?")
+            params.append(now)
+            params.extend([guild_id, provider])
+            conn.execute(
+                f"UPDATE provider_settings SET {', '.join(sets)} "
+                "WHERE guild_id=? AND provider=?",
+                tuple(params),
+            )
+
+        await self.run(_fn, write=True)
+
+    async def get_destination(self, provider: str) -> sqlite3.Row | None:
+        """Owner が登録した入金先 (方式ごとに1つ)。"""
+        return await self.fetchone(
+            "SELECT * FROM payment_destinations WHERE provider=?", (provider,)
+        )
+
+    async def list_destinations(self) -> dict[str, sqlite3.Row]:
+        rows = await self.fetchall("SELECT * FROM payment_destinations")
+        return {str(r["provider"]): r for r in rows}
+
+    async def set_destination(
+        self, provider: str, *, address: str, label: str | None,
+        note: str | None, updated_by: int,
+    ) -> None:
+        if provider not in config.MANUAL_PROVIDERS:
+            raise DatabaseError(f"入金先を設定できない方式です: {provider}")
+        now = utils.now_ts()
+        await self.execute(
+            "INSERT INTO payment_destinations("
+            "provider, address, label, note, updated_by, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(provider) DO UPDATE SET "
+            "address=excluded.address, label=excluded.label, note=excluded.note, "
+            "updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+            (provider, address, label, note, updated_by, now, now),
+        )
+
+    async def delete_destination(self, provider: str) -> bool:
+        def _fn(conn: sqlite3.Connection) -> bool:
+            cur = conn.execute(
+                "DELETE FROM payment_destinations WHERE provider=?", (provider,)
+            )
+            return cur.rowcount > 0
+
+        return await self.run(_fn, write=True)
+
+    # ------------------------------------------------------------------
+    # チャージ申請 (charge_requests)
+    # ------------------------------------------------------------------
+    async def count_open_requests(self, guild_id: int, user_id: int) -> int:
+        """未処理 (送金待ち + 承認待ち) の申請数。"""
+        row = await self.fetchone(
+            "SELECT COUNT(*) AS c FROM charge_requests "
+            "WHERE guild_id=? AND user_id=? AND status IN (?,?)",
+            (guild_id, user_id, config.RequestStatus.QUOTED, config.RequestStatus.PENDING),
+        )
+        return int(row["c"]) if row else 0
+
+    async def create_request(
+        self,
+        *,
+        guild_id: int,
+        user_id: int,
+        provider: str,
+        requested_amount: int,
+        charge_rate: Decimal,
+        role_id: int | None,
+        estimated_credit: int,
+        asset_amount: Decimal | None = None,
+        asset_price: Decimal | None = None,
+        price_source: str | None = None,
+        price_fetched_at: int | None = None,
+        destination: str | None = None,
+        quote_seconds: int = config.QUOTE_WAIT_SECONDS,
+    ) -> int:
+        """入金先を案内した時点の申請 (QUOTED) を作る。
+
+        LTC はここで価格を確定させ、以後この単価で計算する
+        (チャージ率と同じく、後の相場変動に影響されない)。
+        """
+        now = utils.now_ts()
+        open_count_limit = config.MAX_OPEN_REQUESTS_PER_USER
+
+        def _fn(conn: sqlite3.Connection) -> int:
+            open_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM charge_requests "
+                "WHERE guild_id=? AND user_id=? AND status IN (?,?)",
+                (guild_id, user_id,
+                 config.RequestStatus.QUOTED, config.RequestStatus.PENDING),
+            ).fetchone()
+            if int(open_count["c"]) >= open_count_limit:
+                raise RequestError(
+                    config.ErrorCode.OPEN_REQUEST_LIMIT,
+                    f"未処理の申請が {open_count['c']} 件あります",
+                )
+            cur = conn.execute(
+                "INSERT INTO charge_requests("
+                "guild_id, user_id, provider, status, requested_amount, charge_rate, role_id, "
+                "estimated_credit, asset_amount, asset_price, price_source, price_fetched_at, "
+                "destination, quote_expires_at, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    guild_id, user_id, provider, config.RequestStatus.QUOTED,
+                    int(requested_amount), utils.rate_to_db(charge_rate), role_id,
+                    int(estimated_credit),
+                    format(asset_amount, "f") if asset_amount is not None else None,
+                    utils.rate_to_db(asset_price) if asset_price is not None else None,
+                    price_source, price_fetched_at, destination,
+                    now + int(quote_seconds), now, now,
+                ),
+            )
+            return _lastrowid(cur)
+
+        return await self.run(_fn, write=True)
+
+    async def submit_request_proof(
+        self,
+        request_id: int,
+        *,
+        user_id: int,
+        proof_ref: str,
+        proof_hash: str,
+        proof_note: str | None,
+        asset_amount: Decimal | None = None,
+        review_seconds: int = config.REQUEST_REVIEW_SECONDS,
+    ) -> sqlite3.Row:
+        """証拠を登録して承認待ち (PENDING) にする。
+
+        同じ証拠が既に使われていれば ``DUPLICATE_PROOF`` で拒否する
+        (UNIQUE 制約と明示チェックの二重防御)。
+        """
+        now = utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> sqlite3.Row:
+            row = conn.execute(
+                "SELECT * FROM charge_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            if row is None:
+                raise RequestError(config.ErrorCode.REQUEST_NOT_FOUND, "申請が存在しません")
+            if int(row["user_id"]) != int(user_id):
+                raise RequestError(config.ErrorCode.NOT_ALLOWED, "他人の申請です")
+            if row["status"] != config.RequestStatus.QUOTED:
+                raise RequestError(
+                    config.ErrorCode.REQUEST_ALREADY_HANDLED,
+                    f"状態が {row['status']} のため受け付けられません",
+                )
+            if row["quote_expires_at"] and int(row["quote_expires_at"]) < now:
+                conn.execute(
+                    "UPDATE charge_requests SET status=?, updated_at=? WHERE id=?",
+                    (config.RequestStatus.EXPIRED, now, request_id),
+                )
+                raise RequestError(config.ErrorCode.QUOTE_EXPIRED, "入金の受付時間が過ぎました")
+            duplicate = conn.execute(
+                "SELECT id, user_id, status FROM charge_requests "
+                "WHERE proof_hash=? AND id<>?",
+                (proof_hash, request_id),
+            ).fetchone()
+            if duplicate is not None:
+                raise RequestError(
+                    config.ErrorCode.DUPLICATE_PROOF,
+                    f"申請 #{duplicate['id']} で既に使われています",
+                )
+            try:
+                conn.execute(
+                    "UPDATE charge_requests SET status=?, proof_ref=?, proof_hash=?, "
+                    "proof_note=?, asset_amount=COALESCE(?, asset_amount), "
+                    "submitted_at=?, expires_at=?, updated_at=? WHERE id=?",
+                    (
+                        config.RequestStatus.PENDING, proof_ref, proof_hash, proof_note,
+                        format(asset_amount, "f") if asset_amount is not None else None,
+                        now, now + int(review_seconds), now, request_id,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                # UNIQUE インデックスによる最終防御
+                raise RequestError(
+                    config.ErrorCode.DUPLICATE_PROOF, "同じ証拠が既に使われています"
+                ) from exc
+            result = conn.execute(
+                "SELECT * FROM charge_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            assert result is not None
+            return result
+
+        return await self.run(_fn, write=True)
+
+    async def get_request(
+        self, request_id: int, guild_id: int | None = None
+    ) -> sqlite3.Row | None:
+        if guild_id is None:
+            return await self.fetchone(
+                "SELECT * FROM charge_requests WHERE id=?", (request_id,)
+            )
+        return await self.fetchone(
+            "SELECT * FROM charge_requests WHERE id=? AND guild_id=?",
+            (request_id, guild_id),
+        )
+
+    async def get_request_by_message(self, message_id: int) -> sqlite3.Row | None:
+        """審査カードのメッセージから申請を引く (ボタン操作の起点)。"""
+        return await self.fetchone(
+            "SELECT * FROM charge_requests WHERE review_message_id=?", (message_id,)
+        )
+
+    async def set_request_review_message(
+        self, request_id: int, *, channel_id: int, message_id: int
+    ) -> None:
+        await self.execute(
+            "UPDATE charge_requests SET review_channel_id=?, review_message_id=?, "
+            "updated_at=? WHERE id=?",
+            (channel_id, message_id, utils.now_ts(), request_id),
+        )
+
+    async def list_requests(
+        self,
+        *,
+        guild_id: int | None = None,
+        user_id: int | None = None,
+        provider: str | None = None,
+        statuses: Sequence[str] | None = None,
+        offset: int = 0,
+        limit: int = 10,
+    ) -> tuple[list[sqlite3.Row], int]:
+        where: list[str] = []
+        params: list[Any] = []
+        if guild_id is not None:
+            where.append("guild_id=?")
+            params.append(guild_id)
+        if user_id is not None:
+            where.append("user_id=?")
+            params.append(user_id)
+        if provider is not None:
+            where.append("provider=?")
+            params.append(provider)
+        if statuses:
+            where.append(f"status IN ({','.join('?' * len(statuses))})")
+            params.extend(statuses)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+
+        def _fn(conn: sqlite3.Connection) -> tuple[list[sqlite3.Row], int]:
+            total = conn.execute(
+                f"SELECT COUNT(*) AS c FROM charge_requests {clause}", tuple(params)
+            ).fetchone()
+            rows = conn.execute(
+                f"SELECT * FROM charge_requests {clause} "
+                "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                tuple(params) + (int(limit), int(offset)),
+            ).fetchall()
+            return list(rows), int(total["c"]) if total else 0
+
+        return await self.run(_fn)
+
+    async def count_requests_by_status(self, provider: str | None = None) -> dict[str, int]:
+        if provider:
+            rows = await self.fetchall(
+                "SELECT status, COUNT(*) AS c FROM charge_requests "
+                "WHERE provider=? GROUP BY status",
+                (provider,),
+            )
+        else:
+            rows = await self.fetchall(
+                "SELECT status, COUNT(*) AS c FROM charge_requests GROUP BY status"
+            )
+        return {str(r["status"]): int(r["c"]) for r in rows}
+
+    async def claim_request_for_review(
+        self, request_id: int, *, status: str, operator_id: int
+    ) -> sqlite3.Row:
+        """申請を APPROVED / REJECTED へ遷移させる (同時押し対策)。
+
+        書き込みは ``run(write=True)`` が ``BEGIN IMMEDIATE`` で囲むため、
+        その中で状態を確認して更新すれば、2人の管理者が同時にボタンを
+        押しても一度しか通らない。
+        残高付与そのものは呼び出し側が ``credit_transaction`` で行う。
+        """
+        if status not in (config.RequestStatus.APPROVED, config.RequestStatus.REJECTED):
+            raise DatabaseError(f"遷移先が不正です: {status}")
+        now = utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> sqlite3.Row:
+            row = conn.execute(
+                "SELECT * FROM charge_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            if row is None:
+                raise RequestError(config.ErrorCode.REQUEST_NOT_FOUND, "申請が存在しません")
+            current = str(row["status"])
+            if status not in config.REQUEST_TRANSITIONS.get(current, ()):
+                raise RequestError(
+                    config.ErrorCode.REQUEST_ALREADY_HANDLED,
+                    f"{config.REQUEST_STATUS_LABELS.get(current, current)} からは変更できません",
+                )
+            conn.execute(
+                "UPDATE charge_requests SET status=?, reviewed_by=?, reviewed_at=?, "
+                "updated_at=? WHERE id=? AND status=?",
+                (status, operator_id, now, now, request_id, current),
+            )
+            updated = conn.execute(
+                "SELECT * FROM charge_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            assert updated is not None
+            return updated
+
+        return await self.run(_fn, write=True)
+
+    async def finalize_request(
+        self,
+        request_id: int,
+        *,
+        credited_amount: int | None = None,
+        transaction_id: str | None = None,
+        operation_id: str | None = None,
+        reject_reason: str | None = None,
+    ) -> None:
+        """承認・却下の結果を申請へ書き戻す。"""
+        await self.execute(
+            "UPDATE charge_requests SET credited_amount=COALESCE(?, credited_amount), "
+            "transaction_id=COALESCE(?, transaction_id), "
+            "operation_id=COALESCE(?, operation_id), "
+            "reject_reason=COALESCE(?, reject_reason), updated_at=? WHERE id=?",
+            (credited_amount, transaction_id, operation_id, reject_reason,
+             utils.now_ts(), request_id),
+        )
+
+    async def cancel_request(self, request_id: int, *, user_id: int | None = None) -> sqlite3.Row:
+        """申請を取り消す (利用者本人または管理者)。"""
+        now = utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> sqlite3.Row:
+            row = conn.execute(
+                "SELECT * FROM charge_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            if row is None:
+                raise RequestError(config.ErrorCode.REQUEST_NOT_FOUND, "申請が存在しません")
+            if user_id is not None and int(row["user_id"]) != int(user_id):
+                raise RequestError(config.ErrorCode.NOT_ALLOWED, "他人の申請です")
+            current = str(row["status"])
+            if config.RequestStatus.CANCELLED not in config.REQUEST_TRANSITIONS.get(current, ()):
+                raise RequestError(
+                    config.ErrorCode.REQUEST_ALREADY_HANDLED,
+                    f"{config.REQUEST_STATUS_LABELS.get(current, current)} は取り消せません",
+                )
+            conn.execute(
+                "UPDATE charge_requests SET status=?, updated_at=? WHERE id=? AND status=?",
+                (config.RequestStatus.CANCELLED, now, request_id, current),
+            )
+            updated = conn.execute(
+                "SELECT * FROM charge_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            assert updated is not None
+            return updated
+
+        return await self.run(_fn, write=True)
+
+    async def expire_requests(self, now: int | None = None) -> list[sqlite3.Row]:
+        """期限切れの申請を EXPIRED にして、対象行を返す。"""
+        now = now or utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+            rows = conn.execute(
+                "SELECT * FROM charge_requests WHERE "
+                "(status=? AND quote_expires_at IS NOT NULL AND quote_expires_at < ?) OR "
+                "(status=? AND expires_at IS NOT NULL AND expires_at < ?)",
+                (config.RequestStatus.QUOTED, now, config.RequestStatus.PENDING, now),
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    "UPDATE charge_requests SET status=?, updated_at=? WHERE id=? AND status=?",
+                    (config.RequestStatus.EXPIRED, now, int(row["id"]), row["status"]),
+                )
+            return list(rows)
+
+        return await self.run(_fn, write=True)
+
+    async def list_pending_requests(self, *, limit: int = 25) -> list[sqlite3.Row]:
+        """未処理の申請 (古い順)。管理者への催促に使う。"""
+        return await self.fetchall(
+            "SELECT * FROM charge_requests WHERE status=? "
+            "ORDER BY submitted_at ASC, id ASC LIMIT ?",
+            (config.RequestStatus.PENDING, int(limit)),
+        )
+
+    async def create_manual_transaction(
+        self,
+        *,
+        guild_id: int,
+        user_id: int,
+        requested_amount: int,
+        received_amount: int,
+        charge_rate: Decimal,
+        source: str,
+    ) -> str:
+        """承認された申請の取引を RECEIVED 状態で作成する。
+
+        Kyash と同じ冪等な残高付与経路 (``credit_transaction``) をそのまま
+        使うため、方式の違いは ``source`` だけで表す。
+        """
+        if source not in (config.TxSource.MANUAL_PAYPAY, config.TxSource.MANUAL_LTC):
+            raise DatabaseError(f"source が不正です: {source}")
+        now = utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> str:
+            for _ in range(8):
+                tx_id = utils.new_transaction_id()
+                try:
+                    conn.execute(
+                        "INSERT INTO charge_transactions("
+                        "id, guild_id, user_id, requested_amount, received_amount, charge_rate, "
+                        "status, source, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            tx_id, guild_id, user_id, int(requested_amount),
+                            int(received_amount), utils.rate_to_db(charge_rate),
+                            config.TxStatus.RECEIVED, source, now, now,
+                        ),
+                    )
+                    return tx_id
+                except sqlite3.IntegrityError:
+                    continue
+            raise DatabaseError("取引IDの生成に失敗しました")
+
+        return await self.run(_fn, write=True)
 
     # ------------------------------------------------------------------
     # キュー
@@ -3484,6 +4048,9 @@ _FORWARD_COMPAT_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("ranking_panels", "last_signature", "TEXT"),
     ("ranking_panels", "last_updated_at", "INTEGER"),
     ("admin_audit_logs", "operation_id", "TEXT"),
+    # v3 で追加
+    ("charge_requests", "operation_id", "TEXT"),
+    ("charge_requests", "role_id", "INTEGER"),
 )
 
 

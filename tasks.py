@@ -93,6 +93,7 @@ class BackgroundTasks:
             self.backup_task,
             self.integrity_task,
             self.shop_expiry,
+            self.request_task,
             self.heartbeat,
             self.summary_task,
             self.campaign_task,
@@ -447,6 +448,22 @@ class BackgroundTasks:
 
     @shop_expiry.before_loop
     async def _before_shop(self) -> None:
+        await self._wait_ready()
+
+    @tasks.loop(seconds=config.TASK_REQUEST_INTERVAL)
+    async def request_task(self) -> None:
+        """チャージ申請の期限切れ処理と、未処理申請の催促。"""
+        try:
+            await self.charge.expire_stale_requests()
+        except Exception:  # noqa: BLE001
+            logger.exception("チャージ申請の期限処理に失敗しました")
+        try:
+            await self.charge.remind_pending_requests()
+        except Exception:  # noqa: BLE001
+            logger.exception("チャージ申請の催促に失敗しました")
+
+    @request_task.before_loop
+    async def _before_request(self) -> None:
         await self._wait_ready()
 
     @tasks.loop(seconds=config.TASK_HEARTBEAT_INTERVAL)

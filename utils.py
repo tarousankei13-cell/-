@@ -18,9 +18,9 @@ import time
 import unicodedata
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Final, Iterable, Sequence
 
 import config
 
@@ -213,6 +213,127 @@ def validate_charge_rate(raw: str) -> Decimal | None:
 def rate_to_db(rate: Decimal) -> str:
     """チャージ率を DB 保存用の文字列へ変換する。"""
     return format(rate.normalize(), "f")
+
+
+# ---------------------------------------------------------------------------
+# 暗号資産 (LTC) の数量と価格
+# ---------------------------------------------------------------------------
+
+_LTC_QUANT: Final[Decimal] = Decimal(1).scaleb(-config.LTC_DECIMALS)
+
+
+def fmt_asset(amount: Decimal | str | None, *, unit: str = "LTC") -> str:
+    """暗号資産の数量を表示用に整える (末尾のゼロを落とす)。"""
+    dec = to_decimal(amount)
+    if dec is None:
+        return "-"
+    text = format(quantize_asset(dec).normalize(), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    text = text or "0"
+    return f"{text} {unit}" if unit else text
+
+
+def quantize_asset(amount: Decimal) -> Decimal:
+    """LTC の最小単位 (1e-8) へ切り捨てる。
+
+    切り上げると利用者に「送れない額」を要求してしまうため、
+    請求額の算出では常に切り上げ (``asset_amount_for``) を使い、
+    ここでは表示・保存用の丸めだけを行う。
+    """
+    return amount.quantize(_LTC_QUANT, rounding=ROUND_DOWN)
+
+
+def asset_amount_for(jpy_amount: int, price_jpy: Decimal) -> Decimal:
+    """円建ての金額を、その時の単価で暗号資産の数量へ換算する。
+
+    利用者が送る額が不足しないよう **切り上げ** る。1 litoshi 未満の
+    不足で承認できなくなるのを防ぐため。
+    """
+    if price_jpy <= 0:
+        raise ValueError("価格が不正です")
+    raw = Decimal(int(jpy_amount)) / price_jpy
+    return raw.quantize(_LTC_QUANT, rounding=ROUND_UP)
+
+
+def jpy_value_of(asset_amount: Decimal, price_jpy: Decimal) -> int:
+    """暗号資産の数量を円換算する (四捨五入)。"""
+    value = asset_amount * price_jpy
+    return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def parse_asset_amount(raw: str) -> Decimal | None:
+    """利用者が入力した LTC 数量を検証する。
+
+    全角・カンマ・単位表記を許容し、負数・ゼロ・桁あふれは拒否する。
+    """
+    text = unicodedata.normalize("NFKC", str(raw)).strip()
+    # カンマは小数点の代わりに使われることがあり (0,1 = 0.1)、桁区切りと
+    # 区別できない。金額を取り違えると実害が出るため、含む入力は拒否する。
+    if "," in text or "_" in text:
+        return None
+    for suffix in ("ltc", "LTC", "Ltc"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)].strip()
+            break
+    if not text or not re.fullmatch(r"\d{0,12}(?:\.\d{0,12})?", text):
+        return None
+    dec = to_decimal(text)
+    if dec is None or not dec.is_finite() or dec <= 0:
+        return None
+    quantized = quantize_asset(dec)
+    if quantized <= 0:
+        return None
+    return quantized
+
+
+def validate_price_jpy(raw: str) -> Decimal | None:
+    """1 LTC あたりの円価格を検証する (手動設定・API 応答の共通検証)。"""
+    dec = to_decimal(unicodedata.normalize("NFKC", str(raw)).strip().replace(",", ""))
+    if dec is None or not dec.is_finite() or dec <= 0:
+        return None
+    if dec < Decimal(config.PRICE_MIN_JPY) or dec > Decimal(config.PRICE_MAX_JPY):
+        return None
+    return dec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP).normalize()
+
+
+_TXID_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{%d}$" % config.LTC_TXID_LENGTH)
+
+
+def normalize_txid(raw: str) -> str | None:
+    """Litecoin の txid を正規化する (64桁の16進数のみ)。
+
+    エクスプローラの URL を貼られた場合も末尾の txid を取り出す。
+    """
+    text = unicodedata.normalize("NFKC", str(raw)).strip()
+    if "/" in text:                       # URL で貼られた場合
+        text = text.rstrip("/").rsplit("/", 1)[-1]
+    text = text.split("?", 1)[0].split("#", 1)[0].strip().lower()
+    if text.startswith("0x"):
+        text = text[2:]
+    return text if _TXID_RE.fullmatch(text) else None
+
+
+_PAYPAY_REF_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9A-Za-z_-]{6,64}$")
+
+
+def normalize_payment_ref(raw: str) -> str | None:
+    """PayPay の取引ID を正規化する。
+
+    表示形式が将来変わっても壊れないよう、英数と ``-`` ``_`` のみに
+    絞った緩い検証にとどめる (二重申請の判定には正規化後の値を使う)。
+    """
+    text = unicodedata.normalize("NFKC", str(raw)).strip()
+    text = text.replace(" ", "").replace("\u3000", "")
+    if text.lower().startswith("id:"):
+        text = text[3:]
+    text = text.strip().upper()
+    return text if _PAYPAY_REF_RE.fullmatch(text) else None
+
+
+def proof_hash(provider: str, proof_ref: str) -> str:
+    """証拠 (取引ID / txid) のハッシュ。二重申請の判定に使う。"""
+    return hashlib.sha256(f"proof:v1:{provider}:{proof_ref}".encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------

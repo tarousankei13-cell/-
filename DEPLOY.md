@@ -18,6 +18,17 @@ Bot は管理者が登録した **受取用 Kyash アカウント** でリンク
 - トークン失効の事前警告 / 受取アカウント残高しきい値 / 連続失敗クールダウン
 - 死活監視 (ハートビート) / バックアップの外部保存 / GitHub Actions による自動テスト
 
+**v3.0 の追加機能 (PayPay / Litecoin チャージ)**
+- **PayPay** と **Litecoin (LTC)** でもチャージできるようになりました
+  (どちらも「利用者が申請 → 管理者が承認」の承認制)
+- **方式ごとにチャージ率・金額上下限・受付の有効/無効**を設定できます
+- LTC は **CoinGecko API でその時のレートを取得**し、案内した時点の単価を申請に固定します
+  (取得できないときは固定価格へフォールバック、どちらも無ければ LTC の受付を停止)
+- 申請は**審査チャンネルに承認/却下ボタン付きのカード**として投稿されます
+- 承認された申請は **Kyash と同じ残高付与経路**を通るため、二重付与防止・実績投稿・
+  ランキング・招待報酬の確定・監査ログがそのまま働きます
+- 同じ取引ID / txid は**二度使えません** (DB の UNIQUE 制約で担保)
+
 **v2.1 の変更点 (UI の分かりやすさとバグ修正)**
 - チャージが **3ステップ表示** になり、「いま何をすればよいか」が常に見えます
   (`ステップ 1/3 金額入力` → `2/3 リンク送信` → `3/3 受取処理中`)
@@ -30,9 +41,11 @@ Bot は管理者が登録した **受取用 Kyash アカウント** でリンク
 - Embed が Discord の上限を超えたときに無言で失敗しないよう、送信前に自動で切り詰め
 - 静的解析 (mypy) を 0 エラーにし、同種の引数ミスを検出できるようにしました
 
-- Bot バージョン: `2.1.0` / DB スキーマ: `v2` (v2.0 から移行不要)
+- Bot バージョン: `3.0.0` / DB スキーマ: `v3` (v1 / v2 の DB は起動時に自動移行)
 - 想定環境: Python 3.11+ / discord.py 2.x / SQLite (WAL) / Linux VPS + systemd
 - Kyash 連携: 同梱の添付モジュール `vendor/Kyasher` (Kyasher 1.5.0) のみを使用
+- PayPay / LTC: **外部 API は使いません** (LTC の価格取得のみ CoinGecko を参照)。
+  着金確認は管理者が自分の目で行う承認制です
 
 ---
 
@@ -45,6 +58,7 @@ discord-charge-bot/
 ├── utils.py                    # 金額(Decimal)・リンク正規化/ハッシュ・マスキング・レート制限・トークン暗号化
 ├── database.py                 # SQLite スキーマ / マイグレーション / 全クエリ / 冪等な残高付与
 ├── kyash_service.py            # 添付モジュールの安全な抽象化 (直列化・タイムアウト・受取確認)
+├── price_service.py            # LTC/JPY 価格の取得 (厳格な検証・キャッシュ・異常値ガード)
 ├── charge_service.py           # チャージ・ショップ・招待・残高操作・通知・ランキング
 ├── ui.py                       # Embed / Persistent View / Modal
 ├── commands.py                 # スラッシュコマンド (Owner / Admin)
@@ -54,9 +68,10 @@ discord-charge-bot/
 ├── tests/
 │   ├── test_charge_flow.py     # 統合テスト: チャージ本体 (87項目)
 │   ├── test_v2_features.py     # 統合テスト: ショップ/招待/残高操作/実績投稿 (88項目)
-│   ├── test_migration.py       # v1 → v2 スキーマ移行 (13項目)
-│   ├── test_ui_render.py       # 全 Embed の描画と文字数上限 (116項目)
-│   └── test_commands_smoke.py  # 全コマンド/全ボタンの実行と権限 (131項目)
+│   ├── test_migration.py       # 旧DBの自動移行 (19項目)
+│   ├── test_providers.py       # PayPay / LTC の申請・承認 (75項目)
+│   ├── test_ui_render.py       # 全 Embed の描画と文字数上限 (155項目)
+│   └── test_commands_smoke.py  # 全コマンド/全ボタンの実行と権限 (167項目)
 ├── .github/workflows/test.yml  # CI (lint + 起動前チェック + 全テスト)
 ├── vendor/
 │   └── Kyasher/                # 添付モジュール (無変更で同梱・監査用)
@@ -277,6 +292,31 @@ journalctl -u discord-charge-bot -p err        # エラーのみ
 
 ---
 
+#### チャージ方式 (PayPay / LTC)
+
+| コマンド | 内容 | 権限 |
+|---|---|---|
+| `/provider status` | 方式の状態・レート・価格の取得状況をまとめて表示 | 管理者 |
+| `/provider enable` | 方式ごとに受付を切り替え | 管理者 |
+| `/provider rate` | 方式ごとのチャージ率 (`clear` で既定に戻す) | 管理者 |
+| `/provider limits` | 方式ごとの金額上下限 (`0 0` で既定に戻す) | 管理者 |
+| `/provider destination` | 入金先 (PayPay ID / LTC アドレス) を登録 | **Owner** |
+| `/provider destination_clear` | 入金先の登録を削除 | **Owner** |
+| `/provider review_channel` | 申請の審査チャンネルを設定 | **Owner** |
+| `/provider delegate` | そのサーバーの管理者にも承認を許可 | **Owner** |
+| `/provider price_source` | LTC 価格の取得元 (API / 固定価格) | **Owner** |
+| `/provider price` | LTC の固定価格 (API 障害時のフォールバック) | **Owner** |
+| `/provider price_check` | 価格を実際に取得して確認 | **Owner** |
+| `/request pending` | 未処理の申請をまとめて表示 | 管理者 |
+| `/request list` | 申請の一覧 (状態・方式・利用者で絞り込み) | 管理者 |
+| `/request show` | 申請の詳細 (照合用の値) | 管理者 |
+| `/request approve` | 承認して残高を付与 (`amount` で額を変更可) | 承認者 |
+| `/request reject` | 却下 (理由は利用者へ DM) | 承認者 |
+| `/request cancel` | 申請を取り消す | 承認者 |
+
+> 「承認者」= Bot Owner、または Owner が `/provider delegate` で承認を委任した
+> サーバーの管理者。入金先が Owner のものであるため、既定では Owner だけが承認できます。
+
 ## G. 利用者の操作 (コマンド不要)
 
 チャージパネルのボタンだけで完結します。
@@ -304,7 +344,18 @@ journalctl -u discord-charge-bot -p err        # エラーのみ
 | 📊 自分の招待状況 | 確定/保留/要確認/無効の件数と獲得報酬 |
 | 🏆 招待ランキング | 確定した招待数のランキング |
 
-### チャージの流れ (利用者には 3 ステップとして表示されます)
+### チャージ方法が複数あるとき
+
+`💰 チャージ` を押すと方法の選択メニューが出ます (使えない方法は理由つきで表示)。
+使える方法が Kyash だけのサーバーでは選択画面は出ず、従来どおり金額入力へ進みます。
+
+| 方法 | 反映 | 手順 |
+|---|---|---|
+| 💰 Kyash | **自動** (10〜60秒) | 送金リンクを貼るだけ |
+| 🅿️ PayPay | 管理者の承認後 | 送金 → 取引ID を申請 |
+| Ł Litecoin (LTC) | 管理者の承認後 | 表示された数量を送金 → txid を申請 |
+
+### チャージの流れ (Kyash: 3 ステップ / PayPay・LTC: 4 ステップ)
 
 ```
 [ステップ 1/3] 💰 チャージ → 金額入力 Modal (半角数字のみ)
@@ -321,6 +372,26 @@ journalctl -u discord-charge-bot -p err        # エラーのみ
 - 入力した金額と送金リンクの金額が **一致しない場合は処理しません** (差額処理もしません)。
 - 請求リンクは受け取れません (送金リンクを作成してください)。
 - リンク入力期限は約 15 分、同時に進行できるチャージは 1 ユーザー 1 件です。
+
+---
+
+## H-0. PayPay / LTC を使う場合の設定順
+
+```bash
+# --- Bot Owner が一度だけ ---
+/provider destination provider:PayPay address:<PayPay ID> label:受取用
+/provider destination provider:Litecoin\ (LTC) address:<LTC アドレス> label:受取用
+/provider review_channel channel:#charge-review
+/provider price_check                      # LTC の価格取得を確認
+
+# --- 各サーバーの管理者 ---
+/provider rate provider:PayPay charge_rate:120
+/provider rate provider:Litecoin\ (LTC) charge_rate:150
+/provider status                           # 🟢 になったか確認
+/charge_panel                              # パネルを貼り直すと方式が反映されます
+```
+
+詳細は本文後半の「v3: PayPay / Litecoin チャージ (承認制)」を参照してください。
 
 ---
 
@@ -357,12 +428,13 @@ journalctl -u discord-charge-bot -p err        # エラーのみ
 
 ```bash
 cd /opt/discord-charge-bot
-./venv/bin/python3 tests/test_charge_flow.py     # 87 件  チャージの本流と異常系
+./venv/bin/python3 tests/test_charge_flow.py     #  87 件  Kyash チャージの本流と異常系
 ./venv/bin/python3 tests/test_v2_features.py    #  88 件  ショップ・招待・残高操作・実績投稿
-./venv/bin/python3 tests/test_migration.py      #  13 件  v1 → v2 の移行
-./venv/bin/python3 tests/test_ui_render.py      # 116 件  全 Embed の描画と文字数上限
-./venv/bin/python3 tests/test_commands_smoke.py # 131 件  全コマンド・全ボタンの実行
-# → 合計 435 件成功 / 0 件失敗
+./venv/bin/python3 tests/test_migration.py      #  19 件  旧DBの自動移行 (v1 → v3)
+./venv/bin/python3 tests/test_providers.py      #  75 件  PayPay / LTC の申請・承認
+./venv/bin/python3 tests/test_ui_render.py      # 155 件  全 Embed の描画と文字数上限
+./venv/bin/python3 tests/test_commands_smoke.py # 167 件  全コマンド・全ボタンの実行
+# → 合計 591 件成功 / 0 件失敗
 ```
 
 静的解析も併せて実行できます (どちらも 0 件が正常)。
@@ -370,8 +442,8 @@ cd /opt/discord-charge-bot
 ```bash
 ./venv/bin/python3 -m pyflakes *.py tests/*.py
 ./venv/bin/python3 -m mypy --ignore-missing-imports \
-    config.py utils.py database.py kyash_service.py charge_service.py \
-    ui.py commands.py tasks.py main.py
+    config.py utils.py database.py kyash_service.py price_service.py \
+    charge_service.py ui.py commands.py tasks.py main.py
 ```
 
 検証内容: 金額検証 / 正常チャージ (130%→1300) / 二重付与防止 / 同一リンク再利用拒否 /
@@ -446,6 +518,31 @@ cd /opt/discord-charge-bot
 
 > 利用者には「現在処理結果を確認しています」と通知され、残高は付与されません。
 > 対象ユーザーはこの取引が解決するまで新しいチャージを開始できません (安全側の仕様)。
+
+### PayPay / LTC のチャージができない
+
+`💰 チャージ` に方法が出てこない、または選ぶと拒否される場合は
+`/provider status` で原因を確認してください。
+
+| 表示 | 原因と対処 |
+|---|---|
+| 🔴 入金先が未登録です | `/provider destination` で登録 (Owner) |
+| 🔴 審査チャンネルが未設定です | `/provider review_channel` で設定 (Owner) |
+| 🔴 管理者が停止しています | `/provider enable` で受付を再開 |
+| LTC だけ使えない | `/provider price_check` を実行。価格が取得できていません |
+
+利用者が「レートを取得できないため利用できません」と言われる場合は、
+CoinGecko へ到達できていません。上の「価格が取得できないとき」を参照してください。
+
+### 申請が承認できない
+
+| メッセージ | 原因 |
+|---|---|
+| `その申請は既に処理されています` | 他の管理者が処理済み、または期限切れ |
+| `操作できません` | 承認権限がありません (`/provider delegate` で委任) |
+| `その取引は既に申請されています` | 同じ取引ID / txid が既に使われています |
+
+`/request show request_id:<ID>` で現在の状態を確認できます。
 
 ### 実績投稿について
 
@@ -537,6 +634,22 @@ sudo systemctl start discord-charge-bot
 
 ---
 
+## セキュリティ / 整合性の方針 (v3 の追加分)
+
+- **PayPay / LTC で外部の決済 API は使いません。** 着金確認は管理者が行う承認制です。
+  そのため決済サービスの規約違反やアカウント凍結のリスクを負いません。
+- LTC の入金先は**アドレスだけ**を登録します。**秘密鍵は一切扱いません**。
+  Bot が侵害されても LTC を動かすことはできません。
+- 価格は「取れたら使う」のではなく「**信用できるときだけ使う**」方針です。
+  検証・範囲・鮮度・異常値ガードのいずれかに引っかかれば採用せず、
+  代替値も無ければ LTC の受付を止めます (推測した価格で残高を発行しません)。
+- 承認は既定で Bot Owner のみ。入金先が Owner のものなので、
+  確認できる人だけが承認できる構成にしています。
+- 同じ証拠 (取引ID / txid) は DB の UNIQUE 制約で一度しか使えません。
+- 承認は `BEGIN IMMEDIATE` 内の状態遷移で直列化され、同時押しでも一度しか付与されません。
+- 申請の承認は Kyash と同じ `credit_transaction` を通るため、
+  冪等性・監査ログ・実績・ランキング・招待確定の保証をそのまま受け継ぎます。
+
 ## セキュリティ / 整合性の方針
 
 - **秘密情報をログ・DB に残さない**: Token / パスワード / OTP / Cookie / Authorization /
@@ -554,6 +667,197 @@ sudo systemctl start discord-charge-bot
 - **Discord 通知の失敗でチャージを巻き戻さない**: 通知・ランキング更新はすべて例外を吸収します。
 - **graceful shutdown**: SIGTERM/SIGINT で新規受付停止 → タスク停止 → セッション破棄 → DB commit → 切断。
 - **自己復旧**: 停止したバックグラウンドタスクを定期タスクが相互監視して再開します。
+
+---
+
+# v3: PayPay / Litecoin チャージ (承認制)
+
+Kyash は Bot が自動で受け取りますが、**PayPay と LTC は「利用者が申請 → 管理者が承認」**
+という流れです。外部の決済 API を使わないので、規約リスクも API 障害もありません。
+その代わり、**入金が実際に届いているかは管理者が自分の目で確認**します。
+
+## 利用者から見た流れ (4 ステップ)
+
+```
+[1/4] 💰 チャージ → 方法を選ぶ  [Kyash / PayPay / LTC]
+[2/4] 金額を入力 (LTC も「円」で入力します)
+[3/4] Bot が宛先と送る金額を表示 → 送金 → 「✅ 送金しました」
+        → PayPay: 取引ID を入力
+        → LTC:   txid と実際に送った数量を入力
+[4/4] 申請完了 → 管理者の承認待ち
+        承認 → 残高に反映 + DM + 実績投稿 + ランキング更新 + 招待報酬の確定
+        却下 → DM で理由を通知 (残高は動きません)
+```
+
+- 使える方法が Kyash だけのサーバーでは、**選択画面は出ません** (従来どおり 3 ステップ)。
+- `📜 履歴` の先頭に「進行中の申請」が出るので、利用者は状態をいつでも確認できます。
+- 申請の受付期限: 送金待ち **30 分** / 承認待ち **72 時間** (期限切れは DM で通知)。
+- 1 人が同時に持てる未処理の申請は **3 件**まで。
+
+## 初期設定 (Bot Owner)
+
+```bash
+# 1) 入金先を登録する (全サーバー共通)
+/provider destination provider:PayPay address:<PayPay ID> label:受取用 \
+    note:メモ欄には何も書かないでください
+/provider destination provider:Litecoin\ (LTC) address:<LTC アドレス> label:受取用
+
+# 2) 審査チャンネルを設定する (全サーバーの申請がここへ集まります)
+/provider review_channel channel:#charge-review
+
+# 3) LTC の価格取得を確認する
+/provider price_check
+#   🟢 取得できた → そのまま使えます
+#   🔴 取得できない → 下の「価格が取得できないとき」を参照
+
+# 4) (任意) 相場 API 障害時のフォールバック価格を入れておく
+/provider price jpy:12000
+```
+
+**入金先は Bot Owner のものなので、承認できるのは既定で Bot Owner だけです。**
+信頼できるサーバーの管理者にも承認させたい場合だけ、明示的に委任します。
+
+```bash
+/provider delegate guild_id:<サーバーID> enabled:true
+```
+
+> ⚠️ 委任したサーバーの管理者は、入金を確認せずに残高を発行できてしまいます。
+> 入金先を共有している相手にだけ委任してください。
+
+## サーバーごとの設定 (管理者)
+
+```bash
+/provider status                              # 方式の状態をまとめて確認
+/provider enable provider:PayPay enabled:true # 方式ごとに受付を切り替え
+/provider rate provider:PayPay charge_rate:120   # 方式ごとのチャージ率
+/provider rate provider:Litecoin\ (LTC) charge_rate:150
+/provider rate provider:PayPay charge_rate:clear # サーバー既定に戻す
+/provider limits provider:PayPay minimum:1000 maximum:30000  # 0 0 で既定に戻す
+```
+
+### チャージ率の決まり方
+
+```
+方式別レート が サーバー既定 を置き換える
+    ↓
+ロール別レート (VIP 等) があれば、その 高い方 を採用する
+```
+
+| 設定 | VIP なし | VIP (150%) |
+|---|---|---|
+| サーバー既定 130% のみ | 130% | 150% |
+| PayPay 100% | **100%** | 150% |
+| LTC 200% | **200%** | **200%** |
+
+こうすることで「PayPay は低めにする」意図も、「LTC を高くしたのに VIP が損をする」
+という逆転も同時に避けられます。適用したレートは**申請作成時に保存**されるので、
+後から設定を変えても既存の申請には影響しません。
+
+## 審査 (承認 / 却下)
+
+申請が来ると審査チャンネルにカードが投稿されます。
+
+| ボタン | 動作 |
+|---|---|
+| 🟢 承認 | 申請どおりの額を付与 |
+| ✏️ 金額を直して承認 | 実際の入金額と違うとき。**理由が必須**で監査ログに残ります |
+| 🔴 却下 | 理由を入力して却下。残高は動かず、利用者へ DM で理由が届きます |
+| 🔍 詳細 | txid・宛先・確定レート・その利用者の直近の申請・現在残高を表示 |
+
+カードのボタンは**再起動後も動きます** (Persistent View)。処理済みのカードは
+自動で更新され、ボタンが外れます。コマンドでも同じことができます。
+
+```bash
+/request pending                    # 未処理の申請をまとめて見る
+/request list status:🟡\ 承認待ち    # 絞り込み
+/request show request_id:12         # 詳細 (照合用の値をコピーできます)
+/request approve request_id:12                        # 申請どおり承認
+/request approve request_id:12 amount:900 note:入金が900円だったため
+/request reject request_id:12 reason:入金を確認できませんでした
+/request cancel request_id:12       # 取り消し
+```
+
+未処理の申請が **6 時間**を超えると Owner へ DM で催促します。
+
+### 確認のしかた
+
+| 方式 | 照合する値 | 確認場所 |
+|---|---|---|
+| PayPay | 取引ID・金額 | PayPay アプリの取引履歴 |
+| LTC | txid・宛先・数量・承認数 | ブロックエクスプローラ (txid で検索) |
+
+**LTC は txid が公開情報なので、PayPay より確実に検証できます。**
+`🔍 詳細` に txid がコードブロックで出るので、そのままコピーして
+エクスプローラで検索してください。
+
+## LTC のレート
+
+利用者が**円**で金額を入力すると、Bot がその時のレートで「送る LTC 数量」を計算します。
+
+```
+入力: 1,000 円
+  ↓ CoinGecko から 1 LTC = 12,000 円 を取得
+表示: 0.08333334 LTC を送ってください (切り上げ / 不足が出ないように)
+  ↓ この単価 12,000 円を申請に固定
+承認: 1,000 円 × チャージ率 150% = 1,500 を付与
+```
+
+申請を作った後に相場が動いても、**その申請の単価は変わりません**
+(チャージ率スナップショットと同じ考え方)。
+
+### 価格の安全弁
+
+| 仕組み | 内容 |
+|---|---|
+| 厳格な検証 | 応答の型・範囲を検査。想定外の形なら採用しません |
+| 範囲チェック | 100 円〜1 億円の外は拒否 (桁違いの応答を弾く) |
+| 鮮度チェック | 15 分より古い価格は使いません |
+| 異常値ガード | 直近の採用値から **35% 以上**跳ねたら採用せず Owner へ通知 |
+| キャッシュ | 60 秒。API を叩きすぎません |
+| レート制限 | 価格取得の前にレート制限をかけるので、連打で API を叩けません |
+| フォールバック | 取得失敗時は `/provider price` の固定価格 → 直近の採用値 の順 |
+| 最終手段 | どれも使えない場合は **LTC チャージを拒否**します (推測した価格は使いません) |
+
+### 価格が取得できないとき
+
+`/provider price_check` が 🔴 になる主な原因は**ネットワーク**です。
+
+```bash
+# VPS から到達できるか確認する
+curl -sS "https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=jpy"
+# → {"litecoin":{"jpy":12345}} が返れば OK
+```
+
+到達できない場合 (ファイアウォール・プロキシ環境など) は固定価格で運用できます。
+
+```bash
+/provider price jpy:12000            # 1 LTC = 12,000 円
+/provider price_source source:管理者が設定した固定価格
+```
+
+> ⚠️ 固定価格のまま相場が動くと、差額を突かれる恐れがあります。
+> `/provider status` に最終更新時刻が出るので、定期的に見直してください。
+
+## 不正防止
+
+| 手口 | 対策 |
+|---|---|
+| 同じ取引ID / txid で何度も申請 | `charge_requests.proof_hash` に **UNIQUE 制約**。却下・取消済みのものも占有し続けます |
+| 2 人の管理者が同時に承認 | `BEGIN IMMEDIATE` 内で状態遷移を確認。**一度しか付与されません** |
+| 承認を何度も押す | 同上。2 回目は `🟡 承認待ち からは変更できません` で拒否 |
+| 送金せずに申請 | 管理者が入金を確認してから承認します (Bot は自動承認しません) |
+| 申請を大量に作る | 同時 **3 件**まで + レート制限 |
+| 承認権限の乗っ取り | 既定は Bot Owner のみ。委任は Owner が明示的に行います |
+| 期限切れの申請を後から承認 | 状態遷移表で拒否されます |
+
+## 返金について
+
+**LTC の返金は Bot からはできません。** ブロックチェーンは取り消せないため、
+`/transaction refund` で内部残高を取り消しても、LTC 自体は戻りません。
+返金が必要な場合は、内部残高を取り消したうえで**管理者が手動で送金**してください。
+この点は申請画面と `🔍 詳細` にも明記してあります。
+
+PayPay は PayPay 側の操作で対応してください (Bot は内部残高の取り消しのみ行います)。
 
 ---
 

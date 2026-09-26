@@ -295,7 +295,137 @@ def main() -> None:
                                     config.InviteStatus.REJECTED] * 4)
         ]))
 
-    print("\n=== 8. 管理者向け ===")
+    print("\n=== 8. チャージ方式 (PayPay / LTC) ===")
+    entries = [
+        {"provider": config.ChargeProvider.KYASH, "available": True, "reason": None,
+         "error_code": None, "minimum": 100, "maximum": 50_000,
+         "rate": Decimal("130"), "destination": None},
+        {"provider": config.ChargeProvider.PAYPAY, "available": True, "reason": None,
+         "error_code": None, "minimum": 500, "maximum": 30_000, "rate": Decimal("120"),
+         "destination": Row(address="paypay-id-123", label="受取用" * 20,
+                            note="メモ欄には何も書かないでください" * 20)},
+        {"provider": config.ChargeProvider.LTC, "available": False,
+         "reason": "入金先が未登録です",
+         "error_code": config.ErrorCode.PROVIDER_NOT_CONFIGURED,
+         "minimum": 1000, "maximum": 100_000, "rate": Decimal("150"), "destination": None},
+    ]
+    verify("provider_select_embed", ui.provider_select_embed(entries))
+    verify("provider_select_embed (全部使えない)",
+           ui.provider_select_embed([{**e, "available": False, "reason": "停止中"}
+                                     for e in entries]))
+    verify("charge_panel_embed (複数方式)",
+           ui.charge_panel_embed(settings, kyash_ready=True, providers=entries))
+    verify("charge_panel_embed (Kyashのみ)",
+           ui.charge_panel_embed(settings, kyash_ready=True, providers=[entries[0]]))
+    verify("help_embed (複数方式)",
+           ui.help_embed(settings, shop_available=True, campaign_name="春の祭",
+                         providers=entries))
+    check(ui.step_line(1, ui.MANUAL_CHARGE_STEPS).count("○") == 3,
+          "承認制は 4 ステップ表示になる")
+
+    ltc_quote = {
+        "request_id": 7, "provider": config.ChargeProvider.LTC, "amount": 1000,
+        "charge_rate": Decimal("150"), "role_id": 101, "estimated_credit": 1500,
+        "asset_amount": Decimal("0.08333334"), "asset_price": Decimal("12000"),
+        "price_source": config.PRICE_SOURCE_COINGECKO, "price_stale": False,
+        "destination": Row(address="ltc1q" + "x" * 40, label="受取用", note="長い注意" * 80),
+        "quote_expires_at": now + 1800,
+    }
+    verify("deposit_embed (LTC)", ui.deposit_embed(ltc_quote))
+    verify("deposit_embed (LTC・代替レート)",
+           ui.deposit_embed({**ltc_quote, "price_stale": True}))
+    paypay_quote = {
+        "request_id": 8, "provider": config.ChargeProvider.PAYPAY, "amount": 1000,
+        "charge_rate": Decimal("120"), "role_id": None, "estimated_credit": 1200,
+        "asset_amount": None, "asset_price": None, "price_source": None,
+        "price_stale": False,
+        "destination": Row(address="paypay-id-123", label=None, note=None),
+        "quote_expires_at": now + 1800,
+    }
+    verify("deposit_embed (PayPay)", ui.deposit_embed(paypay_quote))
+    verify("request_submitted_embed", ui.request_submitted_embed({
+        "request_id": 7, "provider": config.ChargeProvider.LTC,
+        "estimated_credit": 1500, "pending_total": 4, "expires_at": now + 86400,
+    }))
+    verify("request_submitted_embed (待ちなし)", ui.request_submitted_embed({
+        "request_id": 7, "provider": config.ChargeProvider.PAYPAY,
+        "estimated_credit": 1200, "pending_total": 1, "expires_at": None,
+    }))
+
+    def make_request(**over: object) -> Row:
+        base = dict(
+            id=7, guild_id=1, user_id=100, provider=config.ChargeProvider.LTC,
+            status=config.RequestStatus.PENDING, requested_amount=1000,
+            charge_rate="150", role_id=101, estimated_credit=1500,
+            asset_amount="0.08333334", asset_price="12000",
+            price_source=config.PRICE_SOURCE_COINGECKO, price_fetched_at=now - 60,
+            destination="ltc1q" + "x" * 40, proof_ref="ab" * 32, proof_hash="h" * 64,
+            proof_note=None, review_channel_id=5, review_message_id=6,
+            reviewed_by=None, reviewed_at=None, reject_reason=None,
+            credited_amount=None, transaction_id=None, operation_id=None,
+            quote_expires_at=now + 1800, expires_at=now + 86400,
+            submitted_at=now - 30, created_at=now - 120, updated_at=now,
+        )
+        base.update(over)
+        return Row(**base)
+
+    for status, extra in (
+        (config.RequestStatus.PENDING, {}),
+        (config.RequestStatus.APPROVED,
+         {"credited_amount": 1500, "transaction_id": "TX-ABC", "reviewed_by": 9,
+          "reviewed_at": now}),
+        (config.RequestStatus.REJECTED,
+         {"reject_reason": "入金が確認できませんでした" * 40, "reviewed_by": 9,
+          "reviewed_at": now}),
+        (config.RequestStatus.EXPIRED, {}),
+        (config.RequestStatus.CANCELLED, {}),
+        (config.RequestStatus.QUOTED, {"proof_ref": None, "submitted_at": None}),
+    ):
+        verify(f"review_card_embed ({status})",
+               ui.review_card_embed(request=make_request(status=status, **extra),
+                                    guild_name="テストサーバー" * 20, pending_total=5))
+    verify("review_card_embed (PayPay)",
+           ui.review_card_embed(
+               request=make_request(provider=config.ChargeProvider.PAYPAY,
+                                    asset_amount=None, asset_price=None,
+                                    proof_ref="ABC-123", destination="paypay-id"),
+               guild_name="サーバー", pending_total=1))
+    verify("review_detail_embed", ui.review_detail_embed(
+        request=make_request(), history=[make_request(id=i) for i in range(8)],
+        balance=12_345))
+    verify("review_detail_embed (PayPay・履歴なし)", ui.review_detail_embed(
+        request=make_request(provider=config.ChargeProvider.PAYPAY, asset_amount=None,
+                             asset_price=None, proof_ref="ABC-123"),
+        history=[], balance=0))
+    verify("request_result_dm_embed (却下)", ui.request_result_dm_embed(
+        guild_name="サーバー" * 30,
+        request=make_request(status=config.RequestStatus.REJECTED,
+                             reject_reason="入金が確認できませんでした" * 40)))
+    verify("request_result_dm_embed (期限切れ)", ui.request_result_dm_embed(
+        guild_name="サーバー", request=make_request(status=config.RequestStatus.EXPIRED)))
+    verify("request_list_embed (空)",
+           ui.request_list_embed([], page=1, total_pages=1, total=0, title="📨 申請"))
+    verify("request_list_embed", ui.request_list_embed(
+        [make_request(id=i, status=st) for i, st in enumerate(
+            list(config.REQUEST_STATUS_LABELS) * 2)],
+        page=2, total_pages=5, total=48, title="📨 申請"))
+    verify("provider_status_embed", ui.provider_status_embed(
+        entries, guild_name="サーバー" * 30, review_channel_id=12345,
+        price={"source": config.PRICE_SOURCE_COINGECKO, "manual_price": "11000",
+               "manual_updated_at": now - 3600, "last_good_price": "12000",
+               "last_good_at": now - 60, "cached_price": "12000", "cached_age": 30,
+               "cached_stale": False, "last_error": "x" * 500,
+               "consecutive_failures": 2},
+        delegated=True))
+    verify("provider_status_embed (価格なし・未設定)", ui.provider_status_embed(
+        entries, guild_name="サーバー", review_channel_id=None, price=None,
+        delegated=False))
+    verify("history_embed (進行中の申請あり)", ui.history_embed(
+        rows, page=1, total_pages=3, total=20,
+        open_requests=[make_request(id=1, status=config.RequestStatus.QUOTED),
+                       make_request(id=2, status=config.RequestStatus.PENDING)]))
+
+    print("\n=== 9. 管理者向け ===")
     verify("daily_summary_embed", ui.daily_summary_embed(
         guild_name="サーバー", start=now - 86400, end=now,
         summary={"total": 10, "success": 8, "failed": 1, "review": 1,
@@ -306,6 +436,24 @@ def main() -> None:
         distribution={"count": 5, "total": 50_000, "zero": 1, "median": 8000,
                       "max": 20_000, "top10_share": 40.0, "issued": 60_000,
                       "spent": 10_000}))
+    request_counts = {k: 3 for k in config.REQUEST_STATUS_LABELS}
+    price_snapshot = {
+        "source": config.PRICE_SOURCE_COINGECKO, "manual_price": "11000",
+        "manual_updated_at": now - 3600, "last_good_price": "12000",
+        "last_good_at": now - 60, "cached_price": "12000", "cached_age": 30,
+        "cached_stale": True, "last_error": "timeout", "consecutive_failures": 3,
+    }
+    verify("admin_panel_embed (申請・価格つき)", ui.admin_panel_embed(
+        guild_name="サーバー", settings=settings,
+        kyash={"logged_in": True, "wallet_balance": 1, "token_days_left": 30.0,
+               "token_expiring_soon": False, "last_error": None,
+               "consecutive_failures": 0, "wallet_headroom": 1000},
+        queue={}, stats={"today_count": 1, "today_sent": 1, "today_credited": 1,
+                         "success": 1, "failed": 0, "credited": 1, "users": 1},
+        metrics={"receive_avg_seconds": 1, "purchases": 0, "purchase_refunds": 0,
+                 "invites_confirmed": 0, "invites_hold": 0},
+        review_count=2, updated_at=now,
+        requests=request_counts, price=price_snapshot))
     verify("admin_panel_embed", ui.admin_panel_embed(
         guild_name="サーバー" * 30, settings=long_settings,
         kyash={"logged_in": True, "wallet_balance": 100_000, "token_days_left": 3.5,
@@ -319,7 +467,7 @@ def main() -> None:
         metrics={"success_rate": 90.0, "average_seconds": 12.3, "p95_seconds": 30.0},
         review_count=5, updated_at=now))
 
-    print("\n=== 9. 汎用 ===")
+    print("\n=== 10. 汎用 ===")
     verify("info_embed", ui.info_embed("題名" * 60, "本文" * 1000))
     verify("info_embed (超過入力を切り詰める)",
            ui.info_embed("題" * 1000, "本" * 10_000))
@@ -328,7 +476,7 @@ def main() -> None:
     verify("log_embed (フィールド超過)",
            ui.log_embed("題名", "本文", fields=[("名" * 500, "値" * 3000, True)] * 40))
 
-    print("\n=== 10. 上限の最後の砦 (clamp_embed) ===")
+    print("\n=== 11. 上限の最後の砦 (clamp_embed) ===")
     import discord
 
     broken = discord.Embed(title="題" * 500, description="本" * 9000)

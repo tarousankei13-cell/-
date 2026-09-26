@@ -1,4 +1,7 @@
-"""スキーマの前方互換 (v1 で作った DB を v2 で開けるか) を検証する。
+"""スキーマの前方互換 (古い DB を最新のコードで開けるか) を検証する。
+
+v1 相当の DB を作り、最新のコードで開いてマイグレーションが通ることと、
+v2 / v3 で追加した機能が既存データの上でも動くことを確認する。
 
 実行:
     python3 tests/test_migration.py
@@ -217,13 +220,60 @@ async def main() -> None:
     check(integrity["pragma"] == "ok" and not integrity["balance_mismatch"],
           "整合性チェックが通る")
 
+    # --- v3 (チャージ方式) の新機能が既存 DB 上でも動く ---
+    tables = await db.run(
+        lambda c: {r[0] for r in c.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+    )
+    check({"charge_requests", "provider_settings", "payment_destinations"} <= tables,
+          "v3 で追加したテーブルが作られた")
+    await db.set_provider_settings(
+        1, config.ChargeProvider.LTC, enabled=True, charge_rate=Decimal("150"),
+        updated_by=2,
+    )
+    provider_row = await db.get_provider_settings(1, config.ChargeProvider.LTC)
+    check(provider_row is not None
+          and utils.to_decimal(provider_row["charge_rate"]) == Decimal("150"),
+          "移行後の DB で方式別レートを登録できる")
+    await db.set_destination(
+        config.ChargeProvider.PAYPAY, address="paypay-recv", label="受取",
+        note=None, updated_by=2,
+    )
+    check((await db.get_destination(config.ChargeProvider.PAYPAY)) is not None,
+          "移行後の DB で入金先を登録できる")
+    request_id = await db.create_request(
+        guild_id=1, user_id=10, provider=config.ChargeProvider.PAYPAY,
+        requested_amount=1000, charge_rate=Decimal("120"), role_id=None,
+        estimated_credit=1200, destination="paypay-recv",
+    )
+    proof = "MIG-TX-0001"
+    await db.submit_request_proof(
+        request_id, user_id=10, proof_ref=proof,
+        proof_hash=utils.proof_hash(config.ChargeProvider.PAYPAY, proof),
+        proof_note=None,
+    )
+    await db.claim_request_for_review(
+        request_id, status=config.RequestStatus.APPROVED, operator_id=2
+    )
+    manual_tx = await db.create_manual_transaction(
+        guild_id=1, user_id=10, requested_amount=1000, received_amount=1000,
+        charge_rate=Decimal("120"), source=config.TxSource.MANUAL_PAYPAY,
+    )
+    credited = await db.credit_transaction(manual_tx, 1200)
+    check(credited["balance_after"] == 4900,
+          f"移行後の DB で申請の承認と残高付与ができる ({credited['balance_after']})")
+    audit = await db.audit_balance(1, 10)
+    check(audit["diff"] == 0, "申請の承認後も残高と履歴合計が一致")
+
     # --- 再接続しても壊れない (冪等なマイグレーション) ---
     await db.close()
     db2 = database.Database(config.DB_PATH)
     await db2.connect()
-    # 4200 (v1) − 1000 (ショップ購入) + 500 (招待報酬) = 3700
+    # 4200 (v1) − 1000 (ショップ購入) + 500 (招待報酬) + 1200 (PayPay承認) = 4900
     final_balance = await db2.get_balance(1, 10)
-    check(final_balance == 3700, f"再接続してもデータが保持される ({final_balance})")
+    check(final_balance == 4900, f"再接続してもデータが保持される ({final_balance})")
+    check((await db2.get_request(request_id))["status"] == config.RequestStatus.APPROVED,
+          "再接続後も申請の状態が保持される")
     await db2.close()
 
     print("\n" + "=" * 70)

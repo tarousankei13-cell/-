@@ -19,6 +19,7 @@ import sys
 import traceback
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
@@ -287,6 +288,7 @@ class StubInteraction:
         self.user = user
         self.channel = guild.channel
         self.command = None
+        self.message: object | None = None   # 審査カードのボタン操作で使う
         self.calls: list[str] = []
         self.embeds: list[discord.Embed] = []
         self.files: list[object] = []
@@ -439,6 +441,9 @@ async def main() -> None:
 
         def get_guild(self, guild_id: int):  # type: ignore[override]
             return guild if guild_id == guild.id else None
+
+        def get_channel(self, channel_id: int):  # type: ignore[override]
+            return guild.get_channel(channel_id)
 
         def get_user(self, user_id: int):  # type: ignore[override]
             return guild.get_member(user_id)
@@ -776,6 +781,135 @@ async def main() -> None:
                 f"残高 {balance_before_purchase}→{balance_after_purchase})",
             ))
             print(" FAIL  検証: ショップ購入が成立していない")
+
+    # --- チャージ方式 (PayPay / LTC の申請と審査) ---
+    await bot.db.set_destination(
+        config.ChargeProvider.PAYPAY, address="paypay-smoke-001", label="受取用",
+        note=None, updated_by=owner.id,
+    )
+    await bot.db.set_destination(
+        config.ChargeProvider.LTC, address="ltc1qsmoketest0000000000000000",
+        label="受取用", note=None, updated_by=owner.id,
+    )
+    await bot.charge.set_review_channel_id(guild.channel.id)
+    # 価格 API は使わせない (固定価格でテストする)
+    await bot.price.set_source(config.PRICE_SOURCE_MANUAL)
+    await bot.price.set_manual_price(Decimal("12000"))
+
+    settings = await bot.db.get_settings(G)
+    entries = await bot.charge.provider_availability(G, settings)
+    provider_view = ui.ProviderSelectView(entries)
+    provider_select = provider_view.children[0]
+    for provider in (config.ChargeProvider.PAYPAY, config.ChargeProvider.LTC):
+        provider_select._values = [provider]  # type: ignore[attr-defined]
+        interaction = fresh(rich)
+        await run_ui(f"方式選択: {provider}", provider_select.callback(interaction),
+                     interaction)
+
+    for provider, proof, asset in (
+        (config.ChargeProvider.PAYPAY, "SMOKE-PP-0001", None),
+        (config.ChargeProvider.LTC, "ef" * 32, "0.09"),
+    ):
+        limits = await bot.charge.provider_limits(G, provider, settings)
+        amount_modal = ui.ManualAmountModal(provider, settings, limits)
+        amount_modal.amount._value = "1000"  # type: ignore[attr-defined]
+        interaction = fresh(rich)
+        await run_ui(f"Modal: {provider} 金額入力",
+                     amount_modal.on_submit(interaction), interaction)
+        pending, _ = await bot.db.list_requests(
+            guild_id=G, user_id=rich.id, provider=provider,
+            statuses=[config.RequestStatus.QUOTED], limit=1,
+        )
+        if not pending:
+            FAILURES.append((f"Modal: {provider} 金額入力",
+                             "申請が作成されませんでした: " + ", ".join(interaction.titles)))
+            print(f" FAIL  検証: {provider} の申請が作成されていない")
+            continue
+        request_id = int(pending[0]["id"])
+        print(f"  ok   検証: {provider} の申請を作成 (#{request_id})")
+
+        deposit_view = ui.DepositView(request_id, provider, owner_id=rich.id, timeout=60)
+        for item in deposit_view.children:
+            if isinstance(item, discord.ui.Button) and item.label == "送金しました":
+                interaction = fresh(rich)
+                await run_ui(f"入金View: {provider} 送金しました",
+                             item.callback(interaction), interaction)
+
+        proof_modal = ui.RequestProofModal(request_id, provider)
+        proof_modal.proof._value = proof  # type: ignore[attr-defined]
+        if proof_modal.asset is not None and asset:
+            proof_modal.asset._value = asset  # type: ignore[attr-defined]
+        interaction = fresh(rich)
+        await run_ui(f"Modal: {provider} 申請", proof_modal.on_submit(interaction),
+                     interaction)
+        row = await bot.db.get_request(request_id)
+        if row["status"] == config.RequestStatus.PENDING and row["review_message_id"]:
+            OK.append(f"{provider}: 申請が承認待ちになり審査カードが投稿される")
+            print(f"  ok   検証: {provider} の申請が承認待ち + 審査カード投稿")
+        else:
+            FAILURES.append((f"Modal: {provider} 申請",
+                             f"状態 {row['status']} / カード {row['review_message_id']}"))
+            print(f" FAIL  検証: {provider} の申請が承認待ちになっていない")
+
+    # 審査カードのボタン (承認 / 金額修正 / 却下 / 詳細)
+    pending_rows = await bot.db.list_pending_requests(limit=5)
+    review_view = ui.ReviewCardView()
+    if pending_rows:
+        approve_target = int(pending_rows[0]["id"])
+        reject_target = int(pending_rows[-1]["id"])
+        message_id = int(pending_rows[0]["review_message_id"] or 0)
+        for item in review_view.children:
+            if not isinstance(item, discord.ui.Button):
+                continue
+            interaction = fresh(owner)
+            interaction.message = SimpleNamespace(id=message_id)
+            await run_ui(f"審査カード: {item.label}", item.callback(interaction),
+                         interaction)
+        row = await bot.db.get_request(approve_target)
+        if row["status"] == config.RequestStatus.APPROVED and row["transaction_id"]:
+            OK.append("審査カードの承認で残高が付与される")
+            print(f"  ok   検証: 承認で残高付与 (付与 {row['credited_amount']} / "
+                  f"取引 {row['transaction_id']})")
+        else:
+            FAILURES.append(("審査カード: 承認", f"状態 {row['status']}"))
+            print(f" FAIL  検証: 承認が反映されていない ({row['status']})")
+
+        # 金額修正 Modal / 却下 Modal
+        if reject_target != approve_target:
+            edit_modal = ui.ApproveAmountModal(reject_target, 1200)
+            edit_modal.amount._value = "900"  # type: ignore[attr-defined]
+            edit_modal.note._value = "入金が 900 円だったため"  # type: ignore[attr-defined]
+            interaction = fresh(owner)
+            await run_ui("Modal: 金額修正して承認",
+                         edit_modal.on_submit(interaction), interaction)
+            edited = await bot.db.get_request(reject_target)
+            if edited["status"] == config.RequestStatus.APPROVED \
+                    and int(edited["credited_amount"] or 0) == 900:
+                OK.append("金額を直して承認できる")
+                print("  ok   検証: 金額を直して承認 (900 付与)")
+            else:
+                FAILURES.append(("Modal: 金額修正して承認",
+                                 f"状態 {edited['status']} / 付与 {edited['credited_amount']}"))
+                print(" FAIL  検証: 金額修正して承認が反映されていない")
+
+        # 却下は新しい申請で確認する
+        fresh_quote = await bot.charge.start_manual_charge(
+            G, rich.id, config.ChargeProvider.PAYPAY, "1000")
+        await bot.charge.submit_request(
+            int(fresh_quote["request_id"]), rich.id, "SMOKE-PP-REJECT")
+        reject_modal = ui.RejectReasonModal(int(fresh_quote["request_id"]))
+        reject_modal.reason._value = "入金を確認できませんでした"  # type: ignore[attr-defined]
+        interaction = fresh(owner)
+        await run_ui("Modal: 却下理由", reject_modal.on_submit(interaction), interaction)
+        rejected = await bot.db.get_request(int(fresh_quote["request_id"]))
+        if rejected["status"] == config.RequestStatus.REJECTED:
+            OK.append("却下で残高が動かない")
+            print("  ok   検証: 却下が反映された")
+        else:
+            FAILURES.append(("Modal: 却下理由", f"状態 {rejected['status']}"))
+            print(f" FAIL  検証: 却下が反映されていない ({rejected['status']})")
+    else:
+        print("  --   審査カード (承認待ちの申請が無いためスキップ)")
 
     # --- 確認ビュー (2段階) ---
     confirm_view = ui.ConfirmView(owner_id=owner.id, confirm_label="実行", stages=2)

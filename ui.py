@@ -40,17 +40,29 @@ def bot_of(interaction: discord.Interaction) -> "ChargeBot":
 # Embed ビルダー
 # ---------------------------------------------------------------------------
 
-def charge_panel_embed(settings: "GuildSettings", *, kyash_ready: bool) -> discord.Embed:
+def charge_panel_embed(
+    settings: "GuildSettings",
+    *,
+    kyash_ready: bool,
+    providers: Sequence[dict[str, Any]] | None = None,
+) -> discord.Embed:
     """常設チャージパネルの Embed。
 
     「何ができるか」「どう操作するか」「いくら増えるか」が
     パネルを見るだけで分かるようにする。
+
+    Args:
+        providers: 各チャージ方式の利用可否 (``provider_availability`` の戻り値)。
+            省略した場合は Kyash のみの表示になる。
     """
+    usable = [p for p in (providers or []) if p["available"]]
     if settings.emergency_stop:
         state = "🔴 **緊急停止中** — 現在チャージを受け付けていません"
     elif settings.maintenance:
         state = "🟠 **メンテナンス中** — 残高・履歴の確認はできます"
-    elif not kyash_ready:
+    elif providers is not None and not usable:
+        state = "🟠 **一時停止中** — 復旧までお待ちください"
+    elif providers is None and not kyash_ready:
         state = "🟠 **一時停止中** — 復旧までお待ちください"
     else:
         state = "🟢 **受付中** — いつでもチャージできます"
@@ -61,24 +73,43 @@ def charge_panel_embed(settings: "GuildSettings", *, kyash_ready: bool) -> disco
         example_base = settings.maximum_charge
     example_credit = utils.calc_credited_amount(example_base, settings.charge_rate)
 
+    multi = len(usable) > 1
     embed = discord.Embed(
         title=settings.panel_title or "💰 チャージシステム",
         description=(
             f"{SEPARATOR}\n"
             + (
                 settings.panel_description
-                or "Kyash で送金すると、このサーバーで使える**内部残高**が増えます。"
+                or ("送金すると、このサーバーで使える**内部残高**が増えます。"
+                    if multi else
+                    "Kyash で送金すると、このサーバーで使える**内部残高**が増えます。")
             )
             + f"\n{SEPARATOR}"
         ),
         color=settings.accent_color if settings.accent_color is not None else config.Color.BASE,
     )
-    embed.add_field(
-        name="📈 チャージ率",
-        value=f"**{utils.fmt_rate(settings.charge_rate)}**\n"
-              f"例) {utils.fmt_yen(example_base)} → **{utils.fmt_int(example_credit)}**",
-        inline=True,
-    )
+    if providers is not None and (usable or providers):
+        lines = []
+        for entry in providers:
+            provider = str(entry["provider"])
+            emoji = config.PROVIDER_EMOJI.get(provider, "💠")
+            name = config.PROVIDER_LABELS.get(provider, provider)
+            if entry["available"]:
+                kind = ("自動反映" if provider == config.ChargeProvider.KYASH
+                        else "管理者の承認制")
+                lines.append(
+                    f"{emoji} **{name}** — {utils.fmt_rate(entry['rate'])} / {kind}"
+                )
+            else:
+                lines.append(f"{emoji} ~~{name}~~ — 🚫 {entry['reason']}")
+        embed.add_field(name="💠 使えるチャージ方法", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(
+            name="📈 チャージ率",
+            value=f"**{utils.fmt_rate(settings.charge_rate)}**\n"
+                  f"例) {utils.fmt_yen(example_base)} → **{utils.fmt_int(example_credit)}**",
+            inline=True,
+        )
     embed.add_field(
         name="💵 1回の金額",
         value=f"**{utils.fmt_yen(settings.minimum_charge)}** 〜\n"
@@ -91,19 +122,32 @@ def charge_panel_embed(settings: "GuildSettings", *, kyash_ready: bool) -> disco
         else "**無制限**",
         inline=True,
     )
-    embed.add_field(
-        name="🪜 チャージの手順",
-        value=(
-            "**1.** 下の `💰 チャージ` を押して**金額を入力**\n"
-            "**2.** Kyash アプリで**同じ金額**の送金リンクを作成\n"
-            "**3.** `🔗 送金リンクを送信` を押して URL を貼る\n"
-            "**4.** 自動で受け取り → 残高が増え、DM が届きます"
-        ),
-        inline=False,
-    )
+    if multi:
+        embed.add_field(
+            name="🪜 チャージの手順",
+            value=(
+                "**1.** 下の `💰 チャージ` を押して**方法を選ぶ**\n"
+                "**2.** 金額を入力する\n"
+                "**3.** 表示された宛先へ送金する\n"
+                "**4.** 画面の案内どおりに申請する\n"
+                "　→ Kyash は自動、PayPay / LTC は管理者の承認後に反映されます"
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="🪜 チャージの手順",
+            value=(
+                "**1.** 下の `💰 チャージ` を押して**金額を入力**\n"
+                "**2.** Kyash アプリで**同じ金額**の送金リンクを作成\n"
+                "**3.** `🔗 送金リンクを送信` を押して URL を貼る\n"
+                "**4.** 自動で受け取り → 残高が増え、DM が届きます"
+            ),
+            inline=False,
+        )
     embed.add_field(name="状態", value=state, inline=False)
     embed.set_footer(
-        text="送金リンクは公開チャンネルに貼らないでください / "
+        text="送金リンクや取引IDは公開チャンネルに貼らないでください / "
              "内部残高は現金化・出金できません"
     )
     return embed
@@ -215,7 +259,12 @@ def balance_embed(
 
 
 def history_embed(
-    rows: Sequence[Any], *, page: int, total_pages: int, total: int
+    rows: Sequence[Any],
+    *,
+    page: int,
+    total_pages: int,
+    total: int,
+    open_requests: Sequence[Any] = (),
 ) -> discord.Embed:
     """チャージ履歴 (Ephemeral / ページング)。
 
@@ -233,6 +282,29 @@ def history_embed(
         ),
         color=config.Color.NEUTRAL,
     )
+    if open_requests:
+        # 承認待ち・送金待ちの申請はまだ取引になっていないため、先に見せる
+        lines: list[str] = []
+        for req in list(open_requests)[:5]:
+            provider = str(req["provider"])
+            status = str(req["status"])
+            line = (
+                f"`#{int(req['id'])}` "
+                f"{config.REQUEST_STATUS_LABELS.get(status, status)} "
+                f"{config.PROVIDER_EMOJI.get(provider, '💠')} "
+                f"{config.PROVIDER_LABELS.get(provider, provider)} "
+                f"{utils.fmt_yen(int(req['requested_amount']))} "
+                f"→ 付与予定 **{utils.fmt_int(int(req['estimated_credit']))}**"
+            )
+            if status == config.RequestStatus.QUOTED:
+                line += f" (送金期限 {utils.discord_ts(req['quote_expires_at'], 'R')})"
+            lines.append(line)
+        embed.add_field(
+            name="📨 進行中の申請",
+            value="\n".join(lines)
+            + "\n※ 承認されると下の履歴に並びます。",
+            inline=False,
+        )
     for row in rows:
         status = str(row["status"])
         emoji = config.STATUS_EMOJI.get(status, "⚪")
@@ -271,6 +343,7 @@ def help_embed(
     shop_available: bool = False,
     campaign_name: str | None = None,
     example_amount: int | None = None,
+    providers: Sequence[dict[str, Any]] | None = None,
 ) -> discord.Embed:
     """ヘルプ (Ephemeral)。何ができて、どう操作するかを順番に示す。"""
     base = example_amount or max(settings.minimum_charge, 1000)
@@ -283,25 +356,54 @@ def help_embed(
         description=(
             f"{SEPARATOR}\n"
             "このサーバーで使える**内部残高**のしくみです。\n"
-            "Kyash で送金すると、チャージ率を掛けた残高が受け取れます。\n"
+            "送金すると、チャージ率を掛けた残高が受け取れます。\n"
             f"{SEPARATOR}"
         ),
         color=config.Color.INFO,
     )
+    usable = [p for p in (providers or []) if p["available"]]
+    manual_usable = [
+        p for p in usable if p["provider"] in config.MANUAL_PROVIDERS
+    ]
+    if len(usable) > 1:
+        embed.add_field(
+            name="① 使えるチャージ方法",
+            value="\n".join(
+                f"{config.PROVIDER_EMOJI.get(str(p['provider']), '💠')} "
+                f"**{config.PROVIDER_LABELS.get(str(p['provider']), p['provider'])}** "
+                f"({utils.fmt_rate(p['rate'])}) — "
+                f"{config.PROVIDER_DESCRIPTIONS.get(str(p['provider']), '')}"
+                for p in usable
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="② チャージのしかた",
+            value=(
+                "**1.** `💰 チャージ` を押して**方法を選ぶ**\n"
+                "**2.** チャージしたい金額を入力する (LTC も**円**で入力します)\n"
+                "**3.** 表示された宛先へ、表示された金額をそのまま送る\n"
+                "**4.** Kyash は送金リンクを貼るだけ。PayPay / LTC は\n"
+                "　　`✅ 送金しました` から取引ID (txid) を入力して申請\n"
+                "**5.** Kyash は自動、PayPay / LTC は管理者の承認後に反映されます"
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="① チャージのしかた",
+            value=(
+                "**1.** `💰 チャージ` を押す\n"
+                "**2.** チャージしたい金額を入力する\n"
+                "**3.** Kyash アプリで「送る」→ **リンクで送る** で\n"
+                "　　**同じ金額**の送金リンクを作る\n"
+                "**4.** `🔗 送金リンクを送信` を押して URL を貼る\n"
+                "**5.** 自動で受け取り、残高が増えます (結果は DM でお知らせ)"
+            ),
+            inline=False,
+        )
     embed.add_field(
-        name="① チャージのしかた",
-        value=(
-            "**1.** `💰 チャージ` を押す\n"
-            "**2.** チャージしたい金額を入力する\n"
-            "**3.** Kyash アプリで「送る」→ **リンクで送る** で\n"
-            "　　**同じ金額**の送金リンクを作る\n"
-            "**4.** `🔗 送金リンクを送信` を押して URL を貼る\n"
-            "**5.** 自動で受け取り、残高が増えます (結果は DM でお知らせ)"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="② いくら増えますか？",
+        name="いくら増えますか？",
         value=(
             f"チャージ率は **{utils.fmt_rate(settings.charge_rate)}** です。\n"
             f"例) **{utils.fmt_yen(base)}** 送金 → **{utils.fmt_int(credit)}** 獲得\n"
@@ -310,7 +412,7 @@ def help_embed(
         inline=True,
     )
     embed.add_field(
-        name="③ 金額の条件",
+        name="金額の条件",
         value=(
             f"1回: **{utils.fmt_yen(settings.minimum_charge)}** 〜 "
             f"**{utils.fmt_yen(settings.maximum_charge)}**\n"
@@ -322,7 +424,7 @@ def help_embed(
         inline=True,
     )
     embed.add_field(
-        name="④ 残高の使い道",
+        name="残高の使い道",
         value=(
             ("・ショップパネルからロールと交換できます\n" if shop_available else "")
             + ("・招待キャンペーンでも残高がもらえます "
@@ -332,26 +434,42 @@ def help_embed(
         ),
         inline=False,
     )
-    embed.add_field(
-        name="⑤ 気をつけること",
-        value=(
-            "・入力した金額と送金リンクの金額が**一致**していないと受け取れません\n"
-            "・**請求リンクではなく送金リンク**を作成してください\n"
-            "・リンクの入力期限は約 "
-            f"{config.LINK_WAIT_SECONDS // 60} 分です\n"
-            "・一度使ったリンクは再利用できません\n"
-            "・送金リンクは**公開チャンネルに貼らないでください** (入力欄は非公開です)"
-        ),
-        inline=False,
+    cautions = [
+        "・送った金額と申請した金額が**一致**していないと受け取れません",
+        "・**請求リンクではなく送金リンク**を作成してください (Kyash)",
+        f"・Kyash のリンク入力期限は約 {config.LINK_WAIT_SECONDS // 60} 分です",
+        "・一度使ったリンク・取引ID は再利用できません",
+        "・送金リンクや取引IDは**公開チャンネルに貼らないでください** (入力欄は非公開です)",
+    ]
+    if manual_usable:
+        cautions.append(
+            f"・PayPay / LTC の送金受付は約 {config.QUOTE_WAIT_SECONDS // 60} 分、"
+            f"申請後の承認期限は {config.REQUEST_REVIEW_SECONDS // 3600} 時間です"
+        )
+        cautions.append("・**送金してから申請**してください (申請だけでは反映されません)")
+        if any(p["provider"] == config.ChargeProvider.LTC for p in manual_usable):
+            cautions.append(
+                "・LTC は**表示された数量をそのまま**送ってください。"
+                "レートは画面を開いた時点で確定します"
+            )
+            cautions.append("・**送金した LTC は返金できません**。宛先をよく確認してください")
+    embed.add_field(name="気をつけること", value="\n".join(cautions), inline=False)
+    timing = [
+        "Kyash は通常 10〜60 秒ほどで完了します (混雑時は順番待ちになります)。",
+    ]
+    if manual_usable:
+        timing.append(
+            "PayPay / LTC は管理者が入金を確認してから反映するため、時間がかかります。"
+            "進行状況は `📜 履歴` で確認できます。"
+        )
+    timing.append(
+        "結果は必ず DM でお知らせします。DM が届かない設定の場合は履歴で確認してください。"
+    )
+    timing.append(
+        "解決しないときは、**取引ID / 申請ID**を添えてサーバーの管理者へお問い合わせください。"
     )
     embed.add_field(
-        name="⑥ 処理時間 / うまくいかないとき",
-        value=(
-            "通常 10〜60 秒ほどで完了します (混雑時は順番待ちになります)。\n"
-            "結果は必ず DM でお知らせします。DM が届かない設定の場合は履歴で確認してください。\n"
-            "解決しないときは、**取引ID**を添えてサーバーの管理者へお問い合わせください。"
-        ),
-        inline=False,
+        name="処理時間 / うまくいかないとき", value="\n".join(timing), inline=False
     )
     embed.set_footer(text="内部残高システム / このサーバー専用の数値です")
     return embed
@@ -624,8 +742,10 @@ def error_embed(
     return embed
 
 
-#: チャージの手順は 3 段階。利用者が「今どこにいるか」を常に示す。
+#: Kyash (自動) の手順は 3 段階。利用者が「今どこにいるか」を常に示す。
 CHARGE_STEPS: Final[int] = 3
+#: PayPay / LTC (承認制) は「方式選択」が入るため 4 段階。
+MANUAL_CHARGE_STEPS: Final[int] = 4
 
 
 def step_line(current: int, total: int = CHARGE_STEPS) -> str:
@@ -972,6 +1092,491 @@ def my_items_embed(rows: Sequence[Any]) -> discord.Embed:
     return embed
 
 
+# ---------------------------------------------------------------------------
+# チャージ方式 (PayPay / LTC の申請と審査)
+# ---------------------------------------------------------------------------
+
+def provider_select_embed(entries: Sequence[dict[str, Any]]) -> discord.Embed:
+    """チャージ方式の選択画面 (ステップ 1/4)。
+
+    使えない方式も理由つきで見せることで、「なぜ選べないのか」を説明する。
+    """
+    embed = discord.Embed(
+        title="💰 チャージ方法を選んでください",
+        description=(
+            f"{step_line(1, MANUAL_CHARGE_STEPS)}\n{SEPARATOR}\n"
+            "下のメニューから方法を選ぶと、次の手順を案内します。\n"
+            f"{SEPARATOR}"
+        ),
+        color=config.Color.ACCENT,
+    )
+    for entry in entries:
+        provider = str(entry["provider"])
+        emoji = config.PROVIDER_EMOJI.get(provider, "💠")
+        name = config.PROVIDER_LABELS.get(provider, provider)
+        if entry["available"]:
+            value = (
+                f"{config.PROVIDER_DESCRIPTIONS.get(provider, '')}\n"
+                f"チャージ率 **{utils.fmt_rate(entry['rate'])}** / "
+                f"{utils.fmt_yen(int(entry['minimum']))} 〜 {utils.fmt_yen(int(entry['maximum']))}"
+            )
+        else:
+            value = f"🚫 いま使えません — {entry['reason']}"
+        embed.add_field(name=f"{emoji} {name}", value=value, inline=False)
+    if not any(e["available"] for e in entries):
+        embed.add_field(
+            name="▶ 次にどうすればいいですか？",
+            value="現在チャージを受け付けていません。管理者の案内をお待ちください。",
+            inline=False,
+        )
+    return embed
+
+
+def deposit_embed(quote: dict[str, Any]) -> discord.Embed:
+    """入金先の案内 (ステップ 3/4)。
+
+    LTC はここで提示した数量と単価が確定値になる。相場が動いても、
+    この画面の金額を送れば申請できる。
+    """
+    provider = str(quote["provider"])
+    destination = quote["destination"]
+    amount = int(quote["amount"])
+    asset_amount = quote.get("asset_amount")
+    is_ltc = provider == config.ChargeProvider.LTC
+
+    embed = discord.Embed(
+        title=f"{config.PROVIDER_EMOJI.get(provider, '💠')} "
+              f"{config.PROVIDER_LABELS.get(provider, provider)} で送金してください",
+        description=(
+            f"{step_line(3, MANUAL_CHARGE_STEPS)}\n{SEPARATOR}\n"
+            "**下の宛先へ、表示された金額をそのまま送ってください。**\n"
+            f"{SEPARATOR}"
+        ),
+        color=config.Color.ACCENT,
+    )
+    if is_ltc:
+        embed.add_field(
+            name="① 送る数量 (この数量をそのまま)",
+            value=f"```\n{utils.fmt_asset(asset_amount, unit='')}\n```",
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="① 送る金額",
+            value=f"```\n{amount}\n```",
+            inline=False,
+        )
+    embed.add_field(
+        name=f"② 送り先 ({destination['label'] or '受取先'})",
+        value=f"```\n{destination['address']}\n```",
+        inline=False,
+    )
+    detail = [
+        f"申請額: **{utils.fmt_yen(amount)}**",
+        f"チャージ率: **{utils.fmt_rate(quote['charge_rate'])}**"
+        + (f" (<@&{int(quote['role_id'])}>)" if quote.get("role_id") else ""),
+        f"もらえる残高: **{utils.fmt_int(int(quote['estimated_credit']))}**",
+    ]
+    if is_ltc and quote.get("asset_price") is not None:
+        source = config.PRICE_SOURCE_LABELS.get(
+            str(quote.get("price_source")), str(quote.get("price_source"))
+        )
+        detail.append(
+            f"適用レート: **1 LTC = {utils.fmt_yen(int(quote['asset_price']))}**"
+            + ("  ⚠️ 取得できなかったため代替値" if quote.get("price_stale") else "")
+        )
+        detail.append(f"レート取得元: {source}")
+    embed.add_field(name="この申請の内容", value="\n".join(detail), inline=False)
+    embed.add_field(
+        name="③ 送金したら",
+        value=(
+            "下の `✅ 送金しました` を押して、"
+            f"**{config.PROVIDER_PROOF_LABELS.get(provider, '証拠')}** を入力してください。\n"
+            "管理者が確認して承認すると残高に反映されます。"
+        ),
+        inline=False,
+    )
+    warn = [
+        f"・受付期限は {utils.discord_ts(quote.get('quote_expires_at'), 'R')} までです",
+        "・**金額が違うと承認されません**。表示された額をそのまま送ってください",
+        "・送金してから申請してください (申請だけでは反映されません)",
+    ]
+    if is_ltc:
+        warn.append("・**LTC の返金はできません**。宛先と数量をよく確認してください")
+        if quote.get("asset_price") is not None:
+            warn.append(
+                "・レートは**この画面を開いた時点で確定**しています "
+                f"(1 LTC = {utils.fmt_yen(int(quote['asset_price']))})。"
+                "その後に相場が動いても、この数量を送れば申請できます"
+            )
+    if destination["note"]:
+        warn.append(f"・{utils.truncate(str(destination['note']), 300)}")
+    embed.add_field(name="⚠️ 注意", value="\n".join(warn), inline=False)
+    embed.set_footer(text=f"申請ID: #{quote['request_id']}")
+    return embed
+
+
+def request_submitted_embed(result: dict[str, Any]) -> discord.Embed:
+    """申請完了 (ステップ 4/4)。"""
+    provider = str(result["provider"])
+    embed = discord.Embed(
+        title="📨 申請を受け付けました",
+        description=(
+            f"{step_line(4, MANUAL_CHARGE_STEPS)}\n{SEPARATOR}\n"
+            "**管理者の承認をお待ちください。** これ以上の操作は不要です。\n"
+            f"{SEPARATOR}"
+        ),
+        color=config.Color.SUCCESS,
+    )
+    embed.add_field(name="申請ID", value=f"`#{result['request_id']}`", inline=True)
+    embed.add_field(
+        name="方式",
+        value=config.PROVIDER_LABELS.get(provider, provider),
+        inline=True,
+    )
+    embed.add_field(
+        name="付与予定",
+        value=f"**{utils.fmt_int(int(result['estimated_credit']))}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="この後の流れ",
+        value=(
+            "**1.** 管理者が入金を確認します\n"
+            "**2.** 承認されると残高に反映され、**DM** でお知らせします\n"
+            "**3.** `📜 履歴` で申請の状態を確認できます\n\n"
+            f"承認されない場合の期限: {utils.discord_ts(result.get('expires_at'), 'R')}"
+        ),
+        inline=False,
+    )
+    waiting = int(result.get("pending_total") or 0)
+    if waiting > 1:
+        embed.set_footer(text=f"現在 {waiting} 件の申請が承認待ちです")
+    return embed
+
+
+def review_card_embed(
+    *, request: Any, guild_name: str, pending_total: int = 0
+) -> discord.Embed:
+    """審査チャンネルへ出すカード。管理者が照合に必要な情報だけを載せる。"""
+    provider = str(request["provider"])
+    status = str(request["status"])
+    color = {
+        config.RequestStatus.PENDING: config.Color.WARNING,
+        config.RequestStatus.APPROVED: config.Color.SUCCESS,
+        config.RequestStatus.REJECTED: config.Color.DANGER,
+        config.RequestStatus.EXPIRED: config.Color.NEUTRAL,
+        config.RequestStatus.CANCELLED: config.Color.NEUTRAL,
+        config.RequestStatus.QUOTED: config.Color.INFO,
+    }.get(status, config.Color.INFO)
+    embed = discord.Embed(
+        title=f"{config.PROVIDER_EMOJI.get(provider, '💠')} "
+              f"{config.PROVIDER_LABELS.get(provider, provider)} チャージ申請 "
+              f"#{int(request['id'])}",
+        description=(
+            f"{SEPARATOR}\n"
+            f"**{config.REQUEST_STATUS_LABELS.get(status, status)}**\n"
+            f"{SEPARATOR}"
+        ),
+        color=color,
+    )
+    embed.add_field(name="サーバー", value=f"{guild_name}\n`{int(request['guild_id'])}`", inline=True)
+    embed.add_field(name="利用者", value=f"<@{int(request['user_id'])}>", inline=True)
+    embed.add_field(
+        name="申請額", value=f"**{utils.fmt_yen(int(request['requested_amount']))}**", inline=True
+    )
+    if request["asset_amount"] is not None:
+        expected = utils.to_decimal(request["asset_amount"])
+        embed.add_field(
+            name="送金数量 (申請)", value=f"**{utils.fmt_asset(expected)}**", inline=True
+        )
+    if request["asset_price"] is not None:
+        embed.add_field(
+            name="確定レート",
+            value=f"1 LTC = {utils.fmt_yen(int(utils.to_decimal(request['asset_price']) or 0))}",
+            inline=True,
+        )
+    embed.add_field(
+        name="チャージ率",
+        value=utils.fmt_rate(request["charge_rate"])
+        + (f"\n<@&{int(request['role_id'])}>" if request["role_id"] else ""),
+        inline=True,
+    )
+    embed.add_field(
+        name="付与予定",
+        value=f"**{utils.fmt_int(int(request['estimated_credit']))}**",
+        inline=True,
+    )
+    if request["proof_ref"]:
+        label = config.PROVIDER_PROOF_LABELS.get(provider, "証拠")
+        value = f"```\n{utils.truncate(str(request['proof_ref']), 200)}\n```"
+        if provider == config.ChargeProvider.LTC:
+            value += (
+                "エクスプローラで着金・数量・承認数を確認してください。\n"
+                f"`{utils.truncate(str(request['proof_ref']), 64)}`"
+            )
+        embed.add_field(name=f"📋 照合用: {label}", value=value, inline=False)
+    if request["destination"]:
+        embed.add_field(
+            name="送り先", value=f"`{utils.truncate(str(request['destination']), 120)}`",
+            inline=False,
+        )
+    times = [f"申請: {utils.discord_ts(request['submitted_at'] or request['created_at'])}"]
+    if status == config.RequestStatus.PENDING and request["expires_at"]:
+        times.append(f"期限: {utils.discord_ts(request['expires_at'], 'R')}")
+    if request["reviewed_at"]:
+        times.append(
+            f"処理: {utils.discord_ts(request['reviewed_at'])}"
+            + (f" (<@{int(request['reviewed_by'])}>)" if request["reviewed_by"] else "")
+        )
+    embed.add_field(name="日時", value="\n".join(times), inline=False)
+    if status == config.RequestStatus.APPROVED:
+        embed.add_field(
+            name="結果",
+            value=(
+                f"付与 **{utils.fmt_int(int(request['credited_amount'] or 0))}**\n"
+                f"取引ID `{request['transaction_id']}`"
+            ),
+            inline=False,
+        )
+    elif status == config.RequestStatus.REJECTED and request["reject_reason"]:
+        embed.add_field(
+            name="却下理由", value=utils.truncate(str(request["reject_reason"]), 900), inline=False
+        )
+    if status == config.RequestStatus.PENDING:
+        embed.add_field(
+            name="▶ 確認してから押してください",
+            value=(
+                "**入金が実際に届いているか**を自分の目で確認してから承認してください。\n"
+                "`🟢 承認` … 表示どおりの額を付与\n"
+                "`✏️ 金額を直して承認` … 実際の入金額と違うとき\n"
+                "`🔴 却下` … 理由を入力して却下 (残高は動きません)"
+            ),
+            inline=False,
+        )
+        if pending_total > 1:
+            embed.set_footer(text=f"未処理の申請: {pending_total} 件")
+    return embed
+
+
+def review_detail_embed(
+    *, request: Any, history: Sequence[Any], balance: int
+) -> discord.Embed:
+    """審査の「詳細」表示。承認前に見ておきたい情報をまとめる。"""
+    provider = str(request["provider"])
+    embed = discord.Embed(
+        title=f"🔍 申請 #{int(request['id'])} の詳細",
+        description=f"{SEPARATOR}\n照合に使う値はコードブロックからコピーできます。\n{SEPARATOR}",
+        color=config.Color.INFO,
+    )
+    if request["proof_ref"]:
+        embed.add_field(
+            name=config.PROVIDER_PROOF_LABELS.get(provider, "証拠"),
+            value=f"```\n{utils.truncate(str(request['proof_ref']), 300)}\n```",
+            inline=False,
+        )
+    if request["destination"]:
+        embed.add_field(
+            name="入金先",
+            value=f"```\n{utils.truncate(str(request['destination']), 200)}\n```",
+            inline=False,
+        )
+    amounts = [
+        f"申請額: **{utils.fmt_yen(int(request['requested_amount']))}**",
+        f"チャージ率: **{utils.fmt_rate(request['charge_rate'])}**",
+        f"付与予定: **{utils.fmt_int(int(request['estimated_credit']))}**",
+    ]
+    if request["asset_amount"] is not None:
+        amounts.append(f"送金数量 (申請): **{utils.fmt_asset(request['asset_amount'])}**")
+    if request["asset_price"] is not None:
+        price = utils.to_decimal(request["asset_price"]) or Decimal(0)
+        amounts.append(f"確定レート: 1 LTC = **{utils.fmt_yen(int(price))}**")
+        source = config.PRICE_SOURCE_LABELS.get(
+            str(request["price_source"]), str(request["price_source"] or "-")
+        )
+        amounts.append(f"レート取得元: {source}")
+        amounts.append(f"レート取得時刻: {utils.discord_ts(request['price_fetched_at'])}")
+    embed.add_field(name="金額とレート", value="\n".join(amounts), inline=False)
+    embed.add_field(
+        name="利用者",
+        value=(
+            f"<@{int(request['user_id'])}> (`{int(request['user_id'])}`)\n"
+            f"現在の残高: **{utils.fmt_int(balance)}**"
+        ),
+        inline=False,
+    )
+    if history:
+        lines = [
+            f"`#{int(r['id'])}` {config.REQUEST_STATUS_LABELS.get(str(r['status']), r['status'])} "
+            f"{config.PROVIDER_LABELS.get(str(r['provider']), r['provider'])} "
+            f"{utils.fmt_yen(int(r['requested_amount']))} "
+            f"{utils.discord_ts(r['submitted_at'] or r['created_at'], 'R')}"
+            for r in list(history)[:5]
+        ]
+        embed.add_field(
+            name="この利用者の直近の申請", value="\n".join(lines), inline=False
+        )
+    embed.add_field(
+        name="⚠️ 承認の前に",
+        value=(
+            "**入金が実際に届いていることを自分で確認してください。**\n"
+            + ("Litecoin はエクスプローラで txid・宛先・数量・承認数を確認できます。\n"
+               "**承認後の返金はブロックチェーン上では行えません。**"
+               if provider == config.ChargeProvider.LTC else
+               "PayPay アプリの取引履歴で、取引IDと金額が一致することを確認してください。")
+        ),
+        inline=False,
+    )
+    return embed
+
+
+def request_result_dm_embed(*, guild_name: str, request: Any) -> discord.Embed:
+    """却下・期限切れを利用者へ知らせる DM。"""
+    provider = str(request["provider"])
+    status = str(request["status"])
+    if status == config.RequestStatus.REJECTED:
+        title = "🔴 チャージ申請が却下されました"
+        color = config.Color.DANGER
+        guidance = (
+            "残高は変わっていません。内容を確認し、必要なら最初からやり直してください。\n"
+            "身に覚えがない場合はサーバーの管理者へお問い合わせください。"
+        )
+    else:
+        title = "⚫ チャージ申請が期限切れになりました"
+        color = config.Color.NEUTRAL
+        guidance = (
+            "承認されないまま期限を過ぎました。残高は変わっていません。\n"
+            "送金済みの場合は、申請IDを添えてサーバーの管理者へお問い合わせください。"
+        )
+    embed = discord.Embed(
+        title=title,
+        description=f"{SEPARATOR}\n**{guild_name}**\n{SEPARATOR}",
+        color=color,
+    )
+    embed.add_field(name="申請ID", value=f"`#{int(request['id'])}`", inline=True)
+    embed.add_field(
+        name="方式", value=config.PROVIDER_LABELS.get(provider, provider), inline=True
+    )
+    embed.add_field(
+        name="申請額", value=utils.fmt_yen(int(request["requested_amount"])), inline=True
+    )
+    if request["reject_reason"]:
+        embed.add_field(
+            name="理由", value=utils.truncate(str(request["reject_reason"]), 900), inline=False
+        )
+    embed.add_field(name="▶ 次にどうすればいいですか？", value=guidance, inline=False)
+    return embed
+
+
+def request_list_embed(
+    rows: Sequence[Any], *, page: int, total_pages: int, total: int, title: str
+) -> discord.Embed:
+    """申請の一覧 (管理者・利用者共通)。"""
+    embed = discord.Embed(
+        title=title,
+        description=(
+            f"{SEPARATOR}\n全 **{utils.fmt_int(total)}** 件のうち {len(rows)} 件を表示\n{SEPARATOR}"
+            if total else f"{SEPARATOR}\n該当する申請はありません。\n{SEPARATOR}"
+        ),
+        color=config.Color.INFO,
+    )
+    for row in list(rows)[:10]:
+        provider = str(row["provider"])
+        status = str(row["status"])
+        lines = [
+            f"{config.PROVIDER_EMOJI.get(provider, '💠')} "
+            f"{config.PROVIDER_LABELS.get(provider, provider)} / "
+            f"<@{int(row['user_id'])}>",
+            f"申請 **{utils.fmt_yen(int(row['requested_amount']))}** → "
+            f"付与予定 **{utils.fmt_int(int(row['estimated_credit']))}**",
+        ]
+        if row["asset_amount"] is not None:
+            lines.append(f"数量 {utils.fmt_asset(row['asset_amount'])}")
+        if row["proof_ref"]:
+            lines.append(f"証拠 `{utils.truncate(str(row['proof_ref']), 40)}`")
+        lines.append(utils.discord_ts(row["submitted_at"] or row["created_at"], "R"))
+        if status == config.RequestStatus.APPROVED and row["credited_amount"] is not None:
+            lines.append(f"付与 **{utils.fmt_int(int(row['credited_amount']))}**")
+        if status == config.RequestStatus.REJECTED and row["reject_reason"]:
+            lines.append(f"理由 {utils.truncate(str(row['reject_reason']), 100)}")
+        embed.add_field(
+            name=f"#{int(row['id'])} {config.REQUEST_STATUS_LABELS.get(status, status)}",
+            value="\n".join(lines),
+            inline=False,
+        )
+    embed.set_footer(text=f"ページ {page}/{max(1, total_pages)}")
+    return embed
+
+
+def provider_status_embed(
+    entries: Sequence[dict[str, Any]], *, guild_name: str,
+    review_channel_id: int | None, price: dict[str, Any] | None,
+    delegated: bool,
+) -> discord.Embed:
+    """管理者向けの方式一覧。"""
+    embed = discord.Embed(
+        title="💠 チャージ方式の状態",
+        description=f"{SEPARATOR}\n**{guild_name}**\n{SEPARATOR}",
+        color=config.Color.INFO,
+    )
+    for entry in entries:
+        provider = str(entry["provider"])
+        mark = "🟢 利用可" if entry["available"] else f"🔴 {entry['reason']}"
+        lines = [
+            mark,
+            f"チャージ率: **{utils.fmt_rate(entry['rate'])}**",
+            f"金額: {utils.fmt_yen(int(entry['minimum']))} 〜 {utils.fmt_yen(int(entry['maximum']))}",
+        ]
+        destination = entry.get("destination")
+        if destination is not None:
+            lines.append(
+                f"入金先: `{utils.truncate(str(destination['address']), 60)}`"
+            )
+        embed.add_field(
+            name=f"{config.PROVIDER_EMOJI.get(provider, '💠')} "
+                 f"{config.PROVIDER_LABELS.get(provider, provider)}",
+            value="\n".join(lines),
+            inline=False,
+        )
+    review = f"<#{review_channel_id}>" if review_channel_id else "未設定"
+    embed.add_field(
+        name="審査",
+        value=(
+            f"審査チャンネル: {review}\n"
+            f"このサーバーの管理者による承認: {'許可' if delegated else '不可 (Bot Owner のみ)'}"
+        ),
+        inline=False,
+    )
+    if price is not None:
+        source = config.PRICE_SOURCE_LABELS.get(
+            str(price.get("source")), str(price.get("source"))
+        )
+        value = [f"取得元: {source}"]
+        if price.get("cached_price"):
+            value.append(
+                f"直近の価格: **1 LTC = {utils.fmt_yen(int(float(price['cached_price'])))}**"
+                f" ({price.get('cached_age')}秒前"
+                + ("・代替値" if price.get("cached_stale") else "") + ")"
+            )
+        elif price.get("last_good_price"):
+            value.append(
+                f"最後に取得できた価格: 1 LTC = "
+                f"{utils.fmt_yen(int(float(price['last_good_price'])))}"
+                f" ({utils.discord_ts(price.get('last_good_at'), 'R')})"
+            )
+        if price.get("manual_price"):
+            value.append(
+                f"手動設定: 1 LTC = {utils.fmt_yen(int(float(price['manual_price'])))}"
+                f" ({utils.discord_ts(price.get('manual_updated_at'), 'R')})"
+            )
+        if price.get("consecutive_failures"):
+            value.append(f"⚠️ 連続取得失敗: {price['consecutive_failures']} 回")
+        if price.get("last_error"):
+            value.append(f"直近のエラー: {utils.truncate(str(price['last_error']), 200)}")
+        embed.add_field(name="Ł LTC 価格", value="\n".join(value), inline=False)
+    return embed
+
+
 def invite_panel_embed(settings: "GuildSettings", campaign: Any | None) -> discord.Embed:
     """招待キャンペーンのパネル。"""
     if campaign is None:
@@ -1230,6 +1835,8 @@ def admin_panel_embed(
     metrics: dict[str, Any],
     review_count: int,
     updated_at: int,
+    requests: dict[str, int] | None = None,
+    price: dict[str, Any] | None = None,
 ) -> discord.Embed:
     """管理者ダッシュボード (常設・自動更新)。"""
     problems: list[str] = []
@@ -1244,6 +1851,11 @@ def admin_panel_embed(
         problems.append(f"🟠 トークン残り {days_left:.1f} 日")
     if review_count:
         problems.append(f"🟠 手動確認 {review_count} 件")
+    pending_requests = int((requests or {}).get(config.RequestStatus.PENDING, 0))
+    if pending_requests:
+        problems.append(f"🟠 承認待ちの申請 {pending_requests} 件")
+    if price is not None and price.get("consecutive_failures"):
+        problems.append(f"🟠 LTC 価格の取得失敗 {price['consecutive_failures']} 回")
     headroom = kyash.get("wallet_headroom")
     if headroom is not None and headroom <= 0:
         problems.append("🔴 受取残高しきい値に到達")
@@ -1266,6 +1878,29 @@ def admin_panel_embed(
         ),
         inline=True,
     )
+    if requests is not None:
+        embed.add_field(
+            name="チャージ申請",
+            value=(
+                f"承認待ち: **{pending_requests}**\n"
+                f"送金待ち: {requests.get(config.RequestStatus.QUOTED, 0)}\n"
+                f"承認済み: {requests.get(config.RequestStatus.APPROVED, 0)} / "
+                f"却下: {requests.get(config.RequestStatus.REJECTED, 0)}"
+            ),
+            inline=True,
+        )
+    if price is not None:
+        current = price.get("cached_price") or price.get("last_good_price")
+        embed.add_field(
+            name="LTC 価格",
+            value=(
+                (f"1 LTC = **{utils.fmt_yen(int(float(current)))}**\n"
+                 if current else "未取得\n")
+                + f"取得元: {config.PRICE_SOURCE_LABELS.get(str(price.get('source')), '-')}"
+                + ("\n⚠️ 代替値を使用中" if price.get("cached_stale") else "")
+            ),
+            inline=True,
+        )
     embed.add_field(
         name="本日",
         value=(
@@ -1372,6 +2007,257 @@ class AmountModal(discord.ui.Modal, title="ステップ1 / 3 ・ 金額の入力
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
         logger.error("金額入力Modalでエラー: %s", utils.safe_error_text(error))
+        await safe_respond(interaction, embed=error_embed(config.ErrorCode.UNKNOWN_ERROR))
+
+
+class ManualAmountModal(discord.ui.Modal):
+    """PayPay / LTC の金額入力 (ステップ 2/4)。
+
+    LTC でも入力は「円」。その時のレートで送る数量を Bot が計算して示す。
+    利用者に暗号資産の計算をさせない。
+    """
+
+    def __init__(
+        self, provider: str, settings: "GuildSettings", limits: tuple[int, int]
+    ) -> None:
+        name = config.PROVIDER_LABELS.get(provider, provider)
+        super().__init__(title=f"ステップ2 / 4 ・ {utils.truncate(name, 20)} の金額", timeout=300)
+        self.provider = provider
+        low, high = limits
+        self.amount: discord.ui.TextInput = discord.ui.TextInput(
+            label="チャージしたい金額 (円・半角数字のみ)",
+            placeholder=f"{low}〜{high} の範囲で入力",
+            required=True,
+            min_length=1,
+            max_length=config.AMOUNT_INPUT_MAX_LEN,
+        )
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await bot_of(interaction).handle_manual_amount_submit(
+            interaction, self.provider, str(self.amount.value)
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
+        logger.error("金額入力Modalでエラー: %s", utils.safe_error_text(error))
+        await safe_respond(interaction, embed=error_embed(config.ErrorCode.UNKNOWN_ERROR))
+
+
+class ProviderSelect(discord.ui.Select["ProviderSelectView"]):
+    """チャージ方式の選択メニュー (使える方式だけを並べる)。"""
+
+    def __init__(self, entries: Sequence[dict[str, Any]]) -> None:
+        options: list[discord.SelectOption] = []
+        for entry in entries:
+            if not entry["available"]:
+                continue
+            provider = str(entry["provider"])
+            options.append(
+                discord.SelectOption(
+                    label=config.PROVIDER_LABELS.get(provider, provider),
+                    value=provider,
+                    description=utils.truncate(
+                        f"{utils.fmt_rate(entry['rate'])} / "
+                        f"{config.PROVIDER_DESCRIPTIONS.get(provider, '')}", 95,
+                    ),
+                    emoji=config.PROVIDER_EMOJI.get(provider),
+                )
+            )
+        # 都度生成する一時 View なので custom_id は固定しない
+        super().__init__(
+            placeholder="チャージ方法を選んでください" if options else "利用できる方法がありません",
+            min_values=1,
+            max_values=1,
+            options=options or [
+                discord.SelectOption(label="利用できる方法がありません", value="none")
+            ],
+            disabled=not options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        value = self.values[0]
+        if value == "none":
+            await safe_respond(
+                interaction,
+                embed=info_embed("利用できません", "現在チャージを受け付けていません。"),
+            )
+            return
+        await bot_of(interaction).on_provider_selected(interaction, value)
+
+
+class ProviderSelectView(discord.ui.View):
+    """方式選択 (Ephemeral・一時 View)。"""
+
+    def __init__(self, entries: Sequence[dict[str, Any]], *, timeout: float = 180) -> None:
+        super().__init__(timeout=timeout)
+        self.add_item(ProviderSelect(entries))
+
+
+class DepositView(discord.ui.View):
+    """入金先を案内した後の「送金しました」ボタン (Ephemeral・一時 View)。"""
+
+    def __init__(self, request_id: int, provider: str, *, owner_id: int, timeout: float) -> None:
+        super().__init__(timeout=max(30.0, timeout))
+        self.request_id = int(request_id)
+        self.provider = provider
+        self.owner_id = int(owner_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:  # type: ignore[override]
+        if interaction.user.id != self.owner_id:
+            await safe_respond(
+                interaction,
+                embed=info_embed("操作できません", "この画面を開いた本人のみ操作できます。"),
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="送金しました", emoji="✅", style=discord.ButtonStyle.success)
+    async def submitted(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.send_modal(
+            RequestProofModal(self.request_id, self.provider)
+        )
+
+    @discord.ui.button(label="やめる", emoji="✖️", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await bot_of(interaction).on_request_cancel(interaction, self.request_id)
+        self.stop()
+
+
+class RequestProofModal(discord.ui.Modal):
+    """送金の証拠を入力する Modal (ステップ 3/4 → 4/4)。"""
+
+    def __init__(self, request_id: int, provider: str) -> None:
+        is_ltc = provider == config.ChargeProvider.LTC
+        super().__init__(
+            title="ステップ3 / 4 ・ 送金の申請",
+            timeout=float(config.QUOTE_WAIT_SECONDS),
+        )
+        self.request_id = int(request_id)
+        self.provider = provider
+        self.proof: discord.ui.TextInput = discord.ui.TextInput(
+            label=("トランザクションID (txid)" if is_ltc else "PayPay の取引ID"),
+            placeholder=("64桁の英数字をそのまま貼り付け" if is_ltc else "アプリの取引詳細に表示されるID"),
+            required=True,
+            min_length=6,
+            max_length=200,
+        )
+        self.add_item(self.proof)
+        self.asset: discord.ui.TextInput | None = None
+        if is_ltc:
+            self.asset = discord.ui.TextInput(
+                label="実際に送った数量 (LTC)",
+                placeholder="例: 0.08333334",
+                required=False,
+                max_length=32,
+            )
+            self.add_item(self.asset)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await bot_of(interaction).handle_request_submit(
+            interaction,
+            self.request_id,
+            str(self.proof.value),
+            str(self.asset.value) if self.asset is not None else None,
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
+        logger.error("申請Modalでエラー: %s", utils.safe_error_text(error))
+        await safe_respond(interaction, embed=error_embed(config.ErrorCode.UNKNOWN_ERROR))
+
+
+class ReviewCardView(discord.ui.View):
+    """審査カードのボタン (Persistent View / 再起動後も動く)。"""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="承認", emoji="🟢", style=discord.ButtonStyle.success,
+        custom_id=config.CustomID.REQUEST_APPROVE, row=0,
+    )
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await bot_of(interaction).on_review_approve(interaction)
+
+    @discord.ui.button(
+        label="金額を直して承認", emoji="✏️", style=discord.ButtonStyle.primary,
+        custom_id=config.CustomID.REQUEST_EDIT_APPROVE, row=0,
+    )
+    async def edit_approve(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await bot_of(interaction).on_review_edit_approve(interaction)
+
+    @discord.ui.button(
+        label="却下", emoji="🔴", style=discord.ButtonStyle.danger,
+        custom_id=config.CustomID.REQUEST_REJECT, row=0,
+    )
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await bot_of(interaction).on_review_reject(interaction)
+
+    @discord.ui.button(
+        label="詳細", emoji="🔍", style=discord.ButtonStyle.secondary,
+        custom_id=config.CustomID.REQUEST_DETAIL, row=1,
+    )
+    async def detail(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await bot_of(interaction).on_review_detail(interaction)
+
+
+class ApproveAmountModal(discord.ui.Modal, title="付与する額を入力して承認"):
+    """実際の入金額が申請と違うときに額を直して承認する。"""
+
+    amount: discord.ui.TextInput = discord.ui.TextInput(
+        label="付与する内部残高 (半角数字)",
+        placeholder="例: 1200",
+        required=True,
+        max_length=12,
+    )
+    note: discord.ui.TextInput = discord.ui.TextInput(
+        label="修正の理由 (監査ログに残ります)",
+        style=discord.TextStyle.paragraph,
+        placeholder="例: 実際の入金が 950 円だったため",
+        required=True,
+        max_length=300,
+    )
+
+    def __init__(self, request_id: int, suggested: int) -> None:
+        super().__init__(timeout=600)
+        self.request_id = int(request_id)
+        self.amount.default = str(int(suggested))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await bot_of(interaction).handle_review_edit_approve(
+            interaction, self.request_id, str(self.amount.value), str(self.note.value)
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
+        logger.error("承認Modalでエラー: %s", utils.safe_error_text(error))
+        await safe_respond(interaction, embed=error_embed(config.ErrorCode.UNKNOWN_ERROR))
+
+
+class RejectReasonModal(discord.ui.Modal, title="却下の理由を入力"):
+    """却下理由は必須。利用者へそのまま DM で伝わる。"""
+
+    reason: discord.ui.TextInput = discord.ui.TextInput(
+        label="却下の理由 (利用者へ通知されます)",
+        style=discord.TextStyle.paragraph,
+        placeholder="例: 入金が確認できませんでした",
+        required=True,
+        max_length=400,
+    )
+
+    def __init__(self, request_id: int) -> None:
+        super().__init__(timeout=600)
+        self.request_id = int(request_id)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await bot_of(interaction).handle_review_reject(
+            interaction, self.request_id, str(self.reason.value)
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
+        logger.error("却下Modalでエラー: %s", utils.safe_error_text(error))
         await safe_respond(interaction, embed=error_embed(config.ErrorCode.UNKNOWN_ERROR))
 
 

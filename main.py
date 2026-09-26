@@ -38,6 +38,7 @@ from discord.ext import commands
 
 import config
 import kyash_service
+import price_service
 import ui
 import utils
 from charge_service import ChargeError, ChargeService
@@ -176,7 +177,8 @@ class ChargeBot(commands.Bot):
         self.cipher = utils.TokenCipher(config.SECRET_KEY_PATH)
         self.db = Database(config.DB_PATH)
         self.kyash = kyash_service.KyashService(self.db, self.cipher)
-        self.charge = ChargeService(self, self.db, self.kyash)
+        self.price = price_service.PriceService(self.db, self)
+        self.charge = ChargeService(self, self.db, self.kyash, self.price)
         self.tasks = BackgroundTasks(self, self.db, self.charge, self.kyash)
         self._shutdown_started = False
         self._recovery_summary: dict[str, int] = {}
@@ -220,6 +222,7 @@ class ChargeBot(commands.Bot):
         self.add_view(ui.ShopPanelView())
         self.add_view(ui.InvitePanelView())
         self.add_view(ui.AdminPanelView())
+        self.add_view(ui.ReviewCardView())
         charge_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_CHARGE)
         shop_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_SHOP)
         invite_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_INVITE)
@@ -549,9 +552,69 @@ class ChargeBot(commands.Bot):
         return guild
 
     async def on_charge_button(self, interaction: discord.Interaction) -> None:
-        """💰 チャージ → 金額入力 Modal (進行中の取引があれば再開)。"""
-        settings = await self._guard_user_action(interaction, need_charge=True)
+        """💰 チャージ → 方式選択 または 金額入力 Modal。
+
+        使える方式が Kyash だけのときは選択画面を挟まず、従来どおり
+        そのまま金額入力へ進む (余計な操作を増やさない)。
+        """
+        settings = await self._guard_user_action(interaction)
         if settings is None:
+            return
+        guild = self._require_guild(interaction)
+        providers = await self.charge.usable_providers(guild.id, settings)
+        only_kyash = (
+            len(providers) == 1
+            and providers[0]["provider"] == config.ChargeProvider.KYASH
+        )
+        if not only_kyash:
+            entries = await self.charge.provider_availability(guild.id, settings)
+            await interaction.response.send_message(
+                embed=ui.provider_select_embed(entries),
+                view=ui.ProviderSelectView(entries),
+                ephemeral=True,
+            )
+            return
+        await self._begin_kyash_charge(interaction, settings)
+
+    async def on_provider_selected(
+        self, interaction: discord.Interaction, provider: str
+    ) -> None:
+        """方式選択メニューの確定 (ステップ 1/4 → 2/4)。"""
+        settings = await self._guard_user_action(interaction)
+        if settings is None:
+            return
+        guild = self._require_guild(interaction)
+        available = {
+            p["provider"] for p in await self.charge.usable_providers(guild.id, settings)
+        }
+        if provider not in available:
+            entries = await self.charge.provider_availability(guild.id, settings)
+            blocked = next((e for e in entries if e["provider"] == provider), None)
+            code = (
+                str(blocked["error_code"]) if blocked and blocked["error_code"]
+                else config.ErrorCode.PROVIDER_DISABLED
+            )
+            await ui.safe_respond(interaction, embed=ui.error_embed(code))
+            return
+        if provider == config.ChargeProvider.KYASH:
+            await self._begin_kyash_charge(interaction, settings)
+            return
+        await interaction.response.send_modal(
+            ui.ManualAmountModal(provider, settings, await self.charge.provider_limits(
+                guild.id, provider, settings
+            ))
+        )
+
+    async def _begin_kyash_charge(
+        self, interaction: discord.Interaction, settings: Any
+    ) -> None:
+        """Kyash (自動) のチャージを開始する (進行中の取引があれば再開)。"""
+        try:
+            await self.charge.preflight(
+                self._require_guild(interaction).id, interaction.user.id, settings
+            )
+        except ChargeError as exc:
+            await ui.safe_respond(interaction, embed=ui.error_embed(exc.code))
             return
         guild = self._require_guild(interaction)
         active = await self.db.get_active_transaction(guild.id, interaction.user.id)
@@ -700,6 +763,260 @@ class ChargeBot(commands.Bot):
             ),
         )
 
+    # ------------------------------------------------------------------
+    # PayPay / LTC (申請 → 管理者承認)
+    # ------------------------------------------------------------------
+    async def handle_manual_amount_submit(
+        self, interaction: discord.Interaction, provider: str, raw_amount: str
+    ) -> None:
+        """金額確定 → 入金先の案内 (ステップ 2/4 → 3/4)。"""
+        guild = interaction.guild
+        if guild is None:
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            quote = await self.charge.start_manual_charge(
+                guild.id, interaction.user.id, provider, raw_amount
+            )
+        except ChargeError as exc:
+            embed = ui.error_embed(exc.code)
+            if exc.code in (
+                config.ErrorCode.AMOUNT_BELOW_MIN, config.ErrorCode.AMOUNT_ABOVE_MAX
+            ):
+                settings = await self.db.get_settings(guild.id)
+                low, high = await self.charge.provider_limits(guild.id, provider, settings)
+                embed.add_field(
+                    name="ご案内",
+                    value=f"受付範囲: {utils.fmt_yen(low)} 〜 {utils.fmt_yen(high)}",
+                    inline=False,
+                )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception("チャージ申請の作成で予期しない例外が発生しました provider=%s",
+                             provider)
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.UNKNOWN_ERROR), ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            embed=ui.deposit_embed(quote),
+            view=ui.DepositView(
+                int(quote["request_id"]), provider,
+                owner_id=interaction.user.id,
+                timeout=float(config.QUOTE_WAIT_SECONDS),
+            ),
+            ephemeral=True,
+        )
+
+    async def handle_request_submit(
+        self,
+        interaction: discord.Interaction,
+        request_id: int,
+        raw_proof: str,
+        raw_asset: str | None,
+    ) -> None:
+        """証拠の提出 → 承認待ちへ (ステップ 3/4 → 4/4)。"""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await self.charge.submit_request(
+                request_id, interaction.user.id, raw_proof, raw_asset
+            )
+        except ChargeError as exc:
+            logger.info("申請の受付に失敗しました request=%s code=%s", request_id, exc.code)
+            await interaction.followup.send(
+                embed=ui.error_embed(exc.code), ephemeral=True
+            )
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception("申請の受付で予期しない例外が発生しました request=%s", request_id)
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.UNKNOWN_ERROR), ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            embed=ui.request_submitted_embed(result), ephemeral=True
+        )
+
+    async def on_request_cancel(
+        self, interaction: discord.Interaction, request_id: int
+    ) -> None:
+        """利用者が入金前の申請をやめる。"""
+        try:
+            await self.charge.cancel_own_request(request_id, interaction.user.id)
+        except ChargeError as exc:
+            await ui.safe_respond(interaction, embed=ui.error_embed(exc.code))
+            return
+        await ui.safe_respond(
+            interaction,
+            embed=ui.info_embed(
+                "キャンセルしました",
+                "申請を取り消しました。まだ送金していない場合は、送金しないでください。\n"
+                "送金してしまった場合はサーバーの管理者へお問い合わせください。",
+                color=config.Color.NEUTRAL,
+            ),
+        )
+
+    # --- 審査カードのボタン ------------------------------------------
+    async def _review_target(
+        self, interaction: discord.Interaction
+    ) -> sqlite3.Row | None:
+        """審査カードのボタンから申請を引き、権限を確認する。"""
+        if interaction.message is None:
+            await ui.safe_respond(
+                interaction, embed=ui.error_embed(config.ErrorCode.REQUEST_NOT_FOUND)
+            )
+            return None
+        row = await self.db.get_request_by_message(interaction.message.id)
+        if row is None:
+            await ui.safe_respond(
+                interaction, embed=ui.error_embed(config.ErrorCode.REQUEST_NOT_FOUND)
+            )
+            return None
+        if not await self.charge.can_review(int(row["guild_id"]), interaction.user):
+            logger.info("権限のない承認操作を拒否しました user=%s request=%s",
+                        interaction.user.id, int(row["id"]))
+            await ui.safe_respond(
+                interaction,
+                embed=ui.info_embed(
+                    "操作できません",
+                    "この申請を処理できるのは Bot Owner "
+                    "(または Owner が承認を委任したサーバーの管理者) だけです。",
+                    color=config.Color.DANGER,
+                ),
+            )
+            return None
+        if row["status"] != config.RequestStatus.PENDING:
+            await ui.safe_respond(
+                interaction, embed=ui.error_embed(config.ErrorCode.REQUEST_ALREADY_HANDLED)
+            )
+            await self.charge.update_review_card(int(row["id"]))
+            return None
+        return row
+
+    async def on_review_approve(self, interaction: discord.Interaction) -> None:
+        """🟢 承認 (表示どおりの額を付与)。"""
+        row = await self._review_target(interaction)
+        if row is None:
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self._run_approve(interaction, int(row["id"]), None, None)
+
+    async def on_review_edit_approve(self, interaction: discord.Interaction) -> None:
+        """✏️ 金額を直して承認。"""
+        row = await self._review_target(interaction)
+        if row is None:
+            return
+        await interaction.response.send_modal(
+            ui.ApproveAmountModal(int(row["id"]), int(row["estimated_credit"]))
+        )
+
+    async def handle_review_edit_approve(
+        self, interaction: discord.Interaction, request_id: int, raw_amount: str, note: str
+    ) -> None:
+        amount = utils.parse_user_amount(raw_amount)
+        if amount is None or amount <= 0:
+            await ui.safe_respond(
+                interaction, embed=ui.error_embed(config.ErrorCode.INVALID_AMOUNT)
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self._run_approve(interaction, request_id, amount, note)
+
+    async def _run_approve(
+        self,
+        interaction: discord.Interaction,
+        request_id: int,
+        credited: int | None,
+        note: str | None,
+    ) -> None:
+        try:
+            result = await self.charge.approve_request(
+                request_id, operator_id=interaction.user.id,
+                credited_amount=credited, note=note,
+            )
+        except ChargeError as exc:
+            await interaction.followup.send(
+                embed=ui.error_embed(exc.code, admin_detail=exc.detail), ephemeral=True
+            )
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception("申請の承認で予期しない例外が発生しました request=%s", request_id)
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.UNKNOWN_ERROR), ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "🟢 承認しました",
+                f"申請ID: `#{request_id}`\n"
+                f"付与: **{utils.fmt_int(int(result['credited_amount']))}**\n"
+                f"取引ID: `{result['transaction_id']}`\n"
+                f"操作ID: `{result['operation_id']}`\n"
+                f"利用者の残高: {utils.fmt_int(int(result['balance_before']))} → "
+                f"**{utils.fmt_int(int(result['balance_after']))}**",
+            ),
+            ephemeral=True,
+        )
+
+    async def on_review_reject(self, interaction: discord.Interaction) -> None:
+        """🔴 却下 (理由を入力)。"""
+        row = await self._review_target(interaction)
+        if row is None:
+            return
+        await interaction.response.send_modal(ui.RejectReasonModal(int(row["id"])))
+
+    async def handle_review_reject(
+        self, interaction: discord.Interaction, request_id: int, reason: str
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await self.charge.reject_request(
+                request_id, operator_id=interaction.user.id, reason=reason
+            )
+        except ChargeError as exc:
+            await interaction.followup.send(
+                embed=ui.error_embed(exc.code, admin_detail=exc.detail), ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            embed=ui.info_embed(
+                "🔴 却下しました",
+                f"申請ID: `#{request_id}`\n"
+                f"操作ID: `{result['operation_id']}`\n"
+                "残高は変更していません。利用者へ理由を DM で通知しました。",
+                color=config.Color.DANGER,
+            ),
+            ephemeral=True,
+        )
+
+    async def on_review_detail(self, interaction: discord.Interaction) -> None:
+        """🔍 詳細 (照合に必要な情報をコピーしやすい形で出す)。"""
+        if interaction.message is None:
+            return
+        row = await self.db.get_request_by_message(interaction.message.id)
+        if row is None:
+            await ui.safe_respond(
+                interaction, embed=ui.error_embed(config.ErrorCode.REQUEST_NOT_FOUND)
+            )
+            return
+        if not await self.charge.can_review(int(row["guild_id"]), interaction.user):
+            await ui.safe_respond(
+                interaction,
+                embed=ui.info_embed("操作できません", "この申請を参照する権限がありません。",
+                                    color=config.Color.DANGER),
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        history, _ = await self.db.list_requests(
+            guild_id=int(row["guild_id"]), user_id=int(row["user_id"]), limit=5
+        )
+        balance = await self.db.get_balance(int(row["guild_id"]), int(row["user_id"]))
+        await interaction.followup.send(
+            embed=ui.review_detail_embed(request=row, history=history, balance=balance),
+            ephemeral=True,
+        )
+
     async def on_balance_button(self, interaction: discord.Interaction) -> None:
         """💳 残高 (Ephemeral)。"""
         if await self._guard_user_action(interaction) is None:
@@ -754,7 +1071,16 @@ class ChargeBot(commands.Bot):
             rows, total = await self.db.list_user_transactions(
                 view.guild_id, interaction.user.id, offset=offset, limit=view.PAGE_SIZE
             )
-        embed = ui.history_embed(rows, page=view.page, total_pages=total_pages, total=total)
+        open_requests, _ = await self.db.list_requests(
+            guild_id=view.guild_id,
+            user_id=interaction.user.id,
+            statuses=[config.RequestStatus.QUOTED, config.RequestStatus.PENDING],
+            limit=5,
+        )
+        embed = ui.history_embed(
+            rows, page=view.page, total_pages=total_pages, total=total,
+            open_requests=open_requests if view.page == 1 else (),
+        )
         view.previous.disabled = view.page <= 1  # type: ignore[attr-defined]
         view.next.disabled = view.page >= total_pages  # type: ignore[attr-defined]
         if edit:
@@ -779,6 +1105,7 @@ class ChargeBot(commands.Bot):
                 settings,
                 shop_available=shop_available,
                 campaign_name=str(campaign["name"]) if campaign else None,
+                providers=await self.charge.provider_availability(guild.id, settings),
             ),
             ephemeral=True,
         )
@@ -788,7 +1115,12 @@ class ChargeBot(commands.Bot):
         settings = await self._guard_user_action(interaction)
         if settings is None:
             return
-        embed = ui.charge_panel_embed(settings, kyash_ready=self.kyash.is_usable)
+        guild = self._require_guild(interaction)
+        embed = ui.charge_panel_embed(
+            settings,
+            kyash_ready=self.kyash.is_usable,
+            providers=await self.charge.provider_availability(guild.id, settings),
+        )
         try:
             await interaction.response.edit_message(embed=embed, view=ui.ChargePanelView())
         except discord.HTTPException:
@@ -1250,6 +1582,10 @@ class ChargeBot(commands.Bot):
             await self.kyash.shutdown()
         except Exception:  # noqa: BLE001
             logger.exception("Kyash セッション停止で例外が発生しました")
+        try:
+            await self.price.shutdown()
+        except Exception:  # noqa: BLE001
+            logger.exception("価格取得サービス停止で例外が発生しました")
         try:
             await self.db.close()
         except Exception:  # noqa: BLE001

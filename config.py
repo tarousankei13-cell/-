@@ -12,8 +12,8 @@ from typing import Final
 # ---------------------------------------------------------------------------
 # バージョン
 # ---------------------------------------------------------------------------
-BOT_VERSION: Final[str] = "2.1.0"
-SCHEMA_VERSION: Final[int] = 2
+BOT_VERSION: Final[str] = "3.0.0"
+SCHEMA_VERSION: Final[int] = 3
 
 # ---------------------------------------------------------------------------
 # パス
@@ -128,7 +128,9 @@ TASK_BACKUP_INTERVAL: Final[int] = 3600
 TASK_INTEGRITY_INTERVAL: Final[int] = 21600
 BACKUP_MIN_INTERVAL: Final[int] = 86400          # 最低1日1回
 BACKUP_KEEP: Final[int] = 14                     # 保持世代数
-TASK_SHOP_EXPIRY_INTERVAL: Final[int] = 300       # 期限付きロールの剥奪確認
+TASK_SHOP_EXPIRY_INTERVAL: Final[int] = 300
+#: チャージ申請の期限処理・催促の間隔 (秒)
+TASK_REQUEST_INTERVAL: Final[int] = 300       # 期限付きロールの剥奪確認
 TASK_HEARTBEAT_INTERVAL: Final[int] = 60          # 死活監視の更新間隔
 TASK_SUMMARY_INTERVAL: Final[int] = 300           # 日次サマリの投稿判定間隔
 TASK_CAMPAIGN_INTERVAL: Final[int] = 600          # キャンペーン期限・保留の確認間隔
@@ -320,8 +322,144 @@ MANUAL_BALANCE_TYPES: Final[frozenset[str]] = frozenset({
 
 
 class TxSource:
-    AUTOMATIC = "AUTOMATIC"
-    ADMIN_PROXY = "ADMIN_PROXY"
+    AUTOMATIC = "AUTOMATIC"        # Kyash の自動受取
+    ADMIN_PROXY = "ADMIN_PROXY"    # 管理者の代理実績
+    MANUAL_PAYPAY = "MANUAL_PAYPAY"  # PayPay 申請の承認
+    MANUAL_LTC = "MANUAL_LTC"        # Litecoin 申請の承認
+
+
+#: 取引の出自を利用者向けに表示する文言
+TX_SOURCE_LABELS: Final[dict[str, str]] = {
+    TxSource.AUTOMATIC: "Kyash (自動)",
+    TxSource.ADMIN_PROXY: "管理者による代理登録",
+    TxSource.MANUAL_PAYPAY: "PayPay (承認制)",
+    TxSource.MANUAL_LTC: "Litecoin (承認制)",
+}
+
+
+# ---------------------------------------------------------------------------
+# チャージ方式 (Kyash は自動 / PayPay・LTC は申請 → 管理者承認)
+# ---------------------------------------------------------------------------
+class ChargeProvider:
+    """チャージ手段。DB の ``charge_requests.provider`` に保存する。"""
+
+    KYASH = "KYASH"
+    PAYPAY = "PAYPAY"
+    LTC = "LTC"
+
+
+#: 選択メニュー・パネルに表示する名前
+PROVIDER_LABELS: Final[dict[str, str]] = {
+    ChargeProvider.KYASH: "Kyash",
+    ChargeProvider.PAYPAY: "PayPay",
+    ChargeProvider.LTC: "Litecoin (LTC)",
+}
+
+#: 方式の性質を一言で説明する (利用者が選ぶときの判断材料)
+PROVIDER_DESCRIPTIONS: Final[dict[str, str]] = {
+    ChargeProvider.KYASH: "送金リンクを送るとすぐ自動で反映されます",
+    ChargeProvider.PAYPAY: "送金後に申請 → 管理者の承認で反映されます",
+    ChargeProvider.LTC: "その時のレートで送金 → 申請 → 管理者の承認で反映されます",
+}
+
+PROVIDER_EMOJI: Final[dict[str, str]] = {
+    ChargeProvider.KYASH: "💰",
+    ChargeProvider.PAYPAY: "🅿️",
+    ChargeProvider.LTC: "Ł",
+}
+
+#: すべての方式 (表示順)
+ALL_PROVIDERS: Final[tuple[str, ...]] = (
+    ChargeProvider.KYASH, ChargeProvider.PAYPAY, ChargeProvider.LTC,
+)
+
+#: 管理者承認が必要な方式
+MANUAL_PROVIDERS: Final[tuple[str, ...]] = (ChargeProvider.PAYPAY, ChargeProvider.LTC)
+
+#: 承認時に作る取引の source
+PROVIDER_TX_SOURCE: Final[dict[str, str]] = {
+    ChargeProvider.PAYPAY: TxSource.MANUAL_PAYPAY,
+    ChargeProvider.LTC: TxSource.MANUAL_LTC,
+}
+
+#: 方式ごとに利用者へ求める証拠の名前
+PROVIDER_PROOF_LABELS: Final[dict[str, str]] = {
+    ChargeProvider.PAYPAY: "PayPay の取引ID",
+    ChargeProvider.LTC: "トランザクションID (txid)",
+}
+
+
+class RequestStatus:
+    """チャージ申請の状態。"""
+
+    QUOTED = "QUOTED"        # 入金先を案内済み・送金待ち (LTC はレート確定済み)
+    PENDING = "PENDING"      # 申請済み・管理者の承認待ち
+    APPROVED = "APPROVED"    # 承認され残高付与済み
+    REJECTED = "REJECTED"    # 却下 (残高は動かない)
+    EXPIRED = "EXPIRED"      # 期限切れ
+    CANCELLED = "CANCELLED"  # 利用者が取り消した
+
+
+REQUEST_STATUS_LABELS: Final[dict[str, str]] = {
+    RequestStatus.QUOTED: "⌛ 送金待ち",
+    RequestStatus.PENDING: "🟡 承認待ち",
+    RequestStatus.APPROVED: "🟢 承認済み",
+    RequestStatus.REJECTED: "🔴 却下",
+    RequestStatus.EXPIRED: "⚫ 期限切れ",
+    RequestStatus.CANCELLED: "⚪ 取消",
+}
+
+#: 申請の状態遷移。ここに無い遷移は DB 層で拒否する。
+REQUEST_TRANSITIONS: Final[dict[str, tuple[str, ...]]] = {
+    RequestStatus.QUOTED: (
+        RequestStatus.PENDING, RequestStatus.EXPIRED, RequestStatus.CANCELLED,
+    ),
+    RequestStatus.PENDING: (
+        RequestStatus.APPROVED, RequestStatus.REJECTED,
+        RequestStatus.EXPIRED, RequestStatus.CANCELLED,
+    ),
+    RequestStatus.APPROVED: (),
+    RequestStatus.REJECTED: (),
+    RequestStatus.EXPIRED: (),
+    RequestStatus.CANCELLED: (),
+}
+
+#: 入金先を案内してから送金待ちを打ち切るまで (秒)
+QUOTE_WAIT_SECONDS: Final[int] = 30 * 60
+#: 申請してから承認されないまま期限切れにするまで (秒)
+REQUEST_REVIEW_SECONDS: Final[int] = 72 * 3600
+#: 1利用者が同時に持てる未処理申請の数
+MAX_OPEN_REQUESTS_PER_USER: Final[int] = 3
+#: 申請が未処理のまま この時間を超えたら Owner へ催促する (秒)
+REVIEW_REMIND_SECONDS: Final[int] = 6 * 3600
+
+# --- Litecoin ---
+#: LTC の最小単位 (1 litoshi = 1e-8 LTC)
+LTC_DECIMALS: Final[int] = 8
+#: これ未満は手数料負けするため受け付けない
+LTC_MIN_AMOUNT: Final[str] = "0.0005"
+#: txid は 64 桁の 16 進数
+LTC_TXID_LENGTH: Final[int] = 64
+
+#: LTC/JPY の価格取得元 (CoinGecko の公開エンドポイント)
+PRICE_SOURCE_COINGECKO: Final[str] = "COINGECKO"
+PRICE_SOURCE_MANUAL: Final[str] = "MANUAL"
+PRICE_SOURCE_LABELS: Final[dict[str, str]] = {
+    PRICE_SOURCE_COINGECKO: "CoinGecko API (自動)",
+    PRICE_SOURCE_MANUAL: "管理者が設定した固定価格",
+}
+COINGECKO_PRICE_URL: Final[str] = "https://api.coingecko.com/api/v3/simple/price"
+COINGECKO_LTC_ID: Final[str] = "litecoin"
+COINGECKO_VS_CURRENCY: Final[str] = "jpy"
+#: 価格 API のタイムアウト・キャッシュ・許容鮮度
+PRICE_HTTP_TIMEOUT: Final[float] = 10.0
+PRICE_CACHE_SECONDS: Final[int] = 60
+PRICE_MAX_AGE_SECONDS: Final[int] = 15 * 60
+#: 直近の価格から この割合 (%) 以上跳ねた場合は採用せず Owner へ通知する
+PRICE_DEVIATION_GUARD_PERCENT: Final[str] = "35"
+#: 価格として受け付ける範囲 (円)。桁違いの応答を弾くための安全弁。
+PRICE_MIN_JPY: Final[str] = "100"
+PRICE_MAX_JPY: Final[str] = "100000000"
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +606,18 @@ class ErrorCode:
     ROLE_ASSIGN_FAILED = "ROLE_ASSIGN_FAILED"
     CAMPAIGN_NOT_ACTIVE = "CAMPAIGN_NOT_ACTIVE"
     INVITE_NOT_AVAILABLE = "INVITE_NOT_AVAILABLE"
+    # --- チャージ方式 / 申請 ---
+    PROVIDER_DISABLED = "PROVIDER_DISABLED"
+    PROVIDER_NOT_CONFIGURED = "PROVIDER_NOT_CONFIGURED"
+    DUPLICATE_PROOF = "DUPLICATE_PROOF"
+    INVALID_PROOF = "INVALID_PROOF"
+    OPEN_REQUEST_LIMIT = "OPEN_REQUEST_LIMIT"
+    REQUEST_NOT_FOUND = "REQUEST_NOT_FOUND"
+    REQUEST_ALREADY_HANDLED = "REQUEST_ALREADY_HANDLED"
+    QUOTE_EXPIRED = "QUOTE_EXPIRED"
+    PRICE_UNAVAILABLE = "PRICE_UNAVAILABLE"
+    ASSET_AMOUNT_TOO_SMALL = "ASSET_AMOUNT_TOO_SMALL"
+    REVIEW_CHANNEL_NOT_SET = "REVIEW_CHANNEL_NOT_SET"
     UNKNOWN_ERROR = "UNKNOWN_ERROR"
 
 
@@ -510,6 +660,17 @@ USER_ERROR_MESSAGES: Final[dict[str, str]] = {
     ErrorCode.CAMPAIGN_NOT_ACTIVE: "現在開催中の招待キャンペーンはありません。",
     ErrorCode.INVITE_NOT_AVAILABLE: "招待リンクを発行できませんでした。管理者にお問い合わせください。",
     ErrorCode.UNKNOWN_ERROR: "予期しないエラーが発生しました。管理者にお問い合わせください。",
+    ErrorCode.PROVIDER_DISABLED: "この方法でのチャージは現在受け付けていません。",
+    ErrorCode.PROVIDER_NOT_CONFIGURED: "この方法はまだ利用できる状態になっていません。",
+    ErrorCode.DUPLICATE_PROOF: "その取引は既に申請されています。同じものを二重に申請することはできません。",
+    ErrorCode.INVALID_PROOF: "入力された情報の形式が正しくありません。",
+    ErrorCode.OPEN_REQUEST_LIMIT: "未処理の申請が多すぎます。先の申請が処理されるまでお待ちください。",
+    ErrorCode.REQUEST_NOT_FOUND: "申請が見つかりません。",
+    ErrorCode.REQUEST_ALREADY_HANDLED: "その申請は既に処理されています。",
+    ErrorCode.QUOTE_EXPIRED: "入金の受付時間が過ぎました。最初からやり直してください。",
+    ErrorCode.PRICE_UNAVAILABLE: "レートを取得できないため、現在この方法は利用できません。",
+    ErrorCode.ASSET_AMOUNT_TOO_SMALL: "金額が小さすぎます。もう少し大きい金額でお試しください。",
+    ErrorCode.REVIEW_CHANNEL_NOT_SET: "この方法はまだ利用できる状態になっていません。",
 }
 
 #: 利用者向けの「次にどうすればよいか」。エラー表示に添えて迷わせない。
@@ -551,6 +712,17 @@ USER_ERROR_NEXT_ACTIONS: Final[dict[str, str]] = {
     ErrorCode.GUILD_DISABLED: "このサーバーの利用が停止されています。サーバーの管理者にお問い合わせください。",
     ErrorCode.DATABASE_ERROR: "時間をおいてもう一度お試しください。続く場合は管理者にお知らせください。",
     ErrorCode.UNKNOWN_ERROR: "時間をおいてもう一度お試しください。続く場合は取引IDを添えて管理者にお知らせください。",
+    ErrorCode.PROVIDER_DISABLED: "別のチャージ方法を選ぶか、再開までお待ちください。",
+    ErrorCode.PROVIDER_NOT_CONFIGURED: "別のチャージ方法を選んでください (管理者の設定待ちです)。",
+    ErrorCode.DUPLICATE_PROOF: "`📜 履歴` で前の申請の状態を確認してください。取引IDの打ち間違いなら、正しいIDで再申請してください。",
+    ErrorCode.INVALID_PROOF: "取引ID / txid を、余分な文字を入れずにそのまま貼り付けてください。",
+    ErrorCode.OPEN_REQUEST_LIMIT: "`📜 履歴` で未処理の申請を確認し、不要なものは取り消してください。",
+    ErrorCode.REQUEST_NOT_FOUND: "`📜 履歴` から申請を選び直してください。",
+    ErrorCode.REQUEST_ALREADY_HANDLED: "`📜 履歴` で結果を確認してください。",
+    ErrorCode.QUOTE_EXPIRED: "もう一度 `💰 チャージ` を押して、表示された金額を時間内に送ってください。",
+    ErrorCode.PRICE_UNAVAILABLE: "別のチャージ方法を選ぶか、しばらくしてからもう一度お試しください。",
+    ErrorCode.ASSET_AMOUNT_TOO_SMALL: "表示された最低金額以上でもう一度お試しください。",
+    ErrorCode.REVIEW_CHANNEL_NOT_SET: "別のチャージ方法を選んでください (管理者の設定待ちです)。",
 }
 
 #: 再試行してはいけないエラー
@@ -598,6 +770,10 @@ class CustomID:
     INVITE_GET = "chargebot:invite:get"
     INVITE_STATUS = "chargebot:invite:status"
     INVITE_RANK = "chargebot:invite:rank"
+    REQUEST_APPROVE = "chargebot:request:approve"
+    REQUEST_REJECT = "chargebot:request:reject"
+    REQUEST_EDIT_APPROVE = "chargebot:request:editapprove"
+    REQUEST_DETAIL = "chargebot:request:detail"
     ADMIN_REFRESH = "chargebot:admin:refresh"
     ADMIN_MAINTENANCE = "chargebot:admin:maintenance"
     ADMIN_QUEUE = "chargebot:admin:queue"
