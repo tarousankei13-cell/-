@@ -57,6 +57,8 @@ class Scheduler:
         self._spawn(self._loop("expiry", 30, self._leader_only(self._expiry)), "expiry")
         self._spawn(self._loop("aggregates", 300, self._leader_only(self._aggregates)), "aggregates")
         self._spawn(self._loop("retention", 3600, self._leader_only(self._retention)), "retention")
+        self._spawn(self._loop("community_goals", 60, self._leader_only(self._community_goals)), "community_goals")
+        self._spawn(self._loop("auto_backup", 1800, self._leader_only(self._auto_backup)), "auto_backup")
 
     async def stop(self) -> None:
         self._stop.set()
@@ -183,6 +185,31 @@ class Scheduler:
         async with session_scope() as db:
             await stats_svc.recompute_net_worth(db)
         rankings_svc.clear_cache()
+
+    async def _community_goals(self) -> None:
+        from ..services import engagement as engagement_svc
+
+        async with session_scope() as db:
+            await engagement_svc.check_community_goals(db)
+
+    async def _auto_backup(self) -> None:
+        """One scheduled backup per local day, pruned by backup.create itself."""
+        reg = get_registry()
+        enabled = reg.setting("backup.auto_enabled")
+        if enabled is not None and not bool(enabled):
+            return
+        from ..models import Backup
+        from ..services import backup as backup_svc
+        from ..services.engagement import local_day
+
+        async with session_scope() as db:
+            last = (await db.execute(select(Backup).where(Backup.kind == "scheduled")
+                                     .order_by(Backup.id.desc()).limit(1))).scalars().first()
+            if last is not None and last.created_at is not None and local_day(last.created_at) == local_day():
+                return
+        async with session_scope() as db:
+            res = await backup_svc.create(db, kind="scheduled", note="自動バックアップ")
+            log.info("scheduled backup: %s (%s)", res.get("filename"), res.get("status"))
 
     async def _retention(self) -> None:
         reg = get_registry()

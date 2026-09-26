@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from typing import Any
 import sys
 from pathlib import Path
 
@@ -49,8 +50,33 @@ async def _create_all() -> None:
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # create_all makes missing TABLES but never touches existing ones, so a
+        # database written by an older release would be missing every column a
+        # newer model gained, and the first query against it would crash.
+        # Overwriting the app files and restarting is exactly how this game is
+        # updated, so bring existing tables up to the model here: diff each
+        # table against PRAGMA table_info and ADD the columns it lacks.
+        await conn.run_sync(_add_missing_sqlite_columns)
     await dispose_engine()
     print(f"schema ready: {sqlite_path()}")
+
+
+def _add_missing_sqlite_columns(conn: Any) -> None:
+    from sqlalchemy import text as sql_text
+    from sqlalchemy.schema import CreateColumn
+
+    from .db import Base
+
+    for table in Base.metadata.sorted_tables:
+        have = {row[1] for row in conn.execute(sql_text(f'PRAGMA table_info("{table.name}")'))}
+        if not have:  # table was just created by create_all
+            continue
+        for col in table.columns:
+            if col.name in have:
+                continue
+            ddl = CreateColumn(col).compile(dialect=conn.dialect)
+            conn.execute(sql_text(f'ALTER TABLE "{table.name}" ADD COLUMN {ddl}'))
+            print(f"schema: added {table.name}.{col.name}")
 
 
 async def _seed(force: bool) -> None:

@@ -57,6 +57,7 @@ class NotificationSettings(_M):
     toasts: bool = True
     trades: bool = True
     gifts: bool = True
+    live: bool = True
 
 
 class PrivacySettings(_M):
@@ -68,6 +69,7 @@ class PrivacySettings(_M):
 class UISettings(_M):
     font_scale: float = Field(1.0, ge=0.8, le=1.4)
     high_contrast: bool = False
+    tutorial_done: bool = False
 
 
 class PlayerSettings(_M):

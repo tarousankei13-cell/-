@@ -19,6 +19,7 @@ from ..models import Achievement, UserAchievement, UserQuest
 from ..rng.engine import RNG_VERSION
 from ..services import crafting as crafting_svc
 from ..services import effects as effects_svc
+from ..services import engagement as engagement_svc
 from ..services import equipment as equipment_svc
 from ..services import feed as feed_svc
 from ..services import inventory as inv_svc
@@ -564,6 +565,8 @@ async def rankings(board: str, principal: Principal = USER_ANY, db: AsyncSession
                    season_id: int | None = None) -> dict[str, Any]:
     if board == "season":
         data = await rankings_svc.season_board(db, season_id, metric)
+    elif board in engagement_svc.WEEKLY_BOARDS:
+        data = await engagement_svc.weekly_board(db, board)
     else:
         data = await rankings_svc.board(db, board)
         data["me"] = await rankings_svc.user_rank(db, board, principal.user.id)

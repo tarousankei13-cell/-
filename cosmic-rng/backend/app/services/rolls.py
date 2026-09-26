@@ -51,8 +51,10 @@ from . import equipment as equipment_svc
 from . import feed as feed_svc
 from . import inventory as inv_svc
 from . import progress as progress_svc
+from . import engagement as engagement_svc
 from . import seasons as seasons_svc
 from . import user_settings as settings_svc
+from . import share as share_svc
 from . import users as users_svc
 from .constants import (
     FLAG_AUTO,
@@ -95,6 +97,7 @@ class Env:
     favorites: set[int]
     unlocks: set[str]
     chance_mult: float
+    guild_mult: float = 1.0
     progress: ProgressResult = field(default_factory=ProgressResult)
     events: list[ProgressEvent] = field(default_factory=list)
 
@@ -121,9 +124,12 @@ async def load_env(db: AsyncSession, user: User, now: datetime, *, record_from: 
     biome_ctx = await biomes_svc.advance_user(db, user, now, chance_mult=chance, record_from=record_from)
     favorites = await inv_svc.item_favorites(db, user.id)
     unlocks = {r[0] for r in (await db.execute(select(UserUnlock.unlock_key).where(UserUnlock.user_id == user.id))).all()}
+    from . import social as social_svc
+
+    guild_mult, _ = await social_svc.guild_luck(db, user.id)
     env = Env(snap=snap, now=now, user=user, stats=stats, settings=settings, biome=biome_ctx, effect_rows=rows,
               effects=[effects_svc.to_data(r) for r in rows], equips=equips, equip_visuals=visuals, favorites=favorites,
-              unlocks=unlocks, chance_mult=chance)
+              unlocks=unlocks, chance_mult=chance, guild_mult=guild_mult)
     await handle_biome_transitions(db, env, biome_ctx.result.transitions)
     return env
 
@@ -174,6 +180,7 @@ def compute_luck(env: Env, *, biome_key: str, state_key: str | None, mods: RollM
     if hidden:
         lb.special *= float(hidden.get("luck_mult", 1.0))
     lb.event = event_luck(snap, at)
+    lb.guild = env.guild_mult
     lb.other = mods.artifact_luck
     return lb
 
@@ -395,6 +402,13 @@ async def announce_drop(db: AsyncSession, env: Env, won: Won, *, roll_luck: floa
         }, env.settings.privacy.public_drops)
     await discord_notify.enqueue_drop(db, player=env.user.display_name, item=won.info, odds=won.odds, final_luck=roll_luck,
                                       biome=biome_name, first_discovery=first, obtained_at=env.now.isoformat(), serial=serial)
+    # Live reveal: anything at 秘匿級 (tier 5) or above is shown to everyone who
+    # left the setting on. Public-drop privacy still applies.
+    if won.tier >= 5 and env.settings.privacy.public_drops:
+        queue_event(db, "all", "live_reveal", {
+            "item": won.info, "odds": won.odds, "luck": roll_luck, "biome": biome_name, "first": first,
+            "count": count, "offline": offline, "user": users_svc.user_brief(env.user),
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +625,8 @@ async def _single_roll(db: AsyncSession, env: Env, *, auto: bool, flags_extra: i
     await progress_svc.add_xp(db, user, env.stats, xp_gain, env.progress)
     await seasons_svc.add_stats(db, user.id, rolls=1, points=rar.season_points if rar else 1, best_odds=won.odds,
                                 first_discoveries=1 if first else 0)
+    await engagement_svc.add_weekly(db, user.id, rolls=1, best_odds=won.odds,
+                                    points=rar.season_points if rar else 1)
     env.events.append(ProgressEvent("roll", params={
         "biome": biome_def.key, "special_count": 1 if special else 0,
         "hidden_specials": {hidden["key"]: 1} if hidden else {}, "luck": lb.final, "time": env.now,
@@ -631,6 +647,7 @@ async def _single_roll(db: AsyncSession, env: Env, *, auto: bool, flags_extra: i
         "auto_sold": auto_sold, "overflow": overflow, "first_discovery": first_payload, "new_collection": new_collection,
         "duplicated": duplicated, "forced": bool(flags & FLAG_FORCED), "best_of": mods.best_of, "preview_used": bool(flags & FLAG_PREVIEW),
         "xp": xp_gain, "cosmic_eye": reveal_info,
+        "share_url": share_svc.share_url(roll.id) if won.tier >= 4 else None,
     }
 
 
@@ -862,6 +879,7 @@ async def _apply_batch(db: AsyncSession, env: Env, agg: BatchAgg, *, kind: str, 
     await progress_svc.add_xp(db, user, stats, int(round(xp * (1 + env.xp_bonus))), env.progress)
     best = max((agg.won[i].odds for i in ids), default=0.0)
     await seasons_svc.add_stats(db, user.id, rolls=agg.rolls, points=points, best_odds=best, first_discoveries=firsts)
+    await engagement_svc.add_weekly(db, user.id, rolls=agg.rolls, best_odds=best, points=points)
     for bkey, n in agg.per_biome.items():
         env.events.append(ProgressEvent("roll", count=n, params={"biome": bkey, "special_count": 0, "luck": agg.luck_max}))
     env.events.append(ProgressEvent("roll", count=0, params={"biome": "", "special_count": agg.specials, "hidden_specials": agg.hidden}))

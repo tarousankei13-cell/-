@@ -218,6 +218,15 @@ EQUIPMENT = {
     "moonlit_amulet": "月光の護符",
     "fortune_idol": "幸運の偶像",
     "eye_of_providence": "摂理の眼",
+    "meteor_knuckle": "流星の拳",
+    "frostbite_grip": "凍傷の握り",
+    "aurora_palm": "極光の掌",
+    "drift_core": "漂流炉心",
+    "storm_dynamo": "嵐の発電機",
+    "starfall_turbine": "星降りの羽根",
+    "collectors_lens": "蒐集家のレンズ",
+    "echo_locket": "反響のロケット",
+    "prism_sigil": "稜鏡の紋章",
     "paradox_clock": "逆説の時計",
 }
 
@@ -297,6 +306,30 @@ COSMETICS = {
     "bg_singularity": "特異点",
     "bg_genesis": "創世",
     "bg_golden": "黄金の書庫",
+    # --- season pass ---------------------------------------------------------
+    "t_season_runner": "季を駆ける者",
+    "t_season_sovereign": "季の覇者",
+    "b_season_ace": "季の名手",
+    "bg_season_meteor": "流星の季",
+    # --- prestige ------------------------------------------------------------
+    "t_reborn_1": "再誕者",
+    "t_reborn_3": "三度の再誕者",
+    "t_reborn_5": "永劫回帰",
+    "t_reborn_10": "輪を断つ者",
+    # --- collection sets -----------------------------------------------------
+    "t_set_master": "図鑑の織り手",
+    # --- cosmic atelier ------------------------------------------------------
+    "t_atelier_patron": "工房の常連",
+    "t_starlit": "星明かりを纏う者",
+    "t_quiet_orbit": "静かな軌道",
+    "t_lantern_bearer": "灯りを持つ者",
+    "b_atelier_seal": "工房の印",
+    "b_comet_tail": "彗星の尾",
+    "b_paper_moon": "紙の月",
+    "b_orbit_ring": "軌道環",
+    "bg_quiet_dust": "静かな塵",
+    "bg_amber_drift": "琥珀の漂い",
+    "bg_glass_sea": "硝子の海",
 }
 
 SHOPS = {
@@ -305,6 +338,7 @@ SHOPS = {
     "nebula_bazaar": "星雲market",
     "solar_forge": "太陽鍛冶場",
     "void_market": "虚無の市",
+    "cosmic_atelier": "宇宙の仕立て工房",
 }
 
 RECIPES = {
@@ -444,6 +478,17 @@ SHOP_ITEMS = {
     "u_offline_1": "オフライン処理装置I",
     "u_offline_2": "オフライン処理装置II",
     "u_rng_analyzer": "確率解析器",
+    "c_atelier_patron": "称号: 工房の常連",
+    "c_quiet_orbit": "称号: 静かな軌道",
+    "c_starlit": "称号: 星明かりを纏う者",
+    "c_lantern_bearer": "称号: 灯りを持つ者",
+    "c_atelier_seal": "バッジ: 工房の印",
+    "c_paper_moon": "バッジ: 紙の月",
+    "c_comet_tail": "バッジ: 彗星の尾",
+    "c_orbit_ring": "バッジ: 軌道環",
+    "c_bg_quiet_dust": "背景: 静かな塵",
+    "c_bg_amber_drift": "背景: 琥珀の漂い",
+    "c_bg_glass_sea": "背景: 硝子の海",
     "u_ultra_fast": "超高速モジュール",
 }
 

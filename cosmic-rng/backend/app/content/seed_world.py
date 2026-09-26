@@ -155,6 +155,29 @@ EQUIPMENT: list[dict[str, Any]] = [
     E("paradox_clock", "Paradox Clock", "relic", "secret", 1.0, 0.50, "過去と未来を同時に指す時計。オフライン効率+25%。",
       EV("hourglass", "#b8f0ff", "#ff5cf0", aura="#b8f0ff", roll_effect="clock"), [{"type": "offline_efficiency", "add": 0.25}],
       min_level=15, sell=400000),
+    # --- second wave ------------------------------------------------------
+    E("meteor_knuckle", "Meteor Knuckle", "gauntlet", "rare", 0.20, 0.12, "落下する星の重みを拳に乗せる。",
+      EV("glove", "#ffb98a", "#8a3a1a", aura="#ffb98a"), sell=900),
+    E("frostbite_grip", "Frostbite Grip", "gauntlet", "epic", 0.55, 0.0, "凍てつく握り。Frozen Comet中はLuck×1.8。",
+      EV("glove", "#bff0ff", "#2a6aa8", aura="#bff0ff", roll_effect="frost"),
+      [{"type": "biome_luck", "biome": "frozen_comet", "mult": 1.8}], sell=4200),
+    E("aurora_palm", "Aurora Palm", "gauntlet", "legendary", 1.10, 0.15, "極光を編んだ手。Aurora Veil中はLuck×1.8、獲得XP+15%。",
+      EV("glove", "#8affd8", "#3a8aff", aura="#8affd8", roll_effect="aurora"),
+      [{"type": "biome_luck", "biome": "aurora_veil", "mult": 1.8}, {"type": "xp_bonus", "add": 0.15}], min_level=9, sell=28000),
+    E("drift_core", "Drift Core", "core", "rare", 0.0, 0.16, "慣性だけで回り続ける静かなコア。", EV("core", "#cfe0ff", "#5a6ab8"), sell=750),
+    E("storm_dynamo", "Storm Dynamo", "core", "epic", 0.10, 0.34, "Ion Storm中はLuck×1.6。雷を燃料にする発電機。",
+      EV("core", "#a8e8ff", "#3a3aff", aura="#a8e8ff", roll_effect="spark"),
+      [{"type": "biome_luck", "biome": "ion_storm", "mult": 1.6}], sell=5200),
+    E("starfall_turbine", "Starfall Turbine", "core", "legendary", 0.25, 0.62, "降り注ぐ星を受けて回る羽根。自動売却の価値+40%。",
+      EV("core", "#ffe6a8", "#ff7ab8", aura="#ffe6a8", roll_effect="starfall"),
+      [{"type": "sell_bonus", "add": 0.4}], min_level=10, sell=33000),
+    E("collectors_lens", "Collector's Lens", "relic", "rare", 0.08, 0.0, "収集家のレンズ。獲得XP+20%。",
+      EV("prism", "#ffe9c0", "#b8874a"), [{"type": "xp_bonus", "add": 0.2}], sell=1600),
+    E("echo_locket", "Echo Locket", "relic", "epic", 0.35, 0.0, "4回に1回Luck×1.2で反響する首飾り。",
+      EV("moon", "#e0d8ff", "#7a5cff", aura="#e0d8ff"), [{"type": "nth_roll_luck", "every": 4, "mult": 1.2}], sell=7000),
+    E("prism_sigil", "Prism Sigil", "relic", "legendary", 0.90, 0.0, "七色に割れる紋章。Biome出現率×1.4、Special Rollが1回早まる。",
+      EV("rune", "#ffffff", "#7affd8", aura="#d8fff0", roll_effect="prism"),
+      [{"type": "biome_chance", "mult": 1.4}, {"type": "special_interval", "delta": -1}], min_level=12, sell=60000),
 ]
 for i, e in enumerate(EQUIPMENT):
     e["sort_order"] = i
@@ -274,6 +297,7 @@ SHOPS: list[dict[str, Any]] = [
     {"key": "nebula_bazaar", "name": "Nebula Bazaar", "description": "Nebula Bloomの間だけ現れる露店。", "biome_key": "nebula_bloom", "sort_order": 2},
     {"key": "solar_forge", "name": "Solar Forge", "description": "Solar Flareの熱で動く鍛冶場。", "biome_key": "solar_flare", "sort_order": 3},
     {"key": "void_market", "name": "Void Market", "description": "虚無の裂け目の向こうの闇市。", "biome_key": "void_rift", "min_level": 15, "sort_order": 4},
+    {"key": "cosmic_atelier", "name": "Cosmic Atelier", "description": "称号・バッジ・背景を仕立てる工房。毎日ひとつが目玉として割引される。", "sort_order": 5},
 ]
 
 
@@ -326,6 +350,20 @@ SHOP_ITEMS: list[dict[str, Any]] = [
     P("s_chrono_capsule", "solar_forge", "Chrono Capsule", "boost", "chrono_capsule", 12000, limit=5, period="daily"),
     P("s_void_resonator", "void_market", "Void Resonator", "boost", "void_resonator", 50000),
     P("s_celestial_surge", "void_market", "Celestial Surge", "boost", "celestial_surge", 400000, limit=1, period="daily"),
+    # Cosmic Atelier — cosmetics for Stardust (one per account)
+    P("c_atelier_patron", "cosmic_atelier", "称号: Atelier Patron", "cosmetic", "t_atelier_patron", 20000,
+      "工房の常連の証。", limit=1, period="lifetime"),
+    P("c_quiet_orbit", "cosmic_atelier", "称号: Quiet Orbit", "cosmetic", "t_quiet_orbit", 35000, "静かな軌道。", limit=1, period="lifetime"),
+    P("c_starlit", "cosmic_atelier", "称号: Starlit", "cosmetic", "t_starlit", 90000, "星明かりを纏う。", limit=1, period="lifetime", min_level=8),
+    P("c_lantern_bearer", "cosmic_atelier", "称号: Lantern Bearer", "cosmetic", "t_lantern_bearer", 150000,
+      "暗い宙で灯りを持つ者。", limit=1, period="lifetime", min_level=12),
+    P("c_atelier_seal", "cosmic_atelier", "バッジ: Atelier Seal", "cosmetic", "b_atelier_seal", 25000, "", limit=1, period="lifetime"),
+    P("c_paper_moon", "cosmic_atelier", "バッジ: Paper Moon", "cosmetic", "b_paper_moon", 40000, "", limit=1, period="lifetime"),
+    P("c_comet_tail", "cosmic_atelier", "バッジ: Comet Tail", "cosmetic", "b_comet_tail", 120000, "", limit=1, period="lifetime", min_level=8),
+    P("c_orbit_ring", "cosmic_atelier", "バッジ: Orbit Ring", "cosmetic", "b_orbit_ring", 180000, "", limit=1, period="lifetime", min_level=10),
+    P("c_bg_quiet_dust", "cosmic_atelier", "背景: Quiet Dust", "cosmetic", "bg_quiet_dust", 60000, "", limit=1, period="lifetime"),
+    P("c_bg_amber_drift", "cosmic_atelier", "背景: Amber Drift", "cosmetic", "bg_amber_drift", 200000, "", limit=1, period="lifetime", min_level=10),
+    P("c_bg_glass_sea", "cosmic_atelier", "背景: Glass Sea", "cosmetic", "bg_glass_sea", 260000, "", limit=1, period="lifetime", min_level=12),
 ]
 for i, p in enumerate(SHOP_ITEMS):
     p["sort_order"] = i
@@ -392,4 +430,28 @@ COSMETICS: list[dict[str, Any]] = [
     C("bg_singularity", "background", "Singularity", "secret", "", {"theme": "singularity"}),
     C("bg_genesis", "background", "Genesis", "ultra_secret", "", {"theme": "genesis"}),
     C("bg_golden", "background", "Golden Archive", "legendary", "", {"theme": "architects_domain"}),
+    # Season pass track
+    C("t_season_runner", "title", "Season Runner", "rare", "シーズンパスの歩みを進めた者。"),
+    C("t_season_sovereign", "title", "Season Sovereign", "secret", "シーズンを走り切った者。"),
+    C("b_season_ace", "badge", "Season Ace", "epic", "シーズンパス達成の証", {"shape": "star", "colors": ["#ffd98a", "#7a5cff"]}),
+    C("bg_season_meteor", "background", "Meteor Season", "legendary", "", {"theme": "starfall"}),
+    # Prestige (転生)
+    C("t_reborn_1", "title", "Reborn", "epic", "一度、宇宙をやり直した者。"),
+    C("t_reborn_3", "title", "Thrice Reborn", "legendary", "三度、宇宙をやり直した者。"),
+    C("t_reborn_5", "title", "Eternal Return", "secret", "五度、宇宙をやり直した者。"),
+    C("t_reborn_10", "title", "Cycle Breaker", "ultra_secret", "十度目の輪をみずから断った者。"),
+    # Collection sets
+    C("t_set_master", "title", "Set Master", "secret", "図鑑のセットを編み切った者。"),
+    # Cosmic Atelier (stardust cosmetics)
+    C("t_atelier_patron", "title", "Atelier Patron", "rare", "工房の常連。"),
+    C("t_starlit", "title", "Starlit", "epic"),
+    C("t_quiet_orbit", "title", "Quiet Orbit", "rare"),
+    C("t_lantern_bearer", "title", "Lantern Bearer", "epic"),
+    C("b_atelier_seal", "badge", "Atelier Seal", "rare", "", {"shape": "sigil", "colors": ["#ffd9a8", "#b8744a"]}),
+    C("b_comet_tail", "badge", "Comet Tail", "epic", "", {"shape": "diamond", "colors": ["#8ad8ff", "#ff8ad8"]}),
+    C("b_paper_moon", "badge", "Paper Moon", "rare", "", {"shape": "moon", "colors": ["#fff0c0", "#b8a070"]}),
+    C("b_orbit_ring", "badge", "Orbit Ring", "epic", "", {"shape": "ring", "colors": ["#a8ffd8", "#5a8aff"]}),
+    C("bg_quiet_dust", "background", "Quiet Dust", "rare", "", {"theme": "stellar_drift"}),
+    C("bg_amber_drift", "background", "Amber Drift", "epic", "", {"theme": "solar_flare"}),
+    C("bg_glass_sea", "background", "Glass Sea", "epic", "", {"theme": "frozen_comet"}),
 ]

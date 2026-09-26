@@ -305,3 +305,69 @@ def all_items() -> list[dict[str, Any]]:
             it["odds"] = None
         out.append(it)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Lore for the upper tiers
+#
+# Every item at 伝説級 (tier 4) and above carries a line of lore. They live here
+# rather than inline so the table reads as one voice, and so a database seeded
+# before this text existed can be backfilled without touching admin edits.
+# ---------------------------------------------------------------------------
+LORE_JA: dict[str, str] = {
+    # legendary — general
+    "leviathan_scale": "銀河の腕を縫うように泳ぐ影がいる。鱗を一枚だけ残していくのは、見た者への礼だという。",
+    "starborn_halo": "星の胎から生まれた者は、生涯その光輪を外せない。外した者はもう星ではない。",
+    "chronos_gear": "宇宙時計の歯車は全部で十二枚。十一枚までは見つかっている。",
+    "fortunes_edge": "刃は幸運に反応して現れる。切れるのは運命の糸だけで、持ち主を傷つけたことは一度もない。",
+    "andromeda_tear": "四十億年後の衝突を、彼女はもう知っている。涙は先に流れてきた。",
+    "quasar_heart": "銀河ひとつ分の明るさで脈打っている。手のひらに乗るのは、時間が縮めて運んできたからだ。",
+    "dyson_fragment": "恒星をまるごと包む構造物の、ほんの一枚。作った者たちの名は残っていない。",
+    "lucky_seven_relic": "七が七度、七百七十七の刻に重なった時だけ現れる。誰も二度は見ていない。",
+    "frozen_second": "止まった一秒の中では、光さえ動けない。耳を当てると自分の心音だけが響く。",
+    "laurel_of_firsts": "世界で最初にそこへ辿り着いた者へ。二人目には別の冠が用意されている。",
+    "everbloom": "枯れない花は、時間の外で咲いている。摘んだ瞬間から一秒も経っていない。",
+    # secret / ultra / mythic — general
+    "the_last_light": "宇宙が冷えきった後、最後まで消えずに残る一点。見た者は、終わりを知ってしまう。",
+    "crown_of_the_cosmos": "戴くのは王ではなく、宇宙そのもの。人の頭に乗るのは借り物の間だけだ。",
+    "multiverse_key": "鍵穴は無数にあり、同じ扉は二度と開かない。帰り道の保証はどこにもない。",
+    "luck_incarnate": "幸運に形を与えたら、こうなった。触れた者の確率は静かに書き換わる。",
+    "big_bang_echo": "百三十八億年前の一音が、まだ鳴り止んでいない。耳を澄ませば今も膨らんでいる。",
+    "infinity_ouroboros": "自らの尾を喰らい続ける蛇。どこが頭でどこが尾かは、見る者の側の問題だ。",
+    "eye_of_the_universe": "宇宙が自分を見るために作った瞳。覗き込むと、見ているのはどちらか分からなくなる。",
+    "god_particle": "万物に重さを与えた粒。これが無ければ、星も人も光のまま散っていた。",
+    "the_origin": "すべての始まり。それ以上は、誰にも語られていない。",
+    "genesis_codex": "宇宙の法則が記された原典。ページは開くが、読める文字がひとつもない。",
+    "heavens_gate": "門は常にそこにある。開くかどうかを決めているのは、門ではない。",
+    "omega": "終わりの、その先にあるもの。名前だけが先に伝わってきた。",
+    # biome legendaries
+    "pink_quasar": "桃色に灯るクエーサーは観測史上ひとつだけ。誰かの願いが混ざったのだと言われている。",
+    "heart_of_the_sun": "太陽の中心核。直視してはいけない——見た者は、もう夜を思い出せない。",
+    "veil_of_lights": "空をまたぐ光の帳。風もないのに揺れるのは、下から誰かが見上げているからだ。",
+    "absolute_frost": "絶対零度に達した一片。ここでは原子すら口をつぐむ。",
+    "red_giants_tear": "膨らみ切った星が最期に流した一滴。冷える前に拾えた者だけが持っている。",
+    "schrodingers_box": "開けるまで中身は決まらない。開けた後も、決まったのかどうか確かめる術がない。",
+    "wishing_star": "願いを叶えるという。叶った者が語らないので、真偽は誰も知らない。",
+    "star_sovereign": "星々を統べる者の証。玉座は無く、ただ順番に光ることだけが約束されている。",
+    "rift_walker_mask": "裂け目を渡る者の仮面。被った者は向こう側から見られる側になる。",
+    "null_heart": "何も無いことを証明するための心臓。鼓動は無いが、確かに動いている。",
+    "abyssal_eye": "深淵を覗く者を、深淵もまた覗く。この眼はその返事のほうだ。",
+    "spaghettified_light": "引き伸ばされた光の糸。端を辿ると、二度と戻れない場所に着く。",
+    "hawking_radiance": "穴が静かに痩せていく音。宇宙で最も気の長い蒸発である。",
+    "event_horizon_crown": "戴いた者の姿は、外からは永遠に落ち続けて見える。本人はもう着いている。",
+    "first_word": "宇宙が最初に発した言葉。意味は失われ、響きだけが残った。",
+    "creators_fingerprint": "創造主の指紋。どの宇宙の隅にも、同じ渦がひとつ残されている。",
+    "golden_ratio": "美の比率そのもの。分けても分けても、同じ形が出てくる。",
+    "sanctum_relic": "虚無の聖域に祀られていた遺物。祀った者たちは、もうどこにもいない。",
+    "paradox_shard": "在ると無いを同時に満たす欠片。手に持つと、持っていない感触がする。",
+    "source_code_fragment": "世界を記述するコードの断片。読んだ者は、読んでいる自分も書かれていると気づく。",
+    "pioneer_starmedal": "世界で最初にそれを見つけた者へ。二番目の発見者に、この星章は出ない。",
+    "stellar_artifact": "星の欠片を核に、誰かの手が形を与えた遺物。同じものは二つとして生まれない。",
+}
+
+for _bucket in (GENERAL_ITEMS, BIOME_ITEMS, SPECIAL_ITEMS):
+    for _it in _bucket:
+        if not (_it.get("lore") or "").strip():
+            _lore = LORE_JA.get(_it["key"])
+            if _lore:
+                _it["lore"] = _lore

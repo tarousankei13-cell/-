@@ -109,7 +109,7 @@ TYPES: dict[str, ContentType] = {
     ), list_fields=("key", "name", "biome_key", "is_active")),
     "shop_items": ContentType("shop_items", "Shop Items", m.ShopItem, "shop_item", (
         F("key", "str", "Key", True), F("shop_key", "str", "ショップKey", True), F("name", "str", "名前（英）", True), F("name_ja", "str", "名前（日）", help="英語名の隣に表示されます"), F("description", "text", "説明"),
-        F("product_type", "enum", "商品種別", True, ("boost", "equipment", "unlock", "item")), F("product_key", "str", "商品Key", True),
+        F("product_type", "enum", "商品種別", True, ("boost", "equipment", "unlock", "item", "cosmetic")), F("product_key", "str", "商品Key", True),
         F("quantity", "int", "数量", min=1), F("price", "int", "価格", True, min=0), F("limit_count", "int", "購入上限", min=1),
         F("limit_period", "enum", "上限期間", choices=("daily", "lifetime")), F("min_level", "int", "必要レベル", min=1),
         F("requires_unlock", "str", "前提アンロック"), F("biome_key", "str", "Biome限定"), F("visual", "json", "ビジュアル"),

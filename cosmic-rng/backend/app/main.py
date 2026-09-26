@@ -77,17 +77,23 @@ async def _generated_names_ja(db):
 
 
 async def ensure_content() -> None:
-    from .content.seeder import seed
+    from .content.seeder import seed, seed_new_content
     from .models import Rarity
 
     async with session_scope() as db:
         if (await db.execute(select(Rarity).limit(1))).scalar_one_or_none() is None:
             log.warning("empty database detected — seeding initial content")
             await seed(db)
+        else:
+            # An upgrade may ship content the running database has never seen.
+            # The seeder only inserts rows whose key is missing, so this adds
+            # the new ones and leaves every admin edit alone.
+            await seed_new_content(db)
     async with session_scope() as db:
-        from .content.seeder import backfill_names_ja
+        from .content.seeder import backfill_lore, backfill_names_ja
 
         await backfill_names_ja(db)
+        await backfill_lore(db)
     async with session_scope() as db:
         await get_registry().reload(db)
     async with session_scope() as db:
@@ -159,12 +165,16 @@ def create_app() -> FastAPI:
             log.warning("slow request %s %s %.0fms", request.method, request.url.path, dur)
         return response
 
-    from .api import admin, auth, economy, game
+    from .api import admin, auth, economy, engage, game, guest, share, social
     from .ws import routes as ws_routes
 
     app.include_router(auth.router)
     app.include_router(game.router)
     app.include_router(economy.router)
+    app.include_router(social.router)
+    app.include_router(engage.router)
+    app.include_router(share.router)
+    app.include_router(guest.router)
     app.include_router(admin.router)
     app.include_router(ws_routes.router)
 

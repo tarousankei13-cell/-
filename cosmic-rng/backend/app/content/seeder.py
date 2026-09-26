@@ -55,6 +55,53 @@ async def backfill_names_ja(db: AsyncSession) -> int:
     return filled
 
 
+async def seed_new_content(db: AsyncSession) -> None:
+    """Insert content added by an upgrade into a database that already has rows.
+
+    ``seed`` is insert-only unless forced, but it also bumps the content
+    version and rewrites nothing, so on a live database it is only worth the
+    round trip when something really is missing. The check below is cheap:
+    one count per table that the shipped content can grow.
+    """
+    checks: list[tuple[Any, list[dict[str, Any]]]] = [
+        (m.Item, seed_items.all_items()),
+        (m.Equipment, seed_world.EQUIPMENT),
+        (m.Boost, seed_world.BOOSTS),
+        (m.Recipe, seed_world.RECIPES),
+        (m.Shop, seed_world.SHOPS),
+        (m.ShopItem, seed_world.SHOP_ITEMS),
+        (m.Cosmetic, seed_world.COSMETICS),
+        (m.Quest, seed_progress.QUESTS),
+        (m.Achievement, seed_progress.ACHIEVEMENTS),
+        (m.Biome, seed_world.BIOMES),
+    ]
+    missing = 0
+    for model, rows in checks:
+        have = {k for (k,) in (await db.execute(select(model.key))).all()}
+        missing += sum(1 for r in rows if r["key"] not in have)
+    if not missing:
+        return
+    log.info("upgrade: %s content rows are new — seeding them", missing)
+    await seed(db)
+
+
+async def backfill_lore(db: AsyncSession) -> int:
+    """Give upper-tier items their lore on databases seeded before it existed.
+
+    Only rows with no lore at all are touched, so admin-written text stays.
+    """
+    filled = 0
+    for obj in (await db.execute(select(m.Item).where(m.Item.lore == ""))).scalars().all():
+        lore = seed_items.LORE_JA.get(obj.key)
+        if lore:
+            obj.lore = lore
+            filled += 1
+    if filled:
+        await db.commit()
+        log.info("backfilled lore for %s items", filled)
+    return filled
+
+
 async def _upsert_by_key(db: AsyncSession, model: Any, rows: list[dict[str, Any]], force: bool, key_field: str = "key") -> dict[str, Any]:
     existing = {getattr(o, key_field): o for o in (await db.execute(select(model))).scalars().all()}
     out: dict[str, Any] = {}

@@ -65,11 +65,12 @@ class LuckBreakdown:
     temporary: float = 1.0
     special: float = 1.0
     event: float = 1.0
+    guild: float = 1.0
     other: float = 1.0
 
     @property
     def final(self) -> float:
-        v = self.base * self.equipment * self.biome * self.temporary * self.special * self.event * self.other
+        v = self.base * self.equipment * self.biome * self.temporary * self.special * self.event * self.guild * self.other
         if not math.isfinite(v):
             return 1e300
         return max(v, 1e-9)
@@ -77,7 +78,7 @@ class LuckBreakdown:
     def as_dict(self) -> dict[str, float]:
         return {
             "base": self.base, "equipment": self.equipment, "biome": self.biome, "temporary": self.temporary,
-            "special": self.special, "event": self.event, "other": self.other, "final": self.final,
+            "special": self.special, "event": self.event, "guild": self.guild, "other": self.other, "final": self.final,
         }
 
 

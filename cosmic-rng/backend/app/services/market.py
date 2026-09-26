@@ -161,6 +161,13 @@ async def buy(db: AsyncSession, buyer_id: int, listing_id: int) -> dict[str, Any
         raise Forbidden("このアカウントでは購入できません", code="account_restricted")
     if buyer.stardust < listing.price:
         raise AppError("Stardustが足りません", code="insufficient_funds")
+    # Velocity cap: one account can only absorb so many listings per day, which
+    # blunts both bulk laundering and a scripted buyer sweeping the board.
+    bought_today = int((await db.execute(select(func.count()).select_from(MarketListing).where(
+        MarketListing.buyer_id == buyer.id, MarketListing.status == "sold",
+        MarketListing.sold_at > now - timedelta(days=1)))).scalar_one())
+    if bought_today >= int(reg.setting("market.daily_buy_limit") or 120):
+        raise AppError("本日のMarket購入上限に達しています", code="market_daily_limit", status_code=429)
     inst = (await db.execute(select(ItemInstance).where(ItemInstance.id == listing.instance_id).with_for_update())).scalar_one_or_none()
     if inst is None or inst.owner_id != seller.id or inst.state != "listed":
         listing.status = "cancelled"

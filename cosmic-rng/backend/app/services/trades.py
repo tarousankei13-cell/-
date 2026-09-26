@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..content.registry import get_registry
@@ -146,6 +146,32 @@ async def respond(db: AsyncSession, user_id: int, trade_id: int, action: str, re
     return pub
 
 
+async def _velocity_check(db: AsyncSession, a_id: int, b_id: int) -> None:
+    """Cap how fast items can move between accounts.
+
+    A completed trade is the cheapest way to launder items or funnel them into
+    one account, so both a per-account and a per-pair daily ceiling apply. The
+    limits are admin-tunable and count only trades that actually completed.
+    """
+    reg = get_registry()
+    day = utcnow() - timedelta(days=1)
+    per_user = int(reg.setting("trade.daily_limit") or 40)
+    per_pair = int(reg.setting("trade.pair_daily_limit") or 8)
+    done = Trade.status == "accepted"
+    recent = Trade.completed_at > day
+    for uid in (a_id, b_id):
+        n = int((await db.execute(select(func.count()).select_from(Trade).where(
+            done, recent, or_(Trade.from_user_id == uid, Trade.to_user_id == uid)))).scalar_one())
+        if n >= per_user:
+            raise AppError("本日のTrade成立上限に達しています", code="trade_daily_limit", status_code=429)
+    pair = int((await db.execute(select(func.count()).select_from(Trade).where(
+        done, recent,
+        or_(and_(Trade.from_user_id == a_id, Trade.to_user_id == b_id),
+            and_(Trade.from_user_id == b_id, Trade.to_user_id == a_id))))).scalar_one())
+    if pair >= per_pair:
+        raise AppError("この相手との本日のTrade上限に達しています", code="trade_pair_limit", status_code=429)
+
+
 async def _execute(db: AsyncSession, t: Trade) -> None:
     users = await lock_users_ordered(db, t.from_user_id, t.to_user_id)
     a, b = users[t.from_user_id], users[t.to_user_id]
@@ -153,6 +179,7 @@ async def _execute(db: AsyncSession, t: Trade) -> None:
         if u.status != "active":
             raise Forbidden("取引できないアカウントが含まれています", code="account_restricted")
         users_svc.require_feature(u, "trade", "features.trade_enabled")
+    await _velocity_check(db, a.id, b.id)
     if a.stardust < t.offer_stardust or b.stardust < t.request_stardust:
         raise AppError("Stardustが不足しているためTradeできません", code="insufficient_funds")
     o_rows, o_infos = await _validate_items(db, a.id, list(t.offer_items), "Trade", lock=True)

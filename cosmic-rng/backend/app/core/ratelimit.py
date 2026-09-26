@@ -28,6 +28,7 @@ LIMITS: dict[str, Limit] = {
     "ws_msg": Limit(rate=10, burst=30),
     "ws_connect": Limit(rate=0.5, burst=10),
     "search": Limit(rate=3, burst=10),
+    "guest_roll": Limit(rate=1.5, burst=12),
 }
 
 

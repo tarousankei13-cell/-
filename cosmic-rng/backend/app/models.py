@@ -269,6 +269,12 @@ class UserStats(Base):
     boosts_used: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
     quests_completed: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
     achievements_count: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
+    # v2: star shards (duplicate-conversion currency), rebirth count, login streak
+    shards: Mapped[int] = mapped_column(BigInteger, server_default="0", nullable=False)
+    prestige: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
+    login_streak: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
+    login_cycle: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
+    last_bonus_day: Mapped[str] = mapped_column(String(10), server_default="", nullable=False)
     artifacts_used: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
     max_luck: Mapped[float] = mapped_column(Double, server_default="1", nullable=False)
     net_worth: Mapped[int] = mapped_column(BigInteger, server_default="0", nullable=False)
@@ -1096,6 +1102,80 @@ class AuditLog(Base):
     ip: Mapped[str | None] = mapped_column(String(64))
     session_hash: Mapped[str | None] = mapped_column(String(16))
     user_agent: Mapped[str | None] = mapped_column(String(256))
+    created_at: Mapped[datetime] = now_col()
+
+
+class Friendship(Base):
+    """One row per request direction; status pending -> accepted."""
+
+    __tablename__ = "friendships"
+    __table_args__ = (
+        UniqueConstraint("user_id", "friend_id", name="uq_friendships_pair"),
+        Index("ix_friendships_friend", "friend_id", "status"),
+        Index("ix_friendships_user", "user_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    friend_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    status: Mapped[str] = mapped_column(String(12), server_default="pending", nullable=False)
+    created_at: Mapped[datetime] = now_col()
+
+
+class Guild(Base):
+    __tablename__ = "guilds"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(24), unique=True, nullable=False)
+    tag: Mapped[str] = mapped_column(String(8), unique=True, nullable=False)
+    description: Mapped[str] = mapped_column(Text, server_default="", nullable=False)
+    owner_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    is_open: Mapped[bool] = mapped_column(Boolean, server_default=TRUE, nullable=False)
+    created_at: Mapped[datetime] = now_col()
+
+
+class GuildMember(Base):
+    """user_id is the primary key: one guild per player, by design."""
+
+    __tablename__ = "guild_members"
+    __table_args__ = (Index("ix_guild_members_guild", "guild_id"),)
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    guild_id: Mapped[int] = mapped_column(ForeignKey("guilds.id", ondelete="CASCADE"), nullable=False)
+    role: Mapped[str] = mapped_column(String(12), server_default="member", nullable=False)
+    joined_at: Mapped[datetime] = now_col()
+
+
+class WeeklyStats(Base):
+    """Per-ISO-week counters so newcomers can top a board that resets Monday."""
+
+    __tablename__ = "weekly_stats"
+    __table_args__ = (
+        Index("ix_weekly_rolls", "week", "rolls"),
+        Index("ix_weekly_best", "week", "best_odds"),
+    )
+
+    week: Mapped[str] = mapped_column(String(10), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    rolls: Mapped[int] = mapped_column(BigInteger, server_default="0", nullable=False)
+    best_odds: Mapped[float] = mapped_column(Double, server_default="0", nullable=False)
+    points: Mapped[int] = mapped_column(BigInteger, server_default="0", nullable=False)
+
+
+class SeasonPassClaim(Base):
+    __tablename__ = "season_pass_claims"
+
+    season_id: Mapped[int] = mapped_column(ForeignKey("seasons.id", ondelete="CASCADE"), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    tier_idx: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = now_col()
+
+
+class SetClaim(Base):
+    __tablename__ = "set_claims"
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    set_key: Mapped[str] = mapped_column(String(48), primary_key=True)
     created_at: Mapped[datetime] = now_col()
 
 

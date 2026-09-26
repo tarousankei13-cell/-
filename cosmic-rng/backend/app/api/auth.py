@@ -38,7 +38,7 @@ from ..core.security import (
 )
 from ..core.timeutil import utcnow
 from ..db import get_db
-from ..services import audit, progress as progress_svc, user_settings as settings_svc, users as users_svc
+from ..services import audit, guest as guest_svc, progress as progress_svc, user_settings as settings_svc, users as users_svc
 
 log = logging.getLogger("cosmic.auth")
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -168,7 +168,17 @@ async def register(body: RegisterBody, request: Request, db: AsyncSession = Depe
     await get_registry().ensure_fresh(db)
     user = await users_svc.register_local(db, email=body.email, username=body.username, password=body.password)
     log.info("registered account %s (%s)", user.id, user.username)
-    return await _start_session(db, request, user)
+    resp = await _start_session(db, request, user)  # commits the account
+    # Hand over anything the guest session drew. This runs after the account is
+    # safely committed: a failure here costs the freebies, never the account.
+    try:
+        if await guest_svc.carry_over(db, user, request.cookies.get(guest_svc.COOKIE)):
+            await db.commit()
+            resp.delete_cookie(guest_svc.COOKIE, path=get_settings().url("/"))
+    except Exception:
+        log.exception("guest carry-over failed for user %s", user.id)
+        await db.rollback()
+    return resp
 
 
 @router.post("/login")

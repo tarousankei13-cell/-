@@ -44,6 +44,7 @@ DEFINITIONS: list[SettingDef] = [
     S("features.offline_roll_enabled", "bool", True, "features", "オフラインRoll有効"),
     S("features.biome_enabled", "bool", True, "features", "Biome変化有効"),
     S("features.world_feed_enabled", "bool", True, "features", "World Feed有効"),
+    S("features.guest_rolls", "bool", True, "features", "お試しRoll有効", "未登録の訪問者が10回まで無料でRollできる"),
     # --- roll ---------------------------------------------------------------
     S("roll.base_seconds", "float", 1.0, "roll", "基本Roll間隔(秒)", "Roll Speed 100%時のクールダウン", 0.05, 60),
     S("roll.min_seconds", "float", 0.08, "roll", "最短Roll間隔(秒)", "装備・効果による短縮の下限", 0.01, 60),
@@ -91,10 +92,13 @@ DEFINITIONS: list[SettingDef] = [
     S("market.anomaly_high", "float", 80.0, "market", "異常高値判定倍率", "参照価格の何倍以上で検知", 1.5, 1e6),
     S("market.anomaly_low", "float", 0.02, "market", "異常安値判定倍率", "参照価格の何倍以下で検知", 0, 1),
     S("market.wash_threshold", "int", 5, "market", "同一ペア取引の検知回数(24h)", "", 2, 1000),
+    S("market.daily_buy_limit", "int", 120, "market", "1日のMarket購入上限", "1人が1日に購入できる件数", 1, 100000),
     # --- trade / gift ---------------------------------------------------------
     S("trade.expiry_hours", "int", 24, "trade", "Trade有効期限(時間)", "", 1, 720),
     S("trade.max_items", "int", 20, "trade", "片側の最大アイテム数", "", 1, 200),
     S("trade.max_pending", "int", 10, "trade", "送信中Tradeの上限", "", 1, 100),
+    S("trade.daily_limit", "int", 40, "trade", "1日のTrade成立上限", "1人が1日に成立できるTrade数", 1, 10000),
+    S("trade.pair_daily_limit", "int", 8, "trade", "同一ペアの1日成立上限", "同じ相手との1日のTrade成立数", 1, 1000),
     S("gift.cooldown_seconds", "int", 60, "gift", "Giftクールダウン(秒)", "", 0, 86400),
     S("gift.daily_limit", "int", 20, "gift", "1日のGift上限", "", 1, 1000),
     # --- progression ------------------------------------------------------------
@@ -113,6 +117,7 @@ DEFINITIONS: list[SettingDef] = [
     S("economy.sell_mult", "float", 1.0, "economy", "売却価格倍率", "", 0, 1000),
     # --- retention ----------------------------------------------------------------
     S("retention.roll_log_days", "int", 21, "retention", "Rollログ保存日数", "保護レア度未満のRollログ", 1, 3650),
+    S("backup.auto_enabled", "bool", True, "retention", "自動バックアップ", "1日1回、スケジューラが自動でバックアップを取得"),
     S("retention.roll_log_keep_tier", "tier", "epic", "retention", "永久保存するRollの最低レア度", "", choices=TIERS),
     S("retention.feed_days", "int", 60, "retention", "Feed保存日数", "", 1, 3650),
     # --- security ------------------------------------------------------------------
