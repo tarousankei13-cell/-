@@ -1,10 +1,13 @@
 import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
-import { Link, NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
+import { Link, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { useGame } from "./store/game";
 import { connectSocket, disconnectSocket } from "./lib/socket";
 import { audio, bgmForBiome } from "./audio/engine";
 import { CosmosRenderer } from "./visual/cosmos";
 import { RollCutscene, ArtifactCutscene } from "./components/Cutscene";
+import { BottomNav, HubBar } from "./components/Nav";
+import { LiveReveals } from "./components/LiveReveals";
+import { Tutorial } from "./components/Tutorial";
 import { Avatar, Spinner } from "./components/ui";
 import { fmtCompact, fmtInt } from "./lib/format";
 import { post } from "./lib/api";
@@ -25,23 +28,14 @@ const Achievements = lazy(() => import("./pages/Achievements").then((m) => ({ de
 const Ranking = lazy(() => import("./pages/Ranking").then((m) => ({ default: m.Ranking })));
 const Profile = lazy(() => import("./pages/Profile").then((m) => ({ default: m.Profile })));
 const Settings = lazy(() => import("./pages/Settings").then((m) => ({ default: m.Settings })));
+const Friends = lazy(() => import("./pages/Friends").then((m) => ({ default: m.Friends })));
+const GuildPage = lazy(() => import("./pages/Guild").then((m) => ({ default: m.GuildPage })));
+const Events = lazy(() => import("./pages/Events").then((m) => ({ default: m.Events })));
+const Pass = lazy(() => import("./pages/Pass").then((m) => ({ default: m.Pass })));
+const Sets = lazy(() => import("./pages/Sets").then((m) => ({ default: m.Sets })));
+const Shards = lazy(() => import("./pages/Shards").then((m) => ({ default: m.Shards })));
+const Fortune = lazy(() => import("./pages/Fortune").then((m) => ({ default: m.Fortune })));
 const Admin = lazy(() => import("./pages/admin/Admin").then((m) => ({ default: m.Admin })));
-
-const NAV = [
-  { to: "/roll", icon: "✦", label: "抽選" },
-  { to: "/inventory", icon: "🎒", label: "所持品", feature: "inventory" },
-  { to: "/collection", icon: "📖", label: "図鑑", feature: "collection" },
-  { to: "/equipment", icon: "⚙", label: "装備", feature: "equipment" },
-  { to: "/biomes", icon: "🌌", label: "Biome", feature: "biome" },
-  { to: "/shop", icon: "🛒", label: "商店", feature: "shop" },
-  { to: "/market", icon: "💱", label: "市場", feature: "market" },
-  { to: "/trade", icon: "🤝", label: "取引", feature: "trade" },
-  { to: "/quests", icon: "📜", label: "依頼", feature: "quests" },
-  { to: "/achievements", icon: "🏆", label: "実績", feature: "achievements" },
-  { to: "/ranking", icon: "📊", label: "順位", feature: "ranking" },
-  { to: "/profile", icon: "👤", label: "戦績", feature: "profile" },
-  { to: "/settings", icon: "⚡", label: "設定" },
-];
 
 // ------------------------------------------------------------------ cosmos
 let renderer: CosmosRenderer | null = null;
@@ -185,44 +179,6 @@ function TopBar() {
   );
 }
 
-function BottomNav() {
-  const me = useGame((s) => s.me);
-  const unlocks = useGame((s) => s.config?.unlocks);
-  const level = useGame((s) => s.hud?.level ?? s.me?.user.level ?? 1);
-  const unread = useGame((s) => s.unread);
-  const navRef = useRef<HTMLElement>(null);
-  const { pathname } = useLocation();
-  // On a phone the strip is wider than the screen, so the destination you are on
-  // can sit off the edge with nothing saying the row scrolls at all.
-  useEffect(() => {
-    const el = navRef.current?.querySelector<HTMLElement>("a.active");
-    el?.scrollIntoView({ inline: "center", block: "nearest", behavior: "smooth" });
-  }, [pathname]);
-  if (!me) return null;
-  return (
-    <nav className="bottom-nav" ref={navRef} aria-label="メインナビゲーション">
-      {NAV.map((n) => {
-        const need = n.feature ? unlocks?.[n.feature] ?? 1 : 1;
-        const locked = level < need;
-        return (
-          <NavLink key={n.to} to={n.to} className={({ isActive }) => (isActive ? "active" : "")} style={locked ? { opacity: 0.4 } : undefined}
-            title={locked ? `Lv.${need}で解放` : n.label} onClick={() => audio.sfx("click")}>
-            <span className="ic">{locked ? "🔒" : n.icon}</span>
-            <span>{n.label}</span>
-            {n.to === "/profile" && unread > 0 && <span className="dot" />}
-          </NavLink>
-        );
-      })}
-      {me.is_admin && (
-        <NavLink to="/admin" className={({ isActive }) => `admin ${isActive ? "active" : ""}`} onClick={() => audio.sfx("click")}>
-          <span className="ic">🛠</span>
-          <span>管理</span>
-        </NavLink>
-      )}
-    </nav>
-  );
-}
-
 // --------------------------------------------------------------- audio gate
 function useAudioBootstrap() {
   const me = useGame((s) => s.me);
@@ -278,7 +234,7 @@ function Shell() {
   return (
     <div className="app-shell">
       <TopBar />
-      <BottomNav />
+      <HubBar />
       <main>
         <Suspense fallback={<Spinner label="読み込み中…" />}>
           <Routes>
@@ -296,11 +252,20 @@ function Shell() {
             <Route path="/profile" element={<Profile />} />
             <Route path="/profile/:userId" element={<Profile />} />
             <Route path="/settings" element={<Settings />} />
+            <Route path="/friends" element={<Friends />} />
+            <Route path="/guild" element={<GuildPage />} />
+            <Route path="/events" element={<Events />} />
+            <Route path="/pass" element={<Pass />} />
+            <Route path="/sets" element={<Sets />} />
+            <Route path="/shards" element={<Shards />} />
+            <Route path="/fortune" element={<Fortune />} />
             {me?.is_admin && <Route path="/admin/*" element={<Admin />} />}
             <Route path="*" element={<Navigate to="/roll" replace />} />
           </Routes>
         </Suspense>
       </main>
+      <BottomNav />
+      <Tutorial />
     </div>
   );
 }
@@ -381,6 +346,7 @@ export default function App() {
       )}
       <Toasts />
       <WorldBanner />
+      <LiveReveals />
       <RevealQueue />
     </>
   );

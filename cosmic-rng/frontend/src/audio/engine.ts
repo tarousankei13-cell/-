@@ -66,6 +66,22 @@ const BGM_PROFILES: Record<string, BgmProfile> = {
   chrono:      { root: 116.5, scale: DOR, bpm: 72, progression: [T(0), T(6), T(3), T(4)],      arp: "walk",   arpRate: 2, pulse: 0.35, padGain: 0.40, bassGain: 0.30, leadGain: 0.18, filter: 2100, detune: 6,  waveform: "triangle", shimmer: 0.6, reverb: 0.55 },
 };
 
+/**
+ * How far to move the sound effects so they agree with the music.
+ *
+ * Every effect below is written in C. A profile in, say, E♭ would make each
+ * reveal chord clash with the pad underneath it, which is worse than silence
+ * at the moment a player is staring at a 1-in-a-million drop. The shift is
+ * taken to the nearest key within a tritone, so nothing ever jumps an octave.
+ */
+const C0 = 16.3516;
+function keyRatioFor(root: number): number {
+  let semis = Math.round(12 * Math.log2(root / C0)) % 12;
+  if (semis < 0) semis += 12;
+  if (semis > 6) semis -= 12;
+  return Math.pow(2, semis / 12);
+}
+
 const degreeToFreq = (root: number, scale: number[], degree: number, octave = 0): number => {
   const n = scale.length;
   const oct = Math.floor(degree / n) + octave;
@@ -92,6 +108,9 @@ class AudioEngine {
   private voices: Voices | null = null;
   private profileKey = "";
   private profile: BgmProfile = BGM_PROFILES.drift;
+  /** Pitch ratio applied to every musical sound effect, so they land in the
+   *  same key as whatever is playing underneath. */
+  private keyRatio = 1;
   private noiseBuffer: AudioBuffer | null = null;
   private enabled = false;
   private duckUntil = 0;
@@ -220,6 +239,7 @@ class AudioEngine {
     if (this.voices && this.profileKey === key) return;
     this.profileKey = key;
     this.profile = profile;
+    this.keyRatio = keyRatioFor(profile.root);
     if (this.reverbSend) this.reverbSend.gain.setTargetAtTime(profile.reverb, this.ctx.currentTime, 1.5);
     if (this.voices) {
       // Changing biome mid-piece: glide the pads to the new key on the next
@@ -518,14 +538,17 @@ class AudioEngine {
   }
 
   // ----------------------------------------------------------------- SFX
-  private tone(freq: number, dur: number, opts: { type?: OscillatorType; gain?: number; slideTo?: number; delay?: number; attack?: number; q?: number } = {}) {
+  private tone(freq: number, dur: number, opts: { type?: OscillatorType; gain?: number; slideTo?: number; delay?: number; attack?: number; q?: number; atonal?: boolean } = {}) {
     if (!this.ctx || !this.sfxBus) return;
     const ctx = this.ctx;
     const t0 = ctx.currentTime + (opts.delay ?? 0);
     const o = ctx.createOscillator();
     o.type = opts.type ?? "sine";
-    o.frequency.setValueAtTime(freq, t0);
-    if (opts.slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(20, opts.slideTo), t0 + dur);
+    // Effects are written in C and transposed to the current key here. Noise
+    // and pure sweeps opt out: there is no pitch in them to move.
+    const r = opts.atonal ? 1 : this.keyRatio;
+    o.frequency.setValueAtTime(freq * r, t0);
+    if (opts.slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(20, opts.slideTo * r), t0 + dur);
     const g = ctx.createGain();
     const peak = Math.max(0.0002, opts.gain ?? 0.2);
     const atk = opts.attack ?? 0.006;
@@ -577,7 +600,7 @@ class AudioEngine {
         this.noise(0.18, { gain: 0.05 * G, filter: 900, sweepTo: 2600 });
         break;
       case "roll_tick":
-        this.tone(1400 + Math.random() * 200, 0.03, { type: "square", gain: 0.03 * G });
+        this.tone(1400 + Math.random() * 200, 0.03, { type: "square", gain: 0.03 * G, atonal: true });
         break;
       case "reveal_common":
         this.tone(520, 0.14, { type: "sine", gain: 0.09 * G });
@@ -616,19 +639,19 @@ class AudioEngine {
         this.noise(2.6, { gain: 0.1 * G, filter: 120, type: "lowpass", sweepTo: 5000 });
         break;
       case "charge":
-        this.tone(80, 1.8, { type: "sawtooth", gain: 0.10 * G, slideTo: 900, attack: 0.5 });
+        this.tone(80, 1.8, { type: "sawtooth", gain: 0.10 * G, slideTo: 900, attack: 0.5, atonal: true });
         this.noise(1.8, { gain: 0.05 * G, filter: 200, sweepTo: 4000 });
         break;
       case "impact":
-        this.tone(140, 0.6, { type: "sine", gain: 0.3 * G, slideTo: 40 });
+        this.tone(140, 0.6, { type: "sine", gain: 0.3 * G, slideTo: 40, atonal: true });
         this.noise(0.4, { gain: 0.18 * G, filter: 500, type: "lowpass", sweepTo: 80 });
         break;
       case "shatter":
-        for (let i = 0; i < 10; i++) this.tone(1800 + Math.random() * 2400, 0.22, { type: "triangle", gain: 0.05 * G, delay: i * 0.03, slideTo: 400 });
+        for (let i = 0; i < 10; i++) this.tone(1800 + Math.random() * 2400, 0.22, { type: "triangle", gain: 0.05 * G, delay: i * 0.03, slideTo: 400, atonal: true });
         this.noise(0.6, { gain: 0.1 * G, filter: 5000, sweepTo: 800 });
         break;
       case "sparkle":
-        for (let i = 0; i < 7; i++) this.tone(1600 + Math.random() * 2600, 0.16, { type: "sine", gain: 0.035 * G, delay: i * 0.055 });
+        for (let i = 0; i < 7; i++) this.tone(1600 + Math.random() * 2600, 0.16, { type: "sine", gain: 0.035 * G, delay: i * 0.055, atonal: true });
         break;
       case "whoosh":
         this.noise(0.7, { gain: 0.11 * G, filter: 180, sweepTo: 3600, type: "bandpass" });

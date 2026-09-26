@@ -176,6 +176,18 @@ export interface FirstDiscovery {
   offline?: boolean;
 }
 
+/** A tier-5+ find broadcast to everyone watching. */
+export interface LiveReveal {
+  item: ItemInfo;
+  odds: number;
+  luck: number;
+  biome: string;
+  first: boolean;
+  count: number;
+  offline: boolean;
+  user: UserBrief;
+}
+
 export interface RollResult {
   id: number;
   number: number;
@@ -263,9 +275,9 @@ export interface PlayerSettings {
   roll: { speed: "normal" | "fast" | "ultra"; cutscenes: boolean; full_cutscene_min_tier: RarityKey; skip_confirm_min_tier: RarityKey };
   auto_skip: { enabled: boolean; threshold: number };
   auto_delete: { enabled: boolean; max_odds: number; tiers: RarityKey[]; mode: "delete" | "sell"; protect_new: boolean; show_deleted: boolean };
-  notifications: { world_feed: boolean; feed_min_tier: RarityKey; toasts: boolean; trades: boolean; gifts: boolean };
+  notifications: { world_feed: boolean; feed_min_tier: RarityKey; toasts: boolean; trades: boolean; gifts: boolean; live: boolean };
   privacy: { public_profile: boolean; public_drops: boolean; show_inventory: boolean };
-  ui: { font_scale: number; high_contrast: boolean };
+  ui: { font_scale: number; high_contrast: boolean; tutorial_done: boolean };
 }
 
 export interface Me {

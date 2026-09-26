@@ -6,6 +6,7 @@ import type {
   FeedEvent,
   FirstDiscovery,
   HudState,
+  LiveReveal,
   Me,
   OfflineSummary,
   PlayerSettings,
@@ -64,6 +65,8 @@ interface GameStore {
   offline: boolean;
   reveals: RevealJob[];
   worldBanners: FirstDiscovery[];
+  /** Rare finds from other players, shown briefly at the edge of the screen. */
+  live: LiveReveal[];
   adminStats: Record<string, any> | null;
   liveRankings: Record<string, any[]>;
   maintenance: { enabled: boolean; message: string } | null;
@@ -84,6 +87,8 @@ interface GameStore {
   shiftReveal: () => void;
   pushBanner: (b: FirstDiscovery) => void;
   shiftBanner: () => void;
+  pushLive: (r: LiveReveal) => void;
+  shiftLive: () => void;
   set: (p: Partial<GameStore>) => void;
   announceAchievements: (list: AchievementGrant[]) => void;
 }
@@ -107,6 +112,7 @@ export const useGame = create<GameStore>((set, getState) => ({
   offline: false,
   reveals: [],
   worldBanners: [],
+  live: [],
   adminStats: null,
   liveRankings: {},
   maintenance: null,
@@ -224,6 +230,8 @@ export const useGame = create<GameStore>((set, getState) => ({
   },
   pushBanner: (b) => set((s) => ({ worldBanners: [...s.worldBanners, b].slice(-5) })),
   shiftBanner: () => set((s) => ({ worldBanners: s.worldBanners.slice(1) })),
+  pushLive: (r) => set((s) => ({ live: [...s.live, r].slice(-3) })),
+  shiftLive: () => set((s) => ({ live: s.live.slice(1) })),
 
   announceAchievements: (list) => {
     const now = Date.now();

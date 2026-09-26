@@ -64,7 +64,7 @@
   --radius: 14px;
   --radius-sm: 9px;
   --shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
-  --nav-h: 60px;
+  --nav-h: 66px;
   --safe-b: env(safe-area-inset-bottom, 0px);
   --font-scale: 1;
 }
@@ -160,7 +160,7 @@ button, input, select, textarea { font-family: inherit; font-size: inherit; colo
   width: 100%;
   max-width: 1280px;
   margin: 0 auto;
-  padding: 14px 14px calc(var(--nav-h) + 26px + var(--safe-b));
+  padding: 12px 14px calc(var(--nav-h) + 28px + var(--safe-b));
   /* `backwards`, not `both`: a filled transform animation keeps acting as a
      containing block for `position: fixed` long after it has finished, which
      quietly traps every fixed child inside the page box. */
@@ -202,6 +202,8 @@ button, input, select, textarea { font-family: inherit; font-size: inherit; colo
   font-weight: 600;
   letter-spacing: 0.01em;
   cursor: pointer;
+  /* A label that wraps mid-word ("検/索") reads as breakage, not as a button. */
+  white-space: nowrap;
   transition: transform 0.12s ease, box-shadow 0.18s ease, background 0.18s ease, border-color 0.18s ease;
   -webkit-tap-highlight-color: transparent;
   touch-action: manipulation;
@@ -403,40 +405,79 @@ input[type="checkbox"] { width: 18px; height: 18px; min-height: 0; accent-color:
 }
 
 .bottom-nav {
-  position: fixed; left: 0; right: 0; bottom: 0; z-index: 70; display: flex; gap: 2px;
-  padding: 5px 4px calc(5px + var(--safe-b)); overflow-x: auto; scrollbar-width: none;
-  background: linear-gradient(0deg, rgba(5, 7, 18, 0.97), rgba(5, 7, 18, 0.86));
-  border-top: 1px solid var(--line); backdrop-filter: blur(14px);
-  /* The strip is wider than a phone. Fading the ends is the only thing on screen
-     that says so, and snapping keeps a half-cut destination from being the
-     resting state. */
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 70;
+  display: grid; grid-template-columns: repeat(5, 1fr); gap: 2px;
+  padding: 6px 6px calc(6px + var(--safe-b));
+  background: #070a17;
+  border-top: 1px solid var(--line-strong);
+  box-shadow: 0 -10px 30px rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(16px) saturate(140%);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+}
+.bottom-nav .tab {
+  position: relative; min-height: var(--tap);
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+  padding: 6px 4px; border-radius: 12px; color: var(--text-faint); text-decoration: none;
+  font-size: var(--fs-xs); letter-spacing: 0.04em;
+  transition: color 0.16s ease, background 0.16s ease, transform 0.16s ease;
+}
+.bottom-nav .tab .ic { font-size: 1.3rem; line-height: 1; filter: grayscale(0.6) opacity(0.85); transition: filter 0.16s ease, transform 0.16s ease; }
+.bottom-nav .tab:hover { color: var(--text); text-decoration: none; }
+.bottom-nav .tab.active { color: var(--accent); background: rgba(120, 160, 255, 0.14); }
+.bottom-nav .tab.active .ic { filter: none; transform: translateY(-1px) scale(1.06); }
+/* The active tab gets a thin light along its top edge — the one neon accent in
+   the chrome, so it reads as "you are here" without shouting. */
+.bottom-nav .tab.active::before {
+  content: ""; position: absolute; top: 0; left: 22%; right: 22%; height: 2px; border-radius: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  box-shadow: 0 0 10px var(--accent-glow);
+}
+.bottom-nav .tab .dot { position: absolute; top: 5px; right: calc(50% - 20px); width: 7px; height: 7px; border-radius: 50%; background: var(--bad); }
+
+/* The row of places inside the current section. */
+.hub-bar {
+  position: sticky; top: calc(46px + env(safe-area-inset-top, 0px)); z-index: 55;
+  display: flex; gap: 6px; padding: 7px 12px; overflow-x: auto; scrollbar-width: none;
+  background: linear-gradient(180deg, rgba(5, 7, 18, 0.9), rgba(5, 7, 18, 0.55));
+  backdrop-filter: blur(12px);
   scroll-snap-type: x proximity;
-  -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 18px, #000 calc(100% - 18px), transparent 100%);
-  mask-image: linear-gradient(90deg, transparent 0, #000 18px, #000 calc(100% - 18px), transparent 100%);
+  -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 14px, #000 calc(100% - 14px), transparent 100%);
+  mask-image: linear-gradient(90deg, transparent 0, #000 14px, #000 calc(100% - 14px), transparent 100%);
 }
-.bottom-nav a { scroll-snap-align: center; }
-.bottom-nav::-webkit-scrollbar { display: none; }
-.bottom-nav a {
-  flex: 1 0 auto; min-width: 66px; min-height: var(--tap);
-  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
-  padding: 6px 8px; border-radius: 10px; color: var(--text-faint); text-decoration: none;
-  font-size: var(--fs-xs); transition: color 0.15s, background 0.15s; position: relative;
+.hub-bar::-webkit-scrollbar { display: none; }
+.hub-link {
+  position: relative; flex: 0 0 auto; scroll-snap-align: center;
+  display: inline-flex; align-items: center; gap: 5px;
+  min-height: 34px; padding: 5px 14px; border-radius: 999px;
+  border: 1px solid transparent; background: rgba(255, 255, 255, 0.045);
+  color: var(--text-dim); font-size: var(--fs-sm); text-decoration: none; white-space: nowrap;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
 }
-.bottom-nav a .ic { font-size: 1.24rem; line-height: 1; }
-.bottom-nav a.active { color: var(--accent); background: rgba(120, 160, 255, 0.13); }
-.bottom-nav a.admin.active { color: var(--gold); background: rgba(255, 208, 90, 0.12); }
-.bottom-nav a .dot { position: absolute; top: 4px; right: 12px; width: 7px; height: 7px; border-radius: 50%; background: var(--bad); }
-.bottom-nav a:hover { text-decoration: none; color: var(--text); }
+.hub-link:hover { color: var(--text); text-decoration: none; border-color: var(--line); }
+.hub-link.active {
+  color: #f2f6ff; border-color: rgba(150, 185, 255, 0.55);
+  background: linear-gradient(180deg, rgba(110, 145, 255, 0.34), rgba(80, 60, 190, 0.3));
+  box-shadow: 0 0 16px rgba(110, 145, 255, 0.22);
+}
+.hub-link.locked { opacity: 0.45; cursor: not-allowed; }
+.hub-link .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--bad); }
 
 @media (min-width: 900px) {
+  /* Desktop is the same five destinations, widened — not a different app. The
+     tabs move above the section row; `order` does that without a second DOM. */
+  .app-shell > .topbar { order: 0; }
+  .app-shell > .bottom-nav { order: 1; }
+  .app-shell > .hub-bar { order: 2; }
+  .app-shell > main { order: 3; }
   .bottom-nav {
-    position: sticky; top: 52px; bottom: auto; border-top: none; border-bottom: 1px solid var(--line);
-    padding: 6px 10px; justify-content: center; flex-wrap: wrap; background: rgba(5, 7, 18, 0.72);
-    -webkit-mask-image: none; mask-image: none; scroll-snap-type: none;
+    position: sticky; top: 0; bottom: auto; grid-template-columns: repeat(5, minmax(0, 132px));
+    justify-content: center; border-top: none; border-bottom: 1px solid var(--line);
+    padding: 6px 10px; background: rgba(5, 7, 18, 0.8);
   }
-  .bottom-nav a { flex: 0 0 auto; flex-direction: row; gap: 7px; font-size: var(--fs-sm); padding: 9px 14px; min-width: 0; min-height: 40px; }
-  .bottom-nav a .ic { font-size: 1.06rem; }
-  .bottom-nav a .dot { top: 2px; right: 4px; }
+  .bottom-nav .tab { flex-direction: row; gap: 8px; font-size: var(--fs-sm); min-height: 42px; }
+  .bottom-nav .tab .ic { font-size: 1.1rem; }
+  .bottom-nav .tab .dot { top: 6px; right: 8px; }
+  .hub-bar { top: 54px; justify-content: center; }
   .page { padding-bottom: 40px; }
 }
 
@@ -603,4 +644,104 @@ input[type="range"]::-moz-range-thumb {
 @media (max-width: 640px) {
   .visual-designer { grid-template-columns: 1fr; }
   .vd-controls { grid-template-columns: 1fr; }
+}
+
+/* ------------------------------------------------------- v2 surfaces */
+/* Login bonus */
+.daily-card { display: flex; flex-direction: column; gap: 9px; border-color: rgba(255, 208, 90, 0.34); }
+.daily-card .daily-icon { font-size: 1.7rem; filter: drop-shadow(0 0 12px rgba(255, 208, 90, 0.5)); }
+.daily-dots { display: flex; gap: 6px; }
+.daily-dots .dot7 { flex: 1; height: 5px; border-radius: 3px; background: rgba(255, 255, 255, 0.11); }
+.daily-dots .dot7.on { background: linear-gradient(90deg, var(--gold), #ff9e4d); box-shadow: 0 0 8px rgba(255, 208, 90, 0.4); }
+.daily-dots .dot7.big { flex: 1.5; }
+
+/* Event strip on the roll screen */
+.event-strip { border-color: rgba(181, 140, 255, 0.34); }
+.event-live { animation: eventPulse 2.4s ease-in-out infinite; }
+@keyframes eventPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+.event-card.community_goal { border-color: rgba(120, 200, 255, 0.34); }
+
+/* Live reveals from other players */
+.live-stack { position: fixed; right: 12px; top: calc(96px + env(safe-area-inset-top, 0px)); z-index: 65; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
+.live-card {
+  pointer-events: auto; cursor: pointer; display: flex; align-items: center; gap: 10px;
+  width: min(300px, calc(100vw - 24px)); padding: 9px 12px; border-radius: 12px;
+  background: rgba(10, 13, 30, 0.92); border: 1px solid var(--line-strong);
+  backdrop-filter: blur(12px); box-shadow: var(--shadow);
+  animation: liveIn 0.42s cubic-bezier(0.2, 0.9, 0.3, 1.2) backwards;
+}
+.live-card.t5 { border-color: rgba(77, 255, 184, 0.5); }
+.live-card.t6 { border-color: rgba(255, 92, 138, 0.5); }
+.live-card.t7, .live-card.t8 { border-color: rgba(255, 255, 255, 0.6); box-shadow: 0 0 30px rgba(180, 160, 255, 0.35); }
+@keyframes liveIn { from { opacity: 0; transform: translateX(30px); } to { opacity: 1; transform: none; } }
+body.reduced-motion .live-card { animation: none; }
+
+/* Tutorial */
+.tutorial-backdrop { position: fixed; inset: 0; z-index: 120; display: grid; place-items: center; padding: 18px; background: rgba(3, 5, 14, 0.82); backdrop-filter: blur(6px); }
+.tutorial-card { width: min(440px, 100%); display: flex; flex-direction: column; gap: 12px; text-align: center; }
+.tutorial-icon { font-size: 2.6rem; filter: drop-shadow(0 0 18px var(--accent-glow)); }
+.step-dot { width: 7px; height: 7px; border-radius: 50%; background: rgba(255, 255, 255, 0.2); }
+.step-dot.on { background: var(--accent); box-shadow: 0 0 10px var(--accent-glow); }
+
+/* Friends & guilds */
+.friend-row { padding: 7px 4px; border-bottom: 1px solid rgba(255, 255, 255, 0.05); gap: 9px; }
+.friend-row:last-child { border-bottom: none; }
+.presence { width: 8px; height: 8px; border-radius: 50%; background: rgba(255, 255, 255, 0.18); flex: none; }
+.presence.on { background: var(--good); box-shadow: 0 0 8px rgba(77, 255, 184, 0.7); }
+.guild-tag { font-family: var(--font-display); font-weight: 700; color: var(--accent2); letter-spacing: 0.06em; }
+.rank-row { padding: 6px 4px; border-bottom: 1px solid rgba(255, 255, 255, 0.05); gap: 9px; }
+.rank-n { font-family: var(--font-display); width: 26px; color: var(--text-faint); text-align: right; }
+
+/* Season pass */
+.pass-track { display: grid; gap: 8px; }
+.pass-tier { padding: 10px 12px; border-radius: var(--radius-sm); border: 1px solid var(--line); background: var(--panel-2); opacity: 0.75; }
+.pass-tier.reached { opacity: 1; border-color: rgba(150, 185, 255, 0.4); }
+.pass-tier.claimed { opacity: 0.6; }
+.pass-n { width: 30px; height: 30px; flex: none; display: grid; place-items: center; border-radius: 50%; border: 1px solid var(--line-strong); font-size: var(--fs-xs); }
+.pass-tier.reached .pass-n { border-color: var(--accent); color: var(--accent); box-shadow: 0 0 12px var(--accent-glow); }
+
+/* Collection sets */
+.set-card.complete { border-color: rgba(255, 208, 90, 0.42); }
+.set-items { display: flex; flex-wrap: wrap; gap: 8px; }
+.set-item { width: 66px; display: flex; flex-direction: column; align-items: center; gap: 3px; text-align: center; opacity: 0.45; }
+.set-item.have { opacity: 1; }
+.set-unknown { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 9px; border: 1px dashed var(--line-strong); color: var(--text-faint); }
+
+/* Fortune sparkline */
+.sparkline { display: flex; align-items: flex-end; gap: 3px; height: 54px; }
+.spark-col { flex: 1; height: 100%; display: flex; align-items: flex-end; }
+.spark-col > i { display: block; width: 100%; border-radius: 3px 3px 0 0; background: linear-gradient(180deg, var(--accent), rgba(120, 100, 255, 0.35)); }
+
+/* Guest試遊 */
+.guest-panel { display: flex; flex-direction: column; gap: 12px; align-items: center; text-align: center; }
+.guest-result { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-radius: var(--radius-sm); border: 1px solid var(--line); background: var(--panel-2); width: 100%; }
+
+/* ------------------------------------------------- immersive roll (phone) */
+/* On a phone the Roll button is the game. Everything above it is compressed
+   so the button itself lands in the thumb's reach without scrolling. */
+@media (max-width: 899px) {
+  .roll-page .daily-card { padding: 9px 12px; gap: 6px; }
+  .roll-page .daily-card .daily-icon { font-size: 1.3rem; }
+  .roll-page .daily-dots { gap: 4px; }
+  .roll-page .daily-dots .dot7 { height: 4px; }
+
+  .roll-page .biome-card { padding: 10px 12px; gap: 5px; }
+  .roll-page .biome-card h2 { font-size: 1.15rem; }
+  .roll-page .biome-card .biome-desc { display: none; }
+
+  .roll-page .roll-main { padding: 14px 12px 16px; gap: 10px; }
+  .roll-page .luck-value { font-size: clamp(1.9rem, 8vw, 2.6rem); }
+  /* One scrollable line instead of three wrapped rows of multiplier chips. */
+  .roll-page .luck-parts {
+    flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none;
+    /* The parent centres its children, which would let a nowrap row overflow
+       on both sides and clip the first chip. Stretch pins it to the box. */
+    align-self: stretch; max-width: none;
+    justify-content: flex-start; padding-bottom: 2px;
+    -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 10px, #000 calc(100% - 10px), transparent 100%);
+    mask-image: linear-gradient(90deg, transparent 0, #000 10px, #000 calc(100% - 10px), transparent 100%);
+  }
+  .roll-page .luck-parts::-webkit-scrollbar { display: none; }
+  .roll-page .roll-button { width: min(240px, 64vw); }
+  .roll-page .event-strip { padding: 10px 12px; }
 }

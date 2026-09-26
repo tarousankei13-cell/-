@@ -100,6 +100,21 @@ function handle(type: string, data: any) {
         }
       }
       break;
+    case "live_reveal": {
+      // Someone, somewhere, just found something extraordinary. Opt-out lives
+      // in the player's own notification settings.
+      if (data.user?.id === st.me?.user.id) break;
+      if (st.me?.settings.notifications.live === false) break;
+      st.pushLive(data);
+      audio.sfx("world_notice");
+      break;
+    }
+    case "game_event":
+      events.emit("game_event", data);
+      if (data.kind === "community_goal_done") {
+        st.toast("世界目標を達成しました", "cosmic", data.message || "全員にLuckボーナスが付与されました", 12000);
+      }
+      break;
     case "ranking":
       st.set({ liveRankings: data.boards });
       break;

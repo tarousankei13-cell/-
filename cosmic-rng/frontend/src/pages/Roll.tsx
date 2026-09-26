@@ -6,6 +6,9 @@ import { audio } from "../audio/engine";
 import { getCosmos } from "../App";
 import { ItemIcon } from "../components/ItemIcon";
 import { Countdown, Empty, Modal, UserChip, Name } from "../components/ui";
+import { DailyCard } from "../components/Daily";
+import { CommunityBar, type EventsData, type GameEventInfo } from "./Events";
+import { useApi } from "../lib/useApi";
 import { fmtCompact, fmtInt, fmtLuck, fmtOdds, fmtPercent, timeAgo } from "../lib/format";
 import type { ActiveEffect, FeedEvent, HudState, RollResponse, RollResult } from "../lib/types";
 import "./roll.css";
@@ -72,7 +75,7 @@ function BiomeCard() {
             {biome.kind === "admin" && <span className="badge r-admin">ADMIN</span>}
             {biome.forced && <span className="badge" style={{ color: "var(--gold)" }}>FORCED</span>}
           </div>
-          <div className="muted small ellipsis">{biome.description}</div>
+          <div className="muted small ellipsis biome-desc">{biome.description}</div>
         </div>
         <div className="center">
           <div className="stat">
@@ -107,6 +110,49 @@ function BiomeCard() {
   );
 }
 
+/** What the world is doing right now: luck windows and the shared goal. */
+function EventStrip() {
+  const { data, reload } = useApi<EventsData>("/api/events");
+  useEffect(() => events.on("game_event", () => reload()), [reload]);
+  const active = data?.active ?? [];
+  const boosts = active.filter((e) => e.type === "luck_multiplier");
+  const goals = active.filter((e) => e.type === "community_goal");
+  if (!boosts.length && !goals.length) return null;
+  return (
+    <div className="glass pad col event-strip" style={{ gap: 8 }}>
+      {boosts.map((e: GameEventInfo) => (
+        <div className="row-wrap" key={e.key} style={{ gap: 8 }}>
+          <span className="badge event-live" style={{ color: "var(--gold)" }}>開催中</span>
+          <span className="ellipsis" style={{ flex: 1, minWidth: 0 }}>{e.name}</span>
+          {e.mult && <span className="chip tiny mono" style={{ color: "var(--gold)" }}>Luck ×{e.mult}</span>}
+          {e.ends_at && <span className="tiny faint">のこり <Countdown to={e.ends_at} onDone={reload} /></span>}
+        </div>
+      ))}
+      {goals.map((e: GameEventInfo) => <CommunityBar key={e.key} e={e} compact />)}
+      <Link className="tiny" to="/events">イベントをすべて見る →</Link>
+    </div>
+  );
+}
+
+function ShareButton({ roll }: { roll: RollResult }) {
+  const toast = useGame((s) => s.toast);
+  const url = (roll as any).share_url as string | undefined;
+  if (!url) return null;
+  const share = async () => {
+    const text = `${roll.item.name_ja || roll.item.name} (${fmtOdds(roll.odds)}) を引き当てました！`;
+    try {
+      if (navigator.share) await navigator.share({ title: "COSMIC RNG", text, url });
+      else {
+        await navigator.clipboard.writeText(`${text} ${url}`);
+        toast("リンクをコピーしました", "success");
+      }
+    } catch {
+      /* the player dismissed the sheet */
+    }
+  };
+  return <button className="btn xs ghost" onClick={share} title="この結果を共有">共有</button>;
+}
+
 function ResultStrip({ roll }: { roll: RollResult }) {
   return (
     <div className={`result-strip t${roll.item.tier}`}>
@@ -124,7 +170,10 @@ function ResultStrip({ roll }: { roll: RollResult }) {
           {roll.auto_sold > 0 && ` · +✦${fmtInt(roll.auto_sold)}`}
         </div>
       </div>
-      <span className="tiny" style={{ color: "var(--gold)" }}>{roll.fortune.label_ja || roll.fortune.label}</span>
+      <div className="col" style={{ gap: 4, alignItems: "flex-end" }}>
+        <span className="tiny" style={{ color: "var(--gold)" }}>{roll.fortune.label_ja || roll.fortune.label}</span>
+        <ShareButton roll={roll} />
+      </div>
     </div>
   );
 }
@@ -296,6 +345,8 @@ export function RollPage() {
       <div className="roll-layout">
         <div className="col" style={{ gap: 12 }}>
           <BiomeCard />
+          <DailyCard />
+          <EventStrip />
 
           <div className="glass pad roll-main">
             <div className="luck-display">

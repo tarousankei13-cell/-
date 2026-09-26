@@ -11,6 +11,7 @@ import { AdminSettingsPage } from "./SettingsPanel";
 import { AdminArtifacts } from "./Artifacts";
 import { AdminLogs } from "./Logs";
 import { AdminTools } from "./Tools";
+import { AdminRetention } from "./Retention";
 import "./admin.css";
 
 export interface Bootstrap {
@@ -34,6 +35,7 @@ export interface Bootstrap {
 
 const TABS = [
   { to: "/admin", end: true, label: "Dashboard", icon: "📊" },
+  { to: "/admin/retention", label: "Retention", icon: "📈" },
   { to: "/admin/users", label: "Users", icon: "👥" },
   { to: "/admin/content", label: "Content", icon: "📦" },
   { to: "/admin/artifacts", label: "Artifacts", icon: "✨" },
@@ -99,6 +101,7 @@ export function Admin() {
         <div style={{ marginTop: 14 }}>
           <Routes>
             <Route index element={<AdminDashboard />} />
+            <Route path="retention" element={<AdminRetention />} />
             <Route path="users" element={<AdminUsers boot={boot} />} />
             <Route path="content" element={<AdminContent boot={boot} />} />
             <Route path="artifacts" element={<AdminArtifacts boot={boot} />} />

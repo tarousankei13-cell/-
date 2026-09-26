@@ -148,6 +148,27 @@ PASS_TIERS: list[dict[str, Any]] = [
 ]
 
 
+def reward_summary(rewards: dict[str, Any]) -> str:
+    """One readable line per tier — names resolved here, where content lives."""
+    snap = get_registry().snap
+    parts: list[str] = []
+    if rewards.get("stardust"):
+        parts.append(f"✦{int(rewards['stardust']):,}")
+    if rewards.get("shards"):
+        parts.append(f"星の欠片 ×{int(rewards['shards'])}")
+    for b in rewards.get("boosts", []) or []:
+        d = snap.boosts.get(b["key"]) or {}
+        parts.append(f"{d.get('name_ja') or d.get('name') or b['key']} ×{b.get('qty', 1)}")
+    for key in rewards.get("cosmetics", []) or []:
+        c = snap.cosmetics.get(key) or {}
+        kind = {"title": "称号", "badge": "バッジ", "background": "背景"}.get(str(c.get("kind")), "装飾")
+        parts.append(f"{kind}「{c.get('name_ja') or c.get('name') or key}」")
+    for it in rewards.get("items", []) or []:
+        d = snap.items_by_key.get(it["key"])
+        parts.append(f"{(d.name_ja or d.name) if d else it['key']} ×{it.get('qty', 1)}")
+    return " · ".join(parts) or "—"
+
+
 async def pass_state(db: AsyncSession, user_id: int) -> dict[str, Any]:
     sid = await seasons_svc.active_season_id(db)
     if sid is None:
@@ -159,7 +180,7 @@ async def pass_state(db: AsyncSession, user_id: int) -> dict[str, Any]:
     points = int(st.points) if st else 0
     claimed = {r[0] for r in (await db.execute(
         select(SeasonPassClaim.tier_idx).where(SeasonPassClaim.season_id == sid, SeasonPassClaim.user_id == user_id))).all()}
-    tiers = [{"idx": i, "points": t["points"], "rewards": t["rewards"],
+    tiers = [{"idx": i, "points": t["points"], "rewards": t["rewards"], "summary": reward_summary(t["rewards"]),
               "reached": points >= t["points"], "claimed": i in claimed}
              for i, t in enumerate(PASS_TIERS)]
     return {"season": seasons_svc.season_public(season) if season else None, "points": points,

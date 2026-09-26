@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { withBase } from "../lib/base";
 import { useGame } from "../store/game";
 import { AuthPanel } from "../components/AuthPanel";
+import { GuestRoll } from "../components/GuestRoll";
 
 const ERRORS: Record<string, string> = {
   banned: "このアカウントは現在利用できません。",
@@ -98,7 +99,8 @@ export function Landing() {
           </div>
         )}
 
-        <div className="col" style={{ gap: 10, width: "min(380px, 100%)" }}>
+        <div className="col" style={{ gap: 12, width: "min(380px, 100%)" }}>
+          {!unreachable && <GuestRoll />}
           <AuthPanel onDone={signedIn} />
         </div>
       </div>
