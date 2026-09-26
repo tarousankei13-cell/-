@@ -2,6 +2,9 @@
 data/*
 !data/.gitkeep
 
+# 配布用アーカイブ (ビルド成果物)
+*.zip
+
 # Python
 __pycache__/
 *.py[cod]
