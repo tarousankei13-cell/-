@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Final
 import discord
 from discord import app_commands
 
+import chart
 import config
 import kyash_service
 import price_service
@@ -2726,11 +2727,16 @@ async def history_command(
 # /stats, /queue, /system, /config, /logs
 # ---------------------------------------------------------------------------
 @app_commands.command(name="stats", description="チャージ統計を表示します (管理者)")
-@app_commands.describe(global_scope="Bot全体の統計を表示 (Bot Owner のみ)")
+@app_commands.describe(
+    global_scope="Bot全体の統計を表示 (Bot Owner のみ)",
+    days="日別推移グラフの日数 (0でグラフなし)",
+)
 @app_commands.guild_only()
 @require_admin()
 async def stats_command(
-    interaction: discord.Interaction, global_scope: bool = False
+    interaction: discord.Interaction,
+    global_scope: bool = False,
+    days: app_commands.Range[int, 0, config.CHART_MAX_DAYS] = config.CHART_DEFAULT_DAYS,
 ) -> None:
     """統計情報を DB から集計して表示する。"""
     bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
@@ -2790,7 +2796,32 @@ async def stats_command(
     )
     embed.add_field(name="Bot 稼働時間", value=utils.format_duration(uptime), inline=True)
     embed.set_footer(text=f"v{bot.version} / 集計元: charge_transactions・balances")
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    # 日別推移のグラフ (描けない環境では理由を添えて数字だけ出す)
+    image = None
+    if days > 0:
+        image, totals = await bot.charge.build_daily_chart(guild_id, days=int(days))
+        embed.add_field(
+            name=f"直近 {totals['days']} 日",
+            value=(
+                f"合計 **{utils.fmt_yen(totals['amount'])}** / {totals['count']}回\n"
+                f"付与 {utils.fmt_int(totals['credited'])}\n"
+                f"チャージのあった日: {totals['active_days']} / {totals['days']}日\n"
+                f"1日の最高: {utils.fmt_yen(totals['best_amount'])}"
+            ),
+            inline=True,
+        )
+        if image is not None:
+            embed.set_image(url=f"attachment://{config.CHART_FILENAME}")
+        else:
+            embed.add_field(
+                name="グラフを表示できません",
+                value=chart.unavailable_reason() or "画像の生成に失敗しました。",
+                inline=False,
+            )
+    if image is not None:
+        await interaction.followup.send(embed=embed, file=image, ephemeral=True)
+    else:
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @app_commands.command(name="queue", description="受取キューの状態を表示します (管理者)")

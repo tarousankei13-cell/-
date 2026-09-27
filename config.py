@@ -1023,6 +1023,8 @@ CHART_WIDTH: Final[int] = 900
 CHART_HEIGHT: Final[int] = 420
 CHART_DEFAULT_DAYS: Final[int] = 14
 CHART_MAX_DAYS: Final[int] = 90
+#: 添付するグラフ画像のファイル名 (Embed から attachment:// で参照する)
+CHART_FILENAME: Final[str] = "daily_chart.png"
 
 
 class ShopItemType:

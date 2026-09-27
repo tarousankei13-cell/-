@@ -4739,6 +4739,32 @@ class Database:
         )
         return (int(row["c"]), int(row["total"])) if row else (0, 0)
 
+    async def get_daily_series(
+        self, guild_id: int | None, *, days: int, now: int | None = None
+    ) -> list[sqlite3.Row]:
+        """日別のチャージ集計 (JST の日付ごと)。
+
+        グラフと日次レポートで同じ数字を使うため、集計はここに1つだけ置く。
+        SQLite の ``unixepoch`` は UTC なので、JST へ寄せるために 9 時間を足す。
+        返金された取引は除く。
+        """
+        now = now or utils.now_ts()
+        since = now - days * 86400
+        clauses = ["status=?", "refunded_at IS NULL", "created_at>=?"]
+        params: list[Any] = [config.TxStatus.COMPLETED, since]
+        if guild_id is not None:
+            clauses.insert(0, "guild_id=?")
+            params.insert(0, guild_id)
+        return await self.fetchall(
+            "SELECT strftime('%Y-%m-%d', created_at + 32400, 'unixepoch') AS day, "
+            "COALESCE(SUM(received_amount),0) AS amount, "
+            "COALESCE(SUM(credited_amount),0) AS credited, "
+            "COUNT(*) AS count, COUNT(DISTINCT user_id) AS users "
+            f"FROM charge_transactions WHERE {' AND '.join(clauses)} "
+            "GROUP BY day ORDER BY day ASC",
+            tuple(params),
+        )
+
     # ==================================================================
     # 不正検知
     # ==================================================================

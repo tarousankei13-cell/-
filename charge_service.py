@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import sqlite3
 import time
@@ -22,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import discord
 
+import chart
 import config
 import kyash_service
 import price_service
@@ -5501,6 +5503,52 @@ class ChargeService:
     # ==================================================================
     # 日次サマリ
     # ==================================================================
+    async def build_daily_chart(
+        self, guild_id: int | None, *, days: int, title: str | None = None
+    ) -> tuple[Any, dict[str, int]]:
+        """日別推移のグラフ画像と、その期間の合計を作る。
+
+        グラフを描けない環境 (Pillow 無し) では画像を ``None`` にして
+        合計だけを返す。数字は Embed 側にも出すので、画像が無くても
+        情報は失われない。
+
+        描画は CPU を使うので専用スレッドで行い、Bot の応答を止めない。
+
+        Returns:
+            ``(discord.File | None, 合計の辞書)``
+        """
+        days = max(1, min(int(days), config.CHART_MAX_DAYS))
+        rows = await self.db.get_daily_series(guild_id, days=days)
+        series = chart.build_daily_series(rows, days=days)
+        totals = {
+            "amount": sum(p.amount for p in series),
+            "count": sum(p.count for p in series),
+            "credited": sum(p.credited for p in series),
+            "days": days,
+            "best_amount": max((p.amount for p in series), default=0),
+            "active_days": sum(1 for p in series if p.count),
+        }
+        if not chart.available():
+            return None, totals
+        name = self.guild_name(guild_id) if guild_id is not None else "Bot 全体"
+        subtitle = (
+            f"{name} ・ 合計 {utils.fmt_yen(totals['amount'])} / "
+            f"{totals['count']}件 ・ 付与 {utils.fmt_int(totals['credited'])}"
+        )
+        try:
+            png = await asyncio.to_thread(
+                chart.render_daily_chart,
+                series,
+                title=title or f"日別チャージ推移 ({days}日)",
+                subtitle=subtitle,
+            )
+        except Exception:  # noqa: BLE001 - 画像が無くても統計は出す
+            logger.exception("グラフの生成に失敗しました guild=%s", guild_id)
+            return None, totals
+        if not png:
+            return None, totals
+        return discord.File(io.BytesIO(png), filename=config.CHART_FILENAME), totals
+
     async def post_daily_summary(self, guild_id: int, *, start: int, end: int) -> bool:
         """前日の実績サマリをサマリチャンネルへ投稿する。"""
         settings = await self.db.get_settings(guild_id)
@@ -5517,8 +5565,26 @@ class ChargeService:
             guild_name=self.guild_name(guild_id),
             start=start, end=end, summary=summary, distribution=distribution,
         )
+        # 推移のグラフを添える (作れなければ Embed だけ送る)
+        image, totals = await self.build_daily_chart(
+            guild_id, days=config.CHART_DEFAULT_DAYS
+        )
+        if image is not None:
+            embed.set_image(url=f"attachment://{config.CHART_FILENAME}")
+            embed.add_field(
+                name=f"直近 {totals['days']} 日の推移",
+                value=(
+                    f"合計 **{utils.fmt_yen(totals['amount'])}** / "
+                    f"{totals['count']}件\n"
+                    f"チャージのあった日: {totals['active_days']} / {totals['days']}日"
+                ),
+                inline=False,
+            )
         try:
-            await channel.send(embed=embed)
+            if image is not None:
+                await channel.send(embed=embed, file=image)
+            else:
+                await channel.send(embed=embed)
         except (discord.Forbidden, discord.HTTPException) as exc:
             logger.warning("日次サマリの投稿に失敗しました guild=%s: %s",
                            guild_id, utils.safe_error_text(exc))

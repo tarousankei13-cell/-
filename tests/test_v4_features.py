@@ -1603,7 +1603,97 @@ async def main() -> None:
         high_first, key=lambda s: {"HIGH": 0, "WARN": 1, "INFO": 2}.get(s, 3)),
         "重要度の高い順に並ぶ")
 
-    print("\n=== 9. 整合性 ===")
+    print("\n=== 9. 日別推移のグラフ ===")
+    import chart as chart_module
+
+    check(chart_module.available(), "Pillow が使える環境ではグラフを描ける")
+
+    # --- 欠けた日を 0 で埋める ---
+    filled = chart_module.build_daily_series(
+        [{"day": "2026-09-20", "amount": 5_000, "count": 2, "credited": 6_500}],
+        days=5, end_day="2026-09-22",
+    )
+    check(len(filled) == 5, f"指定した日数ぶん並ぶ ({len(filled)}点)")
+    check([p.day for p in filled] == [
+        "2026-09-18", "2026-09-19", "2026-09-20", "2026-09-21", "2026-09-22"
+    ], "日付が連続して並ぶ")
+    check(filled[2].amount == 5_000 and filled[0].amount == 0,
+          "データのある日だけ値が入り、他は0になる")
+    check(filled[2].credited == 6_500, "付与額も引き継ぐ")
+
+    # --- 画像が作れる ---
+    png = chart_module.render_daily_chart(
+        filled, title="テスト推移", subtitle="日本語の字が入る"
+    )
+    check(bool(png) and png[:8] == b"\x89PNG\r\n\x1a\n",
+          f"PNG 画像が返る ({len(png or b'')} バイト)")
+    check(len(png or b"") < 8 * 1024 * 1024, "Discord の添付上限に収まる大きさ")
+
+    # 全部ゼロでも落ちない
+    zero = chart_module.render_daily_chart(
+        [chart_module.DailyPoint(day="2026-09-22", amount=0, count=0)],
+        title="データなし",
+    )
+    check(bool(zero), "データが無くても画像を返す (空であることを描く)")
+    # 1点だけ・大量の点でも落ちない
+    single = chart_module.render_daily_chart(
+        [chart_module.DailyPoint(day="2026-09-22", amount=1_000, count=1)],
+        title="1点",
+    )
+    check(bool(single), "1点だけでも描ける")
+    many = chart_module.render_daily_chart(
+        [chart_module.DailyPoint(day=f"2026-{(i // 28) + 1:02d}-{(i % 28) + 1:02d}",
+                                 amount=i * 1_000, count=i % 20)
+         for i in range(config.CHART_MAX_DAYS)],
+        title="最大日数",
+    )
+    check(bool(many), f"最大日数 ({config.CHART_MAX_DAYS}日) でも描ける")
+    check(chart_module.render_daily_chart([], title="空") is None,
+          "点が1つも無ければ None を返す")
+
+    # --- 目盛りの丸め ---
+    check(chart_module._nice_step(0) == 1, "0でも目盛り幅が決まる")
+    for maximum in (1, 9, 37, 1_234, 98_765, 12_345_678):
+        step = chart_module._nice_step(maximum)
+        check(step > 0 and maximum / step <= 20,
+              f"目盛りが多すぎない (max={maximum} step={step})")
+
+    # --- DB からの集計 ---
+    chart_user = guild.add_member(StubMember(67_101, guild))
+    await give_charge(chart_user.id, 4_000)
+    rows = await bot.db.get_daily_series(G, days=7)
+    check(bool(rows), f"日別集計が取れる ({len(rows)}日ぶん)")
+    today = utils.format_jst(utils.now_ts())[:10]
+    check(any(str(r["day"]) == today for r in rows),
+          f"今日のぶんが JST の日付で入る ({today})")
+
+    image, totals = await bot.charge.build_daily_chart(G, days=7)
+    check(totals["days"] == 7, "指定した日数が返る")
+    check(totals["amount"] > 0 and totals["count"] > 0,
+          f"期間の合計が入る ({totals['amount']} / {totals['count']}件)")
+    check(image is not None and getattr(image, "filename", "") == config.CHART_FILENAME,
+          "Embed から参照できるファイル名で添付される")
+    over = await bot.charge.build_daily_chart(G, days=config.CHART_MAX_DAYS + 50)
+    check(over[1]["days"] == config.CHART_MAX_DAYS,
+          f"日数は上限で頭打ちにする ({over[1]['days']}日)")
+
+    # --- Pillow が無い環境でも Bot は動く ---
+    real_image = chart_module.Image
+    chart_module.Image = None  # type: ignore[assignment]
+    try:
+        check(not chart_module.available(), "Pillow が無い場合は available() が False")
+        check("Pillow" in chart_module.unavailable_reason(),
+              "描けない理由を説明できる")
+        check(chart_module.render_daily_chart(filled, title="x") is None,
+              "Pillow が無ければ画像は None")
+        no_image, no_totals = await bot.charge.build_daily_chart(G, days=7)
+        check(no_image is None and no_totals["count"] > 0,
+              "画像が無くても集計は返る (統計は失われない)")
+    finally:
+        chart_module.Image = real_image  # type: ignore[assignment]
+    check(chart_module.available(), "後始末でグラフ機能が戻る")
+
+    print("\n=== 10. 整合性 ===")
     integrity = await bot.db.integrity_check()
     check(integrity["pragma"] == "ok", "PRAGMA quick_check OK")
     check(not integrity["balance_mismatch"], "残高と履歴合計が一致")
