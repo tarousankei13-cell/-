@@ -89,3 +89,8 @@ jobs:
 
       - name: Static audit (custom_id, transitions, secrets, schema)
         run: python tests/test_static_audit.py
+
+      - name: Interaction timeout guard (Discord の3秒制限)
+        run: python tests/test_interaction_timeout.py
+        env:
+          CHARGE_BOT_TEST_DIR: ${{ runner.temp }}/charge_bot_timeout

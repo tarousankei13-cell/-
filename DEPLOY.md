@@ -18,6 +18,29 @@ Bot は管理者が登録した **受取用 Kyash アカウント** でリンク
 - トークン失効の事前警告 / 受取アカウント残高しきい値 / 連続失敗クールダウン
 - 死活監視 (ハートビート) / バックアップの外部保存 / GitHub Actions による自動テスト
 
+**v4.1 の修正・追加**
+
+- **ボタンが「応答しませんでした」となる不具合を修正**
+  Discord はボタン操作に3秒以内の応答を求めます。DB が重い処理で塞がると
+  応答が間に合わず、操作が無効になっていました
+  (チャージボタンは応答までに 38 回の DB 問い合わせをしていました)
+  - パネル表示用の情報を短時間キャッシュし、判断を**待ち時間ゼロ**で行う
+  - 入力欄を出す前の DB 待ちに 1.2 秒の上限を設けた
+  - バックアップ・整合性チェックを別接続へ分離し、対話操作を止めない
+  - 応答前の問い合わせは **38 回 → 2 回**
+- **Kyash の受け取り方を1つに絞れるようにした** (`/provider kyash_mode`)
+  送金リンク方式 / 請求リンク方式 のどちらか一方だけを利用者に見せます
+- **PayPay の請求リンク方式を追加** (`/provider paypay_mode` `/provider paypay_link`)
+  事前に登録した請求リンクを見せ、利用者は開いて支払うだけにできます
+  ID方式 / 請求リンク方式 を切り替えられます
+- **UI の修正と整理**
+  - 請求リンク方式を「承認制」と誤表示していたのを修正 (実際は自動反映)
+  - 方式が1つのときに、別の方式の手順を案内していたのを修正
+  - 反映の早さを ⚡ 自動 / 🕐 承認後 で統一し、選ぶときに分かるようにした
+  - パネルは「いま使えるか」を最初に表示
+- **再試行しても無駄なエラーを再試行しないようにした**
+  金額不一致・使用済みリンクなどは即座に確定し、通知が遅れないようにしました
+
 **v4.0 の追加機能**
 
 v4 は「サーバーを続けて使ってもらう仕組み」と「運用者が異変に気付ける仕組み」を足しました。
@@ -92,7 +115,7 @@ v4 は「サーバーを続けて使ってもらう仕組み」と「運用者�
 - Embed が Discord の上限を超えたときに無言で失敗しないよう、送信前に自動で切り詰め
 - 静的解析 (mypy) を 0 エラーにし、同種の引数ミスを検出できるようにしました
 
-- Bot バージョン: `4.0.0` / DB スキーマ: `v4` (v1 / v2 / v3 の DB は起動時に自動移行)
+- Bot バージョン: `4.1.0` / DB スキーマ: `v5` (v1〜v4 の DB は起動時に自動移行)
 - 想定環境: Python 3.11+ / discord.py 2.x / SQLite (WAL) / Linux VPS + systemd
 - Kyash 連携: 同梱の添付モジュール `vendor/Kyasher` (Kyasher 1.5.0) のみを使用
 - PayPay / LTC: **外部 API は使いません** (LTC の価格取得のみ CoinGecko を参照)。
@@ -128,7 +151,8 @@ discord-charge-bot/
 │   ├── test_ui_render.py       # 全 Embed の描画と文字数上限 (290項目)
 │   ├── test_commands_smoke.py  # 全コマンド/全ボタンの実行と権限 (225項目)
 │   ├── test_concurrency.py     # 同時実行でお金が増減しないこと (26項目)
-│   └── test_static_audit.py    # 静的監査: 起動せずに不整合を検出 (95項目)
+│   ├── test_static_audit.py    # 静的監査: 起動せずに不整合を検出 (118項目)
+│   └── test_interaction_timeout.py  # ボタンが3秒以内に応答すること (16項目)
 ├── .github/workflows/test.yml  # CI (lint + 起動前チェック + 全テスト)
 ├── vendor/
 │   └── Kyasher/                # 添付モジュール (無変更で同梱・監査用)
@@ -327,6 +351,9 @@ journalctl -u discord-charge-bot -p err        # エラーのみ
 | `/goal create\|panel\|close\|cancel\|grants` | サーバー全体のチャージ目標 (v4) |
 | `/fraud list\|resolve\|ignore\|scan\|thresholds` | 不正の兆候の確認と処理 (v4) |
 | `/refund approve\|reject` | 返金申請の審査 (v4) |
+| `/provider kyash_mode <mode>` | Kyash の受け取り方を選ぶ (v4.1) |
+| `/provider paypay_mode <mode>` | PayPay の受け取り方を選ぶ (v4.1) |
+| `/provider paypay_link <url>` | PayPay の請求リンクを登録 (Bot Owner・v4.1) |
 | `/queue` | 受取キュー (処理中 / 待機 / 手動確認待ち) |
 | `/system` | Bot・DB・Kyash・キュー・タスク稼働・バージョン |
 | `/logs [action] [actor] [page]` | 監査ログ |
@@ -539,16 +566,17 @@ cd /opt/discord-charge-bot
 ./venv/bin/python3 tests/test_charge_flow.py     #  91 件  Kyash 送金リンクの本流と異常系
 ./venv/bin/python3 tests/test_claim_link.py      #  56 件  Kyash 請求リンクの支払い
 ./venv/bin/python3 tests/test_v2_features.py     #  89 件  ショップ・招待・残高操作・実績投稿
-./venv/bin/python3 tests/test_v4_features.py     # 278 件  段位・ランキング報酬・複数アカウント・
+./venv/bin/python3 tests/test_v4_features.py     # 300 件  段位・ランキング報酬・複数アカウント・
                                                  #         サブスク・オークション・目標・検知・
                                                  #         返金申請・レシート・グラフ
-./venv/bin/python3 tests/test_migration.py       #  29 件  旧DBの自動移行 (v1 → v4)
+./venv/bin/python3 tests/test_migration.py       #  34 件  旧DBの自動移行 (v1 → v5)
 ./venv/bin/python3 tests/test_providers.py       #  75 件  PayPay / LTC の申請・承認
-./venv/bin/python3 tests/test_ui_render.py       # 290 件  全 Embed の描画と文字数上限
-./venv/bin/python3 tests/test_commands_smoke.py  # 225 件  全コマンド・全ボタンの実行
+./venv/bin/python3 tests/test_ui_render.py       # 319 件  全 Embed の描画と文字数上限
+./venv/bin/python3 tests/test_commands_smoke.py  # 228 件  全コマンド・全ボタンの実行
 ./venv/bin/python3 tests/test_concurrency.py     #  26 件  同時実行でお金が増減しないこと
-./venv/bin/python3 tests/test_static_audit.py    #  95 件  静的監査 (起動せずに不整合を検出)
-# → 合計 1254 件成功 / 0 件失敗
+./venv/bin/python3 tests/test_static_audit.py    # 118 件  静的監査 (起動せずに不整合を検出)
+./venv/bin/python3 tests/test_interaction_timeout.py  # 16 件  ボタンが3秒以内に応答すること
+# → 合計 1353 件成功 / 0 件失敗
 ```
 
 まとめて実行する場合:
@@ -718,6 +746,25 @@ Discord が両方を別枠で表示するため二重に見えます)。
 | `その取引は既に申請されています` | 同じ取引ID / txid が既に使われています |
 
 `/request show request_id:<ID>` で現在の状態を確認できます。
+
+### ボタンを押すと「応答しませんでした」と出る
+
+v4.1 で根本的に直しました。まず Bot を更新してください。
+
+それでも出る場合の確認:
+
+```bash
+# DB の処理が遅くなっていないか (1秒を超えると警告が出ます)
+sudo journalctl -u discord-charge-bot | grep "DB の処理に"
+
+# ディスクの空きと速度
+df -h /opt/discord-charge-bot
+```
+
+- 警告が頻発する場合は、DB が大きくなりすぎているか、ディスクが遅い可能性があります
+- `/data` を SSD へ置く、古い取引を `/export` して整理する、などで改善します
+- 起動直後の数十秒は表示用のキャッシュがまだ無く、わずかに遅くなります
+  (それでも3秒は超えません)
 
 ### グラフが表示されない
 
@@ -1360,6 +1407,53 @@ PayPay は PayPay 側の操作で対応してください (Bot は内部残高�
 sudo apt-get install -y fonts-noto-cjk    # または fonts-ipafont-gothic
 ```
 
+## 受け取り方の切り替え (v4.1)
+
+利用者に2つの方式を同時に見せると「どちらを使えばいいか」で迷うため、
+**どちらか一方だけ**を見せる設定にできます。
+
+### Kyash
+
+```bash
+/provider kyash_mode mode:請求リンク方式   # Bot がリンクを出す (おすすめ)
+/provider kyash_mode mode:送金リンク方式   # 利用者がリンクを作る (既定)
+```
+
+| | 送金リンク方式 | 請求リンク方式 |
+|---|---|---|
+| 利用者の操作 | 金額入力 → リンク作成 → 貼り付け | 金額入力 → リンクを開いて支払う |
+| 金額の間違い | 起こりえる (不一致なら受け取らない) | **起こらない** (Bot が金額を指定) |
+| 反映 | 自動 | 自動 |
+
+選ばれていない方式は選択肢から消えます。方式が1つだけになると、
+選択画面を挟まずに金額入力まで一気に進みます。
+
+### PayPay
+
+```bash
+# 1. 入金先 (ID) を登録する (Bot Owner)
+/provider destination provider:PayPay address:<PayPay ID>
+
+# 2. 請求リンクを登録する (Bot Owner・請求リンク方式を使う場合)
+/provider paypay_link url:https://pay.paypay.ne.jp/xxxxxxxx
+
+# 3. 方式を選ぶ (管理者)
+/provider paypay_mode mode:請求リンク方式
+/provider paypay_mode mode:ID方式          # 既定
+```
+
+- 請求リンクは **入金先の ID とは別に**保存します。方式を切り替えても
+  どちらの登録も消えません
+- リンクは `https://` のみ登録できます (利用者にそのまま表示されるため)
+- 請求リンクが未登録のまま請求リンク方式にしても、利用者には
+  「いま使えません」と理由つきで表示され、押して失敗することはありません
+- **着金の確認は従来どおり管理者の承認制です。**
+  PayPay を自動照会する手段が無いため、自動化はしていません
+
+現在の設定は `/provider status` で確認できます。
+
+---
+
 ## 返金申請フロー
 
 利用者が申請し、管理者が審査します。
@@ -1408,6 +1502,27 @@ sudo apt-get install -y fonts-noto-cjk    # または fonts-ipafont-gothic
 | ニックネームの管理 | ショップのニックネーム変更 |
 | チャンネルの管理 | ショップの専用チャンネル |
 | ファイルを添付 | 日別推移のグラフ |
+
+## v4 からのアップグレード
+
+1. Bot を停止する (`sudo systemctl stop discord-charge-bot`)
+2. DB をバックアップする (`cp data/charge_bot.db data/charge_bot.db.bak`)
+3. ファイル一式を差し替える (`main.py` の3項目は書き換え直す)
+4. Bot を起動する (`sudo systemctl start discord-charge-bot`)
+   - スキーマは v4 → v5 へ自動移行します
+   - 受け取り方は**従来どおりの動き**で移行します
+     (Kyash = 送金リンク方式 / PayPay = ID方式)
+
+移行後に確認すること:
+
+```bash
+/provider status    # 受け取り方と、方式ごとの利用可否
+/stats days:14      # 表示が速いか (ボタンの応答も速くなります)
+```
+
+請求リンク方式へ切り替える場合は、上の「受け取り方の切り替え」を参照してください。
+
+---
 
 ## v3 からのアップグレード
 
