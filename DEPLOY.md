@@ -576,7 +576,7 @@ cd /opt/discord-charge-bot
 ./venv/bin/python3 tests/test_concurrency.py     #  26 件  同時実行でお金が増減しないこと
 ./venv/bin/python3 tests/test_static_audit.py    # 118 件  静的監査 (起動せずに不整合を検出)
 ./venv/bin/python3 tests/test_interaction_timeout.py  # 16 件  ボタンが3秒以内に応答すること
-# → 合計 1353 件成功 / 0 件失敗
+# → 合計 1352 件成功 / 0 件失敗
 ```
 
 まとめて実行する場合:
