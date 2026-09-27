@@ -512,6 +512,88 @@ async def main() -> None:
     check(fallback is not None and fallback.id == ids[0],
           "未知のIDは最古のアカウントへフォールバック (v3以前の取引用)")
 
+    # --- 監視タスクがアカウント単位で通知するか ---
+    import tasks as tasks_module
+
+    monitor = tasks_module.BackgroundTasks(bot, bot.db, bot.charge, bot.kyash)
+    health_results: dict[int, str] = {
+        ids[0]: config.KyashAccountStatus.ACTIVE,
+        ids[1]: config.KyashAccountStatus.AUTH_REQUIRED,
+        ids[2]: config.KyashAccountStatus.ACTIVE,
+    }
+
+    async def fake_health(account_id=None):
+        assert account_id is not None, "監視はアカウントを指定して確認する"
+        status = health_results[account_id]
+        slot = bot.kyash.get_slot(account_id)
+        assert slot is not None
+        slot.status = status
+        if status != config.KyashAccountStatus.ACTIVE:
+            slot.last_error = "Authorization: Bearer eyJhbGciOi.SECRET.SIG"
+        return status
+
+    real_health = bot.kyash.health_check
+    bot.kyash.health_check = fake_health  # type: ignore[assignment]
+    bot.owner_alerts.clear()
+    await monitor.kyash_health()
+    alerts = "\n".join(bot.owner_alerts)
+    check(len(bot.owner_alerts) >= 1, f"異常なアカウントを通知する ({len(bot.owner_alerts)}件)")
+    check("sub1" in alerts, "通知に対象アカウント名が入る")
+    check("継続" in alerts, "他が生きていれば継続と伝える")
+    check("Bearer eyJ" not in alerts and "SECRET" not in alerts,
+          "通知にトークンを含まない (マスクされる)")
+    before = len(bot.owner_alerts)
+    await monitor.kyash_health()
+    check(len(bot.owner_alerts) == before, "同じ異常は繰り返し通知しない")
+    health_results[ids[1]] = config.KyashAccountStatus.ACTIVE
+    bot.owner_alerts.clear()
+    await monitor.kyash_health()
+    check(any("復帰" in a and "sub1" in a for a in bot.owner_alerts),
+          "復帰も通知する")
+
+    # トークン期限はアカウントごとに1日1回
+    slot1 = bot.kyash.get_slot(ids[1])
+    assert slot1 is not None
+    slot1.token_issued_at = utils.now_ts() - int(29.5 * 86400)
+    bot.owner_alerts.clear()
+    await monitor._check_token_expiry()
+    check(any("sub1" in a and "アクセストークン" in a for a in bot.owner_alerts),
+          "失効が近いアカウントを名指しで通知")
+    before = len(bot.owner_alerts)
+    await monitor._check_token_expiry()
+    check(len(bot.owner_alerts) == before, "トークン警告は1日1回")
+
+    # 残高しきい値: 1台だけなら継続、全台なら停止として通知
+    for account_id in ids:
+        slot = bot.kyash.get_slot(account_id)
+        assert slot is not None
+        slot.status = config.KyashAccountStatus.ACTIVE
+    bot.kyash.get_slot(ids[0]).wallet_balance = 10_000   # type: ignore[union-attr]
+    bot.kyash.get_slot(ids[1]).wallet_balance = 0        # type: ignore[union-attr]
+    bot.owner_alerts.clear()
+    await monitor._check_wallet_threshold()
+    check(any("main" in a for a in bot.owner_alerts), "上限到達を個別に通知")
+    check(all("停止しています" not in a for a in bot.owner_alerts),
+          "他に余裕があれば停止とは言わない")
+    bot.kyash.get_slot(ids[1]).wallet_balance = 20_000   # type: ignore[union-attr]
+    # sub2 はしきい値なし (無制限) なので、これを塞がないと「全台上限」にはならない
+    bot.owner_alerts.clear()
+    await monitor._check_wallet_threshold()
+    check(all("すべて" not in a for a in bot.owner_alerts),
+          "しきい値なしのアカウントが残っていれば全台上限にはしない")
+    await bot.kyash.set_account_options(ids[2], threshold=1_000)
+    bot.kyash.get_slot(ids[2]).wallet_balance = 1_000    # type: ignore[union-attr]
+    bot.owner_alerts.clear()
+    await monitor._check_wallet_threshold()
+    check(any("すべて" in a for a in bot.owner_alerts), "全台上限なら停止を通知")
+    before = len(bot.owner_alerts)
+    await monitor._check_wallet_threshold()
+    check(len(bot.owner_alerts) == before, "全台上限の通知も繰り返さない")
+    bot.kyash.health_check = real_health  # type: ignore[assignment]
+    for account_id in ids:
+        bot.kyash.get_slot(account_id).wallet_balance = 0  # type: ignore[union-attr]
+    await bot.kyash.set_account_options(ids[2], threshold=0)
+
     # 削除
     await bot.kyash.remove_account(ids[2])
     check(len(bot.kyash.slots()) == 2, "削除できる")

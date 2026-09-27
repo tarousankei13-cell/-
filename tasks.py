@@ -25,7 +25,7 @@ import utils
 if TYPE_CHECKING:
     from charge_service import ChargeService
     from database import Database
-    from kyash_service import KyashService
+    from kyash_service import AccountSlot, KyashService
     from main import ChargeBot
 
 logger = logging.getLogger(config.LOGGER_TASKS)
@@ -50,9 +50,11 @@ class BackgroundTasks:
         self.kyash = kyash
         self._closing = False
         self._queue_task: asyncio.Task[None] | None = None
-        self._last_kyash_alert: str | None = None
-        self._token_alert_day: str | None = None
-        self._wallet_alerted: bool = False
+        # アカウントごとの通知状態 (同じ異常を何度も通知しないため)
+        self._kyash_alerts: dict[int, str] = {}
+        self._token_alert_days: dict[int, str] = {}
+        self._wallet_alerted: set[int] = set()
+        self._all_limit_alerted: bool = False
         self._last_heartbeat_error: str | None = None
 
     # ------------------------------------------------------------------
@@ -232,29 +234,52 @@ class BackgroundTasks:
 
     @tasks.loop(seconds=config.KYASH_HEALTH_INTERVAL)
     async def kyash_health(self) -> None:
-        """受取用 Kyash セッションの健康確認。異常時は管理者へ通知する。"""
+        """受取用 Kyash アカウントの健康確認。異常時は管理者へ通知する。
+
+        複数アカウントに対応しているため、確認と通知はアカウント単位で行う。
+        1台が落ちても他が生きていればチャージは継続できるので、
+        「全台が使えない」ときだけ停止として扱う。
+        """
         self.kyash.cleanup_pending_logins()
-        if self.kyash.status == config.KyashAccountStatus.UNCONFIGURED:
+        slots = self.kyash.slots()
+        if not slots:
             return
+        for slot in slots:
+            if slot.status == config.KyashAccountStatus.UNCONFIGURED:
+                continue
+            await self._check_slot_health(slot)
+        await self._check_token_expiry()
+        await self._check_wallet_threshold()
+
+    async def _check_slot_health(self, slot: "AccountSlot") -> None:
+        """1つのアカウントの状態を確認し、変化があれば通知する。"""
+        label = slot.label
         try:
-            status = await self.kyash.health_check()
+            status = await self.kyash.health_check(account_id=slot.id)
         except Exception:  # noqa: BLE001
-            logger.exception("Kyash 健康確認に失敗しました")
+            logger.exception("Kyash 健康確認に失敗しました (%s)", label)
             return
         if status == config.KyashAccountStatus.ACTIVE:
-            if self._last_kyash_alert is not None:
-                self._last_kyash_alert = None
-                await self.bot.alert_owner("✅ Kyash セッションが正常に復帰しました。")
-            await self._check_token_expiry()
-            await self._check_wallet_threshold()
+            if self._kyash_alerts.pop(slot.id, None) is not None:
+                await self.bot.alert_owner(
+                    f"✅ Kyash アカウント **{label}** のセッションが正常に復帰しました。"
+                )
             return
-        if self._last_kyash_alert == status:
+        if self._kyash_alerts.get(slot.id) == status:
             return  # 同じ異常を繰り返し通知しない
-        self._last_kyash_alert = status
+        self._kyash_alerts[slot.id] = status
+        usable = len(self.kyash.usable_slots())
+        if usable:
+            impact = (
+                f"他に使えるアカウントが **{usable} 件** あるため、チャージは継続しています。"
+            )
+        else:
+            impact = "使えるアカウントが無いため、**新規チャージは停止しています**。"
         await self.bot.alert_owner(
-            f"🚨 Kyash セッションに異常があります (状態: {status})。\n"
-            f"新規チャージは停止しています。`/kyash login` で再ログインしてください。\n"
-            f"詳細: {utils.sanitize_for_log(self.kyash.last_error or '不明', limit=300)}"
+            f"🚨 Kyash アカウント **{label}** に異常があります (状態: {status})。\n"
+            f"{impact}\n"
+            f"`/kyash login account:{label}` で再ログインしてください。\n"
+            f"詳細: {utils.sanitize_for_log(slot.last_error or '不明', limit=300)}"
         )
 
     @kyash_health.before_loop
@@ -262,56 +287,97 @@ class BackgroundTasks:
         await self._wait_ready()
 
     async def _check_token_expiry(self) -> None:
-        """アクセストークンの失効が近い場合に事前警告する。
+        """アクセストークンの失効が近いアカウントを事前警告する。
 
         上流仕様ではトークンの有効期間は発行から1ヶ月。更新用のエンドポイントは
         添付モジュールに存在しないため、自動更新はせず管理者へ再ログインを促す。
         """
-        days_left = self.kyash.token_days_left
-        if days_left is None:
-            return
-        if days_left > config.KYASH_TOKEN_WARN_DAYS:
-            self._token_alert_day = None
-            return
-        # 1日1回だけ通知する
         today = utils.format_jst(utils.now_ts())[:10]
-        if self._token_alert_day == today:
-            return
-        self._token_alert_day = today
-        if days_left <= 0:
-            message = (
-                "🚨 Kyash アクセストークンの有効期限が切れている見込みです。\n"
-                "`/kyash login` で再ログインしてください。"
+        expiring_ids: set[int] = set()
+        for slot in self.kyash.slots():
+            if not slot.enabled:
+                continue
+            days_left = slot.token_days_left
+            if days_left is None or days_left > config.KYASH_TOKEN_WARN_DAYS:
+                continue
+            expiring_ids.add(slot.id)
+            if self._token_alert_days.get(slot.id) == today:
+                continue  # 1日1回だけ通知する
+            self._token_alert_days[slot.id] = today
+            if days_left <= 0:
+                message = (
+                    f"🚨 Kyash アカウント **{slot.label}** の"
+                    "アクセストークンの有効期限が切れている見込みです。\n"
+                    f"`/kyash login account:{slot.label}` で再ログインしてください。"
+                )
+            else:
+                message = (
+                    f"⚠️ Kyash アカウント **{slot.label}** の"
+                    f"アクセストークン残り期間が **{days_left:.1f} 日** です。\n"
+                    f"失効前に `/kyash login account:{slot.label}` で再ログインしてください "
+                    "(端末情報が保存されていれば SMS 認証は不要な場合があります)。"
+                )
+            logger.warning(
+                "トークン期限の警告を通知しました (%s / 残り %.1f 日)", slot.label, days_left
             )
-        else:
-            message = (
-                f"⚠️ Kyash アクセストークンの残り期間が **{days_left:.1f} 日** です。\n"
-                f"失効前に `/kyash login` で再ログインしてください "
-                f"(端末情報が保存されていれば SMS 認証は不要な場合があります)。"
-            )
-        logger.warning("トークン期限の警告を通知しました (残り %.1f 日)", days_left)
-        await self.bot.alert_owner(message)
+            await self.bot.alert_owner(message)
+        # 期限が延びた (再ログインされた) アカウントの記録は消しておく
+        for account_id in list(self._token_alert_days):
+            if account_id not in expiring_ids:
+                self._token_alert_days.pop(account_id, None)
 
     async def _check_wallet_threshold(self) -> None:
-        """受取用アカウントの残高がしきい値へ近づいたら通知する。"""
-        headroom = self.kyash.wallet_headroom()
-        if headroom is None:
-            return
-        threshold = self.kyash.wallet_threshold
-        balance = self.kyash.last_wallet_balance or 0
-        if headroom > 0:
-            if self._wallet_alerted and headroom > threshold * 0.1:
-                self._wallet_alerted = False
-            return
-        if self._wallet_alerted:
-            return
-        self._wallet_alerted = True
-        logger.error("受取用アカウントの残高しきい値に到達しました (%s / %s)", balance, threshold)
-        await self.bot.alert_owner(
-            f"🚨 受取用Kyashアカウントの残高がしきい値に到達しました。\n"
-            f"現在残高: {utils.fmt_yen(balance)} / しきい値: {utils.fmt_yen(threshold)}\n"
-            "新規チャージは停止しています。出金または `/kyash threshold` の調整を行ってください。"
-        )
+        """残高しきい値に達したアカウントを通知する。
+
+        1台だけ到達した場合はフェイルオーバーで継続できるため警告にとどめ、
+        使える全アカウントが到達したときだけ「停止」として通知する。
+        """
+        usable = self.kyash.usable_slots()
+        for slot in usable:
+            headroom = slot.headroom()
+            if headroom is None:
+                self._wallet_alerted.discard(slot.id)
+                continue
+            if headroom > 0:
+                # しきい値の10%以上の余裕が戻ったら通知状態を解除する (ばたつき防止)
+                if slot.id in self._wallet_alerted and headroom > slot.threshold * 0.1:
+                    self._wallet_alerted.discard(slot.id)
+                continue
+            if slot.id in self._wallet_alerted:
+                continue
+            self._wallet_alerted.add(slot.id)
+            balance = slot.wallet_balance or 0
+            logger.error(
+                "受取用アカウントの残高しきい値に到達しました (%s: %s / %s)",
+                slot.label, balance, slot.threshold,
+            )
+            others = [s for s in usable if s.id != slot.id and not s.limit_reached]
+            if others:
+                impact = (
+                    f"他のアカウント ({', '.join(s.label for s in others)}) で"
+                    "受け取りを継続します。"
+                )
+            else:
+                impact = "**新規チャージは停止しています。**"
+            await self.bot.alert_owner(
+                f"🚨 受取用Kyashアカウント **{slot.label}** の残高がしきい値に到達しました。\n"
+                f"現在残高: {utils.fmt_yen(balance)} / "
+                f"しきい値: {utils.fmt_yen(slot.threshold)}\n"
+                f"{impact}\n"
+                f"出金するか `/kyash threshold account:{slot.label}` を調整してください。"
+            )
+        # 全台が到達した場合は個別通知に加えて全体停止を明示する
+        if usable and self.kyash.wallet_limit_reached:
+            if not self._all_limit_alerted:
+                self._all_limit_alerted = True
+                await self.bot.alert_owner(
+                    f"🛑 受取用Kyashアカウント **{len(usable)} 件すべて**が"
+                    "残高しきい値に到達しました。\n"
+                    "新規チャージは停止しています。出金または `/kyash add` で"
+                    "受取アカウントを追加してください。"
+                )
+        else:
+            self._all_limit_alerted = False
 
     @tasks.loop(seconds=config.TASK_RANKING_INTERVAL)
     async def ranking_refresher(self) -> None:

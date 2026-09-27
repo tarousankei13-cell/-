@@ -486,6 +486,53 @@ def main() -> None:
                  "invites_confirmed": 0, "invites_hold": 0},
         review_count=2, updated_at=now,
         requests=request_counts, price=price_snapshot))
+    multi_kyash = {
+        "status": config.KyashAccountStatus.ACTIVE, "logged_in": True,
+        "wallet_balance": 30_000, "token_days_left": 12.0,
+        "token_expiring_soon": False, "last_error": None,
+        "wallet_headroom": 5_000, "account_count": 6, "usable_count": 4,
+        "accounts": [
+            {"label": "main", "status": config.KyashAccountStatus.ACTIVE,
+             "limit_reached": False, "enabled": True},
+            {"label": "sub1", "status": config.KyashAccountStatus.ACTIVE,
+             "limit_reached": True, "enabled": True},
+            {"label": "sub2", "status": config.KyashAccountStatus.AUTH_REQUIRED,
+             "limit_reached": False, "enabled": True},
+            {"label": "sub3", "status": config.KyashAccountStatus.ACTIVE,
+             "limit_reached": False, "enabled": True},
+            {"label": "sub4", "status": config.KyashAccountStatus.ACTIVE,
+             "limit_reached": False, "enabled": True},
+            {"label": "sub5", "status": config.KyashAccountStatus.ERROR,
+             "limit_reached": False, "enabled": True},
+        ],
+    }
+    multi_embed = ui.admin_panel_embed(
+        guild_name="サーバー", settings=settings, kyash=multi_kyash,
+        queue={}, stats={"today_count": 1, "today_sent": 1, "today_credited": 1},
+        metrics={}, review_count=0, updated_at=now)
+    verify("admin_panel_embed (複数アカウント)", multi_embed)
+    dump = multi_embed.description + "".join(f.value for f in multi_embed.fields)
+    check("4 / 6 台のみ使用可" in dump, "ダッシュボードが使用可能な台数を出す")
+    check("sub2" in dump and "sub5" in dump, "異常なアカウント名が分かる")
+    check("sub1" in dump and "残高しきい値に到達: sub1" in dump,
+          "上限到達アカウントが個別に分かる")
+    check("他 2 台" in dump, "5台以上は省略表示される")
+    all_limited = dict(multi_kyash)
+    all_limited["usable_count"] = 2
+    all_limited["accounts"] = [
+        {"label": "main", "status": config.KyashAccountStatus.ACTIVE,
+         "limit_reached": True, "enabled": True},
+        {"label": "sub1", "status": config.KyashAccountStatus.ACTIVE,
+         "limit_reached": True, "enabled": True},
+    ]
+    all_limited["account_count"] = 2
+    limited_embed = ui.admin_panel_embed(
+        guild_name="サーバー", settings=settings, kyash=all_limited,
+        queue={}, stats={}, metrics={}, review_count=0, updated_at=now)
+    verify("admin_panel_embed (全台上限)", limited_embed)
+    check("全アカウント" in limited_embed.description,
+          "全台上限なら停止として表示される")
+
     verify("admin_panel_embed", ui.admin_panel_embed(
         guild_name="サーバー" * 30, settings=long_settings,
         kyash={"logged_in": True, "wallet_balance": 100_000, "token_days_left": 3.5,

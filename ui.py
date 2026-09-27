@@ -2245,7 +2245,24 @@ def admin_panel_embed(
         problems.append("🔴 緊急停止中")
     if settings.maintenance:
         problems.append("🟠 メンテナンス中")
-    if kyash.get("status") != config.KyashAccountStatus.ACTIVE:
+    accounts = list(kyash.get("accounts") or [])
+    account_count = int(kyash.get("account_count") or 0)
+    usable_count = int(kyash.get("usable_count") or 0)
+    if account_count > 1:
+        # 複数アカウント運用では「何台が使えるか」が重要
+        if usable_count == 0:
+            problems.append(f"🔴 Kyash: 使える受取アカウントが 0 / {account_count} 台")
+        elif usable_count < account_count:
+            down = [
+                str(a.get("label"))
+                for a in accounts
+                if a.get("status") != config.KyashAccountStatus.ACTIVE
+            ]
+            problems.append(
+                f"🟠 Kyash: {usable_count} / {account_count} 台のみ使用可"
+                + (f" (異常: {', '.join(down[:3])})" if down else "")
+            )
+    elif kyash.get("status") != config.KyashAccountStatus.ACTIVE:
         problems.append(f"🟠 Kyash: {kyash.get('status')}")
     days_left = kyash.get("token_days_left")
     if days_left is not None and days_left <= config.KYASH_TOKEN_WARN_DAYS:
@@ -2258,7 +2275,15 @@ def admin_panel_embed(
     if price is not None and price.get("consecutive_failures"):
         problems.append(f"🟠 LTC 価格の取得失敗 {price['consecutive_failures']} 回")
     headroom = kyash.get("wallet_headroom")
-    if headroom is not None and headroom <= 0:
+    limited = [
+        str(a.get("label")) for a in accounts
+        if a.get("limit_reached") and a.get("status") == config.KyashAccountStatus.ACTIVE
+    ]
+    if usable_count and len(limited) >= usable_count:
+        problems.append("🔴 受取残高しきい値に到達 (全アカウント)")
+    elif limited:
+        problems.append(f"🟠 残高しきい値に到達: {', '.join(limited[:3])}")
+    elif headroom is not None and headroom <= 0:
         problems.append("🔴 受取残高しきい値に到達")
 
     embed = discord.Embed(
@@ -2312,9 +2337,21 @@ def admin_panel_embed(
         inline=True,
     )
     embed.add_field(
-        name="Kyash",
+        name="Kyash 受取" + (f" ({usable_count}/{account_count}台)" if account_count > 1 else ""),
         value=(
-            f"{config.KYASH_STATUS_LABELS.get(str(kyash.get('status')), str(kyash.get('status')))}\n"
+            (
+                # 複数台のときは代表状態ではなく各台の状態を出す
+                "\n".join(
+                    f"{'🟢' if a.get('status') == config.KyashAccountStatus.ACTIVE else '🔴'} "
+                    f"{a.get('label')}"
+                    + ("（上限）" if a.get("limit_reached") else "")
+                    for a in accounts[:4]
+                )
+                + (f"\n…他 {account_count - 4} 台" if account_count > 4 else "")
+                + "\n"
+                if account_count > 1
+                else f"{config.KYASH_STATUS_LABELS.get(str(kyash.get('status')), str(kyash.get('status')))}\n"
+            )
             + (f"トークン残り: {days_left:.1f}日\n" if days_left is not None else "")
             + (f"しきい値まで: {utils.fmt_yen(headroom)}" if headroom is not None else "しきい値: 未設定")
         ),
