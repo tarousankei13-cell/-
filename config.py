@@ -12,8 +12,8 @@ from typing import Final
 # ---------------------------------------------------------------------------
 # バージョン
 # ---------------------------------------------------------------------------
-BOT_VERSION: Final[str] = "3.1.0"
-SCHEMA_VERSION: Final[int] = 3
+BOT_VERSION: Final[str] = "4.0.0"
+SCHEMA_VERSION: Final[int] = 4
 
 # ---------------------------------------------------------------------------
 # パス
@@ -297,6 +297,11 @@ class BalanceChangeType:
     REVERSAL = "REVERSAL"                # 取引の取消 (逆仕訳)
     UNDO = "UNDO"                        # 残高操作の取消 (逆仕訳)
     RECONCILE = "RECONCILE"              # 履歴との突合による修復
+    RANKING_REWARD = "RANKING_REWARD"    # ランキング報酬
+    GOAL_REWARD = "GOAL_REWARD"          # チャージ目標の達成報酬
+    AUCTION_BID = "AUCTION_BID"          # オークションの入札 (引き落とし)
+    AUCTION_REFUND = "AUCTION_REFUND"    # 入札を上回られた分の返金
+    SUBSCRIPTION = "SUBSCRIPTION"        # サブスク商品の継続課金
 
 
 BALANCE_TYPE_LABELS: Final[dict[str, str]] = {
@@ -313,6 +318,11 @@ BALANCE_TYPE_LABELS: Final[dict[str, str]] = {
     BalanceChangeType.REVERSAL: "取引取消",
     BalanceChangeType.UNDO: "操作取消",
     BalanceChangeType.RECONCILE: "突合修復",
+    BalanceChangeType.RANKING_REWARD: "ランキング報酬",
+    BalanceChangeType.GOAL_REWARD: "目標達成報酬",
+    BalanceChangeType.AUCTION_BID: "オークション入札",
+    BalanceChangeType.AUCTION_REFUND: "入札の返金",
+    BalanceChangeType.SUBSCRIPTION: "サブスク課金",
 }
 
 #: 残高を増やす種別 (max_balance の判定に使う)
@@ -320,6 +330,8 @@ BALANCE_INCREASE_TYPES: Final[frozenset[str]] = frozenset({
     BalanceChangeType.CHARGE, BalanceChangeType.ADMIN_ADD, BalanceChangeType.ADMIN_SET,
     BalanceChangeType.PROXY_ACHIEVEMENT, BalanceChangeType.ADMIN_MOVE_IN,
     BalanceChangeType.SPEND_REFUND, BalanceChangeType.INVITE_REWARD,
+    BalanceChangeType.RANKING_REWARD, BalanceChangeType.GOAL_REWARD,
+    BalanceChangeType.AUCTION_REFUND,
 })
 
 #: 管理者の手動操作として残高ログへ流す種別
@@ -651,6 +663,13 @@ class ErrorCode:
     ASSET_AMOUNT_TOO_SMALL = "ASSET_AMOUNT_TOO_SMALL"
     REVIEW_CHANNEL_NOT_SET = "REVIEW_CHANNEL_NOT_SET"
     CLAIM_LINK_FAILED = "CLAIM_LINK_FAILED"
+    AUCTION_NOT_OPEN = "AUCTION_NOT_OPEN"
+    BID_TOO_LOW = "BID_TOO_LOW"
+    ALREADY_HIGHEST = "ALREADY_HIGHEST"
+    REFUND_NOT_ELIGIBLE = "REFUND_NOT_ELIGIBLE"
+    REFUND_ALREADY_REQUESTED = "REFUND_ALREADY_REQUESTED"
+    ITEM_INPUT_INVALID = "ITEM_INPUT_INVALID"
+    NO_KYASH_CAPACITY = "NO_KYASH_CAPACITY"
     PAYMENT_NOT_FOUND = "PAYMENT_NOT_FOUND"
     UNKNOWN_ERROR = "UNKNOWN_ERROR"
 
@@ -707,6 +726,13 @@ USER_ERROR_MESSAGES: Final[dict[str, str]] = {
     ErrorCode.REVIEW_CHANNEL_NOT_SET: "この方法はまだ利用できる状態になっていません。",
     ErrorCode.CLAIM_LINK_FAILED: "請求リンクを発行できませんでした。時間をおいてお試しください。",
     ErrorCode.PAYMENT_NOT_FOUND: "まだ支払いを確認できていません。",
+    ErrorCode.AUCTION_NOT_OPEN: "このオークションは入札を受け付けていません。",
+    ErrorCode.BID_TOO_LOW: "入札額が足りません。",
+    ErrorCode.ALREADY_HIGHEST: "すでにあなたが最高入札者です。",
+    ErrorCode.REFUND_NOT_ELIGIBLE: "この取引は返金を申請できません。",
+    ErrorCode.REFUND_ALREADY_REQUESTED: "この取引はすでに返金を申請しています。",
+    ErrorCode.ITEM_INPUT_INVALID: "入力内容が正しくありません。",
+    ErrorCode.NO_KYASH_CAPACITY: "現在チャージを受け付けられません。時間をおいてお試しください。",
 }
 
 #: 利用者向けの「次にどうすればよいか」。エラー表示に添えて迷わせない。
@@ -761,6 +787,13 @@ USER_ERROR_NEXT_ACTIONS: Final[dict[str, str]] = {
     ErrorCode.REVIEW_CHANNEL_NOT_SET: "別のチャージ方法を選んでください (管理者の設定待ちです)。",
     ErrorCode.CLAIM_LINK_FAILED: "少し待ってから、もう一度 `💰 チャージ` を試してください。別の方法でもチャージできます。",
     ErrorCode.PAYMENT_NOT_FOUND: "Kyash アプリで支払いが完了しているか確認し、30秒ほど待って `🔄 支払いを確認` をもう一度押してください。自動でも確認しています。",
+    ErrorCode.AUCTION_NOT_OPEN: "パネルの表示を最新にして、開催中のオークションをご確認ください。",
+    ErrorCode.BID_TOO_LOW: "表示されている「次の入札額」以上の金額で入札してください。",
+    ErrorCode.ALREADY_HIGHEST: "他の人に上回られるまで待ってください。上回られたら自動で返金されます。",
+    ErrorCode.REFUND_NOT_ELIGIBLE: "完了したチャージのうち、まだ取消されていないものだけが対象です。期限を過ぎた取引は管理者へご相談ください。",
+    ErrorCode.REFUND_ALREADY_REQUESTED: "`/refund list` で申請の状態を確認してください。",
+    ErrorCode.ITEM_INPUT_INVALID: "入力欄の説明にある形式で、もう一度入力してください。",
+    ErrorCode.NO_KYASH_CAPACITY: "別のチャージ方法を選ぶか、時間をおいてもう一度お試しください。",
 }
 
 #: 再試行してはいけないエラー
@@ -799,6 +832,228 @@ class Color:
 RANK_MEDALS: Final[dict[int, str]] = {1: "🥇", 2: "🥈", 3: "🥉"}
 
 # ---------------------------------------------------------------------------
+# v4: 段位 / ランキング報酬 / オークション / 目標 / 不正検知 / 返金申請
+# ---------------------------------------------------------------------------
+#: 累計チャージの段位を判定する間隔 (秒)
+TASK_TIER_INTERVAL: Final[int] = 900
+#: 段位を設定できる最大数 (表示が破綻しない範囲)
+MAX_TIERS_PER_GUILD: Final[int] = 10
+
+
+class RankingPeriod:
+    """ランキング報酬で締める期間の種類。"""
+
+    WEEKLY = "WEEKLY"     # 月曜 00:00 JST 区切り
+    MONTHLY = "MONTHLY"   # 1日 00:00 JST 区切り
+
+
+RANKING_PERIOD_LABELS: Final[dict[str, str]] = {
+    RankingPeriod.WEEKLY: "週間",
+    RankingPeriod.MONTHLY: "月間",
+}
+
+#: ランキング報酬の配布を確認する間隔 (秒)
+TASK_RANKING_REWARD_INTERVAL: Final[int] = 1800
+#: 1つの順位範囲に設定できる最大順位
+MAX_REWARD_RANK: Final[int] = 100
+
+
+class AuctionStatus:
+    OPEN = "OPEN"            # 入札受付中
+    CLOSED = "CLOSED"        # 締切・落札者確定
+    CANCELLED = "CANCELLED"  # 中止 (全額返金)
+    FAILED = "FAILED"        # 入札なしで終了
+
+
+AUCTION_STATUS_LABELS: Final[dict[str, str]] = {
+    AuctionStatus.OPEN: "🟢 入札受付中",
+    AuctionStatus.CLOSED: "🏁 落札",
+    AuctionStatus.CANCELLED: "⚫ 中止",
+    AuctionStatus.FAILED: "🔴 入札なし",
+}
+
+#: オークションの締切を確認する間隔 (秒)
+TASK_AUCTION_INTERVAL: Final[int] = 30
+#: 開催できる期間の上限 (日)
+AUCTION_MAX_DAYS: Final[int] = 30
+#: 1サーバーが同時に開催できるオークション数
+MAX_OPEN_AUCTIONS: Final[int] = 5
+
+
+class GoalStatus:
+    OPEN = "OPEN"            # 集計中
+    ACHIEVED = "ACHIEVED"    # 達成・報酬配布済み
+    CLOSED = "CLOSED"        # 未達のまま終了
+    CANCELLED = "CANCELLED"
+
+
+GOAL_STATUS_LABELS: Final[dict[str, str]] = {
+    GoalStatus.OPEN: "🟢 集計中",
+    GoalStatus.ACHIEVED: "🎉 達成",
+    GoalStatus.CLOSED: "⚫ 終了 (未達)",
+    GoalStatus.CANCELLED: "⚫ 中止",
+}
+
+#: 目標の進捗を確認する間隔 (秒)
+TASK_GOAL_INTERVAL: Final[int] = 120
+#: 進捗バーの桁数
+GOAL_BAR_WIDTH: Final[int] = 12
+
+
+class FraudKind:
+    """不正の兆候の種類。"""
+
+    BURST_CHARGE = "BURST_CHARGE"          # 短時間の大量チャージ
+    SHARED_SENDER = "SHARED_SENDER"        # 同一 Kyash 送金者名を複数人が使用
+    DRAIN_AND_LEAVE = "DRAIN_AND_LEAVE"    # チャージ直後に使い切って退出
+    INVITE_ONLY = "INVITE_ONLY"            # 招待報酬だけを集め活動しない
+    RAPID_REFUND = "RAPID_REFUND"          # 返金申請を繰り返す
+
+
+FRAUD_KIND_LABELS: Final[dict[str, str]] = {
+    FraudKind.BURST_CHARGE: "短時間の大量チャージ",
+    FraudKind.SHARED_SENDER: "送金者名の共有 (名義貸し・転売の疑い)",
+    FraudKind.DRAIN_AND_LEAVE: "チャージ直後の使い切りと退出",
+    FraudKind.INVITE_ONLY: "招待報酬のみの収集",
+    FraudKind.RAPID_REFUND: "返金申請の繰り返し",
+}
+
+
+class FraudSeverity:
+    INFO = "INFO"
+    WARN = "WARN"
+    HIGH = "HIGH"
+
+
+FRAUD_SEVERITY_LABELS: Final[dict[str, str]] = {
+    FraudSeverity.INFO: "🔵 参考",
+    FraudSeverity.WARN: "🟠 注意",
+    FraudSeverity.HIGH: "🔴 重要",
+}
+
+
+class FraudStatus:
+    OPEN = "OPEN"          # 未処理
+    RESOLVED = "RESOLVED"  # 対処済み
+    IGNORED = "IGNORED"    # 問題なしと判断
+
+
+FRAUD_STATUS_LABELS: Final[dict[str, str]] = {
+    FraudStatus.OPEN: "🟠 未処理",
+    FraudStatus.RESOLVED: "🟢 対処済み",
+    FraudStatus.IGNORED: "⚪ 問題なし",
+}
+
+#: 不正検知を回す間隔 (秒)
+TASK_FRAUD_INTERVAL: Final[int] = 600
+#: 短時間の大量チャージ: この秒数以内に この件数 を超えたら検知
+FRAUD_BURST_WINDOW: Final[int] = 600
+FRAUD_BURST_COUNT: Final[int] = 5
+#: 同一送金者名を この人数 以上が使っていたら検知
+FRAUD_SHARED_SENDER_USERS: Final[int] = 2
+#: チャージ後 この秒数以内 に残高をほぼ使い切ったら検知
+FRAUD_DRAIN_WINDOW: Final[int] = 3600
+FRAUD_DRAIN_RATIO: Final[str] = "0.9"
+#: 招待報酬のみ: 確定招待が この件数 以上でチャージが0件なら検知
+FRAUD_INVITE_ONLY_COUNT: Final[int] = 3
+#: 返金申請を この件数 以上繰り返したら検知
+FRAUD_REFUND_COUNT: Final[int] = 3
+
+
+class RefundRequestStatus:
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    CANCELLED = "CANCELLED"
+
+
+REFUND_STATUS_LABELS: Final[dict[str, str]] = {
+    RefundRequestStatus.PENDING: "🟡 審査待ち",
+    RefundRequestStatus.APPROVED: "🟢 承認 (返金済み)",
+    RefundRequestStatus.REJECTED: "🔴 却下",
+    RefundRequestStatus.CANCELLED: "⚪ 取消",
+}
+
+REFUND_TRANSITIONS: Final[dict[str, tuple[str, ...]]] = {
+    RefundRequestStatus.PENDING: (
+        RefundRequestStatus.APPROVED, RefundRequestStatus.REJECTED,
+        RefundRequestStatus.CANCELLED,
+    ),
+    RefundRequestStatus.APPROVED: (),
+    RefundRequestStatus.REJECTED: (),
+    RefundRequestStatus.CANCELLED: (),
+}
+
+#: 返金申請できるのはチャージ完了から この秒数以内
+REFUND_REQUEST_WINDOW: Final[int] = 14 * 86400
+#: 1利用者が同時に出せる返金申請の数
+MAX_OPEN_REFUND_REQUESTS: Final[int] = 2
+
+#: レシート署名のバージョン (形式を変えるときに上げる)
+RECEIPT_VERSION: Final[str] = "R1"
+
+#: グラフ画像のサイズと既定の日数
+CHART_WIDTH: Final[int] = 900
+CHART_HEIGHT: Final[int] = 420
+CHART_DEFAULT_DAYS: Final[int] = 14
+CHART_MAX_DAYS: Final[int] = 90
+
+
+class ShopItemType:
+    """ショップ商品の種類。"""
+
+    ROLE = "ROLE"                      # 既存のロール販売
+    CUSTOM_ROLE = "CUSTOM_ROLE"        # 名前と色を指定してロールを作る
+    NICKNAME = "NICKNAME"              # ニックネームの変更権
+    RATE_BOOST = "RATE_BOOST"          # 一定時間チャージ率が上がる
+    PRIVATE_CHANNEL = "PRIVATE_CHANNEL"  # 本人専用チャンネル
+
+
+SHOP_ITEM_TYPE_LABELS: Final[dict[str, str]] = {
+    ShopItemType.ROLE: "ロール付与",
+    ShopItemType.CUSTOM_ROLE: "カスタムロール作成",
+    ShopItemType.NICKNAME: "ニックネーム変更",
+    ShopItemType.RATE_BOOST: "チャージ率ブースト",
+    ShopItemType.PRIVATE_CHANNEL: "専用チャンネル",
+}
+
+SHOP_ITEM_TYPE_EMOJI: Final[dict[str, str]] = {
+    ShopItemType.ROLE: "🎫",
+    ShopItemType.CUSTOM_ROLE: "🎨",
+    ShopItemType.NICKNAME: "✏️",
+    ShopItemType.RATE_BOOST: "⚡",
+    ShopItemType.PRIVATE_CHANNEL: "🔒",
+}
+
+#: 既存のロールを指定する必要がある種類 (それ以外は role_id を使わない)
+SHOP_TYPES_NEED_ROLE: Final[tuple[str, ...]] = (ShopItemType.ROLE,)
+#: Bot が作成物を後片付けする必要がある種類
+SHOP_TYPES_WITH_ASSET: Final[tuple[str, ...]] = (
+    ShopItemType.CUSTOM_ROLE, ShopItemType.PRIVATE_CHANNEL,
+)
+
+
+class PurchaseAssetType:
+    ROLE = "ROLE"        # Bot が作成したロール
+    CHANNEL = "CHANNEL"  # Bot が作成したチャンネル
+
+
+#: カスタムロール・専用チャンネルの名前の長さ
+CUSTOM_NAME_MAX_LEN: Final[int] = 40
+#: ニックネームの長さ (Discord の上限)
+NICKNAME_MAX_LEN: Final[int] = 32
+#: チャージ率ブーストの上限 (%ポイント)
+RATE_BOOST_MAX_BONUS: Final[str] = "100"
+#: チャージ率ブーストの最長時間 (時間)
+RATE_BOOST_MAX_HOURS: Final[int] = 720
+
+#: サブスク商品の更新を確認する間隔 (秒)
+TASK_SUBSCRIPTION_INTERVAL: Final[int] = 600
+#: 更新の何秒前に予告 DM を送るか
+SUBSCRIPTION_NOTICE_SECONDS: Final[int] = 86400
+
+
+# ---------------------------------------------------------------------------
 # Persistent View custom_id (Bot 再起動後もボタンが動くよう固定値にする)
 # ---------------------------------------------------------------------------
 class CustomID:
@@ -808,6 +1063,14 @@ class CustomID:
     INVITE_GET = "chargebot:invite:get"
     INVITE_STATUS = "chargebot:invite:status"
     INVITE_RANK = "chargebot:invite:rank"
+    AUCTION_BID = "chargebot:auction:bid"
+    AUCTION_INFO = "chargebot:auction:info"
+    GOAL_REFRESH = "chargebot:goal:refresh"
+    FRAUD_RESOLVE = "chargebot:fraud:resolve"
+    FRAUD_IGNORE = "chargebot:fraud:ignore"
+    FRAUD_DETAIL = "chargebot:fraud:detail"
+    REFUND_APPROVE = "chargebot:refund:approve"
+    REFUND_REJECT = "chargebot:refund:reject"
     REQUEST_APPROVE = "chargebot:request:approve"
     REQUEST_REJECT = "chargebot:request:reject"
     REQUEST_EDIT_APPROVE = "chargebot:request:editapprove"
@@ -835,6 +1098,8 @@ PANEL_TYPE_CHARGE: Final[str] = "CHARGE"
 PANEL_TYPE_SHOP: Final[str] = "SHOP"
 PANEL_TYPE_INVITE: Final[str] = "INVITE"
 PANEL_TYPE_ADMIN: Final[str] = "ADMIN"
+PANEL_TYPE_GOAL: Final[str] = "GOAL"
+PANEL_TYPE_AUCTION: Final[str] = "AUCTION"
 
 # ---------------------------------------------------------------------------
 # ロガー名

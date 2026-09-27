@@ -95,6 +95,8 @@ class BackgroundTasks:
             self.shop_expiry,
             self.request_task,
             self.claim_task,
+            self.tier_task,
+            self.ranking_reward_task,
             self.heartbeat,
             self.summary_task,
             self.campaign_task,
@@ -449,6 +451,30 @@ class BackgroundTasks:
 
     @shop_expiry.before_loop
     async def _before_shop(self) -> None:
+        await self._wait_ready()
+
+    @tasks.loop(seconds=config.TASK_TIER_INTERVAL)
+    async def tier_task(self) -> None:
+        """累計チャージによる段位の取りこぼしを拾う。"""
+        try:
+            await self.charge.sweep_tiers()
+        except Exception:  # noqa: BLE001
+            logger.exception("段位の判定に失敗しました")
+
+    @tier_task.before_loop
+    async def _before_tier(self) -> None:
+        await self._wait_ready()
+
+    @tasks.loop(seconds=config.TASK_RANKING_REWARD_INTERVAL)
+    async def ranking_reward_task(self) -> None:
+        """締めた期間のランキング報酬を配布する。"""
+        try:
+            await self.charge.run_ranking_rewards()
+        except Exception:  # noqa: BLE001
+            logger.exception("ランキング報酬の配布に失敗しました")
+
+    @ranking_reward_task.before_loop
+    async def _before_ranking_reward(self) -> None:
         await self._wait_ready()
 
     @tasks.loop(seconds=config.TASK_CLAIM_INTERVAL)

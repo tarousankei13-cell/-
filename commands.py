@@ -26,7 +26,7 @@ import price_service
 import ui
 import utils
 from charge_service import ChargeError
-from database import RequestError
+from database import DatabaseError, RequestError
 
 if TYPE_CHECKING:
     from main import ChargeBot
@@ -4830,6 +4830,373 @@ class GlobalGroup(app_commands.Group):
 
 
 # ---------------------------------------------------------------------------
+# /tier (累計チャージによる自動昇格)
+# ---------------------------------------------------------------------------
+class TierGroup(app_commands.Group):
+    """累計チャージ額による段位 (自動昇格・降格なし)。"""
+
+    def __init__(self) -> None:
+        super().__init__(name="tier", description="累計チャージによる段位の管理 (管理者)")
+
+    @app_commands.command(name="add", description="段位を追加します")
+    @app_commands.describe(
+        name="段位の名前 (例: ゴールド)",
+        threshold="この累計チャージ額に達したら付与",
+        role="付与するロール",
+        description="特典の説明 (任意)",
+    )
+    @app_commands.guild_only()
+    @require_admin()
+    async def add(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        threshold: app_commands.Range[int, 1, 1_000_000_000],
+        role: discord.Role,
+        description: str | None = None,
+    ) -> None:
+        """段位を追加する。
+
+        チャージ率は付与したロールへ ``/rate set`` で設定する。
+        レートの決まり方を1系統に保つため、段位自体はレートを持たない。
+        """
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        assert guild is not None
+        label = name.strip()[:config.CUSTOM_NAME_MAX_LEN]
+        if not label:
+            await interaction.followup.send(
+                embed=ui.info_embed("入力が不正です", "段位の名前を入力してください。",
+                                    color=config.Color.DANGER),
+                ephemeral=True,
+            )
+            return
+        problem = bot.charge.role_grant_problem(guild, role)
+        if problem:
+            await interaction.followup.send(
+                embed=ui.info_embed("このロールは使えません", problem,
+                                    color=config.Color.DANGER),
+                ephemeral=True,
+            )
+            return
+        try:
+            tier_id = await bot.db.add_tier(
+                guild_id=guild.id, name=label, threshold=int(threshold), role_id=role.id,
+                description=(description.strip()[:300] if description else None),
+                created_by=interaction.user.id,
+            )
+        except DatabaseError as exc:
+            await interaction.followup.send(
+                embed=ui.info_embed("追加できません", str(exc), color=config.Color.DANGER),
+                ephemeral=True,
+            )
+            return
+        op_id = await _audit(
+            interaction, "TIER_ADD",
+            detail={"tier_id": tier_id, "name": label, "threshold": int(threshold),
+                    "role_id": role.id},
+        )
+        rates = {int(r["role_id"]): r for r in await bot.db.list_role_rates(guild.id)}
+        hint = (
+            f"このロールのチャージ率は **{utils.fmt_rate(rates[role.id]['charge_rate'])}** です。"
+            if role.id in rates else
+            f"チャージ率を上げるには `/rate set role:{role.name} charge_rate:140` を実行してください。"
+        )
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "✅ 段位を追加しました",
+                f"段位ID: `{tier_id}`\n名前: **{label}**\n"
+                f"しきい値: 累計 **{utils.fmt_yen(int(threshold))}**\n"
+                f"ロール: {role.mention}\n操作ID: `{op_id}`\n\n{hint}\n"
+                "※ 既にしきい値を超えている利用者へは、次回のチャージまたは定期判定で付与されます。",
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="remove", description="段位を削除します")
+    @app_commands.describe(tier_id="段位ID (`/tier list` で確認)")
+    @app_commands.guild_only()
+    @require_admin()
+    async def remove(
+        self, interaction: discord.Interaction,
+        tier_id: app_commands.Range[int, 1, 10_000_000],
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        tier = await bot.db.get_tier(guild.id, int(tier_id))
+        if tier is None:
+            await ui.safe_respond(
+                interaction,
+                embed=ui.info_embed("見つかりません", "その段位IDは存在しません。",
+                                    color=config.Color.DANGER),
+            )
+            return
+        approved = await _confirm(
+            interaction,
+            title=f"段位「{tier['name']}」を削除します",
+            description=(
+                "設定と付与記録を削除します。\n"
+                "**既に付与したロールは外れません** (必要なら手動で外してください)。\n"
+                "同じ段位を作り直すと、条件を満たす人へ再度付与されます。"
+            ),
+            confirm_label="削除する",
+        )
+        if not approved:
+            return
+        removed = await bot.db.remove_tier(guild.id, int(tier_id))
+        op_id = await _audit(
+            interaction, "TIER_REMOVE", detail={"tier_id": int(tier_id)}
+        )
+        await interaction.followup.send(
+            embed=ui.info_embed(
+                "削除しました" if removed else "見つかりません",
+                f"段位ID: `{tier_id}`\n操作ID: `{op_id}`",
+                color=config.Color.NEUTRAL,
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="list", description="段位の一覧を表示します")
+    @app_commands.guild_only()
+    @require_admin()
+    async def list_tiers(self, interaction: discord.Interaction) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        assert guild is not None
+        tiers = await bot.db.list_tiers(guild.id)
+        rates = {
+            int(r["role_id"]): utils.fmt_rate(r["charge_rate"])
+            for r in await bot.db.list_role_rates(guild.id)
+        }
+        await interaction.followup.send(
+            embed=ui.tier_list_embed(tiers, guild_name=guild.name, rates=rates),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="sweep", description="条件を満たす利用者へ段位をまとめて付与します"
+    )
+    @app_commands.guild_only()
+    @require_admin()
+    async def sweep(self, interaction: discord.Interaction) -> None:
+        """しきい値を変更した後などに、取りこぼしを拾うための手動実行。"""
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        assert guild is not None
+        promoted = 0
+        for user_id in await bot.db.list_tier_candidates(guild.id, limit=500):
+            promoted += len(await bot.charge.check_tiers(guild.id, user_id))
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "✅ 段位の判定を実行しました",
+                f"新しく付与した段位: **{promoted} 件**\n"
+                "既に付与済みの段位は変更していません。",
+            ),
+            ephemeral=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# /ranking_reward (ランキング上位への自動配布)
+# ---------------------------------------------------------------------------
+_RANKING_PERIOD_CHOICES = [
+    app_commands.Choice(name=label, value=key)
+    for key, label in config.RANKING_PERIOD_LABELS.items()
+]
+
+
+class RankingRewardGroup(app_commands.Group):
+    """締めた期間のランキング上位へ報酬を自動配布する。"""
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="ranking_reward", description="ランキング報酬の管理 (管理者)"
+        )
+
+    @app_commands.command(name="set", description="順位範囲への報酬を設定します")
+    @app_commands.describe(
+        period="集計期間", rank_from="開始順位", rank_to="終了順位",
+        amount="配布する残高 (0 でロールのみ)", role="付与するロール (任意)",
+    )
+    @app_commands.choices(period=_RANKING_PERIOD_CHOICES)
+    @app_commands.guild_only()
+    @require_admin()
+    async def set_reward(
+        self,
+        interaction: discord.Interaction,
+        period: app_commands.Choice[str],
+        rank_from: app_commands.Range[int, 1, config.MAX_REWARD_RANK],
+        rank_to: app_commands.Range[int, 1, config.MAX_REWARD_RANK],
+        amount: app_commands.Range[int, 0, 1_000_000_000] = 0,
+        role: discord.Role | None = None,
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        assert guild is not None
+        if int(rank_from) > int(rank_to):
+            await interaction.followup.send(
+                embed=ui.info_embed("入力が不正です", "開始順位が終了順位を超えています。",
+                                    color=config.Color.DANGER),
+                ephemeral=True,
+            )
+            return
+        if int(amount) == 0 and role is None:
+            await interaction.followup.send(
+                embed=ui.info_embed(
+                    "入力が不正です", "残高かロールの少なくとも一方を指定してください。",
+                    color=config.Color.DANGER),
+                ephemeral=True,
+            )
+            return
+        if role is not None:
+            problem = bot.charge.role_grant_problem(guild, role)
+            if problem:
+                await interaction.followup.send(
+                    embed=ui.info_embed("このロールは使えません", problem,
+                                        color=config.Color.DANGER),
+                    ephemeral=True,
+                )
+                return
+        reward_id = await bot.db.set_ranking_reward(
+            guild_id=guild.id, ranking_type=period.value, rank_from=int(rank_from),
+            rank_to=int(rank_to), amount=int(amount),
+            role_id=role.id if role else None, created_by=interaction.user.id,
+        )
+        op_id = await _audit(
+            interaction, "RANKING_REWARD_SET",
+            detail={"reward_id": reward_id, "period": period.value,
+                    "rank_from": int(rank_from), "rank_to": int(rank_to),
+                    "amount": int(amount), "role_id": role.id if role else None},
+        )
+        rank_text = (f"{rank_from}位" if int(rank_from) == int(rank_to)
+                     else f"{rank_from}〜{rank_to}位")
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "✅ ランキング報酬を設定しました",
+                f"期間: **{period.name}**\n対象: **{rank_text}**\n"
+                + (f"残高: **{utils.fmt_int(int(amount))}**\n" if amount else "")
+                + (f"ロール: {role.mention}\n" if role else "")
+                + f"操作ID: `{op_id}`\n\n"
+                + ("週間は毎週月曜 00:00 (JST)、月間は毎月1日 00:00 (JST) に"
+                   "**締めた期間**を自動配布します。"),
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="remove", description="報酬の設定を削除します")
+    @app_commands.describe(reward_id="設定ID (`/ranking_reward list` で確認)")
+    @app_commands.guild_only()
+    @require_admin()
+    async def remove(
+        self, interaction: discord.Interaction,
+        reward_id: app_commands.Range[int, 1, 10_000_000],
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        assert guild is not None
+        removed = await bot.db.remove_ranking_reward(guild.id, int(reward_id))
+        op_id = await _audit(
+            interaction, "RANKING_REWARD_REMOVE", detail={"reward_id": int(reward_id)}
+        )
+        await interaction.followup.send(
+            embed=ui.info_embed(
+                "削除しました" if removed else "見つかりません",
+                f"設定ID: `{reward_id}`\n操作ID: `{op_id}`",
+                color=config.Color.NEUTRAL if removed else config.Color.DANGER,
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="list", description="報酬の設定と直近の配布を表示します")
+    @app_commands.guild_only()
+    @require_admin()
+    async def list_rewards(self, interaction: discord.Interaction) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.followup.send(
+            embed=ui.ranking_reward_list_embed(
+                await bot.db.list_ranking_rewards(guild.id),
+                guild_name=guild.name,
+                grants=await bot.db.list_ranking_grants(guild.id, limit=10),
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="run", description="報酬の配布を手動で実行します")
+    @app_commands.describe(
+        period="集計期間", current="進行中の期間で配布する (既定は締めた期間)",
+    )
+    @app_commands.choices(period=_RANKING_PERIOD_CHOICES)
+    @app_commands.guild_only()
+    @require_admin()
+    async def run(
+        self,
+        interaction: discord.Interaction,
+        period: app_commands.Choice[str],
+        current: bool = False,
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        start, end, period_key = (
+            utils.current_period_bounds(period.value) if current
+            else utils.period_bounds(period.value)
+        )
+        approved = await _confirm(
+            interaction,
+            title=f"{period.name}ランキングの報酬を配布します",
+            description=(
+                f"対象期間: **{period_key}**\n"
+                f"{utils.format_jst(start)} 〜 {utils.format_jst(end)}\n"
+                + ("⚠️ **進行中の期間**で配布します。以後この期間は自動配布されません。\n"
+                   if current else "")
+                + "\n配布済みの利用者へは二重に配布されません。"
+            ),
+            confirm_label="配布する",
+            danger=False,
+        )
+        if not approved:
+            return
+        result = await bot.charge.distribute_ranking_rewards(
+            guild.id, period.value, use_current=current, operator_id=interaction.user.id
+        )
+        await _audit(
+            interaction, "RANKING_REWARD_RUN",
+            detail={"period": period.value, "period_key": result.get("period_key"),
+                    "granted": result.get("granted"), "current": current},
+        )
+        if result.get("already"):
+            await interaction.followup.send(
+                embed=ui.info_embed(
+                    "すでに配布済みです",
+                    f"期間 **{result['period_key']}** の配布は完了しています。",
+                    color=config.Color.NEUTRAL,
+                ),
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "🏆 配布しました",
+                f"期間: **{result.get('period_key')}**\n"
+                f"配布: **{result.get('granted')} 人**\n"
+                f"重複スキップ: {result.get('skipped')} 人\n\n"
+                + ("報酬の設定がないか、期間中のチャージがありませんでした。"
+                   if not result.get("granted") else "実績チャンネルへ結果を投稿しました。"),
+            ),
+            ephemeral=True,
+        )
+
+
+# ---------------------------------------------------------------------------
 # /provider (チャージ方式の設定)
 # ---------------------------------------------------------------------------
 _PROVIDER_CHOICES = [
@@ -5600,7 +5967,7 @@ async def setup_commands(bot: "ChargeBot") -> None:
         MaintenanceGroup(), EmergencyStopGroup(), AchievementGroup(), TransactionGroup(),
         DataGroup(), ConfigGroup(), SystemGroup(), RateGroup(), ShopGroup(),
         CampaignGroup(), ExportGroup(), GlobalGroup(),
-        ProviderGroup(), RequestGroup(),
+        ProviderGroup(), RequestGroup(), TierGroup(), RankingRewardGroup(),
     ):
         tree.add_command(group)
 

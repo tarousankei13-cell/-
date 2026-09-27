@@ -81,6 +81,67 @@ def discord_ts(ts: int | None, style: str = "f") -> str:
     return f"<t:{int(ts)}:{style}>"
 
 
+def jst_week_start(ts: int | None = None) -> int:
+    """その週の月曜 00:00 (JST) の UNIX 秒。"""
+    moment = datetime.fromtimestamp(ts or now_ts(), JST)
+    start = moment.replace(hour=0, minute=0, second=0, microsecond=0)
+    start -= timedelta(days=start.weekday())
+    return int(start.timestamp())
+
+
+def period_bounds(period: str, ts: int | None = None) -> tuple[int, int, str]:
+    """締めた期間の (開始, 終了, 期間キー) を返す。
+
+    ``ts`` が属する期間ではなく、**その1つ前の完了した期間**を返す。
+    ランキング報酬は「終わった期間」を表彰するため。
+
+    Returns:
+        ``(start, end, period_key)``。end は期間の直後 (半開区間)。
+        period_key は ``2026-W39`` / ``2026-09`` の形式。
+    """
+    moment = ts or now_ts()
+    if period == config.RankingPeriod.WEEKLY:
+        this_start = jst_week_start(moment)
+        start = jst_week_start(this_start - 1)
+        end = this_start
+        iso = datetime.fromtimestamp(start, JST).isocalendar()
+        return start, end, f"{iso[0]}-W{iso[1]:02d}"
+    if period == config.RankingPeriod.MONTHLY:
+        this_start = jst_month_start(moment)
+        start = jst_month_start(this_start - 1)
+        end = this_start
+        stamp = datetime.fromtimestamp(start, JST)
+        return start, end, f"{stamp.year}-{stamp.month:02d}"
+    raise ValueError(f"不明な期間です: {period}")
+
+
+def current_period_bounds(period: str, ts: int | None = None) -> tuple[int, int, str]:
+    """進行中の期間の (開始, 現在, 期間キー)。手動配布の確認用。"""
+    moment = ts or now_ts()
+    if period == config.RankingPeriod.WEEKLY:
+        start = jst_week_start(moment)
+        iso = datetime.fromtimestamp(start, JST).isocalendar()
+        return start, moment, f"{iso[0]}-W{iso[1]:02d}"
+    if period == config.RankingPeriod.MONTHLY:
+        start = jst_month_start(moment)
+        stamp = datetime.fromtimestamp(start, JST)
+        return start, moment, f"{stamp.year}-{stamp.month:02d}"
+    raise ValueError(f"不明な期間です: {period}")
+
+
+def progress_bar(current: int, target: int, width: int = config.GOAL_BAR_WIDTH) -> str:
+    """進捗バーを文字で描く (端末・スマホどちらでも崩れない文字を使う)。"""
+    if target <= 0:
+        return "─" * width
+    ratio = min(1.0, max(0.0, current / target))
+    filled = int(ratio * width)
+    if 0 < ratio < 1 and filled == 0:
+        filled = 1           # わずかでも進んでいれば1つ塗る
+    if ratio < 1 and filled == width:
+        filled = width - 1   # 未達で満タンに見せない
+    return "█" * filled + "░" * (width - filled)
+
+
 def format_duration(seconds: int | float) -> str:
     """秒数を「1d 02:03:04」形式へ整形する。"""
     seconds = int(max(0, seconds))

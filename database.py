@@ -245,6 +245,8 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         charge_rate            TEXT    NOT NULL,
         credited_amount        INTEGER,
         provider               TEXT    NOT NULL DEFAULT 'KYASH',
+        sender_name            TEXT,
+        kyash_account_id       INTEGER,
         link_hash              TEXT UNIQUE,
         link_uuid              TEXT UNIQUE,
         claim_link_id          TEXT,
@@ -396,6 +398,9 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         duration_days  INTEGER NOT NULL DEFAULT 0,
         stock          INTEGER NOT NULL DEFAULT -1,
         purchase_limit INTEGER NOT NULL DEFAULT 0,
+        item_type      TEXT    NOT NULL DEFAULT 'ROLE',
+        subscription   INTEGER NOT NULL DEFAULT 0,
+        payload        TEXT,
         sort_order     INTEGER NOT NULL DEFAULT 0,
         active         INTEGER NOT NULL DEFAULT 1,
         created_by     INTEGER,
@@ -414,6 +419,11 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         role_id       INTEGER NOT NULL,
         price         INTEGER NOT NULL,
         status        TEXT    NOT NULL DEFAULT 'PENDING',
+        item_type     TEXT    NOT NULL DEFAULT 'ROLE',
+        subscription  INTEGER NOT NULL DEFAULT 0,
+        renewal_count INTEGER NOT NULL DEFAULT 0,
+        next_charge_at INTEGER,
+        notified_at   INTEGER,
         expires_at    INTEGER,
         refunded_at   INTEGER,
         refund_reason TEXT,
@@ -600,6 +610,255 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     "ON charge_requests(provider, status, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_requests_message "
     "ON charge_requests(review_message_id) WHERE review_message_id IS NOT NULL",
+    # ================= v4 =================
+    # -- 累計チャージによる自動昇格 --
+    """
+    CREATE TABLE IF NOT EXISTS charge_tiers (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id    INTEGER NOT NULL,
+        name        TEXT    NOT NULL,
+        threshold   INTEGER NOT NULL,
+        role_id     INTEGER NOT NULL,
+        description TEXT,
+        created_by  INTEGER,
+        created_at  INTEGER NOT NULL DEFAULT 0,
+        updated_at  INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_tiers_role ON charge_tiers(guild_id, role_id)",
+    "CREATE INDEX IF NOT EXISTS idx_tiers_threshold ON charge_tiers(guild_id, threshold)",
+    # 昇格の記録 (同じ段位を二重に付与しない)
+    """
+    CREATE TABLE IF NOT EXISTS tier_grants (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id   INTEGER NOT NULL,
+        user_id    INTEGER NOT NULL,
+        tier_id    INTEGER NOT NULL,
+        total_at   INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL DEFAULT 0,
+        UNIQUE (guild_id, user_id, tier_id)
+    )
+    """,
+    # -- ランキング報酬 --
+    """
+    CREATE TABLE IF NOT EXISTS ranking_rewards (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id     INTEGER NOT NULL,
+        ranking_type TEXT    NOT NULL,
+        rank_from    INTEGER NOT NULL,
+        rank_to      INTEGER NOT NULL,
+        amount       INTEGER NOT NULL DEFAULT 0,
+        role_id      INTEGER,
+        created_by   INTEGER,
+        created_at   INTEGER NOT NULL DEFAULT 0,
+        updated_at   INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_ranking_rewards_range "
+    "ON ranking_rewards(guild_id, ranking_type, rank_from, rank_to)",
+    # 配布履歴。period_key で締めた期間を表し、UNIQUE で二重配布を防ぐ
+    """
+    CREATE TABLE IF NOT EXISTS ranking_reward_grants (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id     INTEGER NOT NULL,
+        ranking_type TEXT    NOT NULL,
+        period_key   TEXT    NOT NULL,
+        user_id      INTEGER NOT NULL,
+        rank         INTEGER NOT NULL,
+        score        INTEGER NOT NULL DEFAULT 0,
+        amount       INTEGER NOT NULL DEFAULT 0,
+        role_id      INTEGER,
+        created_at   INTEGER NOT NULL DEFAULT 0,
+        UNIQUE (guild_id, ranking_type, period_key, user_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_ranking_grants_period "
+    "ON ranking_reward_grants(guild_id, ranking_type, period_key)",
+    # -- 受取用 Kyash アカウント (複数登録) --
+    """
+    CREATE TABLE IF NOT EXISTS kyash_accounts (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        label             TEXT    NOT NULL,
+        email             TEXT,
+        client_uuid       TEXT,
+        installation_uuid TEXT,
+        access_token_enc  TEXT,
+        status            TEXT    NOT NULL DEFAULT 'UNCONFIGURED',
+        username          TEXT,
+        wallet_uuid       TEXT,
+        wallet_balance    INTEGER,
+        threshold         INTEGER NOT NULL DEFAULT 0,
+        priority          INTEGER NOT NULL DEFAULT 0,
+        enabled           INTEGER NOT NULL DEFAULT 1,
+        last_checked_at   INTEGER,
+        last_error        TEXT,
+        token_issued_at   INTEGER,
+        created_at        INTEGER NOT NULL DEFAULT 0,
+        updated_at        INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_kyash_accounts_label ON kyash_accounts(label)",
+    "CREATE INDEX IF NOT EXISTS idx_kyash_accounts_pick "
+    "ON kyash_accounts(enabled, priority, id)",
+    # -- オークション --
+    """
+    CREATE TABLE IF NOT EXISTS auctions (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id       INTEGER NOT NULL,
+        name           TEXT    NOT NULL,
+        description    TEXT,
+        role_id        INTEGER NOT NULL,
+        duration_days  INTEGER NOT NULL DEFAULT 0,
+        start_price    INTEGER NOT NULL,
+        min_increment  INTEGER NOT NULL DEFAULT 1,
+        current_bid    INTEGER,
+        current_bidder INTEGER,
+        status         TEXT    NOT NULL DEFAULT 'OPEN',
+        winner_id      INTEGER,
+        winning_bid    INTEGER,
+        channel_id     INTEGER,
+        message_id     INTEGER,
+        ends_at        INTEGER NOT NULL,
+        closed_at      INTEGER,
+        created_by     INTEGER,
+        created_at     INTEGER NOT NULL DEFAULT 0,
+        updated_at     INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_auctions_open ON auctions(status, ends_at)",
+    "CREATE INDEX IF NOT EXISTS idx_auctions_guild ON auctions(guild_id, status, ends_at)",
+    "CREATE INDEX IF NOT EXISTS idx_auctions_message "
+    "ON auctions(message_id) WHERE message_id IS NOT NULL",
+    """
+    CREATE TABLE IF NOT EXISTS auction_bids (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        auction_id INTEGER NOT NULL REFERENCES auctions(id),
+        guild_id   INTEGER NOT NULL,
+        user_id    INTEGER NOT NULL,
+        amount     INTEGER NOT NULL,
+        refunded   INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_auction_bids ON auction_bids(auction_id, created_at DESC)",
+    # -- サーバー全体のチャージ目標 --
+    """
+    CREATE TABLE IF NOT EXISTS charge_goals (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id       INTEGER NOT NULL,
+        name           TEXT    NOT NULL,
+        target_amount  INTEGER NOT NULL,
+        reward_amount  INTEGER NOT NULL DEFAULT 0,
+        reward_role_id INTEGER,
+        status         TEXT    NOT NULL DEFAULT 'OPEN',
+        starts_at      INTEGER NOT NULL,
+        ends_at        INTEGER,
+        achieved_at    INTEGER,
+        achieved_total INTEGER,
+        closed_at      INTEGER,
+        created_by     INTEGER,
+        created_at     INTEGER NOT NULL DEFAULT 0,
+        updated_at     INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_goals_open ON charge_goals(guild_id, status)",
+    """
+    CREATE TABLE IF NOT EXISTS goal_reward_grants (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        goal_id    INTEGER NOT NULL REFERENCES charge_goals(id),
+        guild_id   INTEGER NOT NULL,
+        user_id    INTEGER NOT NULL,
+        amount     INTEGER NOT NULL DEFAULT 0,
+        role_id    INTEGER,
+        created_at INTEGER NOT NULL DEFAULT 0,
+        UNIQUE (goal_id, user_id)
+    )
+    """,
+    # -- 不正検知のフラグ --
+    """
+    CREATE TABLE IF NOT EXISTS fraud_flags (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id    INTEGER NOT NULL,
+        user_id     INTEGER NOT NULL,
+        kind        TEXT    NOT NULL,
+        severity    TEXT    NOT NULL DEFAULT 'WARN',
+        detail      TEXT,
+        evidence    TEXT,
+        status      TEXT    NOT NULL DEFAULT 'OPEN',
+        channel_id  INTEGER,
+        message_id  INTEGER,
+        reviewed_by INTEGER,
+        reviewed_at INTEGER,
+        note        TEXT,
+        created_at  INTEGER NOT NULL DEFAULT 0,
+        updated_at  INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    # 同じ利用者・同じ種別の未処理フラグを重複して立てない
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_fraud_open "
+    "ON fraud_flags(guild_id, user_id, kind) WHERE status='OPEN'",
+    "CREATE INDEX IF NOT EXISTS idx_fraud_status ON fraud_flags(status, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_fraud_message "
+    "ON fraud_flags(message_id) WHERE message_id IS NOT NULL",
+    # -- 返金申請 --
+    """
+    CREATE TABLE IF NOT EXISTS refund_requests (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id       INTEGER NOT NULL,
+        user_id        INTEGER NOT NULL,
+        transaction_id TEXT    NOT NULL,
+        amount         INTEGER NOT NULL DEFAULT 0,
+        reason         TEXT,
+        status         TEXT    NOT NULL DEFAULT 'PENDING',
+        channel_id     INTEGER,
+        message_id     INTEGER,
+        reviewed_by    INTEGER,
+        reviewed_at    INTEGER,
+        reject_reason  TEXT,
+        operation_id   TEXT,
+        created_at     INTEGER NOT NULL DEFAULT 0,
+        updated_at     INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    # 同じ取引について未処理の申請を2つ作らせない
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_refund_open "
+    "ON refund_requests(transaction_id) WHERE status='PENDING'",
+    "CREATE INDEX IF NOT EXISTS idx_refund_status "
+    "ON refund_requests(status, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_refund_message "
+    "ON refund_requests(message_id) WHERE message_id IS NOT NULL",
+    # -- ショップ: 購入で作った付随物 (カスタムロール・チャンネル等) --
+    """
+    CREATE TABLE IF NOT EXISTS purchase_assets (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        purchase_id INTEGER NOT NULL REFERENCES shop_purchases(id),
+        guild_id    INTEGER NOT NULL,
+        user_id     INTEGER NOT NULL,
+        asset_type  TEXT    NOT NULL,
+        asset_id    INTEGER,
+        detail      TEXT,
+        removed_at  INTEGER,
+        created_at  INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_purchase_assets ON purchase_assets(purchase_id)",
+    "CREATE INDEX IF NOT EXISTS idx_purchase_assets_live "
+    "ON purchase_assets(guild_id, asset_type) WHERE removed_at IS NULL",
+    # -- 一時的なチャージ率ブースト --
+    """
+    CREATE TABLE IF NOT EXISTS rate_boosts (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id    INTEGER NOT NULL,
+        user_id     INTEGER NOT NULL,
+        bonus_rate  TEXT    NOT NULL,
+        source      TEXT,
+        purchase_id INTEGER,
+        expires_at  INTEGER NOT NULL,
+        created_at  INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_rate_boosts_live "
+    "ON rate_boosts(guild_id, user_id, expires_at)",
 )
 
 
@@ -1611,8 +1870,10 @@ class Database:
         """管理者操作による残高変更 (加算 / 減算 / 設定)。
 
         ``change_type``:
-            ADMIN_ADD → amount を加算 / ADMIN_REMOVE → amount を減算 (0未満にはしない)
-            ADMIN_SET → amount を設定値とする / PROXY_ACHIEVEMENT → amount を加算
+            加算 … ADMIN_ADD / PROXY_ACHIEVEMENT / RANKING_REWARD / GOAL_REWARD /
+                   AUCTION_REFUND / INVITE_REWARD
+            減算 … ADMIN_REMOVE / AUCTION_BID / SUBSCRIPTION (0未満にはしない)
+            設定 … ADMIN_SET
         """
         now = utils.now_ts()
 
@@ -1621,10 +1882,9 @@ class Database:
                 "SELECT balance FROM balances WHERE guild_id=? AND user_id=?", (guild_id, user_id)
             ).fetchone()
             before = int(bal_row["balance"]) if bal_row else 0
-            if change_type in (config.BalanceChangeType.ADMIN_ADD,
-                               config.BalanceChangeType.PROXY_ACHIEVEMENT):
+            if change_type in _ADJUST_ADD_TYPES:
                 after = before + int(amount)
-            elif change_type == config.BalanceChangeType.ADMIN_REMOVE:
+            elif change_type in _ADJUST_SUBTRACT_TYPES:
                 after = max(0, before - int(amount))
             elif change_type == config.BalanceChangeType.ADMIN_SET:
                 after = max(0, int(amount))
@@ -2176,6 +2436,247 @@ class Database:
             raise DatabaseError("取引IDの生成に失敗しました")
 
         return await self.run(_fn, write=True)
+
+    # ------------------------------------------------------------------
+    # 累計チャージによる段位 (charge_tiers / tier_grants)
+    # ------------------------------------------------------------------
+    async def get_total_charged(self, guild_id: int, user_id: int) -> int:
+        """段位判定に使う累計チャージ額 (取消された取引は除く)。
+
+        ``get_user_charge_summary`` と違い、返金済みの取引を数えない。
+        「使った額に応じて優遇する」という趣旨に合わせるため。
+        """
+        row = await self.fetchone(
+            "SELECT COALESCE(SUM(received_amount),0) AS s FROM charge_transactions "
+            "WHERE guild_id=? AND user_id=? AND status=? AND refunded_at IS NULL",
+            (guild_id, user_id, config.TxStatus.COMPLETED),
+        )
+        return int(row["s"] or 0) if row else 0
+
+    async def add_tier(
+        self, *, guild_id: int, name: str, threshold: int, role_id: int,
+        description: str | None, created_by: int,
+    ) -> int:
+        """段位を追加する。同じロールは1つの段位にしか使えない。"""
+        now = utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> int:
+            count = conn.execute(
+                "SELECT COUNT(*) AS c FROM charge_tiers WHERE guild_id=?", (guild_id,)
+            ).fetchone()
+            if int(count["c"]) >= config.MAX_TIERS_PER_GUILD:
+                raise DatabaseError(
+                    f"段位は {config.MAX_TIERS_PER_GUILD} 個までです"
+                )
+            cur = conn.execute(
+                "INSERT INTO charge_tiers("
+                "guild_id, name, threshold, role_id, description, created_by, "
+                "created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                (guild_id, name, int(threshold), role_id, description, created_by, now, now),
+            )
+            return _lastrowid(cur)
+
+        return await self.run(_fn, write=True)
+
+    async def remove_tier(self, guild_id: int, tier_id: int) -> bool:
+        def _fn(conn: sqlite3.Connection) -> bool:
+            cur = conn.execute(
+                "DELETE FROM charge_tiers WHERE id=? AND guild_id=?", (tier_id, guild_id)
+            )
+            if cur.rowcount:
+                # 付与記録も消す (段位を作り直したら再付与できるように)
+                conn.execute("DELETE FROM tier_grants WHERE guild_id=? AND tier_id=?",
+                             (guild_id, tier_id))
+            return cur.rowcount > 0
+
+        return await self.run(_fn, write=True)
+
+    async def list_tiers(self, guild_id: int) -> list[sqlite3.Row]:
+        """段位をしきい値の小さい順に返す。"""
+        return await self.fetchall(
+            "SELECT * FROM charge_tiers WHERE guild_id=? ORDER BY threshold ASC, id ASC",
+            (guild_id,),
+        )
+
+    async def get_tier(self, guild_id: int, tier_id: int) -> sqlite3.Row | None:
+        return await self.fetchone(
+            "SELECT * FROM charge_tiers WHERE id=? AND guild_id=?", (tier_id, guild_id)
+        )
+
+    async def list_granted_tier_ids(self, guild_id: int, user_id: int) -> set[int]:
+        rows = await self.fetchall(
+            "SELECT tier_id FROM tier_grants WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        )
+        return {int(r["tier_id"]) for r in rows}
+
+    async def record_tier_grant(
+        self, *, guild_id: int, user_id: int, tier_id: int, total: int
+    ) -> bool:
+        """段位の付与を記録する。
+
+        Returns:
+            新しく記録できた場合 True。既に記録済みなら False
+            (UNIQUE 制約により二重付与にならない)。
+        """
+        def _fn(conn: sqlite3.Connection) -> bool:
+            try:
+                conn.execute(
+                    "INSERT INTO tier_grants(guild_id, user_id, tier_id, total_at, created_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (guild_id, user_id, tier_id, int(total), utils.now_ts()),
+                )
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+        return await self.run(_fn, write=True)
+
+    async def list_tier_candidates(self, guild_id: int, *, limit: int = 200) -> list[int]:
+        """段位判定の対象になる利用者 (チャージ実績のある人)。"""
+        rows = await self.fetchall(
+            "SELECT DISTINCT user_id FROM charge_transactions "
+            "WHERE guild_id=? AND status=? AND refunded_at IS NULL LIMIT ?",
+            (guild_id, config.TxStatus.COMPLETED, int(limit)),
+        )
+        return [int(r["user_id"]) for r in rows]
+
+    # ------------------------------------------------------------------
+    # ランキング報酬 (ranking_rewards / ranking_reward_grants)
+    # ------------------------------------------------------------------
+    async def set_ranking_reward(
+        self, *, guild_id: int, ranking_type: str, rank_from: int, rank_to: int,
+        amount: int, role_id: int | None, created_by: int,
+    ) -> int:
+        now = utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> int:
+            conn.execute(
+                "INSERT INTO ranking_rewards("
+                "guild_id, ranking_type, rank_from, rank_to, amount, role_id, "
+                "created_by, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(guild_id, ranking_type, rank_from, rank_to) DO UPDATE SET "
+                "amount=excluded.amount, role_id=excluded.role_id, "
+                "created_by=excluded.created_by, updated_at=excluded.updated_at",
+                (guild_id, ranking_type, int(rank_from), int(rank_to), int(amount),
+                 role_id, created_by, now, now),
+            )
+            row = conn.execute(
+                "SELECT id FROM ranking_rewards WHERE guild_id=? AND ranking_type=? "
+                "AND rank_from=? AND rank_to=?",
+                (guild_id, ranking_type, int(rank_from), int(rank_to)),
+            ).fetchone()
+            return int(row["id"]) if row else 0
+
+        return await self.run(_fn, write=True)
+
+    async def remove_ranking_reward(self, guild_id: int, reward_id: int) -> bool:
+        def _fn(conn: sqlite3.Connection) -> bool:
+            cur = conn.execute(
+                "DELETE FROM ranking_rewards WHERE id=? AND guild_id=?",
+                (reward_id, guild_id),
+            )
+            return cur.rowcount > 0
+
+        return await self.run(_fn, write=True)
+
+    async def list_ranking_rewards(
+        self, guild_id: int, ranking_type: str | None = None
+    ) -> list[sqlite3.Row]:
+        if ranking_type:
+            return await self.fetchall(
+                "SELECT * FROM ranking_rewards WHERE guild_id=? AND ranking_type=? "
+                "ORDER BY rank_from ASC",
+                (guild_id, ranking_type),
+            )
+        return await self.fetchall(
+            "SELECT * FROM ranking_rewards WHERE guild_id=? "
+            "ORDER BY ranking_type ASC, rank_from ASC",
+            (guild_id,),
+        )
+
+    async def get_period_ranking(
+        self, guild_id: int, *, start: int, end: int, limit: int = 100
+    ) -> list[sqlite3.Row]:
+        """指定した期間に獲得した残高でランキングを作る。
+
+        既存の ``get_ranking`` は「直近7日」「当月」のローリング集計なので、
+        締めた期間で表彰するにはここで明示的に期間を指定する。
+        凍結された利用者と Bot は除外する。
+        """
+        return await self.fetchall(
+            "SELECT t.user_id AS user_id, SUM(t.credited_amount) AS score "
+            "FROM charge_transactions t "
+            "LEFT JOIN users u ON u.guild_id=t.guild_id AND u.user_id=t.user_id "
+            "WHERE t.guild_id=? AND t.status=? AND t.refunded_at IS NULL "
+            "AND t.created_at>=? AND t.created_at<? AND COALESCE(u.frozen,0)=0 "
+            "GROUP BY t.user_id HAVING score > 0 "
+            "ORDER BY score DESC, t.user_id ASC LIMIT ?",
+            (guild_id, config.TxStatus.COMPLETED, int(start), int(end), int(limit)),
+        )
+
+    async def get_period_invite_ranking(
+        self, guild_id: int, *, start: int, end: int, limit: int = 100
+    ) -> list[sqlite3.Row]:
+        """指定した期間に確定した招待数でランキングを作る。"""
+        return await self.fetchall(
+            "SELECT inviter_id AS user_id, COUNT(*) AS score FROM invite_records "
+            "WHERE guild_id=? AND status=? AND inviter_id IS NOT NULL "
+            "AND confirmed_at>=? AND confirmed_at<? "
+            "GROUP BY inviter_id ORDER BY score DESC, inviter_id ASC LIMIT ?",
+            (guild_id, config.InviteStatus.CONFIRMED, int(start), int(end), int(limit)),
+        )
+
+    async def has_ranking_grants(
+        self, guild_id: int, ranking_type: str, period_key: str
+    ) -> bool:
+        """その期間の配布が既に済んでいるか。"""
+        row = await self.fetchone(
+            "SELECT 1 AS x FROM ranking_reward_grants "
+            "WHERE guild_id=? AND ranking_type=? AND period_key=? LIMIT 1",
+            (guild_id, ranking_type, period_key),
+        )
+        return row is not None
+
+    async def record_ranking_grant(
+        self, *, guild_id: int, ranking_type: str, period_key: str, user_id: int,
+        rank: int, score: int, amount: int, role_id: int | None,
+    ) -> bool:
+        """配布を記録する。既に記録済みなら False (二重配布を防ぐ)。"""
+        def _fn(conn: sqlite3.Connection) -> bool:
+            try:
+                conn.execute(
+                    "INSERT INTO ranking_reward_grants("
+                    "guild_id, ranking_type, period_key, user_id, rank, score, amount, "
+                    "role_id, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (guild_id, ranking_type, period_key, user_id, int(rank), int(score),
+                     int(amount), role_id, utils.now_ts()),
+                )
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+        return await self.run(_fn, write=True)
+
+    async def list_ranking_grants(
+        self, guild_id: int, *, ranking_type: str | None = None, limit: int = 25
+    ) -> list[sqlite3.Row]:
+        if ranking_type:
+            return await self.fetchall(
+                "SELECT * FROM ranking_reward_grants WHERE guild_id=? AND ranking_type=? "
+                "ORDER BY created_at DESC, rank ASC LIMIT ?",
+                (guild_id, ranking_type, int(limit)),
+            )
+        return await self.fetchall(
+            "SELECT * FROM ranking_reward_grants WHERE guild_id=? "
+            "ORDER BY created_at DESC, rank ASC LIMIT ?",
+            (guild_id, int(limit)),
+        )
+
+    async def list_reward_guilds(self) -> list[int]:
+        """ランキング報酬が設定されているサーバー。"""
+        rows = await self.fetchall("SELECT DISTINCT guild_id FROM ranking_rewards")
+        return [int(r["guild_id"]) for r in rows]
 
     # ------------------------------------------------------------------
     # キュー
@@ -4146,7 +4647,36 @@ _FORWARD_COMPAT_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("charge_transactions", "claim_link_id", "TEXT"),
     ("charge_requests", "operation_id", "TEXT"),
     ("charge_requests", "role_id", "INTEGER"),
+    # v4 で追加
+    ("charge_transactions", "sender_name", "TEXT"),
+    ("charge_transactions", "kyash_account_id", "INTEGER"),
+    ("shop_items", "item_type", "TEXT NOT NULL DEFAULT 'ROLE'"),
+    ("shop_items", "subscription", "INTEGER NOT NULL DEFAULT 0"),
+    ("shop_items", "payload", "TEXT"),
+    ("shop_purchases", "renewal_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("shop_purchases", "next_charge_at", "INTEGER"),
+    ("shop_purchases", "notified_at", "INTEGER"),
+    ("shop_purchases", "item_type", "TEXT NOT NULL DEFAULT 'ROLE'"),
+    ("shop_purchases", "subscription", "INTEGER NOT NULL DEFAULT 0"),
 )
+
+
+#: ``adjust_balance`` で加算として扱う種別
+_ADJUST_ADD_TYPES: frozenset[str] = frozenset({
+    config.BalanceChangeType.ADMIN_ADD,
+    config.BalanceChangeType.PROXY_ACHIEVEMENT,
+    config.BalanceChangeType.RANKING_REWARD,
+    config.BalanceChangeType.GOAL_REWARD,
+    config.BalanceChangeType.AUCTION_REFUND,
+    config.BalanceChangeType.INVITE_REWARD,
+})
+
+#: ``adjust_balance`` で減算として扱う種別
+_ADJUST_SUBTRACT_TYPES: frozenset[str] = frozenset({
+    config.BalanceChangeType.ADMIN_REMOVE,
+    config.BalanceChangeType.AUCTION_BID,
+    config.BalanceChangeType.SUBSCRIPTION,
+})
 
 
 def _lastrowid(cursor: sqlite3.Cursor) -> int:

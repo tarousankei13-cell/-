@@ -929,6 +929,11 @@ class ChargeService:
             self.confirm_invite_after_charge(int(result["guild_id"]), int(result["user_id"])),
             context="招待確定",
         )
+        # 累計チャージ額による段位の自動昇格
+        await self._safe(
+            self.check_tiers(int(result["guild_id"]), int(result["user_id"])),
+            context="段位判定",
+        )
         await self._safe(self.notify_result(tx_id), context="完了DM")
         await self._safe(self.update_achievement(tx_id), context="実績更新")
         try:
@@ -1241,6 +1246,263 @@ class ChargeService:
             detail={"transaction_id": tx_id, "verdict": verification.verdict},
         )
         self.queue_wakeup.set()
+
+    # ==================================================================
+    # 累計チャージによる段位 (自動昇格・降格なし)
+    # ==================================================================
+    async def check_tiers(self, guild_id: int, user_id: int) -> list[sqlite3.Row]:
+        """累計チャージ額を見て、到達した段位のロールを付与する。
+
+        しきい値を超えた段位はすべて付与する (途中の段位を飛ばさない)。
+        一度付与した段位は記録され、**降格はしない**。
+
+        Returns:
+            新しく付与した段位の行。
+        """
+        tiers = await self.db.list_tiers(guild_id)
+        if not tiers:
+            return []
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return []
+        member = guild.get_member(user_id)
+        if member is None:
+            return []
+        total = await self.db.get_total_charged(guild_id, user_id)
+        granted_ids = await self.db.list_granted_tier_ids(guild_id, user_id)
+        promoted: list[sqlite3.Row] = []
+        for tier in tiers:
+            tier_id = int(tier["id"])
+            if tier_id in granted_ids:
+                continue
+            if total < int(tier["threshold"]):
+                continue
+            role = guild.get_role(int(tier["role_id"]))
+            if role is None:
+                logger.warning("段位のロールが存在しません guild=%s tier=%s role=%s",
+                               guild_id, tier_id, tier["role_id"])
+                continue
+            problem = self.role_grant_problem(guild, role)
+            if problem:
+                logger.warning("段位のロールを付与できません guild=%s tier=%s: %s",
+                               guild_id, tier_id, problem)
+                await self._safe(self.bot.alert_owner(
+                    f"サーバー `{guild_id}` の段位 **{tier['name']}** のロールを"
+                    f"付与できません: {problem}"
+                ), context="Owner通知")
+                continue
+            # 記録を先に取る。ロール付与が失敗しても二重に通知しないため。
+            if not await self.db.record_tier_grant(
+                guild_id=guild_id, user_id=user_id, tier_id=tier_id, total=total
+            ):
+                continue
+            try:
+                if role not in getattr(member, "roles", []):
+                    await member.add_roles(role, reason=f"段位到達: {tier['name']}")
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.warning("段位ロールの付与に失敗しました guild=%s user=%s: %s",
+                               guild_id, user_id, utils.safe_error_text(exc))
+                continue
+            promoted.append(tier)
+            logger.info("段位に到達しました guild=%s user=%s tier=%s total=%s",
+                        guild_id, user_id, tier["name"], total)
+
+        for tier in promoted:
+            await self._safe(
+                self._announce_tier(guild_id, user_id, tier, total), context="段位通知"
+            )
+        return promoted
+
+    async def _announce_tier(
+        self, guild_id: int, user_id: int, tier: sqlite3.Row, total: int
+    ) -> None:
+        """段位到達を実績チャンネルへ投稿し、本人へ DM する。"""
+        embed = ui.tier_achievement_embed(
+            user_mention=f"<@{user_id}>",
+            tier=tier,
+            total_charged=total,
+            timestamp=utils.now_ts(),
+        )
+        await self.post_generic_achievement(guild_id, embed)
+        await self._send_dm(
+            user_id,
+            ui.tier_dm_embed(
+                guild_name=self.guild_name(guild_id), tier=tier, total_charged=total
+            ),
+            queue_on_failure=True,
+        )
+        await self.log_event(
+            guild_id,
+            "🎖 段位に到達しました",
+            fields=(
+                ("利用者", f"<@{user_id}>", True),
+                ("段位", str(tier["name"]), True),
+                ("ロール", f"<@&{int(tier['role_id'])}>", True),
+                ("累計チャージ", utils.fmt_yen(total), True),
+            ),
+            color=config.Color.SUCCESS,
+        )
+
+    def role_grant_problem(
+        self, guild: discord.Guild, role: discord.Role
+    ) -> str | None:
+        """Bot がそのロールを付与できない理由 (問題なければ None)。"""
+        me = guild.me
+        if me is None or not me.guild_permissions.manage_roles:
+            return "Bot に「ロールの管理」権限がありません"
+        if role.managed:
+            return "連携により管理されているロールです"
+        if role.is_default():
+            return "@everyone は指定できません"
+        if role >= me.top_role:
+            return "Bot のロールより上位のため付与できません"
+        return None
+
+    async def sweep_tiers(self, *, limit: int = 200) -> int:
+        """段位の取りこぼしをまとめて拾う (しきい値変更後などの追いつき)。"""
+        total_promoted = 0
+        for guild in list(self.bot.guilds):
+            if not await self.db.is_guild_allowed(guild.id):
+                continue
+            if not await self.db.list_tiers(guild.id):
+                continue
+            for user_id in await self.db.list_tier_candidates(guild.id, limit=limit):
+                try:
+                    total_promoted += len(await self.check_tiers(guild.id, user_id))
+                except Exception:  # noqa: BLE001
+                    logger.exception("段位判定に失敗しました guild=%s user=%s",
+                                     guild.id, user_id)
+        if total_promoted:
+            logger.info("段位を %d 件付与しました (追いつき処理)", total_promoted)
+        return total_promoted
+
+    # ==================================================================
+    # ランキング報酬 (締めた期間の上位へ自動配布)
+    # ==================================================================
+    async def distribute_ranking_rewards(
+        self,
+        guild_id: int,
+        period: str,
+        *,
+        use_current: bool = False,
+        operator_id: int | None = None,
+    ) -> dict[str, Any]:
+        """締めた期間のランキング上位へ報酬を配布する。
+
+        ``ranking_reward_grants`` の UNIQUE 制約により、同じ期間・同じ利用者へ
+        二重に配布されることはない。
+
+        Args:
+            use_current: True の場合、進行中の期間で配布する (手動実行用)。
+            operator_id: 手動実行した管理者 (監査ログ用)。
+        """
+        rewards = await self.db.list_ranking_rewards(guild_id, period)
+        if not rewards:
+            return {"granted": 0, "skipped": 0, "period_key": None, "entries": []}
+        if use_current:
+            start, end, period_key = utils.current_period_bounds(period)
+        else:
+            start, end, period_key = utils.period_bounds(period)
+            if await self.db.has_ranking_grants(guild_id, period, period_key):
+                return {
+                    "granted": 0, "skipped": 0, "period_key": period_key,
+                    "entries": [], "already": True,
+                }
+        rows = await self.db.get_period_ranking(
+            guild_id, start=start, end=end, limit=config.MAX_REWARD_RANK
+        )
+        guild = self.bot.get_guild(guild_id)
+        granted = 0
+        skipped = 0
+        entries: list[dict[str, Any]] = []
+        for index, row in enumerate(rows, start=1):
+            reward = next(
+                (r for r in rewards
+                 if int(r["rank_from"]) <= index <= int(r["rank_to"])),
+                None,
+            )
+            if reward is None:
+                continue
+            user_id = int(row["user_id"])
+            amount = int(reward["amount"])
+            role_id = reward["role_id"]
+            if not await self.db.record_ranking_grant(
+                guild_id=guild_id, ranking_type=period, period_key=period_key,
+                user_id=user_id, rank=index, score=int(row["score"]),
+                amount=amount, role_id=role_id,
+            ):
+                skipped += 1
+                continue
+            if amount > 0:
+                try:
+                    await self.admin_adjust_balance(
+                        guild_id=guild_id, user_id=user_id,
+                        change_type=config.BalanceChangeType.RANKING_REWARD,
+                        amount=amount, operator_id=operator_id or 0,
+                        reason=f"{config.RANKING_PERIOD_LABELS.get(period, period)}"
+                               f"ランキング {index}位 ({period_key})",
+                    )
+                except ChargeError as exc:
+                    logger.warning("ランキング報酬の付与に失敗しました guild=%s user=%s: %s",
+                                   guild_id, user_id, exc.code)
+            if role_id and guild is not None:
+                member = guild.get_member(user_id)
+                role = guild.get_role(int(role_id))
+                if member is not None and role is not None and not self.role_grant_problem(
+                    guild, role
+                ):
+                    try:
+                        await member.add_roles(
+                            role, reason=f"ランキング報酬 {index}位 ({period_key})"
+                        )
+                    except (discord.Forbidden, discord.HTTPException) as exc:
+                        logger.warning("ランキング報酬のロール付与に失敗しました: %s",
+                                       utils.safe_error_text(exc))
+            granted += 1
+            entries.append({
+                "rank": index, "user_id": user_id, "score": int(row["score"]),
+                "amount": amount, "role_id": role_id,
+            })
+        result = {
+            "granted": granted, "skipped": skipped, "period_key": period_key,
+            "entries": entries, "start": start, "end": end, "period": period,
+        }
+        if granted:
+            logger.info("ランキング報酬を配布しました guild=%s %s %s → %d件",
+                        guild_id, period, period_key, granted)
+            await self._safe(
+                self.post_generic_achievement(
+                    guild_id, ui.ranking_reward_embed(guild_name=self.guild_name(guild_id),
+                                                      result=result)
+                ),
+                context="ランキング報酬の実績投稿",
+            )
+            await self._safe(self.log_event(
+                guild_id,
+                f"🏆 {config.RANKING_PERIOD_LABELS.get(period, period)}ランキング報酬を配布",
+                fields=(
+                    ("期間", period_key, True),
+                    ("配布", f"{granted} 人", True),
+                    ("重複スキップ", f"{skipped} 人", True),
+                ),
+                color=config.Color.SUCCESS,
+            ), context="ランキング報酬ログ")
+        return result
+
+    async def run_ranking_rewards(self) -> int:
+        """報酬設定のある全サーバーについて、締めた期間の配布を試す。"""
+        total = 0
+        for guild_id in await self.db.list_reward_guilds():
+            if not await self.db.is_guild_allowed(guild_id):
+                continue
+            for period in (config.RankingPeriod.WEEKLY, config.RankingPeriod.MONTHLY):
+                try:
+                    result = await self.distribute_ranking_rewards(guild_id, period)
+                    total += int(result["granted"])
+                except Exception:  # noqa: BLE001
+                    logger.exception("ランキング報酬の配布に失敗しました guild=%s period=%s",
+                                     guild_id, period)
+        return total
 
     # ==================================================================
     # Kyash 請求リンク (Bot が発行 → 利用者が支払う → 自動で反映)
@@ -1906,6 +2168,7 @@ class ChargeService:
         await self._safe(
             self.confirm_invite_after_charge(guild_id, user_id), context="招待確定"
         )
+        await self._safe(self.check_tiers(guild_id, user_id), context="段位判定")
         await self._safe(self.log_event(
             guild_id,
             "🟢 チャージ申請を承認しました",

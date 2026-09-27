@@ -559,6 +559,203 @@ def shop_achievement_embed(
     return embed
 
 
+def tier_achievement_embed(
+    *, user_mention: str, tier: Any, total_charged: int, timestamp: int
+) -> discord.Embed:
+    """段位到達の実績 (実績チャンネルへ投稿)。"""
+    embed = discord.Embed(
+        title="🎖 段位に到達しました",
+        description=SEPARATOR,
+        color=config.Color.SUCCESS,
+    )
+    embed.add_field(name="利用者", value=user_mention, inline=False)
+    embed.add_field(name="段位", value=f"**{tier['name']}**", inline=True)
+    embed.add_field(name="ロール", value=f"<@&{int(tier['role_id'])}>", inline=True)
+    embed.add_field(
+        name="累計チャージ", value=f"**{utils.fmt_yen(total_charged)}**", inline=True
+    )
+    if tier["description"]:
+        embed.add_field(
+            name="特典", value=utils.truncate(str(tier["description"]), 900), inline=False
+        )
+    embed.add_field(name="日時", value=utils.discord_ts(timestamp), inline=False)
+    embed.set_footer(text="累計チャージ額に応じて自動で昇格します")
+    return embed
+
+
+def tier_dm_embed(*, guild_name: str, tier: Any, total_charged: int) -> discord.Embed:
+    """段位到達を本人へ知らせる DM。"""
+    embed = discord.Embed(
+        title=f"🎖 「{utils.truncate(str(tier['name']), 60)}」に昇格しました",
+        description=f"{SEPARATOR}\n**{guild_name}**\n{SEPARATOR}",
+        color=config.Color.SUCCESS,
+    )
+    embed.add_field(
+        name="累計チャージ", value=f"**{utils.fmt_yen(total_charged)}**", inline=True
+    )
+    embed.add_field(name="ロール", value=f"<@&{int(tier['role_id'])}>", inline=True)
+    if tier["description"]:
+        embed.add_field(
+            name="特典", value=utils.truncate(str(tier["description"]), 900), inline=False
+        )
+    embed.add_field(
+        name="▶ これからどうなりますか？",
+        value=(
+            "ロールが自動で付きました。**降格はありません**。\n"
+            "さらにチャージを続けると上位の段位に進めます。\n"
+            "`❓ ヘルプ` から現在の段位と次の段位を確認できます。"
+        ),
+        inline=False,
+    )
+    return embed
+
+
+def tier_list_embed(
+    tiers: Sequence[Any], *, guild_name: str, rates: dict[int, str] | None = None
+) -> discord.Embed:
+    """段位の一覧 (管理者向け)。"""
+    embed = discord.Embed(
+        title="🎖 段位の設定",
+        description=(
+            f"{SEPARATOR}\n**{guild_name}**\n"
+            + ("累計チャージ額がしきい値に達すると、ロールを自動で付与します。\n"
+               "降格はありません。" if tiers else "まだ設定されていません。")
+            + f"\n{SEPARATOR}"
+        ),
+        color=config.Color.INFO,
+    )
+    for tier in tiers:
+        lines = [
+            f"累計 **{utils.fmt_yen(int(tier['threshold']))}** 以上",
+            f"ロール: <@&{int(tier['role_id'])}>",
+        ]
+        rate = (rates or {}).get(int(tier["role_id"]))
+        lines.append(
+            f"チャージ率: **{rate}**" if rate
+            else "チャージ率: 未設定 (`/rate set` で設定できます)"
+        )
+        if tier["description"]:
+            lines.append(utils.truncate(str(tier["description"]), 200))
+        embed.add_field(name=f"#{int(tier['id'])} {tier['name']}",
+                        value="\n".join(lines), inline=False)
+    if tiers:
+        embed.set_footer(
+            text="段位のロールに /rate set でチャージ率を設定すると優遇できます"
+        )
+    return embed
+
+
+def tier_progress_field(
+    tiers: Sequence[Any], granted: set[int], total_charged: int
+) -> tuple[str, str] | None:
+    """利用者向けの段位表示 (残高・ヘルプに差し込む)。"""
+    if not tiers:
+        return None
+    current = None
+    next_tier = None
+    for tier in tiers:
+        if int(tier["id"]) in granted or total_charged >= int(tier["threshold"]):
+            current = tier
+        elif next_tier is None:
+            next_tier = tier
+    lines = [
+        f"いまの段位: **{current['name'] if current is not None else 'なし'}**",
+        f"累計チャージ: **{utils.fmt_yen(total_charged)}**",
+    ]
+    if next_tier is not None:
+        need = int(next_tier["threshold"]) - total_charged
+        lines.append(
+            f"次は **{next_tier['name']}** まであと **{utils.fmt_yen(max(0, need))}**\n"
+            f"{utils.progress_bar(total_charged, int(next_tier['threshold']))}"
+        )
+    else:
+        lines.append("**最高段位に到達しています**")
+    return "🎖 段位", "\n".join(lines)
+
+
+def ranking_reward_embed(*, guild_name: str, result: dict[str, Any]) -> discord.Embed:
+    """ランキング報酬の配布結果 (実績チャンネルへ投稿)。"""
+    period = str(result.get("period", ""))
+    label = config.RANKING_PERIOD_LABELS.get(period, period)
+    embed = discord.Embed(
+        title=f"🏆 {label}ランキング 報酬配布",
+        description=(
+            f"{SEPARATOR}\n**{guild_name}**\n"
+            f"対象期間: {result.get('period_key', '-')}\n{SEPARATOR}"
+        ),
+        color=config.Color.SUCCESS,
+    )
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = []
+    for entry in list(result.get("entries", []))[:15]:
+        rank = int(entry["rank"])
+        parts = [f"{medals.get(rank, f'{rank}位')} <@{int(entry['user_id'])}>"]
+        if int(entry.get("amount") or 0) > 0:
+            parts.append(f"**{utils.fmt_int(int(entry['amount']))}**")
+        if entry.get("role_id"):
+            parts.append(f"<@&{int(entry['role_id'])}>")
+        parts.append(f"(獲得 {utils.fmt_int(int(entry['score']))})")
+        lines.append(" / ".join(parts))
+    embed.add_field(
+        name="受賞者", value="\n".join(lines) or "対象者がいませんでした", inline=False
+    )
+    if result.get("start") and result.get("end"):
+        embed.add_field(
+            name="集計範囲",
+            value=f"{utils.format_jst(int(result['start']))} 〜 "
+                  f"{utils.format_jst(int(result['end']))}",
+            inline=False,
+        )
+    embed.set_footer(text="期間中にチャージで獲得した残高で集計しています")
+    return embed
+
+
+def ranking_reward_list_embed(
+    rewards: Sequence[Any], *, guild_name: str, grants: Sequence[Any] = ()
+) -> discord.Embed:
+    """ランキング報酬の設定一覧 (管理者向け)。"""
+    embed = discord.Embed(
+        title="🏆 ランキング報酬の設定",
+        description=(
+            f"{SEPARATOR}\n**{guild_name}**\n"
+            + ("締めた期間の上位へ自動で配布します。\n"
+               "週間は毎週月曜 00:00 (JST)、月間は毎月1日 00:00 (JST) 区切りです。"
+               if rewards else "まだ設定されていません。")
+            + f"\n{SEPARATOR}"
+        ),
+        color=config.Color.INFO,
+    )
+    by_type: dict[str, list[Any]] = {}
+    for reward in rewards:
+        by_type.setdefault(str(reward["ranking_type"]), []).append(reward)
+    for period, items in by_type.items():
+        lines = []
+        for reward in items:
+            rank_from = int(reward["rank_from"])
+            rank_to = int(reward["rank_to"])
+            rank_text = f"{rank_from}位" if rank_from == rank_to else f"{rank_from}〜{rank_to}位"
+            parts = [f"**{rank_text}**"]
+            if int(reward["amount"]) > 0:
+                parts.append(utils.fmt_int(int(reward["amount"])))
+            if reward["role_id"]:
+                parts.append(f"<@&{int(reward['role_id'])}>")
+            lines.append(f"#{int(reward['id'])} " + " / ".join(parts))
+        embed.add_field(
+            name=config.RANKING_PERIOD_LABELS.get(period, period),
+            value="\n".join(lines),
+            inline=False,
+        )
+    if grants:
+        lines = [
+            f"{config.RANKING_PERIOD_LABELS.get(str(g['ranking_type']), g['ranking_type'])} "
+            f"{g['period_key']} {int(g['rank'])}位 <@{int(g['user_id'])}> "
+            f"{utils.fmt_int(int(g['amount']))}"
+            for g in list(grants)[:10]
+        ]
+        embed.add_field(name="直近の配布", value="\n".join(lines), inline=False)
+    return embed
+
+
 def invite_achievement_embed(
     *,
     inviter_mention: str | None,
