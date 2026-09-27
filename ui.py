@@ -40,6 +40,45 @@ def bot_of(interaction: discord.Interaction) -> "ChargeBot":
 # Embed ビルダー
 # ---------------------------------------------------------------------------
 
+def provider_steps(provider: str) -> list[str]:
+    """その方式でチャージするときの手順 (方式ごとに言葉を変える)。
+
+    「自分が何をすればよいか」を方式ごとに具体的に書く。
+    共通の文章にすると、どの方式でも当てはまらない案内になってしまう。
+    """
+    if provider == config.ChargeProvider.KYASH:
+        return [
+            "`💰 チャージ` を押して**金額を入力**",
+            "Kyash アプリで**同じ金額**の送金リンクを作る",
+            "`🔗 送金リンクを送信` を押して URL を貼る",
+            "自動で受け取り → 残高が増え、DM が届きます",
+        ]
+    if provider == config.ChargeProvider.KYASH_CLAIM:
+        return [
+            "`💰 チャージ` を押して**金額を入力**",
+            "表示された**請求リンクを開いて支払う**",
+            "自動で確認 → 残高が増え、DM が届きます",
+        ]
+    if provider == config.ChargeProvider.LTC:
+        return [
+            "`💰 チャージ` を押して**円で金額を入力**",
+            "表示された**数量**をそのまま送金する",
+            "`✅ 送金しました` を押して**取引ID**を入力",
+            "管理者が確認して承認すると反映されます",
+        ]
+    return [
+        "`💰 チャージ` を押して**金額を入力**",
+        "表示された**宛先へ送金**する",
+        "`✅ 送金しました` を押して**取引ID**を入力",
+        "管理者が確認して承認すると反映されます",
+    ]
+
+
+def _provider_speed(provider: str) -> str:
+    """反映の早さを一言で (自動か承認待ちか)。"""
+    return "⚡ 自動反映" if provider in config.KYASH_PROVIDERS else "🕐 承認後に反映"
+
+
 def charge_panel_embed(
     settings: "GuildSettings",
     *,
@@ -48,8 +87,8 @@ def charge_panel_embed(
 ) -> discord.Embed:
     """常設チャージパネルの Embed。
 
-    「何ができるか」「どう操作するか」「いくら増えるか」が
-    パネルを見るだけで分かるようにする。
+    見る順番を「いま使えるか → 何ができるか → どう操作するか」に揃える。
+    使えないときに手順を読ませても意味がないため、状態を最初に出す。
 
     Args:
         providers: 各チャージ方式の利用可否 (``provider_availability`` の戻り値)。
@@ -57,17 +96,16 @@ def charge_panel_embed(
     """
     usable = [p for p in (providers or []) if p["available"]]
     if settings.emergency_stop:
-        state = "🔴 **緊急停止中** — 現在チャージを受け付けていません"
+        state = "🔴 **緊急停止中** — いまはチャージできません"
     elif settings.maintenance:
-        state = "🟠 **メンテナンス中** — 残高・履歴の確認はできます"
+        state = "🟠 **メンテナンス中** — 残高と履歴は確認できます"
     elif providers is not None and not usable:
         state = "🟠 **一時停止中** — 復旧までお待ちください"
     elif providers is None and not kyash_ready:
         state = "🟠 **一時停止中** — 復旧までお待ちください"
     else:
-        state = "🟢 **受付中** — いつでもチャージできます"
+        state = "🟢 **受付中**"
 
-    # 具体例で「いくら増えるか」を示す
     example_base = max(settings.minimum_charge, 1000)
     if example_base > settings.maximum_charge:
         example_base = settings.maximum_charge
@@ -75,45 +113,29 @@ def charge_panel_embed(
 
     multi = len(usable) > 1
     embed = discord.Embed(
-        title=settings.panel_title or "💰 チャージシステム",
+        title=settings.panel_title or "💰 チャージ",
         description=(
-            f"{SEPARATOR}\n"
+            f"{state}\n{SEPARATOR}\n"
             + (
                 settings.panel_description
-                or ("送金すると、このサーバーで使える**内部残高**が増えます。"
-                    if multi else
-                    "Kyash で送金すると、このサーバーで使える**内部残高**が増えます。")
+                or "送金すると、このサーバーで使える**内部残高**が増えます。"
             )
             + f"\n{SEPARATOR}"
         ),
         color=settings.accent_color if settings.accent_color is not None else config.Color.BASE,
     )
-    if providers is not None and (usable or providers):
-        lines = []
-        for entry in providers:
-            provider = str(entry["provider"])
-            emoji = config.PROVIDER_EMOJI.get(provider, "💠")
-            name = config.PROVIDER_LABELS.get(provider, provider)
-            if entry["available"]:
-                kind = ("自動反映" if provider == config.ChargeProvider.KYASH
-                        else "管理者の承認制")
-                lines.append(
-                    f"{emoji} **{name}** — {utils.fmt_rate(entry['rate'])} / {kind}"
-                )
-            else:
-                lines.append(f"{emoji} ~~{name}~~ — 🚫 {entry['reason']}")
-        embed.add_field(name="💠 使えるチャージ方法", value="\n".join(lines), inline=False)
-    else:
-        embed.add_field(
-            name="📈 チャージ率",
-            value=f"**{utils.fmt_rate(settings.charge_rate)}**\n"
-                  f"例) {utils.fmt_yen(example_base)} → **{utils.fmt_int(example_credit)}**",
-            inline=True,
-        )
+
+    # --- いくら増えるか (最初に知りたい情報) ---
+    embed.add_field(
+        name="📈 レート",
+        value=f"**{utils.fmt_rate(settings.charge_rate)}**\n"
+              f"{utils.fmt_yen(example_base)} → **{utils.fmt_int(example_credit)}**",
+        inline=True,
+    )
     embed.add_field(
         name="💵 1回の金額",
-        value=f"**{utils.fmt_yen(settings.minimum_charge)}** 〜\n"
-              f"**{utils.fmt_yen(settings.maximum_charge)}**",
+        value=f"**{utils.fmt_yen(settings.minimum_charge)}**\n"
+              f"〜 **{utils.fmt_yen(settings.maximum_charge)}**",
         inline=True,
     )
     embed.add_field(
@@ -122,30 +144,46 @@ def charge_panel_embed(
         else "**無制限**",
         inline=True,
     )
+
+    # --- 使える方法 ---
+    if providers is not None and providers:
+        lines = []
+        for entry in providers:
+            provider = str(entry["provider"])
+            emoji = config.PROVIDER_EMOJI.get(provider, "💠")
+            name = config.PROVIDER_LABELS.get(provider, provider)
+            if entry["available"]:
+                lines.append(
+                    f"{emoji} **{name}**　{_provider_speed(provider)}"
+                    + (f"　{utils.fmt_rate(entry['rate'])}"
+                       if entry["rate"] != settings.charge_rate else "")
+                )
+            else:
+                lines.append(f"{emoji} ~~{name}~~　🚫 {entry['reason']}")
+        embed.add_field(
+            name="💠 チャージの方法" + (f" ({len(usable)}種類)" if multi else ""),
+            value="\n".join(lines),
+            inline=False,
+        )
+
+    # --- 手順 (方法が1つなら、その方法の手順をそのまま書く) ---
     if multi:
-        embed.add_field(
-            name="🪜 チャージの手順",
-            value=(
-                "**1.** 下の `💰 チャージ` を押して**方法を選ぶ**\n"
-                "**2.** 金額を入力する\n"
-                "**3.** 表示された宛先へ送金する\n"
-                "**4.** 画面の案内どおりに申請する\n"
-                "　→ Kyash は自動、PayPay / LTC は管理者の承認後に反映されます"
-            ),
-            inline=False,
-        )
+        steps = [
+            "`💰 チャージ` を押して**方法を選ぶ**",
+            "金額を入力する",
+            "画面の案内どおりに送金・申請する",
+        ]
+        note = "　→ ⚡ の方法は自動、🕐 の方法は管理者の承認後に反映されます"
     else:
-        embed.add_field(
-            name="🪜 チャージの手順",
-            value=(
-                "**1.** 下の `💰 チャージ` を押して**金額を入力**\n"
-                "**2.** Kyash アプリで**同じ金額**の送金リンクを作成\n"
-                "**3.** `🔗 送金リンクを送信` を押して URL を貼る\n"
-                "**4.** 自動で受け取り → 残高が増え、DM が届きます"
-            ),
-            inline=False,
-        )
-    embed.add_field(name="状態", value=state, inline=False)
+        only = str(usable[0]["provider"]) if usable else config.ChargeProvider.KYASH
+        steps = provider_steps(only)
+        note = ""
+    embed.add_field(
+        name="🪜 チャージの手順",
+        value="\n".join(f"**{i}.** {text}" for i, text in enumerate(steps, start=1))
+        + (f"\n{note}" if note else ""),
+        inline=False,
+    )
     embed.set_footer(
         text="送金リンクや取引IDは公開チャンネルに貼らないでください / "
              "内部残高は現金化・出金できません"
@@ -371,8 +409,8 @@ def help_embed(
             value="\n".join(
                 f"{config.PROVIDER_EMOJI.get(str(p['provider']), '💠')} "
                 f"**{config.PROVIDER_LABELS.get(str(p['provider']), p['provider'])}** "
-                f"({utils.fmt_rate(p['rate'])}) — "
-                f"{config.PROVIDER_DESCRIPTIONS.get(str(p['provider']), '')}"
+                f"({utils.fmt_rate(p['rate'])})　{_provider_speed(str(p['provider']))}\n"
+                f"　{config.PROVIDER_DESCRIPTIONS.get(str(p['provider']), '')}"
                 for p in usable
             ),
             inline=False,
@@ -382,23 +420,21 @@ def help_embed(
             value=(
                 "**1.** `💰 チャージ` を押して**方法を選ぶ**\n"
                 "**2.** チャージしたい金額を入力する (LTC も**円**で入力します)\n"
-                "**3.** 表示された宛先へ、表示された金額をそのまま送る\n"
-                "**4.** Kyash は送金リンクを貼るだけ。PayPay / LTC は\n"
-                "　　`✅ 送金しました` から取引ID (txid) を入力して申請\n"
-                "**5.** Kyash は自動、PayPay / LTC は管理者の承認後に反映されます"
+                "**3.** 画面の案内どおりに送金・申請する\n"
+                "→ ⚡ の方法は自動で、🕐 の方法は管理者の承認後に反映されます"
             ),
             inline=False,
         )
     else:
+        # 方法が1つに決まっているときは、その方法の手順だけを書く。
+        # 使わない方法の説明を混ぜると、かえって迷わせてしまう。
+        only = str(usable[0]["provider"]) if usable else config.ChargeProvider.KYASH
+        steps = provider_steps(only)
         embed.add_field(
-            name="① チャージのしかた",
-            value=(
-                "**1.** `💰 チャージ` を押す\n"
-                "**2.** チャージしたい金額を入力する\n"
-                "**3.** Kyash アプリで「送る」→ **リンクで送る** で\n"
-                "　　**同じ金額**の送金リンクを作る\n"
-                "**4.** `🔗 送金リンクを送信` を押して URL を貼る\n"
-                "**5.** 自動で受け取り、残高が増えます (結果は DM でお知らせ)"
+            name=f"① チャージのしかた "
+                 f"({config.PROVIDER_LABELS.get(only, only)})",
+            value="\n".join(
+                f"**{i}.** {text}" for i, text in enumerate(steps, start=1)
             ),
             inline=False,
         )
@@ -2652,38 +2688,58 @@ class AuctionView(discord.ui.View):
 # ---------------------------------------------------------------------------
 
 def provider_select_embed(entries: Sequence[dict[str, Any]]) -> discord.Embed:
-    """チャージ方式の選択画面 (ステップ 1/4)。
+    """チャージ方式の選択画面。
 
-    使えない方式も理由つきで見せることで、「なぜ選べないのか」を説明する。
+    選ぶときに知りたいのは「早く反映されるか」「レートはいくらか」の2つなので、
+    それを各行の先頭に出す。使えない方式も理由つきで見せ、「なぜ選べないのか」に
+    答える。
+
+    手順の番号は方式によって変わる (請求リンクは2段階、PayPay は4段階) ため、
+    この画面では固定の段数を表示しない。
     """
+    available = [e for e in entries if e["available"]]
     embed = discord.Embed(
         title="💰 チャージ方法を選んでください",
         description=(
-            f"{step_line(1, MANUAL_CHARGE_STEPS)}\n{SEPARATOR}\n"
-            "下のメニューから方法を選ぶと、次の手順を案内します。\n"
-            f"{SEPARATOR}"
+            f"{SEPARATOR}\n"
+            + (
+                "下のメニューから選ぶと、次の手順を案内します。"
+                if available else
+                "いまは使える方法がありません。"
+            )
+            + f"\n{SEPARATOR}"
         ),
-        color=config.Color.ACCENT,
+        color=config.Color.ACCENT if available else config.Color.WARNING,
     )
-    for entry in entries:
+    # 使える方式を先に、使えない方式は後ろへ (選べるものが先に目に入るように)
+    ordered = available + [e for e in entries if not e["available"]]
+    for entry in ordered:
         provider = str(entry["provider"])
         emoji = config.PROVIDER_EMOJI.get(provider, "💠")
         name = config.PROVIDER_LABELS.get(provider, provider)
         if entry["available"]:
             value = (
+                f"{_provider_speed(provider)}　"
+                f"レート **{utils.fmt_rate(entry['rate'])}**\n"
                 f"{config.PROVIDER_DESCRIPTIONS.get(provider, '')}\n"
-                f"チャージ率 **{utils.fmt_rate(entry['rate'])}** / "
-                f"{utils.fmt_yen(int(entry['minimum']))} 〜 {utils.fmt_yen(int(entry['maximum']))}"
+                f"金額: {utils.fmt_yen(int(entry['minimum']))} 〜 "
+                f"{utils.fmt_yen(int(entry['maximum']))}"
             )
+            embed.add_field(name=f"{emoji} {name}", value=value, inline=False)
         else:
-            value = f"🚫 いま使えません — {entry['reason']}"
-        embed.add_field(name=f"{emoji} {name}", value=value, inline=False)
-    if not any(e["available"] for e in entries):
+            embed.add_field(
+                name=f"{emoji} ~~{name}~~",
+                value=f"🚫 いま使えません — {entry['reason']}",
+                inline=False,
+            )
+    if not available:
         embed.add_field(
             name="▶ 次にどうすればいいですか？",
             value="現在チャージを受け付けていません。管理者の案内をお待ちください。",
             inline=False,
         )
+    else:
+        embed.set_footer(text="⚡ は自動で反映、🕐 は管理者の承認後に反映されます")
     return embed
 
 

@@ -358,6 +358,90 @@ def main() -> None:
         for i in range(20)
     ], guild_name="サーバー" * 30))
 
+    print("\n=== 6g. 方式ごとの案内 ===")
+    from decimal import Decimal as _D
+
+    def entry(provider: str, available: bool = True, rate: str = "130") -> Row:
+        return Row(provider=provider, available=available,
+                   reason=None if available else "入金先が未登録です",
+                   error_code=None, minimum=100, maximum=50_000,
+                   rate=_D(rate), destination=None)
+
+    # 方式ごとに手順の言葉が変わる (共通文にしない)
+    for provider in config.ALL_PROVIDERS:
+        steps = ui.provider_steps(provider)
+        check(len(steps) >= 3, f"{provider} の手順がある ({len(steps)}段階)")
+        joined = " / ".join(steps)
+        check("チャージ" in joined, f"{provider} の手順が最初の操作から始まる")
+    claim_steps = " ".join(ui.provider_steps(config.ChargeProvider.KYASH_CLAIM))
+    check("請求リンクを開いて" in claim_steps and "送金リンクを作る" not in claim_steps,
+          "請求リンク方式の手順に「リンクを作る」が出てこない")
+    transfer_steps = " ".join(ui.provider_steps(config.ChargeProvider.KYASH))
+    check("送金リンクを作る" in transfer_steps,
+          "送金リンク方式の手順にはリンク作成がある")
+    paypay_steps = " ".join(ui.provider_steps(config.ChargeProvider.PAYPAY))
+    check("承認" in paypay_steps, "承認制の方式は承認が要ると書く")
+
+    # パネル: 請求リンクだけのときに「承認制」と書かない (以前の不具合)
+    claim_only = [entry(config.ChargeProvider.KYASH_CLAIM)]
+    panel = ui.charge_panel_embed(settings, kyash_ready=True, providers=claim_only)
+    verify("charge_panel_embed (請求リンクのみ)", panel)
+    panel_text = (panel.description or "") + "".join(
+        f.name + f.value for f in panel.fields)
+    check("⚡ 自動反映" in panel_text and "承認後に反映" not in panel_text,
+          "請求リンクは自動反映として表示する")
+    check("請求リンクを開いて" in panel_text,
+          "パネルの手順もその方式のものになる")
+    # パネル: 状態が最初に見える
+    check("受付中" in (panel.description or ""),
+          "いま使えるかどうかを最初に出す")
+    stopped = database.GuildSettings(guild_id=1, emergency_stop=True)
+    stopped_panel = ui.charge_panel_embed(stopped, kyash_ready=True,
+                                          providers=claim_only)
+    verify("charge_panel_embed (緊急停止)", stopped_panel)
+    check("緊急停止中" in (stopped_panel.description or ""),
+          "止まっているときも最初に分かる")
+
+    # パネル: PayPay だけのとき
+    paypay_only = [entry(config.ChargeProvider.PAYPAY, rate="120")]
+    pp_panel = ui.charge_panel_embed(settings, kyash_ready=False,
+                                     providers=paypay_only)
+    verify("charge_panel_embed (PayPayのみ)", pp_panel)
+    pp_text = "".join(f.name + f.value for f in pp_panel.fields)
+    check("承認後に反映" in pp_text, "承認制の方式はその旨を出す")
+    check("送金リンク" not in pp_text,
+          "使わない方式の言葉が混ざらない")
+
+    # 複数のとき
+    multi = [entry(config.ChargeProvider.KYASH),
+             entry(config.ChargeProvider.PAYPAY, rate="120"),
+             entry(config.ChargeProvider.LTC, available=False)]
+    multi_panel = ui.charge_panel_embed(settings, kyash_ready=True, providers=multi)
+    verify("charge_panel_embed (複数)", multi_panel)
+    multi_text = "".join(f.name + f.value for f in multi_panel.fields)
+    check("方法を選ぶ" in multi_text, "複数あるときは選ぶ手順から始まる")
+    check("入金先が未登録" in multi_text, "使えない方式は理由つきで見せる")
+
+    # 選択画面: 使える方式が先に並ぶ
+    select = ui.provider_select_embed([
+        entry(config.ChargeProvider.LTC, available=False),
+        entry(config.ChargeProvider.KYASH_CLAIM),
+    ])
+    verify("provider_select_embed (並び順)", select)
+    names = [f.name for f in select.fields]
+    check("Kyash" in names[0], f"使える方式が先に並ぶ ({names})")
+    select_text = "".join(f.name + f.value for f in select.fields)
+    check("⚡ 自動反映" in select_text, "選ぶときに反映の早さが分かる")
+    check("ステップ" not in (select.description or ""),
+          "方式で段数が変わるため、選択画面では段数を出さない")
+
+    # ヘルプ: 1つに絞られているときはその方式の手順だけ
+    help_claim = ui.help_embed(settings, shop_available=True, providers=claim_only)
+    verify("help_embed (請求リンクのみ)", help_claim)
+    help_text = "".join(f.name + f.value for f in help_claim.fields)
+    check("請求リンクを開いて" in help_text and "送金リンクを作る" not in help_text,
+          "ヘルプも実際に使う方式の手順になる")
+
     print("\n=== 6f. 返金申請とレシート ===")
     verify("refund_request_embed", ui.refund_request_embed(
         request_id=1, tx_id="TX-ABC", amount=6_500, received=5_000,
