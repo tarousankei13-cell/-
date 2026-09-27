@@ -358,6 +358,67 @@ def main() -> None:
         for i in range(20)
     ], guild_name="サーバー" * 30))
 
+    print("\n=== 6c. オークション ===")
+    auction_open = Row(
+        id=1, name="レア称号" * 20, description="説明" * 60, role_id=777,
+        duration_days=7, start_price=1_000, min_increment=500,
+        current_bid=3_000, current_bidder=42, status=config.AuctionStatus.OPEN,
+        winner_id=None, winning_bid=None, ends_at=now + 3600, closed_at=None,
+        role_expires_at=None,
+    )
+    auction_bids = [
+        Row(id=i, user_id=40 + i, amount=1_000 + i * 500, refunded=0 if i == 3 else 1,
+            created_at=now - i * 60)
+        for i in range(3, 0, -1)
+    ]
+    verify("auction_panel_embed (受付中)", ui.auction_panel_embed(
+        auction_open, auction_bids, counts=(3, 3)))
+    panel = ui.auction_panel_embed(auction_open, auction_bids, counts=(3, 3))
+    panel_text = "".join(f.name + f.value for f in panel.fields)
+    check("預かり" in panel_text and "全額すぐに返します" in panel_text,
+          "入札が預かり方式であることと返金を説明する")
+    check(str(ui.auction_minimum_bid(auction_open)) == "3500",
+          f"次の最低入札額が計算できる ({ui.auction_minimum_bid(auction_open)})")
+    no_bid = Row(**{**auction_open, "current_bid": None, "current_bidder": None})
+    verify("auction_panel_embed (入札なし)", ui.auction_panel_embed(no_bid, [], counts=(0, 0)))
+    check(ui.auction_minimum_bid(no_bid) == 1_000,
+          "入札が無ければ開始価格が最低額になる")
+    closed = Row(**{**auction_open, "status": config.AuctionStatus.CLOSED,
+                    "winner_id": 42, "winning_bid": 3_000, "closed_at": now})
+    verify("auction_panel_embed (落札)", ui.auction_panel_embed(closed, auction_bids,
+                                                              counts=(3, 3)))
+    failed = Row(**{**auction_open, "status": config.AuctionStatus.FAILED,
+                    "current_bid": None, "current_bidder": None, "closed_at": now})
+    verify("auction_panel_embed (入札なしで終了)", ui.auction_panel_embed(failed, []))
+    cancelled = Row(**{**auction_open, "status": config.AuctionStatus.CANCELLED,
+                       "closed_at": now})
+    verify("auction_panel_embed (中止)", ui.auction_panel_embed(cancelled, auction_bids))
+    verify("auction_bid_success_embed", ui.auction_bid_success_embed(
+        name="レア称号" * 20, amount=3_000, balance_after=7_000,
+        ends_at=now + 3600, extended=True, auction_id=1))
+    verify("auction_outbid_dm_embed", ui.auction_outbid_dm_embed(
+        name="レア称号", auction_id=1, your_bid=2_500, new_bid=3_000,
+        balance_after=9_500, ends_at=now + 3600))
+    verify("auction_won_dm_embed (期限つき)", ui.auction_won_dm_embed(
+        name="レア称号", auction_id=1, winning_bid=3_000, role_id=777,
+        role_expires_at=now + 7 * 86400, balance=7_000))
+    verify("auction_won_dm_embed (無期限)", ui.auction_won_dm_embed(
+        name="レア称号", auction_id=1, winning_bid=3_000, role_id=777,
+        role_expires_at=None, balance=7_000))
+    verify("auction_cancelled_dm_embed", ui.auction_cancelled_dm_embed(
+        name="レア称号", auction_id=1, refunded=3_000, balance_after=10_000,
+        reason="理由" * 200))
+    verify("auction_result_embed (落札)", ui.auction_result_embed(closed, counts=(3, 3)))
+    verify("auction_result_embed (入札なし)", ui.auction_result_embed(failed))
+    verify("auction_list_embed (空)", ui.auction_list_embed([], guild_name="サーバー"))
+    verify("auction_list_embed", ui.auction_list_embed([
+        Row(**{**auction_open, "id": i,
+               "status": list(config.AUCTION_STATUS_LABELS)[i % 4],
+               "winner_id": 42 if i % 4 else None,
+               "winning_bid": 3_000 if i % 4 else None})
+        for i in range(1, 13)
+    ], guild_name="サーバー" * 30))
+
     print("\n=== 7. 招待キャンペーン ===")
     verify("invite_panel_embed (未開催)", ui.invite_panel_embed(settings, None))
     campaign = Row(

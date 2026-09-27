@@ -3629,6 +3629,327 @@ class RateGroup(app_commands.Group):
 
 
 # ---------------------------------------------------------------------------
+# /auction (内部残高でロールを競る)
+# ---------------------------------------------------------------------------
+class AuctionGroup(app_commands.Group):
+    """オークションの開催と入札。"""
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="auction", description="オークション (bid / list は利用者も実行可)"
+        )
+
+    @app_commands.command(name="create", description="オークションを開始します (管理者)")
+    @app_commands.describe(
+        name="オークション名", role="景品のロール",
+        start_price="開始価格 (最初の入札はこの額以上)",
+        hours="開催時間 (時間単位・小数可)",
+        min_increment="最低更新額 (現在額 + この額以上でないと入札できない)",
+        duration_days="落札したロールの有効期間 (0で無期限)",
+        description="説明",
+        channel="パネルを置くチャンネル (未指定なら実行したチャンネル)",
+    )
+    @app_commands.guild_only()
+    @require_admin()
+    async def create(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        role: discord.Role,
+        start_price: app_commands.Range[int, 1, config.AUCTION_MAX_BID],
+        hours: app_commands.Range[float, 0.1, float(config.AUCTION_MAX_DAYS * 24)],
+        min_increment: app_commands.Range[int, 1, 1_000_000] = 100,
+        duration_days: app_commands.Range[int, 0, config.SHOP_DURATION_MAX_DAYS] = 0,
+        description: str | None = None,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        """オークションを開始し、入札パネルを設置する。"""
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        name = name.strip()[:config.SHOP_NAME_MAX_LEN]
+        description = (
+            description.strip()[:config.SHOP_DESC_MAX_LEN] or None if description else None
+        )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        target = channel or interaction.channel
+        if not isinstance(target, discord.TextChannel):
+            await interaction.followup.send(
+                embed=ui.info_embed(
+                    "チャンネルを指定してください",
+                    "パネルを置けるテキストチャンネルを `channel` で指定してください。",
+                    color=config.Color.DANGER,
+                ),
+                ephemeral=True,
+            )
+            return
+        if guild.me is None or not _channel_writable(target, guild.me):
+            await interaction.followup.send(
+                embed=ui.info_embed(
+                    "このチャンネルには置けません",
+                    f"{target.mention} へ Embed 付きメッセージを送れません。\n"
+                    "「チャンネルを見る」「メッセージを送信」「埋め込みリンク」を許可してください。",
+                    color=config.Color.DANGER,
+                ),
+                ephemeral=True,
+            )
+            return
+        try:
+            created = await bot.charge.create_auction(
+                guild, name=name, role=role, start_price=int(start_price),
+                min_increment=int(min_increment), hours=float(hours),
+                duration_days=int(duration_days), description=description,
+                created_by=interaction.user.id,
+            )
+        except ChargeError as exc:
+            await interaction.followup.send(
+                embed=ui.error_embed(exc.code, admin_detail=exc.detail or None),
+                ephemeral=True,
+            )
+            return
+        auction_id = int(created["auction_id"])
+        auction = await bot.db.get_auction(auction_id, guild.id)
+        assert auction is not None
+        try:
+            message = await target.send(
+                embed=ui.auction_panel_embed(auction), view=ui.AuctionView()
+            )
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            # パネルを出せないオークションは即座に中止する (入札できないため)
+            await bot.charge.cancel_auction(
+                guild.id, auction_id, operator_id=interaction.user.id,
+                reason="パネルを設置できなかったため自動中止",
+            )
+            await interaction.followup.send(
+                embed=ui.info_embed(
+                    "パネルを設置できませんでした",
+                    f"オークションは中止しました。\n詳細: {utils.safe_error_text(exc)}",
+                    color=config.Color.DANGER,
+                ),
+                ephemeral=True,
+            )
+            return
+        await bot.db.set_auction_message(
+            auction_id, channel_id=target.id, message_id=message.id
+        )
+        op_id = await _audit(
+            interaction, "AUCTION_PANEL",
+            detail={"auction_id": auction_id, "channel_id": target.id,
+                    "message_id": message.id},
+        )
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "✅ オークションを開始しました",
+                f"オークションID: `{auction_id}`\n名前: **{name}**\n"
+                f"景品: {role.mention}\n"
+                f"開始価格: **{utils.fmt_int(int(start_price))}**\n"
+                f"最低更新額: **{utils.fmt_int(int(min_increment))}**\n"
+                f"締切: {utils.format_jst(int(created['ends_at']))}\n"
+                f"パネル: {target.mention}\n"
+                f"操作ID: `{op_id}`",
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="bid", description="オークションに入札します")
+    @app_commands.describe(auction_id="オークションID", amount="入札額")
+    @app_commands.guild_only()
+    async def bid(
+        self,
+        interaction: discord.Interaction,
+        auction_id: app_commands.Range[int, 1, 10_000_000],
+        amount: app_commands.Range[int, 1, config.AUCTION_MAX_BID],
+    ) -> None:
+        """パネルを使わずに入札する (パネルが流れてしまった場合の代替)。"""
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                embed=ui.error_embed(config.ErrorCode.NOT_ALLOWED), ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await bot.charge.place_bid(member, int(auction_id), int(amount))
+        except ChargeError as exc:
+            await interaction.followup.send(
+                embed=ui.error_embed(exc.code, next_action=exc.detail or None),
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            embed=ui.auction_bid_success_embed(
+                name=str(result["name"]), amount=int(result["amount"]),
+                balance_after=int(result["balance_after"]),
+                ends_at=int(result["ends_at"]), extended=bool(result["extended"]),
+                auction_id=int(auction_id),
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="list", description="オークションの一覧を表示します")
+    @app_commands.describe(status="状態で絞り込み")
+    @app_commands.choices(status=[
+        app_commands.Choice(name=label, value=key)
+        for key, label in config.AUCTION_STATUS_LABELS.items()
+    ])
+    @app_commands.guild_only()
+    async def list_auctions(
+        self,
+        interaction: discord.Interaction,
+        status: app_commands.Choice[str] | None = None,
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        rows = await bot.db.list_auctions(
+            guild.id, status=status.value if status else None
+        )
+        await interaction.followup.send(
+            embed=ui.auction_list_embed(rows, guild_name=guild.name), ephemeral=True
+        )
+
+    @app_commands.command(
+        name="close", description="オークションを締切ります (管理者)"
+    )
+    @app_commands.describe(auction_id="オークションID")
+    @app_commands.guild_only()
+    @require_admin()
+    async def close(
+        self,
+        interaction: discord.Interaction,
+        auction_id: app_commands.Range[int, 1, 10_000_000],
+    ) -> None:
+        """締切時刻より前に締める (現在の最高額が落札となる)。"""
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        auction = await bot.db.get_auction(int(auction_id), guild.id)
+        if auction is None:
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.AUCTION_NOT_OPEN), ephemeral=True
+            )
+            return
+        outcome = await bot.charge.close_auction(
+            int(auction_id), force=True, operator_id=interaction.user.id
+        )
+        if not outcome.get("closed"):
+            await interaction.followup.send(
+                embed=ui.error_embed(
+                    config.ErrorCode.AUCTION_NOT_OPEN,
+                    next_action="このオークションは既に終了しています。",
+                ),
+                ephemeral=True,
+            )
+            return
+        op_id = await _audit(
+            interaction, "AUCTION_FORCE_CLOSE",
+            detail={"auction_id": int(auction_id), "reason": outcome.get("reason")},
+        )
+        if outcome["reason"] == "NO_BIDS":
+            body = "入札がなかったため、落札者なしで終了しました。"
+        elif outcome.get("delivered"):
+            body = (
+                f"落札者: <@{outcome['winner_id']}>\n"
+                f"落札額: **{utils.fmt_int(int(outcome['winning_bid']))}**\n"
+                f"景品: <@&{outcome['role_id']}> を付与しました。"
+            )
+        else:
+            body = (
+                "落札者へ景品を渡せなかったため、落札額を返金して中止扱いにしました。\n"
+                "ロールの位置と Bot の権限を確認してください。"
+            )
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "🏁 オークションを締切りました", f"{body}\n操作ID: `{op_id}`"
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="cancel", description="オークションを中止して全額返金します (管理者)"
+    )
+    @app_commands.describe(auction_id="オークションID", reason="中止の理由")
+    @app_commands.guild_only()
+    @require_admin()
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        auction_id: app_commands.Range[int, 1, 10_000_000],
+        reason: str,
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await bot.charge.cancel_auction(
+                guild.id, int(auction_id), operator_id=interaction.user.id,
+                reason=reason.strip()[:300],
+            )
+        except ChargeError as exc:
+            await interaction.followup.send(
+                embed=ui.error_embed(exc.code, admin_detail=exc.detail or None),
+                ephemeral=True,
+            )
+            return
+        refunded = result.get("refunded")
+        op_id = await _audit(
+            interaction, "AUCTION_CANCEL_CMD",
+            detail={"auction_id": int(auction_id), "reason": reason[:300]},
+        )
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "⚫ オークションを中止しました",
+                f"オークション: **{result['name']}**\n"
+                + (f"返金: <@{refunded['user_id']}> へ "
+                   f"**{utils.fmt_int(int(refunded['amount']))}**\n"
+                   if refunded else "返金: なし (入札がありませんでした)\n")
+                + f"操作ID: `{op_id}`",
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="bids", description="入札の履歴を表示します (管理者)")
+    @app_commands.describe(auction_id="オークションID")
+    @app_commands.guild_only()
+    @require_admin()
+    async def bids(
+        self,
+        interaction: discord.Interaction,
+        auction_id: app_commands.Range[int, 1, 10_000_000],
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        auction = await bot.db.get_auction(int(auction_id), guild.id)
+        if auction is None:
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.AUCTION_NOT_OPEN), ephemeral=True
+            )
+            return
+        rows = await bot.db.list_auction_bids(int(auction_id), limit=20)
+        counts = await bot.db.count_auction_bids(int(auction_id))
+        lines = [
+            f"{utils.format_jst(int(r['created_at']), with_seconds=True)} "
+            f"<@{int(r['user_id'])}> **{utils.fmt_int(int(r['amount']))}**"
+            + (" (返金済み)" if int(r["refunded"] or 0) else " (預かり中)")
+            for r in rows
+        ]
+        await interaction.followup.send(
+            embed=ui.info_embed(
+                f"💸 入札履歴 (`{auction_id}` {auction['name']})",
+                f"{ui.SEPARATOR}\n入札 {counts[0]}件 / {counts[1]}人\n\n"
+                + ("\n".join(lines) if lines else "入札はまだありません。"),
+            ),
+            ephemeral=True,
+        )
+
+
+# ---------------------------------------------------------------------------
 # /shop (内部残高でロールを販売)
 # ---------------------------------------------------------------------------
 class ShopGroup(app_commands.Group):
@@ -6299,6 +6620,7 @@ async def setup_commands(bot: "ChargeBot") -> None:
         ServerGroup(), KyashGroup(), SettingsGroup(), BalanceGroup(), UserGroup(),
         MaintenanceGroup(), EmergencyStopGroup(), AchievementGroup(), TransactionGroup(),
         DataGroup(), ConfigGroup(), SystemGroup(), RateGroup(), ShopGroup(),
+        AuctionGroup(),
         CampaignGroup(), ExportGroup(), GlobalGroup(),
         ProviderGroup(), RequestGroup(), TierGroup(), RankingRewardGroup(),
     ):

@@ -96,6 +96,7 @@ class BackgroundTasks:
             self.integrity_task,
             self.shop_expiry,
             self.subscription_task,
+            self.auction_task,
             self.request_task,
             self.claim_task,
             self.tier_task,
@@ -535,6 +536,22 @@ class BackgroundTasks:
 
     @subscription_task.before_loop
     async def _before_subscription(self) -> None:
+        await self._wait_ready()
+
+    @tasks.loop(seconds=config.TASK_AUCTION_INTERVAL)
+    async def auction_task(self) -> None:
+        """締切を過ぎたオークションを確定し、落札ロールの期限も見る。"""
+        try:
+            await self.charge.close_due_auctions()
+        except Exception:  # noqa: BLE001
+            logger.exception("オークションの締切処理に失敗しました")
+        try:
+            await self.charge.expire_auction_roles()
+        except Exception:  # noqa: BLE001
+            logger.exception("落札ロールの期限処理に失敗しました")
+
+    @auction_task.before_loop
+    async def _before_auction(self) -> None:
         await self._wait_ready()
 
     @tasks.loop(seconds=config.TASK_TIER_INTERVAL)

@@ -666,6 +666,7 @@ class ErrorCode:
     AUCTION_NOT_OPEN = "AUCTION_NOT_OPEN"
     BID_TOO_LOW = "BID_TOO_LOW"
     ALREADY_HIGHEST = "ALREADY_HIGHEST"
+    AUCTION_LIMIT_REACHED = "AUCTION_LIMIT_REACHED"
     REFUND_NOT_ELIGIBLE = "REFUND_NOT_ELIGIBLE"
     REFUND_ALREADY_REQUESTED = "REFUND_ALREADY_REQUESTED"
     ITEM_INPUT_INVALID = "ITEM_INPUT_INVALID"
@@ -733,6 +734,7 @@ USER_ERROR_MESSAGES: Final[dict[str, str]] = {
     ErrorCode.ALREADY_HIGHEST: "すでにあなたが最高入札者です。",
     ErrorCode.REFUND_NOT_ELIGIBLE: "この取引は返金を申請できません。",
     ErrorCode.REFUND_ALREADY_REQUESTED: "この取引はすでに返金を申請しています。",
+    ErrorCode.AUCTION_LIMIT_REACHED: "同時に開催できるオークションの数を超えています。",
     ErrorCode.ITEM_INPUT_INVALID: "入力内容が正しくありません。",
     ErrorCode.ITEM_SETUP_FAILED: "商品の用意に失敗しました。代金は自動で返金されています。",
     ErrorCode.SUBSCRIPTION_NOT_FOUND: "継続中の対象が見つかりません。",
@@ -796,6 +798,7 @@ USER_ERROR_NEXT_ACTIONS: Final[dict[str, str]] = {
     ErrorCode.ALREADY_HIGHEST: "他の人に上回られるまで待ってください。上回られたら自動で返金されます。",
     ErrorCode.REFUND_NOT_ELIGIBLE: "完了したチャージのうち、まだ取消されていないものだけが対象です。期限を過ぎた取引は管理者へご相談ください。",
     ErrorCode.REFUND_ALREADY_REQUESTED: "`/refund list` で申請の状態を確認してください。",
+    ErrorCode.AUCTION_LIMIT_REACHED: "開催中のオークションが終わってから追加してください。",
     ErrorCode.ITEM_INPUT_INVALID: "入力欄の説明にある形式で、もう一度入力してください。",
     ErrorCode.ITEM_SETUP_FAILED: "残高が戻っているか確認し、時間をおいてもう一度お試しください。"
                                  "続く場合は管理者へご連絡ください。",
@@ -885,6 +888,12 @@ TASK_AUCTION_INTERVAL: Final[int] = 30
 AUCTION_MAX_DAYS: Final[int] = 30
 #: 1サーバーが同時に開催できるオークション数
 MAX_OPEN_AUCTIONS: Final[int] = 5
+#: 締切直前の入札で締切を延長する秒数 (駆け込み入札の対策・0で無効)
+AUCTION_ANTI_SNIPE_SECONDS: Final[int] = 120
+#: オークションの最短開催時間 (秒)
+AUCTION_MIN_SECONDS: Final[int] = 300
+#: 入札額の上限 (残高の上限と同じ考え方で暴走を防ぐ)
+AUCTION_MAX_BID: Final[int] = 100_000_000
 
 
 class GoalStatus:

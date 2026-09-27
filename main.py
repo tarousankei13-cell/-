@@ -224,6 +224,7 @@ class ChargeBot(commands.Bot):
         self.add_view(ui.InvitePanelView())
         self.add_view(ui.AdminPanelView())
         self.add_view(ui.ReviewCardView())
+        self.add_view(ui.AuctionView())
         charge_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_CHARGE)
         shop_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_SHOP)
         invite_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_INVITE)
@@ -1518,6 +1519,75 @@ class ChargeBot(commands.Bot):
             ephemeral=True,
         )
         await self.charge.refresh_shop_panels(interaction.guild.id)
+
+    # ------------------------------------------------------------------
+    # オークション操作ハンドラ
+    # ------------------------------------------------------------------
+    async def on_auction_bid_button(self, interaction: discord.Interaction) -> None:
+        """💸 入札する → 入札額の入力 (どのオークションかはメッセージIDで引く)。"""
+        if await self._guard_user_action(interaction) is None:
+            return
+        message = interaction.message
+        if message is None:
+            await ui.safe_respond(
+                interaction, embed=ui.error_embed(config.ErrorCode.AUCTION_NOT_OPEN)
+            )
+            return
+        auction = await self.db.get_auction_by_message(message.id)
+        if auction is None or str(auction["status"]) != config.AuctionStatus.OPEN:
+            await ui.safe_respond(
+                interaction, embed=ui.error_embed(config.ErrorCode.AUCTION_NOT_OPEN)
+            )
+            return
+        if int(auction["ends_at"]) <= utils.now_ts():
+            await ui.safe_respond(
+                interaction,
+                embed=ui.error_embed(
+                    config.ErrorCode.AUCTION_NOT_OPEN,
+                    next_action="締切時刻を過ぎています。他のオークションをご覧ください。",
+                ),
+            )
+            return
+        await interaction.response.send_modal(ui.AuctionBidModal(auction))
+
+    async def handle_auction_bid(
+        self, interaction: discord.Interaction, auction_id: int, raw_amount: str
+    ) -> None:
+        """入札額の入力を受けて入札する。"""
+        member = self._member_of(interaction)
+        if interaction.guild is None or member is None:
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        amount = utils.parse_user_amount(raw_amount)
+        if amount is None:
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.INVALID_AMOUNT), ephemeral=True
+            )
+            return
+        try:
+            result = await self.charge.place_bid(member, auction_id, amount)
+        except ChargeError as exc:
+            logger.info("入札を拒否しました user=%s code=%s", member.id, exc.code)
+            await interaction.followup.send(
+                embed=ui.error_embed(exc.code, next_action=exc.detail or None),
+                ephemeral=True,
+            )
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception("入札処理で予期しない例外が発生しました auction=%s", auction_id)
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.UNKNOWN_ERROR), ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            embed=ui.auction_bid_success_embed(
+                name=str(result["name"]), amount=int(result["amount"]),
+                balance_after=int(result["balance_after"]),
+                ends_at=int(result["ends_at"]), extended=bool(result["extended"]),
+                auction_id=auction_id,
+            ),
+            ephemeral=True,
+        )
 
     async def on_shop_myitems_button(self, interaction: discord.Interaction) -> None:
         """📦 購入履歴 (Ephemeral)。"""

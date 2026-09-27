@@ -1579,6 +1579,344 @@ def subscription_list_embed(rows: Sequence[Any], *, guild_name: str) -> discord.
 
 
 # ---------------------------------------------------------------------------
+# オークション
+# ---------------------------------------------------------------------------
+
+def auction_minimum_bid(auction: Any) -> int:
+    """次に入札できる最低額。"""
+    current = auction["current_bid"]
+    if current is None:
+        return int(auction["start_price"])
+    return int(current) + int(auction["min_increment"])
+
+
+def auction_panel_embed(
+    auction: Any, bids: Sequence[Any] = (), *, counts: tuple[int, int] = (0, 0)
+) -> discord.Embed:
+    """オークションのパネル (入札ごとに更新する)。"""
+    status = str(auction["status"])
+    open_now = status == config.AuctionStatus.OPEN
+    color = {
+        config.AuctionStatus.OPEN: config.Color.ACCENT,
+        config.AuctionStatus.CLOSED: config.Color.SUCCESS,
+        config.AuctionStatus.CANCELLED: config.Color.WARNING,
+        config.AuctionStatus.FAILED: config.Color.NEUTRAL,
+    }.get(status, config.Color.NEUTRAL)
+    current = auction["current_bid"]
+    embed = discord.Embed(
+        title=f"🔨 {utils.truncate(str(auction['name']), 200)}",
+        description=(
+            f"{SEPARATOR}\n"
+            f"{config.AUCTION_STATUS_LABELS.get(status, status)}\n"
+            + (f"{utils.truncate(str(auction['description']), 500)}\n"
+               if auction["description"] else "")
+            + SEPARATOR
+        ),
+        color=color,
+    )
+    embed.add_field(name="景品", value=f"<@&{int(auction['role_id'])}>", inline=True)
+    duration = int(auction["duration_days"] or 0)
+    embed.add_field(
+        name="ロールの有効期間",
+        value=f"**{duration}日間**" if duration else "**無期限**",
+        inline=True,
+    )
+    embed.add_field(
+        name="開始価格", value=f"{utils.fmt_int(int(auction['start_price']))}", inline=True
+    )
+    if open_now:
+        embed.add_field(
+            name="現在の最高額",
+            value=(
+                f"**{utils.fmt_int(int(current))}**\n<@{int(auction['current_bidder'])}>"
+                if current is not None else "まだ入札はありません"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="次の最低入札額",
+            value=f"**{utils.fmt_int(auction_minimum_bid(auction))}**",
+            inline=True,
+        )
+        embed.add_field(
+            name="締切",
+            value=(
+                f"{utils.discord_ts(int(auction['ends_at']))}\n"
+                f"({utils.discord_ts(int(auction['ends_at']), 'R')})"
+            ),
+            inline=True,
+        )
+    else:
+        winner = auction["winner_id"]
+        embed.add_field(
+            name="結果",
+            value=(
+                f"落札者 <@{int(winner)}>\n**{utils.fmt_int(int(auction['winning_bid']))}**"
+                if winner and auction["winning_bid"] else
+                "入札がないまま終了しました" if status == config.AuctionStatus.FAILED
+                else "中止しました (入札は全額返金済み)"
+            ),
+            inline=True,
+        )
+        if auction["closed_at"]:
+            embed.add_field(
+                name="終了", value=utils.discord_ts(int(auction["closed_at"])), inline=True
+            )
+    bid_count, bidder_count = counts
+    if bid_count:
+        embed.add_field(
+            name="入札状況",
+            value=f"{bid_count}件 / {bidder_count}人",
+            inline=True,
+        )
+    if bids:
+        lines = [
+            f"{i}. <@{int(b['user_id'])}> **{utils.fmt_int(int(b['amount']))}**"
+            + ("" if not int(b["refunded"] or 0) else " (返金済み)")
+            for i, b in enumerate(list(bids)[:5], start=1)
+        ]
+        embed.add_field(name="入札の上位", value="\n".join(lines), inline=False)
+    if open_now:
+        embed.add_field(
+            name="▶ 入札のしかた",
+            value=(
+                "**1.** `💸 入札する` を押す\n"
+                "**2.** 入札額を入力する (現在の最低額以上)\n"
+                "→ 入札した分は**その場で残高から預かります**\n"
+                "→ 他の人に上回られたら**全額すぐに返します** (DMでお知らせ)\n"
+                f"→ 締切 {config.AUCTION_ANTI_SNIPE_SECONDS // 60} 分前の入札では"
+                "締切が延長されます"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text=f"オークションID: {int(auction['id'])}")
+    else:
+        embed.set_footer(text=f"オークションID: {int(auction['id'])} / 終了しました")
+    return embed
+
+
+def auction_bid_success_embed(
+    *, name: str, amount: int, balance_after: int, ends_at: int,
+    extended: bool, auction_id: int,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="✅ 入札しました",
+        description=(
+            f"{SEPARATOR}\n**{name}** に **{utils.fmt_int(amount)}** で入札しました。\n"
+            f"この分は残高から預かっています。\n{SEPARATOR}"
+        ),
+        color=config.Color.SUCCESS,
+    )
+    embed.add_field(name="入札後の残高", value=f"**{utils.fmt_int(balance_after)}**", inline=True)
+    embed.add_field(
+        name="締切",
+        value=utils.discord_ts(ends_at) + ("\n(締切が延長されました)" if extended else ""),
+        inline=True,
+    )
+    embed.add_field(name="オークションID", value=f"`{auction_id}`", inline=True)
+    embed.add_field(
+        name="この先の流れ",
+        value=(
+            "・他の人に上回られたら**全額すぐに返金**します (DMでお知らせ)\n"
+            "・そのまま締切を迎えたら落札となり、景品のロールが付きます"
+        ),
+        inline=False,
+    )
+    return embed
+
+
+def auction_outbid_dm_embed(
+    *, name: str, auction_id: int, your_bid: int, new_bid: int,
+    balance_after: int, ends_at: int,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="🔔 入札が上回られました",
+        description=(
+            f"{SEPARATOR}\n**{name}** であなたの入札 "
+            f"({utils.fmt_int(your_bid)}) が上回られました。\n"
+            f"預かっていた **{utils.fmt_int(your_bid)}** は全額返金しました。\n{SEPARATOR}"
+        ),
+        color=config.Color.WARNING,
+    )
+    embed.add_field(name="現在の最高額", value=f"**{utils.fmt_int(new_bid)}**", inline=True)
+    embed.add_field(name="返金後の残高", value=f"**{utils.fmt_int(balance_after)}**", inline=True)
+    embed.add_field(
+        name="締切",
+        value=f"{utils.discord_ts(ends_at)}\n({utils.discord_ts(ends_at, 'R')})",
+        inline=True,
+    )
+    embed.add_field(
+        name="続けて入札するには",
+        value=f"オークションのパネルから、または `/auction bid auction_id:{auction_id}`",
+        inline=False,
+    )
+    return embed
+
+
+def auction_won_dm_embed(
+    *, name: str, auction_id: int, winning_bid: int, role_id: int,
+    role_expires_at: int | None, balance: int,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="🏁 落札しました",
+        description=(
+            f"{SEPARATOR}\n**{name}** を **{utils.fmt_int(winning_bid)}** で落札しました。\n"
+            f"景品の <@&{role_id}> を付与しました。\n{SEPARATOR}"
+        ),
+        color=config.Color.SUCCESS,
+    )
+    embed.add_field(
+        name="お支払い",
+        value=f"入札時に預かった **{utils.fmt_int(winning_bid)}** をそのまま充当しました\n"
+              f"(追加の引き落としはありません)",
+        inline=False,
+    )
+    embed.add_field(name="いまの残高", value=f"**{utils.fmt_int(balance)}**", inline=True)
+    embed.add_field(
+        name="ロールの有効期限",
+        value=(
+            f"{utils.discord_ts(role_expires_at)}\n"
+            f"({utils.discord_ts(role_expires_at, 'R')})"
+            if role_expires_at else "無期限"
+        ),
+        inline=True,
+    )
+    embed.add_field(name="オークションID", value=f"`{auction_id}`", inline=True)
+    return embed
+
+
+def auction_cancelled_dm_embed(
+    *, name: str, auction_id: int, refunded: int, balance_after: int, reason: str
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="⚫ オークションが中止されました",
+        description=(
+            f"{SEPARATOR}\n**{name}** は中止されました。\n"
+            f"預かっていた **{utils.fmt_int(refunded)}** は全額返金しました。\n{SEPARATOR}"
+        ),
+        color=config.Color.WARNING,
+    )
+    embed.add_field(name="返金後の残高", value=f"**{utils.fmt_int(balance_after)}**", inline=True)
+    embed.add_field(name="オークションID", value=f"`{auction_id}`", inline=True)
+    embed.add_field(name="理由", value=utils.truncate(reason, 500) or "-", inline=False)
+    return embed
+
+
+def auction_result_embed(auction: Any, *, counts: tuple[int, int] = (0, 0)) -> discord.Embed:
+    """落札結果の実績 (実績チャンネルへ投稿)。"""
+    status = str(auction["status"])
+    winner = auction["winner_id"]
+    embed = discord.Embed(
+        title="🔨 オークション結果",
+        description=SEPARATOR,
+        color=config.Color.SUCCESS if winner else config.Color.NEUTRAL,
+    )
+    embed.add_field(name="オークション", value=f"**{auction['name']}**", inline=False)
+    embed.add_field(name="景品", value=f"<@&{int(auction['role_id'])}>", inline=True)
+    embed.add_field(
+        name="状態",
+        value=config.AUCTION_STATUS_LABELS.get(status, status),
+        inline=True,
+    )
+    if winner and auction["winning_bid"]:
+        embed.add_field(name="落札者", value=f"<@{int(winner)}>", inline=True)
+        embed.add_field(
+            name="落札額", value=f"**{utils.fmt_int(int(auction['winning_bid']))}**", inline=True
+        )
+    bid_count, bidder_count = counts
+    embed.add_field(name="入札", value=f"{bid_count}件 / {bidder_count}人", inline=True)
+    if auction["closed_at"]:
+        embed.add_field(
+            name="終了", value=utils.discord_ts(int(auction["closed_at"])), inline=True
+        )
+    embed.set_footer(text=f"オークションID: {int(auction['id'])}")
+    return embed
+
+
+def auction_list_embed(rows: Sequence[Any], *, guild_name: str) -> discord.Embed:
+    embed = discord.Embed(
+        title="🔨 オークション一覧",
+        description=(
+            f"{SEPARATOR}\n**{guild_name}**\n"
+            + (f"{len(rows)} 件" if rows else "オークションはありません。")
+            + f"\n{SEPARATOR}"
+        ),
+        color=config.Color.INFO,
+    )
+    for row in list(rows)[:10]:
+        status = str(row["status"])
+        current = row["current_bid"]
+        lines = [
+            config.AUCTION_STATUS_LABELS.get(status, status),
+            f"景品: <@&{int(row['role_id'])}>",
+            f"開始価格: {utils.fmt_int(int(row['start_price']))}",
+        ]
+        if status == config.AuctionStatus.OPEN:
+            lines.append(
+                f"現在: {utils.fmt_int(int(current))} (<@{int(row['current_bidder'])}>)"
+                if current is not None else "現在: 入札なし"
+            )
+            lines.append(f"締切: {utils.discord_ts(int(row['ends_at']))}")
+        elif row["winner_id"] and row["winning_bid"]:
+            lines.append(
+                f"落札: <@{int(row['winner_id'])}> "
+                f"{utils.fmt_int(int(row['winning_bid']))}"
+            )
+        embed.add_field(
+            name=f"`{int(row['id'])}` {utils.truncate(str(row['name']), 80)}",
+            value="\n".join(lines),
+            inline=False,
+        )
+    return embed
+
+
+class AuctionBidModal(discord.ui.Modal):
+    """入札額の入力。"""
+
+    def __init__(self, auction: Any) -> None:
+        super().__init__(
+            title=utils.truncate(f"入札: {auction['name']}", 45), timeout=300
+        )
+        self.auction_id = int(auction["id"])
+        minimum = auction_minimum_bid(auction)
+        self.amount: discord.ui.TextInput = discord.ui.TextInput(
+            label=f"入札額 (最低 {minimum})",
+            placeholder=f"{minimum} 以上の半角数字で入力",
+            required=True,
+            min_length=1,
+            max_length=config.AMOUNT_INPUT_MAX_LEN,
+        )
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await bot_of(interaction).handle_auction_bid(
+            interaction, self.auction_id, str(self.amount.value)
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
+        logger.error("入札Modalでエラー: %s", utils.safe_error_text(error))
+        await safe_respond(interaction, embed=error_embed(config.ErrorCode.UNKNOWN_ERROR))
+
+
+class AuctionView(discord.ui.View):
+    """オークションのパネル (Persistent View)。
+
+    どのオークションかはメッセージIDから引く。custom_id は固定値なので
+    Bot を再起動してもボタンが動き続ける。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="入札する", emoji="💸", style=discord.ButtonStyle.success,
+        custom_id=config.CustomID.AUCTION_BID,
+    )
+    async def bid(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await bot_of(interaction).on_auction_bid_button(interaction)
+
+
+# ---------------------------------------------------------------------------
 # チャージ方式 (PayPay / LTC の申請と審査)
 # ---------------------------------------------------------------------------
 

@@ -56,6 +56,15 @@ class RequestError(DatabaseError):
         self.detail = detail
 
 
+class AuctionError(DatabaseError):
+    """オークションの入札・中止が行えない (利用者向けエラーコードを持つ)。"""
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        super().__init__(detail or code)
+        self.code = code
+        self.detail = detail
+
+
 # ---------------------------------------------------------------------------
 # データクラス
 # ---------------------------------------------------------------------------
@@ -720,12 +729,16 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         message_id     INTEGER,
         ends_at        INTEGER NOT NULL,
         closed_at      INTEGER,
+        role_expires_at INTEGER,
         created_by     INTEGER,
         created_at     INTEGER NOT NULL DEFAULT 0,
         updated_at     INTEGER NOT NULL DEFAULT 0
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_auctions_open ON auctions(status, ends_at)",
+    # 落札ロールの期限切れを探すため (期限つきの落札だけを対象にする)
+    "CREATE INDEX IF NOT EXISTS idx_auctions_role_expiry "
+    "ON auctions(role_expires_at) WHERE role_expires_at IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_auctions_guild ON auctions(guild_id, status, ends_at)",
     "CREATE INDEX IF NOT EXISTS idx_auctions_message "
     "ON auctions(message_id) WHERE message_id IS NOT NULL",
@@ -4117,6 +4130,421 @@ class Database:
         )
 
     # ==================================================================
+    # オークション
+    # ==================================================================
+    async def create_auction(
+        self,
+        *,
+        guild_id: int,
+        name: str,
+        role_id: int,
+        start_price: int,
+        min_increment: int,
+        ends_at: int,
+        duration_days: int = 0,
+        description: str | None = None,
+        created_by: int | None = None,
+    ) -> int:
+        now = utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> int:
+            cur = conn.execute(
+                "INSERT INTO auctions(guild_id, name, description, role_id, duration_days, "
+                "start_price, min_increment, status, ends_at, created_by, created_at, "
+                "updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (guild_id, name, description, role_id, duration_days, start_price,
+                 max(1, min_increment), config.AuctionStatus.OPEN, ends_at, created_by,
+                 now, now),
+            )
+            return _lastrowid(cur)
+
+        return await self.run(_fn, write=True)
+
+    async def get_auction(
+        self, auction_id: int, guild_id: int | None = None
+    ) -> sqlite3.Row | None:
+        if guild_id is None:
+            return await self.fetchone("SELECT * FROM auctions WHERE id=?", (auction_id,))
+        return await self.fetchone(
+            "SELECT * FROM auctions WHERE id=? AND guild_id=?", (auction_id, guild_id)
+        )
+
+    async def get_auction_by_message(self, message_id: int) -> sqlite3.Row | None:
+        """パネルのメッセージIDからオークションを引く (ボタン操作用)。"""
+        return await self.fetchone(
+            "SELECT * FROM auctions WHERE message_id=?", (message_id,)
+        )
+
+    async def list_auctions(
+        self, guild_id: int, *, status: str | None = None, limit: int = 20
+    ) -> list[sqlite3.Row]:
+        clauses = ["guild_id=?"]
+        params: list[Any] = [guild_id]
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        return await self.fetchall(
+            f"SELECT * FROM auctions WHERE {' AND '.join(clauses)} "
+            "ORDER BY CASE status WHEN 'OPEN' THEN 0 ELSE 1 END, ends_at DESC LIMIT ?",
+            (*params, limit),
+        )
+
+    async def count_open_auctions(self, guild_id: int) -> int:
+        row = await self.fetchone(
+            "SELECT COUNT(*) AS c FROM auctions WHERE guild_id=? AND status=?",
+            (guild_id, config.AuctionStatus.OPEN),
+        )
+        return int(row["c"]) if row else 0
+
+    async def list_due_auctions(self, *, now: int | None = None, limit: int = 20) -> list[sqlite3.Row]:
+        """締切時刻を過ぎた開催中のオークション。"""
+        return await self.fetchall(
+            "SELECT * FROM auctions WHERE status=? AND ends_at <= ? ORDER BY ends_at ASC LIMIT ?",
+            (config.AuctionStatus.OPEN, now or utils.now_ts(), limit),
+        )
+
+    async def list_auction_bids(
+        self, auction_id: int, *, limit: int = 10
+    ) -> list[sqlite3.Row]:
+        return await self.fetchall(
+            "SELECT * FROM auction_bids WHERE auction_id=? ORDER BY amount DESC, id DESC LIMIT ?",
+            (auction_id, limit),
+        )
+
+    async def count_auction_bids(self, auction_id: int) -> tuple[int, int]:
+        """(入札件数, 入札した人数)。"""
+        row = await self.fetchone(
+            "SELECT COUNT(*) AS c, COUNT(DISTINCT user_id) AS u FROM auction_bids "
+            "WHERE auction_id=?",
+            (auction_id,),
+        )
+        return (int(row["c"]), int(row["u"])) if row else (0, 0)
+
+    async def place_bid(
+        self, *, auction_id: int, guild_id: int, user_id: int, amount: int,
+        anti_snipe: int = config.AUCTION_ANTI_SNIPE_SECONDS,
+    ) -> dict[str, Any]:
+        """入札する (引き落とし・前の入札者への返金・更新を単一トランザクションで)。
+
+        入札した時点で残高を押さえる (預かる) 方式にしている。こうすると
+        「落札したのに残高が無い」が起きず、支払えない入札で他の人を
+        押しのけることもできない。上回られた人へはその場で全額返す。
+
+        締切直前の入札では締切を少し延長する (いわゆる駆け込み対策)。
+
+        Raises:
+            AuctionError: 入札できない理由 (エラーコード付き)。
+        """
+        now = utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> dict[str, Any]:
+            auction = conn.execute(
+                "SELECT * FROM auctions WHERE id=? AND guild_id=?", (auction_id, guild_id)
+            ).fetchone()
+            if auction is None:
+                raise AuctionError(
+                    config.ErrorCode.AUCTION_NOT_OPEN, "オークションが見つかりません"
+                )
+            if str(auction["status"]) != config.AuctionStatus.OPEN:
+                raise AuctionError(
+                    config.ErrorCode.AUCTION_NOT_OPEN,
+                    f"このオークションは終了しています (状態: {auction['status']})",
+                )
+            if int(auction["ends_at"]) <= now:
+                raise AuctionError(
+                    config.ErrorCode.AUCTION_NOT_OPEN, "締切時刻を過ぎています"
+                )
+            current_bid = auction["current_bid"]
+            current_bidder = auction["current_bidder"]
+            if current_bidder is not None and int(current_bidder) == user_id:
+                raise AuctionError(
+                    config.ErrorCode.ALREADY_HIGHEST, "すでに最高額で入札しています"
+                )
+            minimum = (
+                int(auction["start_price"]) if current_bid is None
+                else int(current_bid) + int(auction["min_increment"])
+            )
+            if amount < minimum:
+                raise AuctionError(
+                    config.ErrorCode.BID_TOO_LOW,
+                    f"最低入札額は {minimum} です (入力 {amount})",
+                )
+            bal_row = conn.execute(
+                "SELECT balance FROM balances WHERE guild_id=? AND user_id=?",
+                (guild_id, user_id),
+            ).fetchone()
+            before = int(bal_row["balance"]) if bal_row else 0
+            if before < amount:
+                raise AuctionError(
+                    config.ErrorCode.INSUFFICIENT_BALANCE,
+                    f"残高不足 (所持 {before} / 必要 {amount})",
+                )
+            after = before - amount
+            conn.execute(
+                "INSERT INTO users(guild_id, user_id, created_at, updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(guild_id, user_id) DO NOTHING",
+                (guild_id, user_id, now, now),
+            )
+            cur = conn.execute(
+                "INSERT INTO auction_bids(auction_id, guild_id, user_id, amount, created_at) "
+                "VALUES(?,?,?,?,?)",
+                (auction_id, guild_id, user_id, amount, now),
+            )
+            bid_id = _lastrowid(cur)
+            conn.execute(
+                "INSERT INTO balances(guild_id, user_id, balance, updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(guild_id, user_id) DO UPDATE SET balance=excluded.balance, "
+                "updated_at=excluded.updated_at",
+                (guild_id, user_id, after, now),
+            )
+            conn.execute(
+                "INSERT INTO balance_history(guild_id, user_id, change_amount, balance_before, "
+                "balance_after, type, transaction_id, operator_id, reason, created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (guild_id, user_id, -amount, before, after,
+                 config.BalanceChangeType.AUCTION_BID, f"AUC-{auction_id}-B{bid_id}", None,
+                 utils.truncate(f"オークション入札: {auction['name']}", 500), now),
+            )
+
+            # 直前の最高額入札者へ即座に返金する
+            refunded: dict[str, Any] | None = None
+            if current_bidder is not None and current_bid is not None:
+                prev_user = int(current_bidder)
+                prev_amount = int(current_bid)
+                prev_bid = conn.execute(
+                    "SELECT * FROM auction_bids WHERE auction_id=? AND user_id=? AND amount=? "
+                    "AND refunded=0 ORDER BY id DESC LIMIT 1",
+                    (auction_id, prev_user, prev_amount),
+                ).fetchone()
+                prev_row = conn.execute(
+                    "SELECT balance FROM balances WHERE guild_id=? AND user_id=?",
+                    (guild_id, prev_user),
+                ).fetchone()
+                prev_before = int(prev_row["balance"]) if prev_row else 0
+                prev_after = prev_before + prev_amount
+                conn.execute(
+                    "INSERT INTO balances(guild_id, user_id, balance, updated_at) "
+                    "VALUES(?,?,?,?) ON CONFLICT(guild_id, user_id) DO UPDATE SET "
+                    "balance=excluded.balance, updated_at=excluded.updated_at",
+                    (guild_id, prev_user, prev_after, now),
+                )
+                ref_tx = (
+                    f"AUC-{auction_id}-B{int(prev_bid['id'])}" if prev_bid is not None
+                    else f"AUC-{auction_id}-R{bid_id}"
+                )
+                conn.execute(
+                    "INSERT INTO balance_history(guild_id, user_id, change_amount, "
+                    "balance_before, balance_after, type, transaction_id, operator_id, "
+                    "reason, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (guild_id, prev_user, prev_amount, prev_before, prev_after,
+                     config.BalanceChangeType.AUCTION_REFUND, ref_tx, None,
+                     utils.truncate(
+                         f"入札が上回られたため返金: {auction['name']}", 500), now),
+                )
+                if prev_bid is not None:
+                    conn.execute(
+                        "UPDATE auction_bids SET refunded=1 WHERE id=?",
+                        (int(prev_bid["id"]),),
+                    )
+                refunded = {
+                    "user_id": prev_user, "amount": prev_amount,
+                    "balance_before": prev_before, "balance_after": prev_after,
+                }
+
+            # 駆け込み対策: 締切直前の入札なら締切を延長する
+            ends_at = int(auction["ends_at"])
+            extended = False
+            if anti_snipe > 0 and ends_at - now < anti_snipe:
+                ends_at = now + anti_snipe
+                extended = True
+            conn.execute(
+                "UPDATE auctions SET current_bid=?, current_bidder=?, ends_at=?, updated_at=? "
+                "WHERE id=?",
+                (amount, user_id, ends_at, now, auction_id),
+            )
+            return {
+                "auction_id": auction_id, "bid_id": bid_id, "amount": amount,
+                "minimum": minimum, "balance_before": before, "balance_after": after,
+                "name": str(auction["name"]), "role_id": int(auction["role_id"]),
+                "ends_at": ends_at, "extended": extended, "refunded": refunded,
+            }
+
+        return await self.run(_fn, write=True)
+
+    async def close_auction(
+        self, auction_id: int, *, now: int | None = None, force: bool = False
+    ) -> dict[str, Any]:
+        """締切を確定する (落札者を決める)。
+
+        落札者の残高は入札時に押さえてあるため、ここでの引き落としは無い。
+        同時に2回呼ばれても ``status=OPEN`` を条件にするため1回しか通らない。
+
+        Args:
+            force: 締切時刻前でも締める (管理者操作用)。
+        """
+        now = now or utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> dict[str, Any]:
+            clauses = ["id=?", "status=?"]
+            params: list[Any] = [auction_id, config.AuctionStatus.OPEN]
+            if not force:
+                clauses.append("ends_at <= ?")
+                params.append(now)
+            auction = conn.execute(
+                f"SELECT * FROM auctions WHERE {' AND '.join(clauses)}", tuple(params)
+            ).fetchone()
+            if auction is None:
+                return {"closed": False, "reason": "NOT_DUE"}
+            bidder = auction["current_bidder"]
+            bid = auction["current_bid"]
+            if bidder is None or bid is None:
+                conn.execute(
+                    "UPDATE auctions SET status=?, closed_at=?, updated_at=? WHERE id=?",
+                    (config.AuctionStatus.FAILED, now, now, auction_id),
+                )
+                return {"closed": True, "reason": "NO_BIDS", "status": config.AuctionStatus.FAILED,
+                        "guild_id": int(auction["guild_id"]), "name": str(auction["name"]),
+                        "auction_id": auction_id, "channel_id": auction["channel_id"],
+                        "message_id": auction["message_id"]}
+            duration = int(auction["duration_days"] or 0)
+            role_expires_at = now + duration * 86400 if duration > 0 else None
+            conn.execute(
+                "UPDATE auctions SET status=?, winner_id=?, winning_bid=?, closed_at=?, "
+                "role_expires_at=?, updated_at=? WHERE id=?",
+                (config.AuctionStatus.CLOSED, int(bidder), int(bid), now,
+                 role_expires_at, now, auction_id),
+            )
+            return {
+                "closed": True, "reason": "OK", "status": config.AuctionStatus.CLOSED,
+                "auction_id": auction_id, "guild_id": int(auction["guild_id"]),
+                "name": str(auction["name"]), "role_id": int(auction["role_id"]),
+                "winner_id": int(bidder), "winning_bid": int(bid),
+                "duration_days": duration, "role_expires_at": role_expires_at,
+                "channel_id": auction["channel_id"], "message_id": auction["message_id"],
+            }
+
+        return await self.run(_fn, write=True)
+
+    async def cancel_auction(
+        self, auction_id: int, *, guild_id: int, operator_id: int, reason: str
+    ) -> dict[str, Any]:
+        """オークションを中止し、預かっている入札額を返す。
+
+        上回られた入札はその時点で返金済みなので、返すのは現在の最高額だけ。
+        """
+        now = utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> dict[str, Any]:
+            auction = conn.execute(
+                "SELECT * FROM auctions WHERE id=? AND guild_id=? AND status=?",
+                (auction_id, guild_id, config.AuctionStatus.OPEN),
+            ).fetchone()
+            if auction is None:
+                raise AuctionError(
+                    config.ErrorCode.AUCTION_NOT_OPEN,
+                    "開催中のオークションが見つかりません",
+                )
+            refunded: dict[str, Any] | None = None
+            bidder = auction["current_bidder"]
+            bid = auction["current_bid"]
+            if bidder is not None and bid is not None:
+                refunded = _refund_auction_bid(
+                    conn, auction_id=auction_id, guild_id=guild_id,
+                    user_id=int(bidder), amount=int(bid), now=now,
+                    reason=f"オークション中止による返金: {auction['name']}",
+                    operator_id=operator_id,
+                )
+            conn.execute(
+                "UPDATE auctions SET status=?, closed_at=?, updated_at=? WHERE id=?",
+                (config.AuctionStatus.CANCELLED, now, now, auction_id),
+            )
+            return {
+                "auction_id": auction_id, "guild_id": guild_id,
+                "name": str(auction["name"]), "refunded": refunded,
+                "channel_id": auction["channel_id"], "message_id": auction["message_id"],
+                "reason": utils.truncate(reason, 300),
+            }
+
+        return await self.run(_fn, write=True)
+
+    async def refund_auction_winner(
+        self, auction_id: int, *, reason: str, operator_id: int | None = None
+    ) -> dict[str, Any]:
+        """落札者へ返金する (景品を渡せなかった場合の救済)。
+
+        返金したオークションは「中止」として扱う。落札したのに何も
+        受け取れない状態を残さないため、状態と残高を必ず揃える。
+        """
+        now = utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> dict[str, Any]:
+            auction = conn.execute(
+                "SELECT * FROM auctions WHERE id=? AND status=?",
+                (auction_id, config.AuctionStatus.CLOSED),
+            ).fetchone()
+            if auction is None:
+                return {"refunded": False, "reason": "NOT_CLOSED"}
+            winner = auction["winner_id"]
+            bid = auction["winning_bid"]
+            if winner is None or bid is None:
+                return {"refunded": False, "reason": "NO_WINNER"}
+            result = _refund_auction_bid(
+                conn, auction_id=auction_id, guild_id=int(auction["guild_id"]),
+                user_id=int(winner), amount=int(bid), now=now, reason=reason,
+                operator_id=operator_id,
+            )
+            if result is None:
+                return {"refunded": False, "reason": "ALREADY_REFUNDED"}
+            conn.execute(
+                "UPDATE auctions SET status=?, role_expires_at=NULL, updated_at=? WHERE id=?",
+                (config.AuctionStatus.CANCELLED, now, auction_id),
+            )
+            return {
+                "refunded": True, "reason": "OK", "auction_id": auction_id,
+                "guild_id": int(auction["guild_id"]), "name": str(auction["name"]),
+                "user_id": int(winner), "amount": int(bid),
+                "balance_before": result["balance_before"],
+                "balance_after": result["balance_after"],
+                "channel_id": auction["channel_id"], "message_id": auction["message_id"],
+            }
+
+        return await self.run(_fn, write=True)
+
+    async def set_auction_message(
+        self, auction_id: int, *, channel_id: int, message_id: int
+    ) -> None:
+        await self.execute(
+            "UPDATE auctions SET channel_id=?, message_id=?, updated_at=? WHERE id=?",
+            (channel_id, message_id, utils.now_ts(), auction_id),
+        )
+
+    async def list_auction_role_expiries(
+        self, *, now: int | None = None, limit: int = 50
+    ) -> list[sqlite3.Row]:
+        """期限が切れた落札ロールを返す。"""
+        return await self.fetchall(
+            "SELECT * FROM auctions WHERE status=? AND role_expires_at IS NOT NULL "
+            "AND role_expires_at <= ? ORDER BY role_expires_at ASC LIMIT ?",
+            (config.AuctionStatus.CLOSED, now or utils.now_ts(), limit),
+        )
+
+    async def clear_auction_role_expiry(self, auction_id: int) -> int:
+        """ロールを剥がし終えた印 (同じ処理を繰り返さない)。"""
+        return await self.execute(
+            "UPDATE auctions SET role_expires_at=NULL, updated_at=? WHERE id=? "
+            "AND role_expires_at IS NOT NULL",
+            (utils.now_ts(), auction_id),
+        )
+
+    async def get_user_bid(self, auction_id: int, user_id: int) -> sqlite3.Row | None:
+        """その人の最高入札 (返金されていないもの)。"""
+        return await self.fetchone(
+            "SELECT * FROM auction_bids WHERE auction_id=? AND user_id=? AND refunded=0 "
+            "ORDER BY amount DESC LIMIT 1",
+            (auction_id, user_id),
+        )
+
+    # ==================================================================
     # 招待キャンペーン
     # ==================================================================
     async def create_campaign(
@@ -5180,6 +5608,7 @@ _FORWARD_COMPAT_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("shop_purchases", "notified_at", "INTEGER"),
     ("shop_purchases", "item_type", "TEXT NOT NULL DEFAULT 'ROLE'"),
     ("shop_purchases", "subscription", "INTEGER NOT NULL DEFAULT 0"),
+    ("auctions", "role_expires_at", "INTEGER"),
 )
 
 
@@ -5211,6 +5640,56 @@ def _lastrowid(cursor: sqlite3.Cursor) -> int:
     if rowid is None:
         raise DatabaseError("INSERT 後の rowid を取得できませんでした")
     return int(rowid)
+
+
+def _refund_auction_bid(
+    conn: sqlite3.Connection,
+    *,
+    auction_id: int,
+    guild_id: int,
+    user_id: int,
+    amount: int,
+    now: int,
+    reason: str,
+    operator_id: int | None = None,
+) -> dict[str, Any] | None:
+    """預かっている入札額を返す (中止・景品を渡せなかった場合の共通処理)。
+
+    同じ入札を二重に返金しないよう、``auction_bids.refunded=0`` の行を
+    対象にして印を付ける。該当が無ければ何もせず None を返す。
+    """
+    bid = conn.execute(
+        "SELECT * FROM auction_bids WHERE auction_id=? AND user_id=? AND amount=? "
+        "AND refunded=0 ORDER BY id DESC LIMIT 1",
+        (auction_id, user_id, amount),
+    ).fetchone()
+    if bid is None:
+        return None
+    bal_row = conn.execute(
+        "SELECT balance FROM balances WHERE guild_id=? AND user_id=?", (guild_id, user_id)
+    ).fetchone()
+    before = int(bal_row["balance"]) if bal_row else 0
+    after = before + amount
+    conn.execute(
+        "INSERT INTO balances(guild_id, user_id, balance, updated_at) VALUES(?,?,?,?) "
+        "ON CONFLICT(guild_id, user_id) DO UPDATE SET balance=excluded.balance, "
+        "updated_at=excluded.updated_at",
+        (guild_id, user_id, after, now),
+    )
+    conn.execute(
+        "INSERT INTO balance_history(guild_id, user_id, change_amount, balance_before, "
+        "balance_after, type, transaction_id, operator_id, reason, created_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (guild_id, user_id, amount, before, after,
+         config.BalanceChangeType.AUCTION_REFUND,
+         f"AUC-{auction_id}-B{int(bid['id'])}", operator_id,
+         utils.truncate(reason, 500), now),
+    )
+    conn.execute("UPDATE auction_bids SET refunded=1 WHERE id=?", (int(bid["id"]),))
+    return {
+        "user_id": user_id, "amount": amount, "bid_id": int(bid["id"]),
+        "balance_before": before, "balance_after": after,
+    }
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:

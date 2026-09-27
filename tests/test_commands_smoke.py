@@ -807,6 +807,59 @@ async def main() -> None:
             ))
             print(" FAIL  検証: ショップ購入が成立していない")
 
+    # --- オークション: パネルのボタンから入札する ---
+    prize_role = StubRole(620_777, "オークション景品", position=4)
+    guild.roles[prize_role.id] = prize_role
+    prize_role.guild = guild  # type: ignore[attr-defined]
+    auction_created = await bot.charge.create_auction(
+        guild, name="スモーク用オークション", role=prize_role, start_price=500,
+        min_increment=100, hours=2.0, duration_days=0, description=None,
+        created_by=owner.id,
+    )
+    smoke_auction_id = int(auction_created["auction_id"])
+    auction_message = await guild.channel.send(
+        embed=ui.auction_panel_embed(
+            await bot.db.get_auction(smoke_auction_id, G)  # type: ignore[arg-type]
+        )
+    )
+    await bot.db.set_auction_message(
+        smoke_auction_id, channel_id=guild.channel.id, message_id=auction_message.id
+    )
+    auction_view = ui.AuctionView()
+    bid_button = next(
+        c for c in auction_view.children if isinstance(c, discord.ui.Button)
+    )
+    bid_interaction = fresh(rich)
+    bid_interaction.message = auction_message
+    await run_ui("オークション: 入札ボタン", bid_button.callback(bid_interaction),
+                 bid_interaction)
+    if bid_interaction.modals:
+        modal = bid_interaction.modals[0]
+        modal.amount._value = "700"  # type: ignore[attr-defined]
+        bal_before_bid = await bot.db.get_balance(G, rich.id)
+        modal_interaction = fresh(rich)
+        await run_ui("オークション: 入札額を送信",
+                     modal.on_submit(modal_interaction), modal_interaction)
+        bal_after_bid = await bot.db.get_balance(G, rich.id)
+        row = await bot.db.get_auction(smoke_auction_id, G)
+        if row is not None and int(row["current_bid"] or 0) == 700 \
+                and bal_after_bid == bal_before_bid - 700:
+            OK.append("オークション入札で残高が預かられる")
+            print(f"  ok   検証: 入札成立 (残高 {bal_before_bid} → {bal_after_bid})")
+        else:
+            FAILURES.append((
+                "オークション: 入札",
+                f"入札が反映されていない (最高額 {row['current_bid'] if row else None} / "
+                f"残高 {bal_before_bid}→{bal_after_bid})",
+            ))
+            print(" FAIL  検証: オークション入札が成立していない")
+    else:
+        FAILURES.append(("オークション: 入札ボタン", "入札用のModalが出なかった"))
+        print(" FAIL  オークション: Modalが出ない")
+    await bot.charge.cancel_auction(
+        G, smoke_auction_id, operator_id=owner.id, reason="スモークテストの後片付け"
+    )
+
     # --- チャージ方式 (PayPay / LTC の申請と審査) ---
     await bot.db.set_destination(
         config.ChargeProvider.PAYPAY, address="paypay-smoke-001", label="受取用",

@@ -887,7 +887,327 @@ async def main() -> None:
     check(not outcome["renewed"] and outcome["reason"] == "ITEM_UNAVAILABLE",
           f"販売停止中の商品は更新しない ({outcome['reason']})")
 
-    print("\n=== 6. 整合性 ===")
+    print("\n=== 6. オークション ===")
+    prize = guild.add_role(StubRole(64_001, "レア称号", position=6))
+    bidder_a = guild.add_member(StubMember(64_101, guild))
+    bidder_b = guild.add_member(StubMember(64_102, guild))
+    bidder_c = guild.add_member(StubMember(64_103, guild))
+    for who, amount in ((bidder_a, 50_000), (bidder_b, 50_000), (bidder_c, 1_000)):
+        await bot.db.adjust_balance(
+            guild_id=G, user_id=who.id, amount=amount,
+            change_type=config.BalanceChangeType.ADMIN_ADD,
+            operator_id=OWNER_ID, reason="オークション用",
+        )
+    async def total_balance() -> int:
+        """3人の残高合計 (お金が増減していないかの確認に使う)。"""
+        members = [bidder_a, bidder_b, bidder_c]
+        members += [m for m in (guild.get_member(64_104),) if m is not None]
+        values = [await bot.db.get_balance(G, w.id) for w in members]
+        return sum(values)
+
+    # 投入した残高の合計。以降「残高 + 預かり額」がこの値と一致することを見る。
+    injected_total = await total_balance()
+
+    created = await bot.charge.create_auction(
+        guild, name="レア称号オークション", role=prize, start_price=1_000,
+        min_increment=500, hours=1.0, duration_days=0, description="テスト",
+        created_by=OWNER_ID,
+    )
+    auction_id = int(created["auction_id"])
+    message = await guild.channel.send(embed=discord.Embed(title="panel"))
+    await bot.db.set_auction_message(
+        auction_id, channel_id=guild.channel.id, message_id=message.id
+    )
+
+    # 開始価格未満は入札できない
+    try:
+        await bot.charge.place_bid(bidder_a, auction_id, 500)
+        check(False, "開始価格未満で入札できてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.BID_TOO_LOW,
+              f"開始価格未満は拒否 ({exc.code})")
+
+    # 最初の入札: その場で残高を預かる
+    bal_a = await bot.db.get_balance(G, bidder_a.id)
+    first = await bot.charge.place_bid(bidder_a, auction_id, 1_000)
+    check(await bot.db.get_balance(G, bidder_a.id) == bal_a - 1_000,
+          "入札した分が残高から引かれる (預かり)")
+    check(first["refunded"] is None, "最初の入札では誰にも返金しない")
+
+    # 同じ人が最高額のまま重ねて入札できない
+    try:
+        await bot.charge.place_bid(bidder_a, auction_id, 2_000)
+        check(False, "最高額の本人が続けて入札できてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.ALREADY_HIGHEST,
+              f"最高額の本人は入札できない ({exc.code})")
+
+    # 最低更新額を満たさない入札は拒否
+    try:
+        await bot.charge.place_bid(bidder_b, auction_id, 1_200)
+        check(False, "最低更新額未満で入札できてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.BID_TOO_LOW,
+              f"最低更新額 (現在額+500) 未満は拒否 ({exc.code})")
+
+    # 上回る入札: 前の人へその場で全額返金
+    bal_a_held = await bot.db.get_balance(G, bidder_a.id)
+    bal_b = await bot.db.get_balance(G, bidder_b.id)
+    bot.dms.clear()
+    second = await bot.charge.place_bid(bidder_b, auction_id, 1_500)
+    check(await bot.db.get_balance(G, bidder_a.id) == bal_a_held + 1_000,
+          "上回られた人へ全額返金される")
+    check(await bot.db.get_balance(G, bidder_b.id) == bal_b - 1_500,
+          "新しい入札者から預かる")
+    check(second["refunded"] and int(second["refunded"]["user_id"]) == bidder_a.id,
+          "返金先が正しい")
+    check(any("上回られました" in d[1] for d in bot.dms),
+          "上回られたことを DM で知らせる")
+
+    # 残高不足では入札できない (預かり方式なので事前に弾ける)
+    try:
+        await bot.charge.place_bid(bidder_c, auction_id, 40_000)
+        check(False, "残高不足で入札できてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.INSUFFICIENT_BALANCE,
+              f"残高不足は拒否 ({exc.code})")
+
+    # 同時入札 (別人が同額) でも預かり額の合計が壊れない
+    bidder_d = guild.add_member(StubMember(64_104, guild))
+    await bot.db.adjust_balance(
+        guild_id=G, user_id=bidder_d.id, amount=50_000,
+        change_type=config.BalanceChangeType.ADMIN_ADD,
+        operator_id=OWNER_ID, reason="オークション用",
+    )
+    injected_total += 50_000
+    results = await asyncio.gather(
+        bot.charge.place_bid(bidder_a, auction_id, 2_000),
+        bot.charge.place_bid(bidder_d, auction_id, 2_000),
+        bot.charge.place_bid(bidder_a, auction_id, 2_000),
+        return_exceptions=True,
+    )
+    accepted = [r for r in results if not isinstance(r, BaseException)]
+    check(len(accepted) == 1,
+          f"同額の同時入札は1件しか通らない ({len(accepted)}件)")
+    codes = {r.code for r in results if isinstance(r, ChargeError)}
+    check(codes <= {config.ErrorCode.BID_TOO_LOW, config.ErrorCode.ALREADY_HIGHEST},
+          f"通らなかった入札は理由が説明される ({codes})")
+    # 通らなかった入札では残高が動いていない
+    loser = bidder_d if int(accepted[0]["bid_id"]) and (
+        await bot.db.get_balance(G, bidder_d.id)) == 50_000 else bidder_a
+    check(await bot.db.get_balance(G, loser.id) in (50_000, 48_000, 47_000, 46_000),
+          "拒否された入札で残高が中途半端に減らない")
+    auction_row = await bot.db.get_auction(auction_id, G)
+    held = int(auction_row["current_bid"])
+    check(int(auction_row["current_bidder"]) == bidder_a.id,
+          "最高額の入札者が記録されている")
+    # 預かり中の入札は「最高額の1件」だけ
+    bids = await bot.db.list_auction_bids(auction_id, limit=50)
+    unrefunded = [b for b in bids if not int(b["refunded"])]
+    check(len(unrefunded) == 1 and int(unrefunded[0]["amount"]) == held,
+          f"預かり中の入札は最高額の1件だけ ({len(unrefunded)}件)")
+    # 残高 + 預かり額 = 最初の総額 (お金が増減していない)
+    total_now = await total_balance()
+    check(total_now + held == injected_total,
+          f"残高と預かり額の合計が保たれる ({total_now} + {held} = {injected_total})")
+
+    # 締切前の入札で締切が延長される
+    await bot.db.execute(
+        "UPDATE auctions SET ends_at=? WHERE id=?",
+        (utils.now_ts() + 30, auction_id),
+    )
+    ext = await bot.charge.place_bid(bidder_b, auction_id, held + 500)
+    check(ext["extended"] and int(ext["ends_at"]) > utils.now_ts() + 30,
+          "締切直前の入札で締切が延長される")
+
+    # 締切 → 落札
+    await bot.db.execute(
+        "UPDATE auctions SET ends_at=? WHERE id=?", (utils.now_ts() - 1, auction_id)
+    )
+    bal_winner = await bot.db.get_balance(G, bidder_b.id)
+    bot.dms.clear()
+    closed = await bot.charge.close_due_auctions()
+    auction_row = await bot.db.get_auction(auction_id, G)
+    check(closed == 1 and str(auction_row["status"]) == config.AuctionStatus.CLOSED,
+          f"締切で落札が確定する ({auction_row['status']})")
+    check(int(auction_row["winner_id"]) == bidder_b.id, "落札者が記録される")
+    check(prize in bidder_b.roles, "落札者に景品のロールが付く")
+    check(await bot.db.get_balance(G, bidder_b.id) == bal_winner,
+          "落札時に追加の引き落としは無い (入札時に預かっている)")
+    check(any("落札しました" in d[1] for d in bot.dms), "落札を DM で知らせる")
+
+    # 締切済みのオークションには入札できない
+    try:
+        await bot.charge.place_bid(bidder_a, auction_id, 999_999)
+        check(False, "終了後に入札できてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.AUCTION_NOT_OPEN,
+              f"終了後の入札は拒否 ({exc.code})")
+
+    # 二重に締め切っても何も起きない
+    again = await bot.db.close_auction(auction_id, force=True)
+    check(not again["closed"] and again["reason"] == "NOT_DUE",
+          "同じオークションを二重に締め切らない")
+
+    # --- 入札なしで終了 ---
+    empty = await bot.charge.create_auction(
+        guild, name="入札なし", role=prize, start_price=100, min_increment=100,
+        hours=1.0, created_by=OWNER_ID,
+    )
+    empty_id = int(empty["auction_id"])
+    await bot.db.execute(
+        "UPDATE auctions SET ends_at=? WHERE id=?", (utils.now_ts() - 1, empty_id)
+    )
+    await bot.charge.close_due_auctions()
+    row = await bot.db.get_auction(empty_id, G)
+    check(str(row["status"]) == config.AuctionStatus.FAILED,
+          f"入札が無ければ FAILED になる ({row['status']})")
+
+    # --- 中止すると預かり分を返す ---
+    cancel_target = await bot.charge.create_auction(
+        guild, name="中止テスト", role=prize, start_price=1_000, min_increment=100,
+        hours=1.0, created_by=OWNER_ID,
+    )
+    cancel_id = int(cancel_target["auction_id"])
+    await bot.charge.place_bid(bidder_a, cancel_id, 1_000)
+    bal_before_cancel = await bot.db.get_balance(G, bidder_a.id)
+    bot.dms.clear()
+    cancel_result = await bot.charge.cancel_auction(
+        G, cancel_id, operator_id=OWNER_ID, reason="テストのため中止"
+    )
+    check(await bot.db.get_balance(G, bidder_a.id) == bal_before_cancel + 1_000,
+          "中止で預かり分が返る")
+    check(cancel_result["refunded"], "返金の記録が返る")
+    check(any("中止" in d[1] for d in bot.dms), "中止を DM で知らせる")
+    row = await bot.db.get_auction(cancel_id, G)
+    check(str(row["status"]) == config.AuctionStatus.CANCELLED, "状態が中止になる")
+    # 二重に中止しても二重返金しない
+    bal_after_cancel = await bot.db.get_balance(G, bidder_a.id)
+    try:
+        await bot.charge.cancel_auction(
+            G, cancel_id, operator_id=OWNER_ID, reason="二重中止"
+        )
+        check(False, "二重に中止できてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.AUCTION_NOT_OPEN,
+              f"終了済みは中止できない ({exc.code})")
+    check(await bot.db.get_balance(G, bidder_a.id) == bal_after_cancel,
+          "二重返金は起きない")
+
+    # --- 景品を渡せなければ落札額を返して中止にする ---
+    undeliverable = await bot.charge.create_auction(
+        guild, name="渡せない景品", role=prize, start_price=1_000,
+        min_increment=100, hours=1.0, created_by=OWNER_ID,
+    )
+    bad_id = int(undeliverable["auction_id"])
+    await bot.charge.place_bid(bidder_a, bad_id, 1_000)
+    await bot.db.execute(
+        "UPDATE auctions SET ends_at=? WHERE id=?", (utils.now_ts() - 1, bad_id)
+    )
+    bidder_a.roles = [r for r in bidder_a.roles if r.id != prize.id]
+    bidder_a.fail_add_roles = True
+    bal_before_fail = await bot.db.get_balance(G, bidder_a.id)
+    bot.owner_alerts.clear()
+    bot.dms.clear()
+    outcome = await bot.charge.close_auction(bad_id)
+    bidder_a.fail_add_roles = False
+    row = await bot.db.get_auction(bad_id, G)
+    check(outcome.get("delivered") is False, "景品を渡せなかったことが分かる")
+    check(await bot.db.get_balance(G, bidder_a.id) == bal_before_fail + 1_000,
+          "渡せなければ落札額を返金する")
+    check(str(row["status"]) == config.AuctionStatus.CANCELLED,
+          f"渡せなかったオークションは中止扱い ({row['status']})")
+    check(bot.owner_alerts or bot.dms, "管理者か落札者へ知らせる")
+
+    # --- 期限つきの落札ロールは期限で剥がれる ---
+    timed_auction = await bot.charge.create_auction(
+        guild, name="期間つき称号", role=prize, start_price=1_000, min_increment=100,
+        hours=1.0, duration_days=7, created_by=OWNER_ID,
+    )
+    timed_id = int(timed_auction["auction_id"])
+    await bot.charge.place_bid(bidder_b, timed_id, 1_000)
+    await bot.db.execute(
+        "UPDATE auctions SET ends_at=? WHERE id=?", (utils.now_ts() - 1, timed_id)
+    )
+    await bot.charge.close_auction(timed_id)
+    row = await bot.db.get_auction(timed_id, G)
+    check(row["role_expires_at"] and int(row["role_expires_at"]) > utils.now_ts(),
+          "期間つきの落札ではロールの期限が入る")
+    check(prize in bidder_b.roles, "落札直後はロールを持っている")
+    await bot.db.execute(
+        "UPDATE auctions SET role_expires_at=? WHERE id=?",
+        (utils.now_ts() - 1, timed_id),
+    )
+    handled = await bot.charge.expire_auction_roles()
+    check(handled == 1 and prize not in bidder_b.roles,
+          f"期限が切れたらロールを剥がす ({handled}件)")
+    check(await bot.charge.expire_auction_roles() == 0,
+          "同じ期限切れを繰り返し処理しない")
+
+    # --- 同時開催数の上限 ---
+    made = []
+    while await bot.db.count_open_auctions(G) < config.MAX_OPEN_AUCTIONS:
+        extra = await bot.charge.create_auction(
+            guild, name=f"枠テスト{len(made)}", role=prize, start_price=100,
+            min_increment=100, hours=1.0, created_by=OWNER_ID,
+        )
+        made.append(int(extra["auction_id"]))
+    try:
+        await bot.charge.create_auction(
+            guild, name="あふれる", role=prize, start_price=100, min_increment=100,
+            hours=1.0, created_by=OWNER_ID,
+        )
+        check(False, "同時開催数の上限を超えられてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.AUCTION_LIMIT_REACHED,
+              f"同時開催数の上限を守る ({exc.code})")
+    for extra_id in made:
+        await bot.charge.cancel_auction(
+            G, extra_id, operator_id=OWNER_ID, reason="後片付け"
+        )
+
+    # --- 開催時間が短すぎる / 渡せないロール ---
+    try:
+        await bot.charge.create_auction(
+            guild, name="短すぎる", role=prize, start_price=100, min_increment=100,
+            hours=0.01, created_by=OWNER_ID,
+        )
+        check(False, "短すぎる開催時間が通ってしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.INVALID_AMOUNT,
+              f"短すぎる開催時間は拒否 ({exc.code})")
+    high_role = guild.add_role(StubRole(64_900, "管理者より上", position=200))
+    try:
+        await bot.charge.create_auction(
+            guild, name="渡せないロール", role=high_role, start_price=100,
+            min_increment=100, hours=1.0, created_by=OWNER_ID,
+        )
+        check(False, "付与できないロールで開催できてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.ROLE_ASSIGN_FAILED,
+              f"付与できないロールでは開催できない ({exc.code})")
+
+    # --- すべて終わった後、預かり金が残っていないこと ---
+    open_left = await bot.db.count_open_auctions(G)
+    leftover = await bot.db.fetchall(
+        "SELECT * FROM auction_bids WHERE guild_id=? AND refunded=0", (G,)
+    )
+    closed_winners = await bot.db.fetchall(
+        "SELECT winning_bid FROM auctions WHERE guild_id=? AND status=? "
+        "AND winning_bid IS NOT NULL",
+        (G, config.AuctionStatus.CLOSED),
+    )
+    won_total = sum(int(r["winning_bid"]) for r in closed_winners)
+    held_total = sum(int(b["amount"]) for b in leftover)
+    check(open_left == 0, f"開催中のオークションが残っていない ({open_left}件)")
+    check(held_total == won_total,
+          f"預かり中の残りは落札分だけ (預かり {held_total} / 落札 {won_total})")
+    final_total = await total_balance()
+    check(final_total + won_total == injected_total,
+          f"最後まで残高と落札額の合計が保たれる "
+          f"({final_total} + {won_total} = {injected_total})")
+
+    print("\n=== 7. 整合性 ===")
     integrity = await bot.db.integrity_check()
     check(integrity["pragma"] == "ok", "PRAGMA quick_check OK")
     check(not integrity["balance_mismatch"], "残高と履歴合計が一致")

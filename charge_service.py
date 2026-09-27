@@ -29,6 +29,7 @@ import ui
 import utils
 from database import (
     AlreadyCredited,
+    AuctionError,
     Database,
     GuildSettings,
     IllegalStateTransition,
@@ -98,6 +99,7 @@ class ChargeService:
             "requests_created": 0, "requests_submitted": 0,
             "requests_approved": 0, "requests_rejected": 0, "requests_expired": 0,
             "subscription_renewals": 0, "subscription_stops": 0,
+            "auctions_closed": 0, "bids": 0,
         }
 
     # ==================================================================
@@ -3809,6 +3811,437 @@ class ChargeService:
             "expires_at": row["expires_at"], "user_id": int(row["user_id"]),
             "price": int(row["price"]),
         }
+
+    # ==================================================================
+    # オークション
+    # ==================================================================
+    async def create_auction(
+        self,
+        guild: discord.Guild,
+        *,
+        name: str,
+        role: discord.Role,
+        start_price: int,
+        min_increment: int,
+        hours: float,
+        duration_days: int = 0,
+        description: str | None = None,
+        created_by: int,
+    ) -> dict[str, Any]:
+        """オークションを開始する。
+
+        入札より先に「本当に景品を渡せるか」を確かめる。渡せないロールで
+        開催すると、落札者から預かった残高を返すしかなくなる。
+        """
+        await self.ensure_usable_guild(guild.id)
+        problem = self.role_grant_problem(guild, role)
+        if problem:
+            raise ChargeError(config.ErrorCode.ROLE_ASSIGN_FAILED, problem)
+        open_count = await self.db.count_open_auctions(guild.id)
+        if open_count >= config.MAX_OPEN_AUCTIONS:
+            raise ChargeError(
+                config.ErrorCode.AUCTION_LIMIT_REACHED,
+                f"開催中のオークションが {open_count} 件あります",
+            )
+        seconds = int(hours * 3600)
+        if seconds < config.AUCTION_MIN_SECONDS:
+            raise ChargeError(
+                config.ErrorCode.INVALID_AMOUNT,
+                f"開催時間は {config.AUCTION_MIN_SECONDS // 60} 分以上にしてください",
+            )
+        ends_at = utils.now_ts() + seconds
+        auction_id = await self.db.create_auction(
+            guild_id=guild.id, name=name, role_id=role.id, start_price=start_price,
+            min_increment=min_increment, ends_at=ends_at, duration_days=duration_days,
+            description=description, created_by=created_by,
+        )
+        await self.db.add_audit_log(
+            actor_id=created_by, action="AUCTION_CREATE", guild_id=guild.id,
+            detail={"auction_id": auction_id, "role_id": role.id,
+                    "start_price": start_price, "min_increment": min_increment,
+                    "ends_at": ends_at, "duration_days": duration_days},
+        )
+        await self._safe(self.log_event(
+            guild.id, "🔨 オークションを開始しました",
+            fields=(
+                ("名前", name, True),
+                ("景品", role.mention, True),
+                ("開始価格", utils.fmt_int(start_price), True),
+                ("最低更新額", utils.fmt_int(min_increment), True),
+                ("締切", utils.format_jst(ends_at), True),
+                ("有効期間", f"{duration_days}日" if duration_days else "無期限", True),
+            ),
+            color=config.Color.ACCENT,
+        ), context="オークション開始ログ")
+        return {"auction_id": auction_id, "ends_at": ends_at}
+
+    async def place_bid(
+        self, member: discord.Member, auction_id: int, amount: int
+    ) -> dict[str, Any]:
+        """入札する。押さえた残高は上回られた時点で自動的に返す。"""
+        guild = member.guild
+        settings = await self.ensure_usable_guild(guild.id)
+        if settings.emergency_stop:
+            raise ChargeError(config.ErrorCode.EMERGENCY_STOP)
+        if await self.db.is_frozen(guild.id, member.id):
+            raise ChargeError(config.ErrorCode.USER_FROZEN)
+        if amount <= 0 or amount > config.AUCTION_MAX_BID:
+            raise ChargeError(config.ErrorCode.INVALID_AMOUNT)
+        self.check_button_rate_limit(member.id)
+        async with self._user_locks.acquire(f"auction:{guild.id}:{auction_id}"):
+            try:
+                result = await self.db.place_bid(
+                    auction_id=auction_id, guild_id=guild.id, user_id=member.id,
+                    amount=amount,
+                )
+            except AuctionError as exc:
+                raise ChargeError(exc.code, exc.detail) from exc
+        await self._log_balance_from_history(
+            guild.id, member.id, change_type=config.BalanceChangeType.AUCTION_BID,
+            fallback=result, reason=f"オークション入札: {result['name']}",
+            transaction_id=f"AUC-{auction_id}-B{result['bid_id']}",
+        )
+        refunded = result.get("refunded")
+        if refunded:
+            # 上回られた人にはその場で返金しているので、必ず知らせる
+            await self._log_balance_from_history(
+                guild.id, int(refunded["user_id"]),
+                change_type=config.BalanceChangeType.AUCTION_REFUND,
+                fallback=refunded,
+                reason=f"入札が上回られたため返金: {result['name']}",
+                transaction_id=f"AUC-{auction_id}-B{result['bid_id']}",
+            )
+            await self._send_dm(
+                int(refunded["user_id"]),
+                ui.auction_outbid_dm_embed(
+                    name=str(result["name"]), auction_id=auction_id,
+                    your_bid=int(refunded["amount"]), new_bid=amount,
+                    balance_after=int(refunded["balance_after"]),
+                    ends_at=int(result["ends_at"]),
+                ),
+                queue_on_failure=False,
+            )
+        await self._safe(self.log_event(
+            guild.id, "💸 オークション入札",
+            fields=(
+                ("オークション", f"`{auction_id}` {result['name']}", True),
+                ("入札者", member.mention, True),
+                ("入札額", utils.fmt_int(amount), True),
+                ("前の入札者", f"<@{refunded['user_id']}> (返金 "
+                              f"{utils.fmt_int(int(refunded['amount']))})"
+                 if refunded else "なし", True),
+                ("締切", utils.format_jst(int(result["ends_at"]))
+                 + (" (延長)" if result["extended"] else ""), True),
+                ("残高", f"{utils.fmt_int(int(result['balance_before']))} → "
+                         f"{utils.fmt_int(int(result['balance_after']))}", True),
+            ),
+            color=config.Color.ACCENT,
+        ), context="入札ログ")
+        self.metrics["bids"] += 1
+        await self._safe(self.refresh_auction_panel(auction_id), context="オークションパネル更新")
+        self.request_ranking_refresh(guild.id)
+        return result
+
+    async def cancel_auction(
+        self, guild_id: int, auction_id: int, *, operator_id: int, reason: str
+    ) -> dict[str, Any]:
+        """オークションを中止して預かり分を返す。"""
+        try:
+            result = await self.db.cancel_auction(
+                auction_id, guild_id=guild_id, operator_id=operator_id, reason=reason
+            )
+        except AuctionError as exc:
+            raise ChargeError(exc.code, exc.detail) from exc
+        refunded = result.get("refunded")
+        await self.db.add_audit_log(
+            actor_id=operator_id, action="AUCTION_CANCEL", guild_id=guild_id,
+            detail={"auction_id": auction_id, "reason": utils.truncate(reason, 300),
+                    "refunded_user": refunded["user_id"] if refunded else None,
+                    "refunded_amount": refunded["amount"] if refunded else 0},
+        )
+        if refunded:
+            await self._log_balance_from_history(
+                guild_id, int(refunded["user_id"]),
+                change_type=config.BalanceChangeType.AUCTION_REFUND,
+                fallback=refunded, operator_id=operator_id,
+                reason=f"オークション中止による返金: {result['name']}",
+                transaction_id=f"AUC-{auction_id}-B{refunded['bid_id']}",
+            )
+            await self._send_dm(
+                int(refunded["user_id"]),
+                ui.auction_cancelled_dm_embed(
+                    name=str(result["name"]), auction_id=auction_id,
+                    refunded=int(refunded["amount"]),
+                    balance_after=int(refunded["balance_after"]),
+                    reason=reason,
+                ),
+                queue_on_failure=False,
+            )
+        await self._safe(self.log_event(
+            guild_id, "⚫ オークションを中止しました",
+            fields=(
+                ("オークション", f"`{auction_id}` {result['name']}", True),
+                ("操作者", f"<@{operator_id}>", True),
+                ("返金", f"<@{refunded['user_id']}> へ "
+                         f"{utils.fmt_int(int(refunded['amount']))}"
+                 if refunded else "なし", True),
+                ("理由", utils.truncate(reason, 200), False),
+            ),
+            color=config.Color.WARNING,
+        ), context="オークション中止ログ")
+        await self._safe(self.refresh_auction_panel(auction_id), context="オークションパネル更新")
+        self.request_ranking_refresh(guild_id)
+        return result
+
+    async def close_auction(
+        self, auction_id: int, *, force: bool = False, operator_id: int | None = None
+    ) -> dict[str, Any]:
+        """締切を確定し、落札者へ景品のロールを渡す。
+
+        ロールを渡せなかった場合は落札額を返金し、中止として扱う。
+        「支払ったのに何も無い」状態を残さないための救済措置。
+        """
+        outcome = await self.db.close_auction(auction_id, force=force)
+        if not outcome.get("closed"):
+            return outcome
+        guild_id = int(outcome["guild_id"])
+        if outcome["reason"] == "NO_BIDS":
+            await self._safe(self.log_event(
+                guild_id, "🔴 オークションは入札なしで終了しました",
+                fields=(("オークション", f"`{auction_id}` {outcome['name']}", True),),
+                color=config.Color.NEUTRAL,
+            ), context="オークション終了ログ")
+            await self._safe(self.refresh_auction_panel(auction_id),
+                             context="オークションパネル更新")
+            return outcome
+
+        winner_id = int(outcome["winner_id"])
+        granted = await self._grant_auction_role(outcome)
+        if not granted:
+            refund = await self.db.refund_auction_winner(
+                auction_id,
+                reason=f"景品のロールを渡せなかったため返金: {outcome['name']}",
+                operator_id=operator_id,
+            )
+            if refund.get("refunded"):
+                await self._log_balance_from_history(
+                    guild_id, winner_id,
+                    change_type=config.BalanceChangeType.AUCTION_REFUND,
+                    fallback=refund, operator_id=operator_id,
+                    reason=f"景品を渡せなかったため返金: {outcome['name']}",
+                )
+                await self._send_dm(
+                    winner_id,
+                    ui.auction_cancelled_dm_embed(
+                        name=str(outcome["name"]), auction_id=auction_id,
+                        refunded=int(refund["amount"]),
+                        balance_after=int(refund["balance_after"]),
+                        reason="景品のロールを付与できなかったため",
+                    ),
+                    queue_on_failure=False,
+                )
+            await self.alert_admins(
+                guild_id, "オークションの景品を渡せませんでした",
+                f"オークション `#{auction_id}` ({outcome['name']}) の景品 "
+                f"<@&{outcome['role_id']}> を <@{winner_id}> へ付与できませんでした。\n"
+                "落札額は返金し、オークションは中止として記録しました。",
+            )
+            await self._safe(self.refresh_auction_panel(auction_id),
+                             context="オークションパネル更新")
+            self.request_ranking_refresh(guild_id)
+            return {**outcome, "delivered": False}
+
+        self.metrics["auctions_closed"] += 1
+        await self.db.add_audit_log(
+            actor_id=operator_id if operator_id is not None else config.SYSTEM_ACTOR_ID,
+            action="AUCTION_CLOSE", guild_id=guild_id, target_user_id=winner_id,
+            detail={"auction_id": auction_id, "winning_bid": outcome["winning_bid"],
+                    "role_id": outcome["role_id"],
+                    "role_expires_at": outcome["role_expires_at"]},
+        )
+        balance = await self.db.get_balance(guild_id, winner_id)
+        await self._send_dm(
+            winner_id,
+            ui.auction_won_dm_embed(
+                name=str(outcome["name"]), auction_id=auction_id,
+                winning_bid=int(outcome["winning_bid"]), role_id=int(outcome["role_id"]),
+                role_expires_at=outcome["role_expires_at"], balance=balance,
+            ),
+            queue_on_failure=False,
+        )
+        await self._safe(self.log_event(
+            guild_id, "🏁 オークションが落札されました",
+            fields=(
+                ("オークション", f"`{auction_id}` {outcome['name']}", True),
+                ("落札者", f"<@{winner_id}>", True),
+                ("落札額", utils.fmt_int(int(outcome["winning_bid"])), True),
+                ("景品", f"<@&{outcome['role_id']}>", True),
+                ("有効期限", utils.format_jst(int(outcome["role_expires_at"]))
+                 if outcome["role_expires_at"] else "無期限", True),
+            ),
+            color=config.Color.SUCCESS,
+        ), context="落札ログ")
+        await self._safe(self.post_auction_result(auction_id), context="落札実績")
+        await self._safe(self.refresh_auction_panel(auction_id), context="オークションパネル更新")
+        self.request_ranking_refresh(guild_id)
+        return {**outcome, "delivered": True}
+
+    async def _grant_auction_role(self, outcome: dict[str, Any]) -> bool:
+        """落札者へ景品のロールを渡す (成功したかを返す)。"""
+        guild = self.bot.get_guild(int(outcome["guild_id"]))
+        if guild is None:
+            logger.error("落札処理でサーバーが見つかりません guild=%s", outcome["guild_id"])
+            return False
+        member = guild.get_member(int(outcome["winner_id"]))
+        role = guild.get_role(int(outcome["role_id"]))
+        if member is None or role is None:
+            logger.error(
+                "落札処理で対象が見つかりません auction=%s member=%s role=%s",
+                outcome["auction_id"], member, role,
+            )
+            return False
+        if role in getattr(member, "roles", []):
+            return True
+        try:
+            await member.add_roles(
+                role, reason=utils.truncate(
+                    f"オークション落札 #{outcome['auction_id']} ({outcome['name']})", 400)
+            )
+        except Exception as exc:  # noqa: BLE001 - 失敗時は返金へ進む
+            logger.error(
+                "落札ロールの付与に失敗しました auction=%s: %s",
+                outcome["auction_id"], utils.safe_error_text(exc),
+            )
+            return False
+        return True
+
+    async def close_due_auctions(self) -> int:
+        """締切を過ぎたオークションを確定する。"""
+        try:
+            rows = await self.db.list_due_auctions()
+        except Exception:  # noqa: BLE001
+            logger.exception("締切オークションの取得に失敗しました")
+            return 0
+        handled = 0
+        for row in rows:
+            try:
+                await self.close_auction(int(row["id"]))
+                handled += 1
+            except Exception:  # noqa: BLE001
+                logger.exception("オークションの締切処理に失敗しました auction=%s", row["id"])
+        if handled:
+            logger.info("オークション %s 件を締め切りました", handled)
+        return handled
+
+    async def expire_auction_roles(self) -> int:
+        """期間つきで落札されたロールの期限切れを処理する。"""
+        try:
+            rows = await self.db.list_auction_role_expiries()
+        except Exception:  # noqa: BLE001
+            logger.exception("落札ロールの期限一覧の取得に失敗しました")
+            return 0
+        handled = 0
+        for row in rows:
+            auction_id = int(row["id"])
+            guild_id = int(row["guild_id"])
+            winner_id = row["winner_id"]
+            # 先に印を消す。剥奪に失敗しても毎回やり直して DM を連投しない。
+            if not await self.db.clear_auction_role_expiry(auction_id):
+                continue
+            if winner_id is not None:
+                await self._remove_auction_role(
+                    guild_id, int(winner_id), int(row["role_id"]),
+                    reason=f"オークション落札ロールの期限切れ #{auction_id}",
+                )
+            await self._safe(self.log_event(
+                guild_id, "⌛ 落札ロールの有効期限が切れました",
+                fields=(
+                    ("オークション", f"`{auction_id}` {row['name']}", True),
+                    ("対象", f"<@{winner_id}>" if winner_id else "-", True),
+                    ("ロール", f"<@&{row['role_id']}>", True),
+                ),
+                color=config.Color.NEUTRAL,
+            ), context="落札ロール期限ログ")
+            handled += 1
+        return handled
+
+    async def _remove_auction_role(
+        self, guild_id: int, user_id: int, role_id: int, *, reason: str
+    ) -> bool:
+        """落札で付与したロールを剥奪する。
+
+        ショップで同じロールを購入している場合は剥がさない (二重に付与された
+        ロールを片方の期限で外してしまうのを防ぐ)。
+        """
+        remaining = await self.db.list_active_purchases_for_role(guild_id, user_id, role_id)
+        if remaining:
+            logger.info(
+                "ショップ購入が有効なためロールを維持します guild=%s user=%s role=%s",
+                guild_id, user_id, role_id,
+            )
+            return False
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return False
+        member = guild.get_member(user_id)
+        role = guild.get_role(role_id)
+        if member is None or role is None:
+            return False
+        if role not in getattr(member, "roles", []):
+            return True
+        try:
+            await member.remove_roles(role, reason=utils.truncate(reason, 400))
+            return True
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning(
+                "落札ロールの剥奪に失敗しました guild=%s user=%s role=%s: %s",
+                guild_id, user_id, role_id, utils.safe_error_text(exc),
+            )
+            await self.alert_admins(
+                guild_id, "落札ロールの剥奪に失敗",
+                f"<@{user_id}> の <@&{role_id}> を剥奪できませんでした。手動で外してください。",
+            )
+            return False
+
+    async def refresh_auction_panel(self, auction_id: int) -> bool:
+        """オークションのパネルを最新の状態に更新する。"""
+        auction = await self.db.get_auction(auction_id)
+        if auction is None or not auction["message_id"]:
+            return False
+        bids = await self.db.list_auction_bids(auction_id, limit=5)
+        counts = await self.db.count_auction_bids(auction_id)
+        embed = ui.auction_panel_embed(auction, bids, counts=counts)
+        channel = await self._resolve_message_channel(
+            int(auction["guild_id"]), int(auction["channel_id"] or 0)
+        )
+        if channel is None:
+            return False
+        view = (
+            ui.AuctionView() if str(auction["status"]) == config.AuctionStatus.OPEN
+            else None
+        )
+        try:
+            message = await channel.fetch_message(int(auction["message_id"]))
+            await message.edit(embed=embed, view=view)
+            return True
+        except discord.NotFound:
+            return False
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning(
+                "オークションパネルの更新に失敗しました auction=%s: %s",
+                auction_id, utils.safe_error_text(exc),
+            )
+            return False
+
+    async def post_auction_result(self, auction_id: int) -> None:
+        """落札結果を実績チャンネルへ投稿する。"""
+        auction = await self.db.get_auction(auction_id)
+        if auction is None:
+            return
+        counts = await self.db.count_auction_bids(auction_id)
+        await self.post_generic_achievement(
+            int(auction["guild_id"]), ui.auction_result_embed(auction, counts=counts)
+        )
 
     # ==================================================================
     # 招待キャンペーン
