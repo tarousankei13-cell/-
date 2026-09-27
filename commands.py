@@ -2399,7 +2399,12 @@ class TransactionGroup(app_commands.Group):
             value=utils.fmt_int(int(row["credited_amount"])) if row["credited_amount"] is not None else "-",
             inline=True,
         )
-        embed.add_field(name="種別", value=str(row["source"]), inline=True)
+        source = str(row["source"] or "")
+        embed.add_field(
+            name="種別",
+            value=config.TX_SOURCE_LABELS.get(source, source or "-"),
+            inline=True,
+        )
         embed.add_field(
             name="残高推移",
             value=(
@@ -4916,6 +4921,13 @@ class ShopGroup(app_commands.Group):
             f"購入上限: {'無制限' if purchase_limit == 0 else f'{purchase_limit}回'}\n"
             + (f"追加設定: `{utils.safe_json_dumps(payload, limit=300)}`\n" if payload else "")
             + f"操作ID: `{op_id}`",
+        )
+        embed.add_field(
+            name="この種類について",
+            value=config.SHOP_ITEM_TYPE_DESCRIPTIONS.get(kind, "-")
+            + ("\n利用者は購入時に内容を入力します。"
+               if kind in config.SHOP_TYPES_NEED_INPUT else ""),
+            inline=False,
         )
         if warning:
             embed.add_field(

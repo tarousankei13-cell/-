@@ -833,6 +833,17 @@ class ChargeService:
     ) -> None:
         """指数バックオフで再試行し、上限に達したら MANUAL_REVIEW へ移す。"""
         next_attempts = attempts + 1
+        if error_code in config.NON_RETRYABLE_ERRORS:
+            # 何度試しても同じ結果になる種類 (金額不一致・使用済みリンク等)。
+            # 再試行しても Kyash を無駄に叩くだけで、利用者への通知も遅れる。
+            queue_logger.info(
+                "再試行しても結果が変わらないため確定させます tx=%s code=%s",
+                tx_id, error_code,
+            )
+            await self._fail(tx_id, error_code, message,
+                             expected=(config.TxStatus.PROCESSING,))
+            await self._safe(self.notify_result(tx_id), context="確定通知")
+            return
         if next_attempts >= config.MAX_RETRY:
             queue_logger.error("再試行上限に達しました tx=%s (%s)", tx_id, message)
             await self._to_manual_review(

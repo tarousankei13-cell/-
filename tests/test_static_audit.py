@@ -148,7 +148,67 @@ for name, src in sources.items():
         money_float.append(f"{name}: {m.group(1)}")
 check(not money_float, f"金額を float にしていない ({money_float})")
 
-print("\n=== 10. 送金リンクの完全な URL を保存しない ===")
+print("\n=== 10. 二重応答 ===")
+# 1つの操作に2回応答すると Discord がエラーを返す。
+# 分岐ごとに応答するのは正しいので、「応答の後に必ず return がある」ことを見る。
+for name, src in sources.items():
+    tree = trees[name]
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        body = ast.get_source_segment(src, node) or ''
+        sends = body.count('interaction.response.send_message')
+        if sends < 2:
+            continue
+        returns = len(re.findall(r'^\s+return\b', body, re.M))
+        check(sends <= returns + 1,
+              f"{name}:{node.name} 応答 {sends} 回に対し return {returns} 回 "
+              f"(分岐ごとに終わっている)")
+
+print("\n=== 11. Embed をループで組み立てる箇所の上限 ===")
+# フィールドは25個まで。ページ送りの1ページ分が25を超えていないか。
+for name in ('commands.py', 'main.py'):
+    src = sources[name]
+    for m in re.finditer(r'per_page\s*=\s*(\d+)', src):
+        size = int(m.group(1))
+        check(size <= 20, f"{name}: 1ページ {size} 件 (Embed のフィールド上限25に収まる)")
+    for m in re.finditer(r'for \w+ in [^\n]*\[:(\d+)\]', src):
+        limit = int(m.group(1))
+        # そのループが add_field を含むかを粗く見る
+        tail = src[m.end():m.end() + 400]
+        if '.add_field(' in tail.split('\n\n')[0]:
+            check(limit <= 25,
+                  f"{name}: ループ上限 {limit} が Embed のフィールド上限を超えない")
+
+print("\n=== 12. 再試行しても無駄なエラーを再試行しない ===")
+check('NON_RETRYABLE_ERRORS' in sources['charge_service.py'],
+      "再試行の判定で NON_RETRYABLE_ERRORS を使っている")
+
+print("\n=== 13. 使われていない定数が残っていない ===")
+used_src = "\n".join(v for k, v in sources.items() if k != 'config.py')
+dead = [
+    key for key, value in vars(config).items()
+    if key.isupper() and not key.startswith('_')
+    and key not in ('BOT_VERSION', 'SCHEMA_VERSION', 'BASE_DIR', 'LOG_FORMAT')
+    and f"config.{key}" not in used_src
+    and key not in used_src
+]
+check(not dead, f"未使用の設定定数がない ({sorted(dead)})")
+
+print("\n=== 14. 利用者へ見せるリンクの検証 ===")
+check('is_safe_link' in sources['utils.py']
+      and 'is_safe_link' in sources['commands.py'],
+      "表示するリンクは形式を検証してから登録する")
+
+print("\n=== 15. 受け取り方の設定 ===")
+check(set(config.KYASH_MODE_PROVIDER) == set(config.KYASH_MODE_LABELS),
+      "Kyash の方式に漏れがない")
+check(set(config.KYASH_MODE_PROVIDER.values()) <= set(config.KYASH_PROVIDERS),
+      "Kyash の方式が実在の provider を指している")
+check(set(config.PAYPAY_MODE_LABELS) == set(config.PAYPAY_MODE_DESCRIPTIONS),
+      "PayPay の方式に説明が揃っている")
+
+print("\n=== 16. 送金リンクの完全な URL を保存しない ==="[:26] + " ===")
 for name, src in sources.items():
     check('INSERT INTO charge_transactions' not in src or 'link_url' not in src,
           f"{name}: 取引に link_url を保存していない")

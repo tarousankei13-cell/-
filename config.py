@@ -101,8 +101,6 @@ RATE_LIMIT_REFUND_WINDOW: Final[int] = 600
 
 #: DB の1処理がこの秒数を超えたら警告する (対話操作が待たされる兆候)
 DB_SLOW_QUERY_WARN_SECONDS: Final[float] = 1.0
-#: ボタン操作がこの秒数を超えたら警告する (Discord の制限は3秒)
-INTERACTION_WARN_SECONDS: Final[float] = 1.5
 #: Modal を出す前に DB を待ってよい上限 (秒)
 #: これを超えたら「進行中の取引の再開」をあきらめ、入力欄を先に開く。
 #: 二重取引の防止は金額送信後の start_charge 側で必ず行われるため安全。
@@ -131,8 +129,6 @@ KYASH_HISTORY_LIMIT: Final[int] = 30             # 受取確認で参照する�
 KYASH_TOKEN_LIFETIME_DAYS: Final[int] = 30
 #: 失効の何日前から警告するか
 KYASH_TOKEN_WARN_DAYS: Final[int] = 5
-#: 受取用アカウントの残高しきい値の既定 (0=無効)。超過で管理者へ通知し新規チャージを止める
-DEFAULT_WALLET_ALERT_THRESHOLD: Final[int] = 0
 
 # ---------------------------------------------------------------------------
 # バックグラウンドタスク間隔 (秒)
@@ -342,14 +338,6 @@ BALANCE_TYPE_LABELS: Final[dict[str, str]] = {
     BalanceChangeType.SUBSCRIPTION: "サブスク課金",
 }
 
-#: 残高を増やす種別 (max_balance の判定に使う)
-BALANCE_INCREASE_TYPES: Final[frozenset[str]] = frozenset({
-    BalanceChangeType.CHARGE, BalanceChangeType.ADMIN_ADD, BalanceChangeType.ADMIN_SET,
-    BalanceChangeType.PROXY_ACHIEVEMENT, BalanceChangeType.ADMIN_MOVE_IN,
-    BalanceChangeType.SPEND_REFUND, BalanceChangeType.INVITE_REWARD,
-    BalanceChangeType.RANKING_REWARD, BalanceChangeType.GOAL_REWARD,
-    BalanceChangeType.AUCTION_REFUND,
-})
 
 #: 管理者の手動操作として残高ログへ流す種別
 MANUAL_BALANCE_TYPES: Final[frozenset[str]] = frozenset({
@@ -679,7 +667,6 @@ CAMPAIGN_PRESETS: Final[dict[str, dict[str, int]]] = {
               "require_review": 0, "require_days": 0},
 }
 DEFAULT_CAMPAIGN_PRESET: Final[str] = "STANDARD"
-DEFAULT_INVITER_REWARD: Final[int] = 500
 DEFAULT_INVITED_REWARD: Final[int] = 300
 #: 短時間の大量参加を疑う判定 (同一招待者で N 秒以内に M 件)
 INVITE_BURST_WINDOW: Final[int] = 300
@@ -1131,12 +1118,6 @@ SHOP_ITEM_TYPE_EMOJI: Final[dict[str, str]] = {
     ShopItemType.PRIVATE_CHANNEL: "🔒",
 }
 
-#: 既存のロールを指定する必要がある種類 (それ以外は role_id を使わない)
-SHOP_TYPES_NEED_ROLE: Final[tuple[str, ...]] = (ShopItemType.ROLE,)
-#: Bot が作成物を後片付けする必要がある種類
-SHOP_TYPES_WITH_ASSET: Final[tuple[str, ...]] = (
-    ShopItemType.CUSTOM_ROLE, ShopItemType.PRIVATE_CHANNEL,
-)
 #: 購入時に利用者の入力が必要な種類 (Modal を出す)
 SHOP_TYPES_NEED_INPUT: Final[tuple[str, ...]] = (
     ShopItemType.CUSTOM_ROLE, ShopItemType.NICKNAME, ShopItemType.PRIVATE_CHANNEL,
@@ -1247,7 +1228,6 @@ PANEL_TYPE_SHOP: Final[str] = "SHOP"
 PANEL_TYPE_INVITE: Final[str] = "INVITE"
 PANEL_TYPE_ADMIN: Final[str] = "ADMIN"
 PANEL_TYPE_GOAL: Final[str] = "GOAL"
-PANEL_TYPE_AUCTION: Final[str] = "AUCTION"
 
 # ---------------------------------------------------------------------------
 # ロガー名
@@ -1260,8 +1240,6 @@ LOGGER_QUEUE = "bot.queue"
 LOGGER_DISCORD_EVENTS = "bot.discord"
 LOGGER_AUDIT = "bot.audit"
 LOGGER_TASKS = "bot.tasks"
-LOGGER_SHOP = "bot.shop"
-LOGGER_INVITE = "bot.invite"
 
 # ---------------------------------------------------------------------------
 # ログ出力形式 ("text" または "json")
