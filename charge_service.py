@@ -1980,11 +1980,18 @@ class ChargeService:
         destinations = await self.db.list_destinations()
         review_channel = await self.get_review_channel_id()
         result: list[dict[str, Any]] = []
+        # Kyash はサーバー設定でどちらか一方だけを見せる
+        kyash_provider = config.KYASH_MODE_PROVIDER.get(
+            settings.kyash_mode, config.ChargeProvider.KYASH
+        )
         for provider in config.ALL_PROVIDERS:
             row = rows.get(provider)
             enabled = True if row is None else bool(row["enabled"])
             reason: str | None = None
             code: str | None = None
+            if provider in config.KYASH_PROVIDERS and provider != kyash_provider:
+                # 選ばれていない方式は、利用者に見せない (選択肢から外す)
+                continue
             if not enabled:
                 reason = "管理者が停止しています"
                 code = config.ErrorCode.PROVIDER_DISABLED
@@ -1997,8 +2004,17 @@ class ChargeService:
                     reason = "受取用アカウントの残高上限に達しています"
                     code = config.ErrorCode.WALLET_LIMIT
             else:
-                if provider not in destinations:
+                destination = destinations.get(provider)
+                if destination is None:
                     reason = "入金先が未登録です"
+                    code = config.ErrorCode.PROVIDER_NOT_CONFIGURED
+                elif (
+                    provider == config.ChargeProvider.PAYPAY
+                    and settings.paypay_mode == config.PayPayMode.CLAIM_LINK
+                    and not (destination["claim_url"] or "").strip()
+                ):
+                    # 請求リンク方式なのにリンクが未登録なら、押させない
+                    reason = "PayPay の請求リンクが未登録です"
                     code = config.ErrorCode.PROVIDER_NOT_CONFIGURED
                 elif review_channel is None:
                     reason = "審査チャンネルが未設定です"
@@ -2114,6 +2130,15 @@ class ChargeService:
             raise ChargeError(
                 config.ErrorCode.PROVIDER_NOT_CONFIGURED, f"{provider} の入金先が未登録です"
             )
+        if (
+            provider == config.ChargeProvider.PAYPAY
+            and settings.paypay_mode == config.PayPayMode.CLAIM_LINK
+            and not str(destination["claim_url"] or "").strip()
+        ):
+            raise ChargeError(
+                config.ErrorCode.PROVIDER_NOT_CONFIGURED,
+                "PayPay の請求リンクが未登録です",
+            )
         if await self.get_review_channel_id() is None:
             raise ChargeError(
                 config.ErrorCode.REVIEW_CHANNEL_NOT_SET, "審査チャンネルが未設定です"
@@ -2207,6 +2232,14 @@ class ChargeService:
             "price_source": quote.source if quote else None,
             "price_stale": bool(quote.stale) if quote else False,
             "destination": destination,
+            # 表示の仕方 (ID を見せるか請求リンクを見せるか) を UI へ渡す
+            "paypay_mode": settings.paypay_mode,
+            "claim_url": (
+                str(destination["claim_url"] or "")
+                if provider == config.ChargeProvider.PAYPAY
+                and settings.paypay_mode == config.PayPayMode.CLAIM_LINK
+                else ""
+            ),
             "quote_expires_at": utils.now_ts() + config.QUOTE_WAIT_SECONDS,
         }
 

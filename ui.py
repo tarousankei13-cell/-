@@ -2721,11 +2721,23 @@ def deposit_embed(quote: dict[str, Any]) -> discord.Embed:
             value=copy_block(str(amount)),
             inline=False,
         )
-    embed.add_field(
-        name=f"② 送り先 ({destination['label'] or '受取先'})",
-        value=copy_block(str(destination["address"]), hint=COPY_HINT),
-        inline=False,
-    )
+    claim_url = str(quote.get("claim_url") or "").strip()
+    if claim_url:
+        # 請求リンク方式: リンクを開いて支払ってもらう (宛先の入力が不要)
+        embed.add_field(
+            name="② このリンクを開いて支払う",
+            value=(
+                f"**[🔗 PayPay で支払う]({claim_url})**\n"
+                + copy_block(claim_url, hint="開けない場合はコピーしてブラウザへ")
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name=f"② 送り先 ({destination['label'] or '受取先'})",
+            value=copy_block(str(destination["address"]), hint=COPY_HINT),
+            inline=False,
+        )
     detail = [
         f"申請額: **{utils.fmt_yen(amount)}**",
         f"チャージ率: **{utils.fmt_rate(quote['charge_rate'])}**"
@@ -3241,7 +3253,8 @@ def kyash_accounts_embed(
 def provider_status_embed(
     entries: Sequence[dict[str, Any]], *, guild_name: str,
     review_channel_id: int | None, price: dict[str, Any] | None,
-    delegated: bool,
+    delegated: bool, settings: "GuildSettings | None" = None,
+    paypay_link: str | None = None,
 ) -> discord.Embed:
     """管理者向けの方式一覧。"""
     embed = discord.Embed(
@@ -3249,6 +3262,19 @@ def provider_status_embed(
         description=f"{SEPARATOR}\n**{guild_name}**\n{SEPARATOR}",
         color=config.Color.INFO,
     )
+    if settings is not None:
+        # いまどちらの受け取り方を使っているかを最初に見せる
+        embed.add_field(
+            name="いまの受け取り方",
+            value=(
+                f"Kyash: **{config.KYASH_MODE_LABELS.get(settings.kyash_mode, settings.kyash_mode)}**\n"
+                f"PayPay: **{config.PAYPAY_MODE_LABELS.get(settings.paypay_mode, settings.paypay_mode)}**"
+                + (f"\n　└ 登録済みリンク: `{utils.truncate(paypay_link, 60)}`"
+                   if paypay_link else "")
+                + "\n`/provider kyash_mode` `/provider paypay_mode` で切り替えます"
+            ),
+            inline=False,
+        )
     for entry in entries:
         provider = str(entry["provider"])
         mark = "🟢 利用可" if entry["available"] else f"🔴 {entry['reason']}"

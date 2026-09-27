@@ -6735,9 +6735,11 @@ class ProviderGroup(app_commands.Group):
         await interaction.response.defer(ephemeral=True, thinking=True)
         guild = interaction.guild
         assert guild is not None
-        entries = await bot.charge.provider_availability(guild.id)
+        settings = await bot.db.get_settings(guild.id)
+        entries = await bot.charge.provider_availability(guild.id, settings)
         price = await bot.price.status_snapshot()
         delegated = guild.id in await bot.charge.get_delegated_guilds()
+        paypay = await bot.db.get_destination(config.ChargeProvider.PAYPAY)
         await interaction.followup.send(
             embed=ui.provider_status_embed(
                 entries,
@@ -6745,6 +6747,9 @@ class ProviderGroup(app_commands.Group):
                 review_channel_id=await bot.charge.get_review_channel_id(),
                 price=price,
                 delegated=delegated,
+                settings=settings,
+                paypay_link=str(paypay["claim_url"]) if paypay and paypay["claim_url"]
+                else None,
             ),
             ephemeral=True,
         )
@@ -6902,6 +6907,169 @@ class ProviderGroup(app_commands.Group):
                 "✅ 金額の範囲を設定しました",
                 f"{provider.name}: **{utils.fmt_yen(low)} 〜 {utils.fmt_yen(high)}**\n"
                 f"操作ID: `{op_id}`",
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="kyash_mode", description="Kyash の受け取り方を選びます (管理者)"
+    )
+    @app_commands.describe(mode="どちらか一方だけを利用者に見せます")
+    @app_commands.choices(mode=[
+        app_commands.Choice(name=label, value=key)
+        for key, label in config.KYASH_MODE_LABELS.items()
+    ])
+    @app_commands.guild_only()
+    @require_admin()
+    async def kyash_mode(
+        self, interaction: discord.Interaction, mode: app_commands.Choice[str]
+    ) -> None:
+        """送金リンク方式 / 請求リンク方式 を切り替える。
+
+        2つ同時に出すと利用者が迷うため、必ずどちらか一方だけを見せる。
+        """
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await bot.db.update_settings(guild.id, kyash_mode=mode.value)
+        op_id = await _audit(
+            interaction, "PROVIDER_KYASH_MODE", detail={"mode": mode.value}
+        )
+        provider = config.KYASH_MODE_PROVIDER[mode.value]
+        await bot.charge.refresh_charge_panels(guild.id)
+        embed = ui.success_embed(
+            "✅ Kyash の受け取り方を変更しました",
+            f"方式: **{mode.name}**\n"
+            f"利用者に見せるのは **{config.PROVIDER_LABELS[provider]}** だけになります。\n"
+            f"操作ID: `{op_id}`",
+        )
+        embed.add_field(
+            name="この方式について",
+            value=config.KYASH_MODE_DESCRIPTIONS[mode.value],
+            inline=False,
+        )
+        if not bot.kyash.is_usable:
+            embed.add_field(
+                name="⚠️ まだ使えません",
+                value="受取用 Kyash アカウントが未ログインです。`/kyash login` を先に実行してください。",
+                inline=False,
+            )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="paypay_mode", description="PayPay の受け取り方を選びます (管理者)"
+    )
+    @app_commands.describe(mode="どちらか一方だけを利用者に見せます")
+    @app_commands.choices(mode=[
+        app_commands.Choice(name=label, value=key)
+        for key, label in config.PAYPAY_MODE_LABELS.items()
+    ])
+    @app_commands.guild_only()
+    @require_admin()
+    async def paypay_mode(
+        self, interaction: discord.Interaction, mode: app_commands.Choice[str]
+    ) -> None:
+        """ID方式 / 請求リンク方式 を切り替える。"""
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await bot.db.update_settings(guild.id, paypay_mode=mode.value)
+        op_id = await _audit(
+            interaction, "PROVIDER_PAYPAY_MODE", detail={"mode": mode.value}
+        )
+        destination = await bot.db.get_destination(config.ChargeProvider.PAYPAY)
+        embed = ui.success_embed(
+            "✅ PayPay の受け取り方を変更しました",
+            f"方式: **{mode.name}**\n操作ID: `{op_id}`",
+        )
+        embed.add_field(
+            name="この方式について",
+            value=config.PAYPAY_MODE_DESCRIPTIONS[mode.value],
+            inline=False,
+        )
+        if destination is None:
+            embed.add_field(
+                name="⚠️ まだ使えません",
+                value="PayPay の入金先が未登録です。`/provider destination` を実行してください。",
+                inline=False,
+            )
+        elif mode.value == config.PayPayMode.CLAIM_LINK and not str(
+            destination["claim_url"] or ""
+        ).strip():
+            embed.add_field(
+                name="⚠️ まだ使えません",
+                value="請求リンクが未登録です。`/provider paypay_link` で登録してください。",
+                inline=False,
+            )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="paypay_link", description="PayPay の請求リンクを登録します (Bot Owner)"
+    )
+    @app_commands.describe(
+        url="PayPay の請求リンク (https://... 形式)。空にすると削除します",
+    )
+    @require_owner()
+    async def paypay_link(
+        self, interaction: discord.Interaction, url: str | None = None
+    ) -> None:
+        """請求リンク方式で利用者へ見せるリンクを登録する。
+
+        入金先の ID とは別に保存するため、方式を切り替えても両方が残る。
+        """
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        value = (url or "").strip()
+        if value and not utils.is_safe_link(value):
+            await interaction.followup.send(
+                embed=ui.info_embed(
+                    "リンクの形式が正しくありません",
+                    "`https://` で始まる PayPay のリンクを指定してください。\n"
+                    "利用者にそのまま表示されるため、開けることを確認してから登録してください。",
+                    color=config.Color.DANGER,
+                ),
+                ephemeral=True,
+            )
+            return
+        ok = await bot.db.set_destination_claim_url(
+            config.ChargeProvider.PAYPAY,
+            claim_url=value or None,
+            updated_by=interaction.user.id,
+        )
+        if not ok:
+            await interaction.followup.send(
+                embed=ui.info_embed(
+                    "先に入金先を登録してください",
+                    "`/provider destination provider:PayPay address:<PayPay ID>` を"
+                    "実行してから、請求リンクを登録してください。",
+                    color=config.Color.DANGER,
+                ),
+                ephemeral=True,
+            )
+            return
+        op_id = await _audit(
+            interaction, "PROVIDER_PAYPAY_LINK",
+            detail={"registered": bool(value)},
+        )
+        if not value:
+            await interaction.followup.send(
+                embed=ui.success_embed(
+                    "🗑 請求リンクを削除しました",
+                    f"請求リンク方式は使えなくなります。\n操作ID: `{op_id}`",
+                ),
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "✅ PayPay の請求リンクを登録しました",
+                f"登録したリンク:\n{ui.copy_block(value)}\n"
+                f"操作ID: `{op_id}`\n\n"
+                "`/provider paypay_mode mode:請求リンク方式` で切り替えると、"
+                "利用者にこのリンクが表示されます。\n"
+                "**利用者にそのまま見せるため、開けることを確認してください。**",
             ),
             ephemeral=True,
         )

@@ -203,6 +203,27 @@ async def main() -> None:
           and purchase["subscription"] is False,
           "v1 由来の商品は既定でロール販売・自動更新なしとして扱われる")
 
+    # --- v5: 受け取り方の設定が既定値で入る ---
+    v5_settings = await db.get_settings(1)
+    check(v5_settings.kyash_mode == config.KyashMode.TRANSFER,
+          f"旧DBは送金リンク方式として移行される ({v5_settings.kyash_mode})")
+    check(v5_settings.paypay_mode == config.PayPayMode.ID,
+          f"旧DBは PayPay ID方式として移行される ({v5_settings.paypay_mode})")
+    await db.update_settings(1, kyash_mode=config.KyashMode.CLAIM)
+    check((await db.get_settings(1)).kyash_mode == config.KyashMode.CLAIM,
+          "移行後の DB でも受け取り方を変更できる")
+    await db.set_destination(
+        config.ChargeProvider.PAYPAY, address="pp-id", label=None, note=None,
+        updated_by=2,
+    )
+    check(await db.set_destination_claim_url(
+        config.ChargeProvider.PAYPAY, claim_url="https://pay.paypay.ne.jp/x",
+        updated_by=2),
+        "移行後の DB で請求リンクを登録できる")
+    dest = await db.get_destination(config.ChargeProvider.PAYPAY)
+    check(dest is not None and str(dest["claim_url"]) == "https://pay.paypay.ne.jp/x",
+          "登録した請求リンクを読み戻せる")
+
     # --- v4: 商品タイプとサブスクの列が移行後の DB でも使える ---
     sub_item = await db.add_shop_item(
         guild_id=1, role_id=0, name="月額ブースト", price=100, duration_days=30,

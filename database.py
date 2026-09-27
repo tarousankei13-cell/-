@@ -114,6 +114,10 @@ class GuildSettings:
     summary_channel_id: int | None = None
     summary_enabled: bool = False
     shop_enabled: bool = True
+    #: Kyash の受け取り方 (送金リンク / 請求リンク のどちらか一方)
+    kyash_mode: str = config.KyashMode.TRANSFER
+    #: PayPay の受け取り方 (ID / 請求リンク のどちらか一方)
+    paypay_mode: str = config.PayPayMode.ID
     panel_title: str | None = None
     panel_description: str | None = None
     accent_color: int | None = None
@@ -145,6 +149,8 @@ class GuildSettings:
             summary_channel_id=row["summary_channel_id"],
             summary_enabled=bool(row["summary_enabled"]),
             shop_enabled=bool(row["shop_enabled"]),
+            kyash_mode=str(row["kyash_mode"] or config.KyashMode.TRANSFER),
+            paypay_mode=str(row["paypay_mode"] or config.PayPayMode.ID),
             panel_title=row["panel_title"],
             panel_description=row["panel_description"],
             accent_color=row["accent_color"],
@@ -234,6 +240,8 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         summary_channel_id     INTEGER,
         summary_enabled        INTEGER NOT NULL DEFAULT 0,
         shop_enabled           INTEGER NOT NULL DEFAULT 1,
+        kyash_mode             TEXT    NOT NULL DEFAULT 'TRANSFER',
+        paypay_mode            TEXT    NOT NULL DEFAULT 'ID',
         panel_title            TEXT,
         panel_description      TEXT,
         accent_color           INTEGER,
@@ -588,6 +596,7 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         address     TEXT NOT NULL,
         label       TEXT,
         note        TEXT,
+        claim_url   TEXT,
         updated_by  INTEGER,
         created_at  INTEGER NOT NULL DEFAULT 0,
         updated_at  INTEGER NOT NULL DEFAULT 0
@@ -1208,6 +1217,7 @@ class Database:
         "max_balance", "manual_review_allow_new", "balance_log_channel_id",
         "balance_log_scope", "summary_channel_id", "summary_enabled", "shop_enabled",
         "panel_title", "panel_description", "accent_color",
+        "kyash_mode", "paypay_mode",
     })
 
     async def update_settings(self, guild_id: int, **values: Any) -> GuildSettings:
@@ -2165,6 +2175,26 @@ class Database:
         )
         # 入金先は Bot 全体で共有するため、全サーバーの表示を作り直す
         self._notify_settings_changed(None)
+
+    async def set_destination_claim_url(
+        self, provider: str, *, claim_url: str | None, updated_by: int
+    ) -> bool:
+        """請求リンク方式で見せるリンクを登録する (PayPay 用)。
+
+        入金先そのもの (ID) とは別に持つ。方式を切り替えても、もう一方の
+        登録内容が消えないようにするため。
+
+        Returns:
+            登録できたら True (入金先が未登録なら False)。
+        """
+        now = utils.now_ts()
+        changed = await self.execute(
+            "UPDATE payment_destinations SET claim_url=?, updated_by=?, updated_at=? "
+            "WHERE provider=?",
+            (claim_url, updated_by, now, provider),
+        )
+        self._notify_settings_changed(None)
+        return changed > 0
 
     async def delete_destination(self, provider: str) -> bool:
         def _fn(conn: sqlite3.Connection) -> bool:
@@ -6357,6 +6387,10 @@ _FORWARD_COMPAT_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("shop_purchases", "subscription", "INTEGER NOT NULL DEFAULT 0"),
     ("auctions", "role_expires_at", "INTEGER"),
     ("guild_member_history", "last_left_at", "INTEGER"),
+    # v5 で追加
+    ("guild_settings", "kyash_mode", "TEXT NOT NULL DEFAULT 'TRANSFER'"),
+    ("guild_settings", "paypay_mode", "TEXT NOT NULL DEFAULT 'ID'"),
+    ("payment_destinations", "claim_url", "TEXT"),
 )
 
 

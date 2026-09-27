@@ -916,6 +916,23 @@ def channel_name_from(raw: Any, *, limit: int = 90) -> str:
     return text[:limit]
 
 
+#: 利用者へそのまま見せてよいリンクの形式
+#: 見せたリンクは押されるため、http(s) 以外のスキームは受け付けない。
+_SAFE_LINK_RE = re.compile(r"^https://[A-Za-z0-9.\-]+(?::\d+)?(?:/[^\s<>\"']*)?$")
+
+
+def is_safe_link(url: Any) -> bool:
+    """利用者へ表示してよいリンクか判定する。
+
+    ``https://`` のみを許可する。``javascript:`` のような危険なスキームや、
+    空白・山括弧を含む値 (Embed を壊す・別のリンクに見せかける) を弾く。
+    """
+    text = str(url or "").strip()
+    if not text or len(text) > 500:
+        return False
+    return bool(_SAFE_LINK_RE.match(text))
+
+
 def load_json_dict(text: Any) -> dict[str, Any]:
     """DB に保存した JSON 文字列を辞書として読み戻す (壊れていても落ちない)。
 

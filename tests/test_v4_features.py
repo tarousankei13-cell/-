@@ -36,6 +36,7 @@ config.RANKING_DEBOUNCE_SECONDS = 0.05
 
 import discord  # noqa: E402
 
+import ui  # noqa: E402
 import utils  # noqa: E402
 from charge_service import ChargeError  # noqa: E402
 
@@ -1899,7 +1900,118 @@ async def main() -> None:
           "別の鍵で作られた控えは受け付けない")
     _Path(str(config.DB_PATH) + ".foreign.key").unlink(missing_ok=True)
 
-    print("\n=== 11. 整合性 ===")
+    print("\n=== 11. 受け取り方の切り替え (Kyash / PayPay) ===")
+    mode_settings = await bot.db.get_settings(G)
+    check(mode_settings.kyash_mode == config.KyashMode.TRANSFER,
+          f"既定は送金リンク方式 (従来の動きを変えない) ({mode_settings.kyash_mode})")
+    check(mode_settings.paypay_mode == config.PayPayMode.ID,
+          f"PayPay の既定は ID方式 ({mode_settings.paypay_mode})")
+
+    # 受取用 Kyash を使える状態にしておく
+    for slot in bot.kyash.slots():
+        slot.status = config.KyashAccountStatus.ACTIVE
+        slot.wallet_balance = 0
+        if slot.client is None:
+            slot.client = object()
+
+    async def providers_now() -> list[str]:
+        bot.charge.invalidate_panel_view(G)
+        entries = await bot.charge.provider_availability(G)
+        return [str(e["provider"]) for e in entries]
+
+    # --- Kyash: 送金リンク方式のときは請求リンクを見せない ---
+    await bot.db.update_settings(G, kyash_mode=config.KyashMode.TRANSFER)
+    shown = await providers_now()
+    check(config.ChargeProvider.KYASH in shown
+          and config.ChargeProvider.KYASH_CLAIM not in shown,
+          f"送金リンク方式では請求リンクを出さない ({shown})")
+
+    # --- Kyash: 請求リンク方式のときは送金リンクを見せない ---
+    await bot.db.update_settings(G, kyash_mode=config.KyashMode.CLAIM)
+    shown = await providers_now()
+    check(config.ChargeProvider.KYASH_CLAIM in shown
+          and config.ChargeProvider.KYASH not in shown,
+          f"請求リンク方式では送金リンクを出さない ({shown})")
+
+    # 使える方式がちょうど1つに絞られる (選択画面を挟まず入力へ進める)
+    bot.charge.invalidate_panel_view(G)
+    snapshot = await bot.charge.panel_view(G)
+    kyash_usable = [
+        e for e in snapshot["usable"]
+        if str(e["provider"]) in config.KYASH_PROVIDERS
+    ]
+    check(len(kyash_usable) == 1,
+          f"Kyash の方式は常に1つだけ使える状態になる ({len(kyash_usable)}件)")
+
+    # --- PayPay: 請求リンク未登録なら請求リンク方式は使えない ---
+    await bot.db.set_destination(
+        config.ChargeProvider.PAYPAY, address="paypay-id-001", label="受取用",
+        note=None, updated_by=OWNER_ID,
+    )
+    await bot.charge.set_review_channel_id(guild.review.id)
+    await bot.db.update_settings(G, paypay_mode=config.PayPayMode.CLAIM_LINK)
+    bot.charge.invalidate_panel_view(G)
+    entries = await bot.charge.provider_availability(G)
+    paypay = next(e for e in entries if e["provider"] == config.ChargeProvider.PAYPAY)
+    check(not paypay["available"]
+          and paypay["error_code"] == config.ErrorCode.PROVIDER_NOT_CONFIGURED,
+          f"請求リンク未登録なら使えない ({paypay['reason']})")
+
+    # --- 請求リンクを登録すると使えるようになる ---
+    registered = await bot.db.set_destination_claim_url(
+        config.ChargeProvider.PAYPAY,
+        claim_url="https://pay.paypay.ne.jp/testlink", updated_by=OWNER_ID,
+    )
+    check(registered, "請求リンクを登録できる")
+    bot.charge.invalidate_panel_view(G)
+    entries = await bot.charge.provider_availability(G)
+    paypay = next(e for e in entries if e["provider"] == config.ChargeProvider.PAYPAY)
+    check(paypay["available"], f"登録後は使えるようになる ({paypay['reason']})")
+
+    # --- 請求リンク方式の案内にリンクが出る ---
+    payer = guild.add_member(StubMember(69_101, guild))
+    quote = await bot.charge.start_manual_charge(
+        G, payer.id, config.ChargeProvider.PAYPAY, "1000"
+    )
+    check(str(quote["claim_url"]) == "https://pay.paypay.ne.jp/testlink",
+          "申請に請求リンクが渡る")
+    deposit = ui.deposit_embed(quote)
+    dump = "".join(f.name + f.value for f in deposit.fields)
+    check("pay.paypay.ne.jp/testlink" in dump, "案内画面に請求リンクが出る")
+    check("リンクを開いて支払う" in dump, "リンクを開くだけでよいと伝える")
+    check("paypay-id-001" not in dump,
+          "請求リンク方式のときは ID を見せない (迷わせない)")
+
+    # --- ID方式に戻すと ID が出る ---
+    await bot.db.update_settings(G, paypay_mode=config.PayPayMode.ID)
+    quote_id = await bot.charge.start_manual_charge(
+        G, payer.id, config.ChargeProvider.PAYPAY, "1000"
+    )
+    deposit_id = ui.deposit_embed(quote_id)
+    dump_id = "".join(f.name + f.value for f in deposit_id.fields)
+    check("paypay-id-001" in dump_id, "ID方式では ID を見せる")
+    check("pay.paypay.ne.jp/testlink" not in dump_id,
+          "ID方式のときは請求リンクを見せない")
+    check(str(quote_id["claim_url"]) == "", "ID方式では請求リンクを渡さない")
+
+    # --- 危険なリンクは登録させない (表示するリンクなので) ---
+    for bad in ("javascript:alert(1)", "http://example.com", "https://a b.com",
+                "ftp://example.com", ""):
+        check(not utils.is_safe_link(bad), f"危険・不正なリンクを弾く ({bad!r})")
+    check(utils.is_safe_link("https://pay.paypay.ne.jp/xxxx"),
+          "正しい https リンクは通す")
+
+    # --- 方式を切り替えても進行中の取引は完了できる ---
+    await bot.db.update_settings(G, kyash_mode=config.KyashMode.TRANSFER)
+    resumer = guild.add_member(StubMember(69_201, guild))
+    tx_id, _amount, _s = await bot.charge.start_charge(G, resumer.id, "1000")
+    await bot.db.update_settings(G, kyash_mode=config.KyashMode.CLAIM)
+    still = await bot.db.get_active_transaction(G, resumer.id)
+    check(still is not None and str(still["id"]) == tx_id,
+          "方式を切り替えても進行中の取引は残る (途中で捨てない)")
+    await bot.charge.cancel_transaction(tx_id, resumer.id)
+
+    print("\n=== 12. 整合性 ===")
     integrity = await bot.db.integrity_check()
     check(integrity["pragma"] == "ok", "PRAGMA quick_check OK")
     check(not integrity["balance_mismatch"], "残高と履歴合計が一致")

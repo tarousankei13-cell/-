@@ -12,8 +12,8 @@ from typing import Final
 # ---------------------------------------------------------------------------
 # バージョン
 # ---------------------------------------------------------------------------
-BOT_VERSION: Final[str] = "4.0.0"
-SCHEMA_VERSION: Final[int] = 4
+BOT_VERSION: Final[str] = "4.1.0"
+SCHEMA_VERSION: Final[int] = 5
 
 # ---------------------------------------------------------------------------
 # パス
@@ -426,6 +426,67 @@ KYASH_PROVIDERS: Final[tuple[str, ...]] = (
 
 #: 管理者承認が必要な方式
 MANUAL_PROVIDERS: Final[tuple[str, ...]] = (ChargeProvider.PAYPAY, ChargeProvider.LTC)
+
+
+class KyashMode:
+    """Kyash の受け取り方。どちらか一方だけを利用者に見せる。
+
+    2つ同時に出すと「どちらを使えばいいのか」が分からなくなるため、
+    サーバーごとに1つへ絞る。
+    """
+
+    TRANSFER = "TRANSFER"  # 利用者が送金リンクを作って送る
+    CLAIM = "CLAIM"        # Bot が請求リンクを発行し、利用者が支払う
+
+
+KYASH_MODE_LABELS: Final[dict[str, str]] = {
+    KyashMode.TRANSFER: "送金リンク方式 (利用者がリンクを作る)",
+    KyashMode.CLAIM: "請求リンク方式 (Botがリンクを出す)",
+}
+
+KYASH_MODE_DESCRIPTIONS: Final[dict[str, str]] = {
+    KyashMode.TRANSFER: (
+        "利用者が Kyash で送金リンクを作り、Bot へ送ります。\n"
+        "・利用者側で金額を入力する手間があります\n"
+        "・金額の打ち間違いが起きえます (不一致なら受け取りません)"
+    ),
+    KyashMode.CLAIM: (
+        "Bot が金額入りの請求リンクを出し、利用者は開いて支払うだけです。\n"
+        "・金額の打ち間違いが原理的に起きません\n"
+        "・利用者の操作が少なく、迷いにくい (おすすめ)"
+    ),
+}
+
+#: Kyash の方式 → 実際に使う ChargeProvider
+KYASH_MODE_PROVIDER: Final[dict[str, str]] = {
+    KyashMode.TRANSFER: ChargeProvider.KYASH,
+    KyashMode.CLAIM: ChargeProvider.KYASH_CLAIM,
+}
+
+
+class PayPayMode:
+    """PayPay の受け取り方。どちらか一方だけを利用者に見せる。"""
+
+    ID = "ID"                  # 送金先の PayPay ID を見せて送ってもらう
+    CLAIM_LINK = "CLAIM_LINK"  # 事前に登録した請求リンクを開いて支払ってもらう
+
+
+PAYPAY_MODE_LABELS: Final[dict[str, str]] = {
+    PayPayMode.ID: "ID方式 (送金先IDを見せる)",
+    PayPayMode.CLAIM_LINK: "請求リンク方式 (登録したリンクを見せる)",
+}
+
+PAYPAY_MODE_DESCRIPTIONS: Final[dict[str, str]] = {
+    PayPayMode.ID: (
+        "登録した PayPay ID を見せ、利用者に送ってもらいます。\n"
+        "・利用者が ID を入力して送金する必要があります"
+    ),
+    PayPayMode.CLAIM_LINK: (
+        "あらかじめ登録した PayPay の請求リンクを見せます。\n"
+        "・利用者はリンクを開いて支払うだけです\n"
+        "・着金の確認は従来どおり管理者の承認制です"
+    ),
+}
 
 #: 承認時に作る取引の source
 PROVIDER_TX_SOURCE: Final[dict[str, str]] = {
