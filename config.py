@@ -1140,7 +1140,6 @@ class CustomID:
     INVITE_STATUS = "chargebot:invite:status"
     INVITE_RANK = "chargebot:invite:rank"
     AUCTION_BID = "chargebot:auction:bid"
-    AUCTION_INFO = "chargebot:auction:info"
     GOAL_REFRESH = "chargebot:goal:refresh"
     FRAUD_RESOLVE = "chargebot:fraud:resolve"
     FRAUD_IGNORE = "chargebot:fraud:ignore"

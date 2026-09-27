@@ -18,6 +18,45 @@ Bot は管理者が登録した **受取用 Kyash アカウント** でリンク
 - トークン失効の事前警告 / 受取アカウント残高しきい値 / 連続失敗クールダウン
 - 死活監視 (ハートビート) / バックアップの外部保存 / GitHub Actions による自動テスト
 
+**v4.0 の追加機能**
+
+v4 は「サーバーを続けて使ってもらう仕組み」と「運用者が異変に気付ける仕組み」を足しました。
+
+- **累計チャージによる自動昇格 (段位)**
+  累計額のしきい値ごとにロールを自動付与。一度得た段位は下がりません
+  (`/tier add|remove|list|sweep`)
+- **ランキング報酬の自動配布**
+  締めた週・月のランキング上位へ残高とロールを自動で配ります。
+  同じ期間に二度配らないよう配布記録で守ります (`/ranking_reward set|remove|list|run`)
+- **受取用 Kyash アカウントの複数登録**
+  1台が残高しきい値に達してもチャージが止まりません。優先度順に余裕のある
+  アカウントを選び、全台が満杯のときだけ停止します (`/kyash add|remove|priority`)
+- **ショップの商品タイプ拡張とサブスク**
+  ロール付与に加えて「カスタムロール作成」「ニックネーム変更」「チャージ率ブースト」
+  「専用チャンネル」を販売できます。期限つき商品は**自動更新 (サブスク)** にもできます
+  (`/shop add type:... subscription:True` / `/shop cancel` / `/shop subscriptions`)
+- **オークション**
+  内部残高でロールを競り落とせます。入札した分はその場で預かり、上回られたら
+  全額を即返金。締切直前の入札では締切を延長します
+  (`/auction create|bid|list|close|cancel|bids`)
+- **サーバー全体のチャージ目標**
+  みんなで目標額を目指し、達成したら**期間中にチャージした全員**へ報酬を配ります。
+  進捗パネルは自動更新です (`/goal create|panel|progress|list|close|cancel|grants`)
+- **不正の兆候の自動検知**
+  短時間の大量チャージ / 送金者名の共有 / 使い切って退出 / 招待報酬のみ /
+  返金の繰り返し を検知して審査チャンネルへ知らせます。
+  **検知しても自動で凍結・処分はしません** (判断は必ず人が行います)
+  (`/fraud list|resolve|ignore|scan|thresholds`)
+- **日別推移のグラフ画像**
+  チャージの推移を画像で確認できます (`/stats days:14`)。日次サマリにも添付します。
+  描画は Pillow のみで行い、集計データを外部サービスへ送りません
+- **返金申請フロー**
+  利用者が `/refund request` で申請し、管理者が審査します。承認すると内部残高を
+  取り消します。**Kyash への実際の返金は管理者の手作業**です (自動送金は行いません)
+- **署名つきレシート**
+  `/receipt show` でチャージの控えを発行できます。`/receipt verify` は署名に加えて
+  **いまの記録との一致**も確認するため、取消済みの控えは「無効」と判定します
+
 **v3.1 の追加機能・修正**
 - **Kyash 請求リンク**でのチャージを追加。Bot が金額入りの請求リンクを発行し、
   利用者は**開いて支払うだけ**。金額の打ち間違いが原理的に起きず、承認も不要
@@ -53,7 +92,7 @@ Bot は管理者が登録した **受取用 Kyash アカウント** でリンク
 - Embed が Discord の上限を超えたときに無言で失敗しないよう、送信前に自動で切り詰め
 - 静的解析 (mypy) を 0 エラーにし、同種の引数ミスを検出できるようにしました
 
-- Bot バージョン: `3.1.0` / DB スキーマ: `v3` (v1 / v2 の DB は起動時に自動移行)
+- Bot バージョン: `4.0.0` / DB スキーマ: `v4` (v1 / v2 / v3 の DB は起動時に自動移行)
 - 想定環境: Python 3.11+ / discord.py 2.x / SQLite (WAL) / Linux VPS + systemd
 - Kyash 連携: 同梱の添付モジュール `vendor/Kyasher` (Kyasher 1.5.0) のみを使用
 - PayPay / LTC: **外部 API は使いません** (LTC の価格取得のみ CoinGecko を参照)。
@@ -71,26 +110,32 @@ discord-charge-bot/
 ├── database.py                 # SQLite スキーマ / マイグレーション / 全クエリ / 冪等な残高付与
 ├── kyash_service.py            # 添付モジュールの安全な抽象化 (直列化・タイムアウト・受取確認)
 ├── price_service.py            # LTC/JPY 価格の取得 (厳格な検証・キャッシュ・異常値ガード)
-├── charge_service.py           # チャージ・ショップ・招待・残高操作・通知・ランキング
+├── charge_service.py           # チャージ・ショップ・招待・残高操作・通知・ランキング・
+│                               # 段位・オークション・目標・不正検知・返金申請・レシート
+├── chart.py                    # 日別推移のグラフ描画 (Pillow のみ・外部送信なし)
 ├── ui.py                       # Embed / Persistent View / Modal
-├── commands.py                 # スラッシュコマンド (Owner / Admin)
+├── commands.py                 # スラッシュコマンド (Owner / Admin / 利用者)
 ├── tasks.py                    # バックグラウンドタスク (キューワーカー等) + 自己復旧監視
 ├── requirements.txt
 ├── discord-charge-bot.service  # systemd unit
 ├── tests/
-│   ├── test_charge_flow.py     # 統合テスト: チャージ本体 (87項目)
-│   ├── test_v2_features.py     # 統合テスト: ショップ/招待/残高操作/実績投稿 (88項目)
-│   ├── test_migration.py       # 旧DBの自動移行 (19項目)
+│   ├── test_charge_flow.py     # 統合テスト: チャージ本体 (91項目)
+│   ├── test_v2_features.py     # 統合テスト: ショップ/招待/残高操作/実績投稿 (89項目)
+│   ├── test_v4_features.py     # 統合テスト: v4 の全機能 (278項目)
+│   ├── test_migration.py       # 旧DBの自動移行 v1→v4 (29項目)
 │   ├── test_providers.py       # PayPay / LTC の申請・承認 (75項目)
 │   ├── test_claim_link.py      # Kyash 請求リンクの支払い (56項目)
-│   ├── test_ui_render.py       # 全 Embed の描画と文字数上限 (155項目)
-│   └── test_commands_smoke.py  # 全コマンド/全ボタンの実行と権限 (167項目)
+│   ├── test_ui_render.py       # 全 Embed の描画と文字数上限 (290項目)
+│   ├── test_commands_smoke.py  # 全コマンド/全ボタンの実行と権限 (225項目)
+│   ├── test_concurrency.py     # 同時実行でお金が増減しないこと (26項目)
+│   └── test_static_audit.py    # 静的監査: 起動せずに不整合を検出 (95項目)
 ├── .github/workflows/test.yml  # CI (lint + 起動前チェック + 全テスト)
 ├── vendor/
 │   └── Kyasher/                # 添付モジュール (無変更で同梱・監査用)
-└── data/                       # 実行時に生成 (DB / バックアップ / 暗号化キー)
+└── data/                       # 実行時に生成 (DB / バックアップ / 鍵)
     ├── charge_bot.db
-    ├── secret.key              # 0600
+    ├── secret.key              # 0600  Kyash トークンの暗号化キー
+    ├── receipt.key             # 0600  レシート署名の鍵 (別ファイルで保持)
     └── backups/
 ```
 
@@ -235,7 +280,10 @@ journalctl -u discord-charge-bot -p err        # エラーのみ
 | `/stats global_scope:True` | Bot 全体の統計 |
 | `/global overview` | 全サーバー横断の状況一覧 |
 | `/global stats` | Bot 全体の統計とメトリクス |
-| `/kyash threshold <amount>` | 受取用アカウントの残高しきい値 |
+| `/kyash threshold <amount> [account]` | 受取用アカウントの残高しきい値 |
+| `/kyash add <label> [threshold] [priority]` | 受取用アカウントを追加 (v4) |
+| `/kyash remove <account>` | 受取用アカウントを削除 (v4) |
+| `/kyash priority <account> <priority>` | 受取に使う順番を変更 (v4) |
 | `/system heartbeat <url>` | 死活監視URLの設定 |
 | `/system backup_remote <mode> [directory]` | バックアップの外部保存 |
 | `/balance repair <user> <mode> <reason>` | 残高の突合修復 (2段階確認) |
@@ -270,7 +318,15 @@ journalctl -u discord-charge-bot -p err        # エラーのみ
 | `/transaction verify <tx_id>` | Kyash 側の受取状態を再確認 |
 | `/transaction resolve <tx_id> <complete> <reason>` | 確認中の取引を完了/失敗で確定 (確認ボタン) |
 | `/transaction retry <tx_id>` | **未受取を確認できた場合のみ** 再受取キューへ戻す |
-| `/stats` | 統計 (回数・送金額・付与残高・今日/今月・成功率・キュー・ユーザー数・稼働時間) |
+| `/stats [days] [global_scope]` | 統計 + 日別推移グラフ (v4・`days:0` でグラフなし) |
+| `/tier add\|remove\|list\|sweep` | 累計チャージによる段位 (v4) |
+| `/ranking_reward set\|remove\|list\|run` | ランキング報酬の自動配布 (v4) |
+| `/shop add ... item_type subscription` | 商品タイプとサブスクの設定 (v4) |
+| `/shop subscriptions [user]` | 自動更新中の購入を一覧 (v4) |
+| `/auction create\|close\|cancel\|bids` | オークションの運営 (v4) |
+| `/goal create\|panel\|close\|cancel\|grants` | サーバー全体のチャージ目標 (v4) |
+| `/fraud list\|resolve\|ignore\|scan\|thresholds` | 不正の兆候の確認と処理 (v4) |
+| `/refund approve\|reject` | 返金申請の審査 (v4) |
 | `/queue` | 受取キュー (処理中 / 待機 / 手動確認待ち) |
 | `/system` | Bot・DB・Kyash・キュー・タスク稼働・バージョン |
 | `/logs [action] [actor] [page]` | 監査ログ |
@@ -353,6 +409,33 @@ journalctl -u discord-charge-bot -p err        # エラーのみ
 | 🔗 招待リンクを取得 | 自分専用の招待リンクを発行 (Ephemeral) |
 | 📊 自分の招待状況 | 確定/保留/要確認/無効の件数と獲得報酬 |
 | 🏆 招待ランキング | 確定した招待数のランキング |
+
+チャージ目標パネル (`/goal create ... channel:` または `/goal panel` で設置・v4):
+
+| ボタン | 内容 |
+|---|---|
+| 🔄 最新の進捗 | いまの達成率と**自分の参加額** (Ephemeral) |
+
+オークションのパネル (`/auction create` で自動設置・v4):
+
+| ボタン | 内容 |
+|---|---|
+| 💸 入札する | 入札額を入力。その場で残高を預かり、上回られたら全額返金します |
+
+### 利用者が使えるコマンド (v4)
+
+| コマンド | 内容 |
+|---|---|
+| `/goal progress` | チャージ目標の進捗と自分の参加額 |
+| `/goal list` | 目標の一覧 |
+| `/auction bid <auction_id> <amount>` | 入札 (パネルが流れた場合の代替) |
+| `/auction list` | 開催中・終了したオークションの一覧 |
+| `/shop cancel <purchase_id>` | 自分のサブスクの自動更新を止める |
+| `/refund request <transaction_id> <reason>` | 返金 (残高の取消) を申請 |
+| `/refund cancel <request_id>` | 自分の申請を取り下げる (審査前のみ) |
+| `/refund list` | 自分の申請の状態 |
+| `/receipt show [transaction_id]` | チャージの控えを発行 (署名つき) |
+| `/receipt verify <code>` | 控えが本物か・いまも有効かを確認 |
 
 ### 値のコピーについて
 
@@ -454,13 +537,26 @@ journalctl -u discord-charge-bot -p err        # エラーのみ
 ```bash
 cd /opt/discord-charge-bot
 ./venv/bin/python3 tests/test_charge_flow.py     #  91 件  Kyash 送金リンクの本流と異常系
-./venv/bin/python3 tests/test_claim_link.py     #  56 件  Kyash 請求リンクの支払い
-./venv/bin/python3 tests/test_v2_features.py    #  88 件  ショップ・招待・残高操作・実績投稿
-./venv/bin/python3 tests/test_migration.py      #  19 件  旧DBの自動移行 (v1 → v3)
-./venv/bin/python3 tests/test_providers.py      #  75 件  PayPay / LTC の申請・承認
-./venv/bin/python3 tests/test_ui_render.py      # 165 件  全 Embed の描画と文字数上限
-./venv/bin/python3 tests/test_commands_smoke.py # 175 件  全コマンド・全ボタンの実行
-# → 合計 669 件成功 / 0 件失敗
+./venv/bin/python3 tests/test_claim_link.py      #  56 件  Kyash 請求リンクの支払い
+./venv/bin/python3 tests/test_v2_features.py     #  89 件  ショップ・招待・残高操作・実績投稿
+./venv/bin/python3 tests/test_v4_features.py     # 278 件  段位・ランキング報酬・複数アカウント・
+                                                 #         サブスク・オークション・目標・検知・
+                                                 #         返金申請・レシート・グラフ
+./venv/bin/python3 tests/test_migration.py       #  29 件  旧DBの自動移行 (v1 → v4)
+./venv/bin/python3 tests/test_providers.py       #  75 件  PayPay / LTC の申請・承認
+./venv/bin/python3 tests/test_ui_render.py       # 290 件  全 Embed の描画と文字数上限
+./venv/bin/python3 tests/test_commands_smoke.py  # 225 件  全コマンド・全ボタンの実行
+./venv/bin/python3 tests/test_concurrency.py     #  26 件  同時実行でお金が増減しないこと
+./venv/bin/python3 tests/test_static_audit.py    #  95 件  静的監査 (起動せずに不整合を検出)
+# → 合計 1254 件成功 / 0 件失敗
+```
+
+まとめて実行する場合:
+
+```bash
+for t in tests/test_*.py; do
+  echo "--- $t"; ./venv/bin/python3 "$t" | tail -3
+done
 ```
 
 静的解析も併せて実行できます (どちらも 0 件が正常)。
@@ -481,7 +577,38 @@ cd /opt/discord-charge-bot
 端数処理 / チャージ率スナップショット / 整合性 / 統計 / バックアップ / 通知キュー /
 レート制限 / コマンドツリー / 再起動後の永続化 /
 **ショップ購入の実績投稿 (返金・期限切れで同じ投稿を更新・重複投稿しない)** /
-**招待確定の実績投稿** / 全 Embed の文字数上限 / 全 101 コマンドが一般利用者を拒否すること
+**招待確定の実績投稿** / 全 Embed の文字数上限 / 管理コマンドが一般利用者を拒否すること /
+**段位の自動昇格 (降格しない・二重通知しない)** / **ランキング報酬の二重配布防止** /
+**受取アカウントのフェイルオーバーと全台満杯の判定** /
+**商品タイプごとの付与と後片付け (返金・期限切れ・用意の失敗)** /
+**サブスクの自動更新 (同時8件でも1回だけ・残高不足で終了し特典も取消)** /
+**オークション (預かり・即返金・締切延長・二重締切の防止・総額の保存)** /
+**チャージ目標 (期間の境界・二重配布の防止・凍結の除外)** /
+**不正検知 (5ルール・二重フラグの防止・送金者名を伏せる・1ルール故障時の継続)** /
+**返金申請 (期限・二重申請・上限・承認で取消・却下で不変)** /
+**レシート (改ざん・別の鍵・取消後・記録との不一致をすべて無効と判定)** /
+**グラフ (0埋め・上限日数・Pillow が無い環境でも統計は出る)**
+
+#### 静的監査で見ているもの (`tests/test_static_audit.py`)
+
+起動しないと分からない壊れ方を、ソースを読んで先に見つけます。
+
+- `custom_id` の衝突・未使用、Persistent View の登録漏れ (再起動後にボタンが死ぬ)
+- 到達できない状態遷移、案内文の無いエラーコード
+- `CREATE TABLE` と後方互換列の食い違い (古い DB で落ちる)
+- トランザクションの入れ子 (実行時にしか出ない例外)
+- 秘密情報をログの引数へ渡していないか
+- `defer` の後に Modal を出していないか (Discord が拒否する)
+- 金額を `float` で扱っていないか
+
+#### 同時実行の監査で見ているもの (`tests/test_concurrency.py`)
+
+残高が動く経路を同時に叩き、**お金が増えも減りもしない**ことを確認します。
+
+- 同じ取引の残高付与 / ショップの在庫と購入上限 / サブスクの更新
+- オークションの入札 (「残高 + 預かり額」の合計が常に一定) と締切
+- 目標報酬の配布 / 返金申請と取消 / 不正検知フラグの作成
+- 最後に `PRAGMA quick_check` と「残高と履歴合計の一致」を確認
 
 ### 2. 手動テスト (実環境・少額で実施)
 
@@ -592,6 +719,67 @@ Discord が両方を別枠で表示するため二重に見えます)。
 
 `/request show request_id:<ID>` で現在の状態を確認できます。
 
+### グラフが表示されない
+
+`/stats days:14` で画像が出ない場合:
+
+```bash
+./venv/bin/pip install Pillow          # 未導入なら入れる
+sudo apt-get install -y fonts-noto-cjk # 日本語ラベル用 (無いと英字ラベルになる)
+sudo systemctl restart discord-charge-bot
+```
+
+Pillow が無くても Bot は動きます (グラフだけ省略し、数字は Embed に出ます)。
+
+### サブスクが更新されない
+
+- 利用者の残高が足りているか (`/balance` または `/inspect`)
+- 商品が販売停止になっていないか (`/shop list` で ⚫ 表示)
+- 利用者が凍結されていないか
+- `/shop subscriptions` で `次回` の日時を確認 (更新は 10 分ごとに判定します)
+
+残高不足で終了した場合は、利用者へ DM で通知し、特典も取り消しています。
+再開するにはショップから買い直してもらってください。
+
+### オークションの景品が渡されない
+
+落札者へロールを付与できなかった場合、Bot は**落札額を返金して中止扱い**にし、
+管理者へ通知します。原因はほぼ次のどちらかです。
+
+- 景品のロールが Bot のロールより**上**にある → ロールの並び順を入れ替える
+- Bot に「ロールの管理」権限が無い
+
+直したうえで、オークションを作り直してください。
+
+### 検知が出すぎる / 出ない
+
+`/fraud thresholds` で現在の条件を確認できます。条件は `config.py` の
+`FRAUD_*` 定数で調整します (変更後は再起動が必要です)。
+
+- 検知は**通知だけ**です。自動での凍結・没収は行いません
+- 「送金者名の共有」は Kyash の送金リンク経由のチャージだけが対象です
+  (PayPay / LTC の申請や請求リンクでは送金者名を取得できません)
+
+### 返金申請ができない
+
+- チャージ完了から **14 日**を過ぎていないか
+- 審査待ちの申請が**すでに 2 件**ないか (`/refund list`)
+- 対象の取引が既に取消済みでないか
+
+管理者が承認しても、**Kyash へのお金の返却は自動では行われません**。
+内部残高を取り消したうえで、管理者が Kyash 側で手作業の送金を行ってください。
+
+### レシートが「無効」と出る
+
+`/receipt verify` は署名だけでなく、**いまの記録との一致**も見ます。
+次の場合は正しく「無効」と判定されます。
+
+- その取引が取消 (返金) された
+- 取引の金額が後から変更された
+- 別の Bot / 別の鍵で発行された控え
+
+`data/receipt.key` を作り直した場合、それ以前に発行した控えはすべて検証できなくなります。
+
 ### 実績投稿について
 
 実績チャンネル (`/settings achievement_channel`) には次の 3 種類を投稿します。
@@ -625,7 +813,7 @@ sqlite3 data/charge_bot.db "PRAGMA integrity_check;"
 
 # バックアップ (毎日自動 / 14世代保持)
 ls -l data/backups/
-/backup            # Discord から手動実行
+/backup            # Discord から手動実行 (対象は DB のみ)
 
 # リストア (Bot を停止してから)
 sudo systemctl stop discord-charge-bot
@@ -633,17 +821,38 @@ cp data/backups/charge_bot_YYYYmmdd_HHMMSS.db data/charge_bot.db
 sudo systemctl start discord-charge-bot
 ```
 
+> `/backup` と自動バックアップの対象は **DB だけ**です。
+> `data/secret.key` (Kyash トークンの復号) と `data/receipt.key` (レシートの検証) は
+> 別途バックアップしてください。失うと、保存済みトークンの復号と、
+> 発行済みレシートの検証ができなくなります。
+>
+> ```bash
+> # 例: 鍵だけを安全な場所へ (権限 0600 のまま扱うこと)
+> sudo cp -p data/secret.key data/receipt.key /root/keybackup/
+> ```
+
 ### エラーコード
 
 利用者には安全な日本語メッセージのみ表示され、管理者向けにはコードと詳細が残ります。
 
-`INVALID_AMOUNT` / `AMOUNT_MISMATCH` / `AMOUNT_BELOW_MIN` / `AMOUNT_ABOVE_MAX` /
-`DAILY_LIMIT_EXCEEDED` / `GUILD_DAILY_LIMIT_EXCEEDED` / `INVALID_LINK` / `LINK_IS_CLAIM` /
-`LINK_EXPIRED` / `LINK_ALREADY_USED` / `KYASH_AUTH_ERROR` / `KYASH_TIMEOUT` /
-`KYASH_NETWORK_ERROR` / `KYASH_REJECTED` / `KYASH_UNAVAILABLE` / `DATABASE_ERROR` /
-`USER_FROZEN` / `GUILD_DISABLED` / `MAINTENANCE` / `EMERGENCY_STOP` /
-`TRANSACTION_EXPIRED` / `ACTIVE_TRANSACTION_EXISTS` / `RATE_LIMITED` / `MANUAL_REVIEW` /
-`UNKNOWN_ERROR`
+全 63 種。すべてに「▶ 次にどうすればいいですか？」の案内文があります。
+
+`ACTIVE_TRANSACTION_EXISTS` / `ALREADY_HIGHEST` / `AMOUNT_ABOVE_MAX` / `AMOUNT_BELOW_MIN` /
+`AMOUNT_MISMATCH` / `ASSET_AMOUNT_TOO_SMALL` / `AUCTION_LIMIT_REACHED` / `AUCTION_NOT_OPEN` /
+`BID_TOO_LOW` / `CAMPAIGN_NOT_ACTIVE` / `CLAIM_LINK_FAILED` / `COOLDOWN` /
+`DAILY_LIMIT_EXCEEDED` / `DATABASE_ERROR` / `DUPLICATE_PROOF` / `EMERGENCY_STOP` /
+`FRAUD_FLAG_NOT_FOUND` / `GOAL_ALREADY_OPEN` / `GOAL_NOT_FOUND` / `GUILD_DAILY_LIMIT_EXCEEDED` /
+`GUILD_DISABLED` / `INSUFFICIENT_BALANCE` / `INVALID_AMOUNT` / `INVALID_LINK` /
+`INVALID_PROOF` / `INVITE_NOT_AVAILABLE` / `ITEM_INPUT_INVALID` / `ITEM_SETUP_FAILED` /
+`KYASH_AUTH_ERROR` / `KYASH_NETWORK_ERROR` / `KYASH_REJECTED` / `KYASH_TIMEOUT` /
+`KYASH_UNAVAILABLE` / `LINK_ALREADY_USED` / `LINK_EXPIRED` / `LINK_IS_CLAIM` /
+`MAINTENANCE` / `MANUAL_REVIEW` / `MAX_BALANCE_EXCEEDED` / `NOT_ALLOWED` /
+`NO_KYASH_CAPACITY` / `OPEN_REQUEST_LIMIT` / `PAYMENT_NOT_FOUND` / `PRICE_UNAVAILABLE` /
+`PROVIDER_DISABLED` / `PROVIDER_NOT_CONFIGURED` / `QUOTE_EXPIRED` / `RATE_LIMITED` /
+`REFUND_ALREADY_REQUESTED` / `REFUND_NOT_ELIGIBLE` / `REQUEST_ALREADY_HANDLED` / `REQUEST_NOT_FOUND` /
+`REVIEW_CHANNEL_NOT_SET` / `ROLE_ASSIGN_FAILED` / `SHOP_ALREADY_OWNED` / `SHOP_ITEM_UNAVAILABLE` /
+`SHOP_LIMIT_REACHED` / `SHOP_OUT_OF_STOCK` / `SUBSCRIPTION_NOT_FOUND` / `TRANSACTION_EXPIRED` /
+`UNKNOWN_ERROR` / `USER_FROZEN` / `WALLET_LIMIT`
 
 ---
 
@@ -705,6 +914,12 @@ sudo systemctl start discord-charge-bot
 - **送金リンクの完全な URL は保存しない**: 二重送信判定用の SHA-256 ハッシュと、
   受取・状態確認に必要なリンクUUIDのみ保存します。
 - **パスワードは保存しない**: アクセストークンのみ `data/secret.key` (0600) で暗号化保存。
+- **鍵は用途ごとに分ける**: レシートの署名は `data/receipt.key` (0600) を使い、
+  トークンの暗号鍵とは別に持ちます (片方が漏れても他方に影響させないため)。
+- **不正検知は通知だけ**: 自動での凍結・残高没収・BAN は一切行いません。
+  検知の記録には Kyash 送金者名をそのまま残さず、先頭だけ残して伏せます。
+- **返金は内部残高の取消のみ**: Kyash への送金は自動化しません (添付モジュールに手段が無いため)。
+  実際の返金は管理者の手作業で、その旨を申請・審査・結果のすべてに明記します。
 - **二重受取防止**: `link_hash` / `link_uuid` の UNIQUE 制約 + プロセス内ロック +
   受取処理の完全直列化 (単一スレッド + Lock)。
 - **二重残高付与防止**: `balance_history(transaction_id, type)` の UNIQUE 制約 +
@@ -954,6 +1169,265 @@ curl -sS "https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currenci
 この点は申請画面と `🔍 詳細` にも明記してあります。
 
 PayPay は PayPay 側の操作で対応してください (Bot は内部残高の取り消しのみ行います)。
+
+
+---
+
+# v4 追加機能ガイド
+
+## 累計チャージによる段位 (自動昇格)
+
+累計チャージ額のしきい値ごとにロールを自動で付けます。**一度得た段位は下がりません**
+(返金で累計が減っても剥奪しない)。チャージ完了のたびに判定し、取りこぼしは
+15 分ごとのタスクが拾います。
+
+```bash
+/tier add name:ブロンズ threshold:10000 role:@ブロンズ description:レート+5%
+/tier add name:シルバー threshold:50000 role:@シルバー
+/tier list          # 設定した段位の一覧
+/tier sweep         # いま条件を満たしている人へまとめて付与 (後から追加したとき用)
+/tier remove tier_id:2
+```
+
+- 累計は**返金された取引を除いた送金額**で数えます
+- 複数のしきい値を一度に超えた場合は、**すべての段位**を付与します
+- 付与の記録を先に残してから `add_roles` するため、同じ昇格を二度通知しません
+- ロール別レート (`/rate`) と組み合わせると「段位が上がるほどお得」になります
+
+## ランキング報酬の自動配布
+
+締めた期間 (週間・月間) の上位へ、残高とロールを自動で配ります。
+
+```bash
+/ranking_reward set period:週間 rank:1 amount:3000 role:@週間1位
+/ranking_reward set period:月間 rank:1 amount:10000
+/ranking_reward list
+/ranking_reward run period:週間        # いますぐ配る (テスト・再配布用)
+/ranking_reward remove period:週間 rank:1
+```
+
+- 対象は**締め切った直前の期間**です (週は月曜 00:00 JST 始まり)
+- 同じ期間に二度配らないよう、配布記録 (`ranking_reward_grants`) で守ります
+- 凍結された利用者と、返金された取引は集計から除きます
+
+## 受取用 Kyash アカウントの複数登録
+
+1台が残高しきい値に達してもチャージが止まらないようにします。
+
+```bash
+/kyash add label:sub1 threshold:80000 priority:1
+/kyash login account:sub1              # 追加したアカウントでログイン
+/kyash status                          # 全アカウントの状態を一覧
+/kyash priority account:sub1 priority:2
+/kyash threshold account:sub1 threshold:50000
+/kyash remove account:sub1
+```
+
+- 受け取りは**優先度の高い順に、その金額が入るアカウント**を選びます
+- 「1台が上限」と「全台が上限」は別扱いです。前者は継続、後者だけ停止します
+- 取引ごとに「どのアカウントで受け取ったか」を記録し、確認も必ず同じアカウントで行います
+  (他のアカウントの残高増加を自分の入金と誤認しないため)
+- 異常・トークン失効・しきい値到達は**アカウント名つきで**通知します
+- v3 以前の単一アカウントは、初回起動時に自動で移行します (`label=main`)
+
+## ショップの商品タイプとサブスク
+
+### 商品タイプ
+
+| 種類 | 何が起きるか | 追加で必要な指定 |
+|---|---|---|
+| ロール付与 | 設定済みのロールを付ける | `role` |
+| カスタムロール作成 | 購入者が名前と色を決めたロールを作って付ける | (色を固定するなら `role_color`) |
+| ニックネーム変更 | 購入者のニックネームを変える | なし |
+| チャージ率ブースト | 一定時間チャージ率が上がる | `bonus_rate` `boost_hours` |
+| 専用チャンネル | 購入者だけが見えるチャンネルを作る | (置き場所は `category`) |
+
+```bash
+/shop add name:好きな名前のロール price:5000 item_type:カスタムロール作成
+/shop add name:率ブースト price:2000 item_type:チャージ率ブースト bonus_rate:20 boost_hours:24 duration_days:1
+/shop add name:自分の部屋 price:10000 item_type:専用チャンネル duration_days:30 category:#個室
+```
+
+- 入力が必要な商品は、購入ボタンの後に**入力欄 (Modal)** が開きます
+- 入力値からはメンション記法・コードブロック記法・表示順を偽装する制御文字を除きます
+- Bot が作ったロール・チャンネルと、変更前のニックネームは記録しておき、
+  **返金・期限切れ・用意の失敗**で必ず元に戻します
+- 購入前に権限と設定を検証するので、「買えたのに渡せない」は起きません
+  (万一失敗した場合は自動で返金します)
+- チャージ率ブーストは複数持っても**合算せず、最も大きい1つ**だけを適用します
+
+### サブスク (自動更新)
+
+`duration_days` を指定した商品に `subscription:True` を付けると、期限のたびに
+残高から自動で引き落として期間を延長します。
+
+```bash
+/shop add name:月額VIP price:5000 duration_days:30 subscription:True role:@VIP item_type:ロール付与
+/shop subscriptions          # 自動更新中の購入を一覧 (管理者)
+/shop cancel purchase_id:12  # 自動更新を止める (利用者本人・期限までは使える)
+```
+
+- 更新の **1日前に DM で予告**します (残高不足なら不足額も知らせます)
+- 残高が足りなければ自動更新を解除し、**特典もその場で取り消して** DM で知らせます
+- 期限の起点は元の期限なので、処理が遅れても期間が削られません
+- 返金すると自動更新は必ず止まります (翌期も課金されることはありません)
+
+## オークション
+
+内部残高でロールを競り落とせます。
+
+```bash
+/auction create name:レア称号 role:@レア start_price:1000 hours:24 min_increment:500 duration_days:30
+/auction list
+/auction bid auction_id:1 amount:2000     # パネルが流れた場合の代替
+/auction close auction_id:1               # 締切前に締める (管理者)
+/auction cancel auction_id:1 reason:中止  # 全額返金して中止 (管理者)
+/auction bids auction_id:1                # 入札の履歴 (管理者)
+```
+
+- **入札した時点で残高を預かります**。支払えない入札で他の人を押しのけられません
+- 上回られたら**その場で全額返金**し、DM で知らせます
+- 締切の 2 分前以内の入札では、締切を 2 分延長します (駆け込み入札の対策)
+- 落札時に追加の引き落としはありません (入札時に預かった分を充当します)
+- 景品のロールを渡せなかった場合は**落札額を返金して中止扱い**にし、管理者へ通知します
+- 期間つきの落札ロールは期限で自動的に外れます
+  (ショップで同じロールを購入中の場合は外しません)
+
+## サーバー全体のチャージ目標
+
+みんなでチャージを積み上げ、達成したら**期間中にチャージした全員**へ報酬を配ります。
+
+```bash
+/goal create name:みんなで10万円 target_amount:100000 reward_amount:500 reward_role:@達成者 days:7 channel:#お知らせ
+/goal progress      # いまの進捗と自分の参加額 (利用者も実行可)
+/goal list
+/goal panel channel:#お知らせ   # 進捗パネルを後から設置
+/goal close goal_id:1           # 手動で締める (届いていれば達成扱い)
+/goal cancel goal_id:1          # 中止 (報酬は配らない)
+/goal grants goal_id:1          # 配布した報酬の一覧
+```
+
+- 集計は「期間内に完了したチャージの**送金額**」の合計です
+  (付与額ではないので、チャージ率を変えても目標の意味が変わりません)
+- 同時に集計できる目標は**1サーバー1つ**です
+- 配布記録を先に立ててから残高を足すので、途中で落ちても二重には配りません
+- 報酬ロールは目標の開始時に付与できるか検証します (達成後に配れない事態を防ぐため)
+
+## 不正の兆候の自動検知
+
+疑わしい動きを拾って審査チャンネルへ知らせます。
+**検知しても自動で凍結・処分は一切しません。** 誤検知で利用者を止める方が害が大きいため、
+判断は必ず管理者が行います。
+
+```bash
+/fraud list                    # 未処理の検知 (既定)
+/fraud list status:すべて kind:送金者名の共有
+/fraud scan                    # いますぐ検知を実行
+/fraud thresholds              # どの条件で検知しているかを表示
+/fraud resolve flag_id:3 note:凍結して対応済み
+/fraud ignore flag_id:4 note:本人確認済み
+```
+
+| 種類 | 既定の条件 |
+|---|---|
+| 短時間の大量チャージ | 10 分以内に 5 件以上のチャージ完了 |
+| 送金者名の共有 | 同じ Kyash 送金者名を 2 人以上が使用 |
+| チャージ直後の使い切りと退出 | 退出前 60 分のチャージ分の 90% 以上を使って退出 |
+| 招待報酬のみの収集 | 確定招待が 3 件以上でチャージが 0 件 |
+| 返金申請の繰り返し | 返金申請が 3 件以上 |
+
+- 検知の記録に**送金者名そのものは残しません** (先頭だけ残して伏せます)
+- 同じ利用者・同じ種別の未処理フラグは1つだけです (通知が埋もれないように)
+- 検知カードから `✅ 対処済み` `⚪ 問題なし` `🔎 詳細` を操作できます (メモを残せます)
+- `/inspect` の調査ビューにも、その利用者の検知履歴が表示されます
+
+## 日別推移のグラフ
+
+```bash
+/stats days:14        # 直近14日のグラフつき統計 (0 でグラフなし・最大90日)
+/stats days:30 global_scope:True   # Bot 全体 (Bot Owner のみ)
+```
+
+- 棒グラフが送金額、折れ線が件数です (件数の目盛りは右側)
+- チャージの無かった日も 0 として必ず表示します (日付が飛ぶと傾きが嘘になるため)
+- 日次サマリにも直近 14 日のグラフを添付します
+- 描画は **Pillow だけ**で行い、集計データを外部サービスへ送りません
+- Pillow が無い環境でもグラフを省いて動作します (数字は Embed に出ます)
+
+日本語のラベルには日本語フォントが必要です。無い場合は英字ラベルへ自動で切り替わります。
+
+```bash
+sudo apt-get install -y fonts-noto-cjk    # または fonts-ipafont-gothic
+```
+
+## 返金申請フロー
+
+利用者が申請し、管理者が審査します。
+
+```bash
+/refund request transaction_id:TX-XXXX reason:間違えてチャージしました
+/refund list                  # 自分の申請 (管理者は全員ぶん)
+/refund cancel request_id:5   # 審査前なら本人が取り下げ可
+/refund approve request_id:5  # 承認して内部残高を取り消す (管理者)
+/refund reject request_id:5 reason:対象外です
+```
+
+- **この手続きで戻るのはサーバー内の残高の取消だけです。**
+  Kyash へ実際にお金を返す作業は、承認後に**管理者が手作業**で行います
+  (添付モジュールに送金の手段が無いため、自動送金は実装していません)
+- 申請できるのはチャージ完了から **14 日以内**、審査待ちは**同時に 2 件まで**です
+- 承認は申請の状態を進めてから残高を取り消します
+  (逆順だと、途中で落ちたときに「残高は減ったが審査待ち」の状態が残るため)
+- 審査カードの `✅ 承認して取消` は二段階で確認します
+
+## 署名つきレシート (チャージの控え)
+
+```bash
+/receipt show                          # 直近のチャージの控え
+/receipt show transaction_id:TX-XXXX
+/receipt verify code:R1.XXXX.YYYY      # 控えが本物かを確認
+```
+
+- 控えは HMAC-SHA256 で署名してあるため、**利用者は偽造できません**
+- 検証は署名の一致に加えて、**いまの記録との一致**も確認します。
+  取消された取引や、金額が書き換えられた取引の控えは「無効」と判定します
+- 署名鍵は `data/receipt.key` (0600) に保存します。
+  Kyash トークンの暗号鍵とは**別のファイル**です (片方が漏れても他方に影響させないため)
+- 控えのコードを他人に見せても、残高を操作されることはありません
+
+> `data/receipt.key` を失うと、それ以前に発行した控えは検証できなくなります。
+> バックアップに含めてください (`/backup` の対象は DB のみです)。
+
+## v4 で必要になる Discord 権限
+
+追加した機能で使う権限です。使わない機能の権限は不要です。
+
+| 権限 | 使う機能 |
+|---|---|
+| ロールの管理 | 段位 / ランキング報酬 / 目標報酬 / オークション / カスタムロール |
+| ニックネームの管理 | ショップのニックネーム変更 |
+| チャンネルの管理 | ショップの専用チャンネル |
+| ファイルを添付 | 日別推移のグラフ |
+
+## v3 からのアップグレード
+
+1. Bot を停止する (`sudo systemctl stop discord-charge-bot`)
+2. DB をバックアップする (`cp data/charge_bot.db data/charge_bot.db.bak`)
+3. ファイル一式を差し替える (`main.py` の3項目は書き換え直す)
+4. 依存を更新する (`./venv/bin/pip install -r requirements.txt`)
+   - グラフ描画のため **Pillow** が追加されています
+5. Bot を起動する (`sudo systemctl start discord-charge-bot`)
+   - スキーマは v3 → v4 へ自動移行します (既存データはそのまま)
+   - 受取用 Kyash アカウントは複数対応の表へ自動で移ります (再ログインは不要)
+   - 起動時にコマンドを同期します。反映まで数分かかることがあります
+
+移行後に確認すること:
+
+```bash
+/kyash status      # 受取アカウントが「main」として残っているか
+/stats days:14     # グラフが表示されるか (出ない場合は Pillow と日本語フォント)
+/shop list         # 既存の商品が「ロール付与」として残っているか
+```
 
 ---
 

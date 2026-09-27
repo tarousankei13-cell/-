@@ -31,7 +31,7 @@ jobs:
         run: |
           python -m mypy --ignore-missing-imports \
             config.py utils.py database.py kyash_service.py price_service.py \
-            charge_service.py ui.py commands.py tasks.py main.py
+            charge_service.py chart.py ui.py commands.py tasks.py main.py
 
       - name: Startup validation must fail safely without a token
         run: |
@@ -54,7 +54,12 @@ jobs:
         env:
           CHARGE_BOT_TEST_DIR: ${{ runner.temp }}/charge_bot_v2_test
 
-      - name: Schema migration test (v1 -> v2)
+      - name: Integration test (v4 features)
+        run: python tests/test_v4_features.py
+        env:
+          CHARGE_BOT_TEST_DIR: ${{ runner.temp }}/charge_bot_v4_test
+
+      - name: Schema migration test (v1 -> v4)
         run: python tests/test_migration.py
         env:
           CHARGE_BOT_TEST_DIR: ${{ runner.temp }}/charge_bot_migration
@@ -76,3 +81,11 @@ jobs:
         run: python tests/test_commands_smoke.py
         env:
           CHARGE_BOT_TEST_DIR: ${{ runner.temp }}/charge_bot_smoke
+
+      - name: Concurrency audit (money must not appear or vanish)
+        run: python tests/test_concurrency.py
+        env:
+          CHARGE_BOT_TEST_DIR: ${{ runner.temp }}/charge_bot_concurrency
+
+      - name: Static audit (custom_id, transitions, secrets, schema)
+        run: python tests/test_static_audit.py
