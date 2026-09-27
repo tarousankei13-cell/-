@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -902,8 +903,19 @@ class Database:
         self._conn: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="db")
+        # 重い読み取り専用処理 (バックアップ・整合性チェック・長い集計) は
+        # こちらで実行する。対話操作の問い合わせと同じ列に並ばせると、
+        # ボタンの応答が Discord の3秒制限を超えてしまうため。
+        self._heavy_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="db-heavy"
+        )
         self._settings_cache: dict[int, GuildSettings] = {}
         self._allowed_cache: dict[int, bool] = {}
+        #: 設定が変わったときに呼ばれる。表示用キャッシュの破棄に使う。
+        #: 引数は guild_id (None は全サーバー)。
+        self.on_settings_changed: Callable[[int | None], None] | None = None
+        #: run() 1回あたりの所要時間の警告しきい値 (秒)
+        self.slow_query_threshold: float = config.DB_SLOW_QUERY_WARN_SECONDS
 
     # ------------------------------------------------------------------
     # ライフサイクル
@@ -953,6 +965,7 @@ class Database:
             await loop.run_in_executor(self._executor, _close)
             self._conn = None
         self._executor.shutdown(wait=True)
+        self._heavy_executor.shutdown(wait=True)
         logger.info("データベース接続を閉じました")
 
     # ------------------------------------------------------------------
@@ -986,8 +999,49 @@ class Database:
                     pass
                 raise
 
+        started = time.monotonic()
         async with self._lock:
-            return await loop.run_in_executor(self._executor, _runner)
+            result = await loop.run_in_executor(self._executor, _runner)
+        elapsed = time.monotonic() - started
+        if elapsed >= self.slow_query_threshold:
+            # 対話操作の応答が遅れる原因になるため、気付けるように残す
+            logger.warning(
+                "DB の処理に %.2f 秒かかりました (write=%s)。"
+                "この間、他の問い合わせは待たされます。", elapsed, write,
+            )
+        return result
+
+    async def run_heavy(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
+        """重い読み取り専用処理を、対話操作とは別の接続で実行する。
+
+        SQLite は WAL モードなら「複数の読み取り + 1つの書き込み」を同時に
+        扱えるため、バックアップや全表走査をここへ逃がすと、ボタン操作の
+        問い合わせが数秒待たされることがなくなる。
+
+        書き込みには使わない (書き込みは ``run(write=True)`` の直列化で守る)。
+        """
+        loop = asyncio.get_running_loop()
+
+        def _runner() -> Any:
+            conn = sqlite3.connect(
+                str(self._path),
+                check_same_thread=False,
+                isolation_level=None,
+                timeout=60.0,
+            )
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute("PRAGMA busy_timeout = 60000")
+                # 読み取り専用にして、誤って書き込まないようにする
+                conn.execute("PRAGMA query_only = ON")
+                return fn(conn)
+            finally:
+                conn.close()
+
+        started = time.monotonic()
+        result = await loop.run_in_executor(self._heavy_executor, _runner)
+        logger.debug("重い DB 処理が完了しました (%.2f 秒)", time.monotonic() - started)
+        return result
 
     async def fetchone(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Row | None:
         return await self.run(lambda c: c.execute(sql, tuple(params)).fetchone())
@@ -1170,6 +1224,7 @@ class Database:
             f"UPDATE guild_settings SET {assignments}, updated_at=? WHERE guild_id=?", params
         )
         self._settings_cache.pop(guild_id, None)
+        self._notify_settings_changed(guild_id)
         return await self.get_settings(guild_id)
 
     def invalidate_settings_cache(self, guild_id: int | None = None) -> None:
@@ -1177,6 +1232,20 @@ class Database:
             self._settings_cache.clear()
         else:
             self._settings_cache.pop(guild_id, None)
+        self._notify_settings_changed(guild_id)
+
+    def _notify_settings_changed(self, guild_id: int | None) -> None:
+        """設定の変更を購読者へ知らせる (表示用キャッシュの破棄)。
+
+        通知の失敗で設定変更そのものを失敗させない。
+        """
+        callback = self.on_settings_changed
+        if callback is None:
+            return
+        try:
+            callback(guild_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("設定変更の通知に失敗しました guild=%s", guild_id)
 
     async def list_guilds_with_settings(self) -> list[int]:
         rows = await self.fetchall("SELECT guild_id FROM guild_settings")
@@ -2066,6 +2135,8 @@ class Database:
             )
 
         await self.run(_fn, write=True)
+        # 方式の有効/無効・率・上下限はパネル表示に直結するため、キャッシュを捨てる
+        self._notify_settings_changed(guild_id)
 
     async def get_destination(self, provider: str) -> sqlite3.Row | None:
         """Owner が登録した入金先 (方式ごとに1つ)。"""
@@ -2092,6 +2163,8 @@ class Database:
             "updated_by=excluded.updated_by, updated_at=excluded.updated_at",
             (provider, address, label, note, updated_by, now, now),
         )
+        # 入金先は Bot 全体で共有するため、全サーバーの表示を作り直す
+        self._notify_settings_changed(None)
 
     async def delete_destination(self, provider: str) -> bool:
         def _fn(conn: sqlite3.Connection) -> bool:
@@ -2100,7 +2173,9 @@ class Database:
             )
             return cur.rowcount > 0
 
-        return await self.run(_fn, write=True)
+        removed = await self.run(_fn, write=True)
+        self._notify_settings_changed(None)
+        return removed
 
     # ------------------------------------------------------------------
     # チャージ申請 (charge_requests)
@@ -3422,7 +3497,8 @@ class Database:
                 ],
             }
 
-        return await self.run(_fn)
+        # 全表を走査するため、対話操作とは別の接続で実行する
+        return await self.run_heavy(_fn)
 
     async def backup(self, destination: Path) -> Path:
         """SQLite のオンラインバックアップを実行する。"""
@@ -3442,7 +3518,8 @@ class Database:
                 pass
             return destination
 
-        return await self.run(_fn)
+        # 全体をコピーするため時間がかかる。対話操作を止めないよう別接続で行う。
+        return await self.run_heavy(_fn)
 
     async def delete_guild_data(self, guild_id: int) -> dict[str, int]:
         """サーバーのデータを削除する (危険操作。呼び出し側で2段階確認する)。"""

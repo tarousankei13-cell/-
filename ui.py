@@ -3789,6 +3789,78 @@ class AmountModal(discord.ui.Modal, title="ステップ1 / 3 ・ 金額の入力
         await safe_respond(interaction, embed=error_embed(config.ErrorCode.UNKNOWN_ERROR))
 
 
+def amount_prompt_embed(
+    provider: str, limits: tuple[int, int] | None, entry: Any = None
+) -> discord.Embed:
+    """金額入力へ進むための案内 (混雑時の代替経路)。
+
+    Discord では「3秒以内に応答」と「入力欄 (Modal) を開く」を両立できない
+    場面がある。応答を優先して先に受け付けを返した場合に、この画面から
+    改めて入力欄を開いてもらう。
+    """
+    name = config.PROVIDER_LABELS.get(provider, provider)
+    emoji = config.PROVIDER_EMOJI.get(provider, "💠")
+    embed = discord.Embed(
+        title=f"{emoji} {name} でチャージ",
+        description=(
+            f"{SEPARATOR}\n"
+            "下の `金額を入力する` を押すと入力欄が開きます。\n"
+            f"{SEPARATOR}"
+        ),
+        color=config.Color.ACCENT,
+    )
+    if limits:
+        low, high = limits
+        embed.add_field(
+            name="受付範囲",
+            value=f"**{utils.fmt_yen(low)}** 〜 **{utils.fmt_yen(high)}**",
+            inline=True,
+        )
+    if entry is not None and entry.get("rate") is not None:
+        embed.add_field(
+            name="チャージ率", value=f"**{utils.fmt_rate(entry['rate'])}**", inline=True
+        )
+    embed.set_footer(text="混み合っていたため、先に受付画面をお返ししました")
+    return embed
+
+
+class AmountEntryView(discord.ui.View):
+    """「金額を入力する」ボタン (混雑時の代替経路)。
+
+    先に応答を返した後は Modal を直接出せないため、この View から開く。
+    """
+
+    def __init__(
+        self, provider: str, settings: "GuildSettings",
+        limits: tuple[int, int] | None, *, owner_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self._provider = provider
+        self._settings = settings
+        self._limits = limits
+        self._owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:  # type: ignore[override]
+        if interaction.user.id != self._owner_id:
+            await safe_respond(interaction, embed=error_embed(config.ErrorCode.NOT_ALLOWED))
+            return False
+        return True
+
+    @discord.ui.button(
+        label="金額を入力する", emoji="✏️", style=discord.ButtonStyle.success
+    )
+    async def enter(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self._provider == config.ChargeProvider.KYASH:
+            await interaction.response.send_modal(AmountModal(self._settings))
+            return
+        limits = self._limits or (
+            self._settings.minimum_charge, self._settings.maximum_charge
+        )
+        await interaction.response.send_modal(
+            ManualAmountModal(self._provider, self._settings, limits)
+        )
+
+
 class ManualAmountModal(discord.ui.Modal):
     """PayPay / LTC の金額入力 (ステップ 2/4)。
 

@@ -99,6 +99,7 @@ class BackgroundTasks:
             self.auction_task,
             self.goal_task,
             self.fraud_task,
+            self.panel_cache_task,
             self.request_task,
             self.claim_task,
             self.tier_task,
@@ -554,6 +555,22 @@ class BackgroundTasks:
 
     @auction_task.before_loop
     async def _before_auction(self) -> None:
+        await self._wait_ready()
+
+    @tasks.loop(seconds=config.PANEL_CACHE_TTL)
+    async def panel_cache_task(self) -> None:
+        """パネル表示用のキャッシュを温め続ける。
+
+        ボタンの最初の応答を await ゼロで返すための土台。ここが動いていれば、
+        DB が重い処理で塞がっていてもボタンは3秒以内に応答できる。
+        """
+        try:
+            await self.charge.warm_panel_views()
+        except Exception:  # noqa: BLE001
+            logger.exception("パネル表示キャッシュの更新に失敗しました")
+
+    @panel_cache_task.before_loop
+    async def _before_panel_cache(self) -> None:
         await self._wait_ready()
 
     @tasks.loop(seconds=config.TASK_GOAL_INTERVAL)

@@ -99,6 +99,18 @@ RATE_LIMIT_BUTTON_WINDOW: Final[int] = 60
 RATE_LIMIT_REFUND_COUNT: Final[int] = 10
 RATE_LIMIT_REFUND_WINDOW: Final[int] = 600
 
+#: DB の1処理がこの秒数を超えたら警告する (対話操作が待たされる兆候)
+DB_SLOW_QUERY_WARN_SECONDS: Final[float] = 1.0
+#: ボタン操作がこの秒数を超えたら警告する (Discord の制限は3秒)
+INTERACTION_WARN_SECONDS: Final[float] = 1.5
+#: Modal を出す前に DB を待ってよい上限 (秒)
+#: これを超えたら「進行中の取引の再開」をあきらめ、入力欄を先に開く。
+#: 二重取引の防止は金額送信後の start_charge 側で必ず行われるため安全。
+INTERACTION_DB_BUDGET: Final[float] = 1.2
+#: パネル表示に使う情報のキャッシュ有効期間 (秒)
+#: 応答前の DB 問い合わせをゼロにして、3秒制限を確実に守るために使う
+PANEL_CACHE_TTL: Final[int] = 20
+
 # 連続失敗によるクールダウン (不正探索・いたずら対策)
 FAILURE_COOLDOWN_THRESHOLD: Final[int] = 5       # 連続失敗回数
 FAILURE_COOLDOWN_SECONDS: Final[int] = 600       # クールダウン時間 (秒)

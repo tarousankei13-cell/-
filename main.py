@@ -228,6 +228,12 @@ class ChargeBot(commands.Bot):
         self.add_view(ui.GoalPanelView())
         self.add_view(ui.FraudCardView())
         self.add_view(ui.RefundCardView())
+        # パネル表示用のキャッシュを先に作っておく (最初の1回が遅くならないように)
+        try:
+            warmed = await self.charge.warm_panel_views()
+            logger.info("パネル表示キャッシュを %s サーバーぶん作成しました", warmed)
+        except Exception:  # noqa: BLE001
+            logger.exception("パネル表示キャッシュの事前作成に失敗しました")
         charge_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_CHARGE)
         shop_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_SHOP)
         invite_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_INVITE)
@@ -640,81 +646,185 @@ class ChargeBot(commands.Bot):
     async def on_charge_button(self, interaction: discord.Interaction) -> None:
         """💰 チャージ → 方式選択 または 金額入力 Modal。
 
-        使える方式が Kyash だけのときは選択画面を挟まず、従来どおり
-        そのまま金額入力へ進む (余計な操作を増やさない)。
+        **必ず3秒以内に応答する**ことを最優先にしている。
+        Discord はボタン操作に3秒以内の応答を求め、超えると
+        「アプリケーションは応答しませんでした」となって操作が無効になる。
+
+        Modal は defer した後には出せないので、Modal を出す可能性がある間は
+        DB を待たない。判断はキャッシュ (await ゼロ) で行い、キャッシュが
+        無いときは先に defer してから作り直す。
         """
-        settings = await self._guard_user_action(interaction)
-        if settings is None:
+        if interaction.guild is None:
+            await ui.safe_respond(
+                interaction, embed=ui.error_embed(config.ErrorCode.NOT_ALLOWED)
+            )
             return
-        guild = self._require_guild(interaction)
-        providers = await self.charge.usable_providers(guild.id, settings)
-        only_kyash = (
-            len(providers) == 1
-            and providers[0]["provider"] == config.ChargeProvider.KYASH
-        )
-        if not only_kyash:
-            entries = await self.charge.provider_availability(guild.id, settings)
-            await interaction.response.send_message(
-                embed=ui.provider_select_embed(entries),
-                view=ui.ProviderSelectView(entries),
+        guild_id = interaction.guild.id
+        try:
+            self.charge.check_button_rate_limit(interaction.user.id)
+        except ChargeError as exc:
+            await ui.safe_respond(interaction, embed=ui.error_embed(exc.code))
+            return
+
+        # 1) キャッシュがあれば DB を待たずに判断する (最速経路)
+        snapshot = self.charge.cached_panel_view(guild_id)
+        if snapshot is not None:
+            await self._route_charge(interaction, snapshot, deferred=False)
+            return
+
+        # 2) キャッシュが無いときは、まず応答権を確保してから作る
+        #    (この後は Modal を出せないので、次の一歩はボタンで案内する)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            snapshot = await self.charge.refresh_panel_view(guild_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("チャージ方式の取得に失敗しました guild=%s", guild_id)
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.UNKNOWN_ERROR), ephemeral=True
+            )
+            return
+        await self._route_charge(interaction, snapshot, deferred=True)
+
+    async def _route_charge(
+        self, interaction: discord.Interaction, snapshot: dict[str, Any], *,
+        deferred: bool,
+    ) -> None:
+        """チャージの入口を振り分ける。
+
+        Args:
+            deferred: すでに defer 済みか。True のときは Modal を出せないため、
+                「金額を入力する」ボタンを持つメッセージで案内する。
+        """
+        settings = snapshot["settings"]
+        usable = snapshot["usable"]
+        try:
+            self.charge.ensure_open_for_charge(settings)
+        except ChargeError as exc:
+            await ui.safe_respond(interaction, embed=ui.error_embed(exc.code))
+            return
+        if len(usable) != 1:
+            # 0件 (使えない理由を見せる) / 複数 (選んでもらう) はどちらもメッセージ
+            await ui.safe_respond(
+                interaction,
+                embed=ui.provider_select_embed(snapshot["entries"]),
+                view=ui.ProviderSelectView(snapshot["entries"]) if usable else None,
+            )
+            return
+        await self._start_provider(interaction, usable[0], settings, deferred=deferred)
+
+    async def _start_provider(
+        self, interaction: discord.Interaction, entry: dict[str, Any], settings: Any, *,
+        deferred: bool,
+    ) -> None:
+        """方式が1つに決まった後の入口 (金額入力へ進む)。
+
+        ``entry`` はキャッシュ済みの方式情報なので、ここでの DB 問い合わせは
+        進行中の取引を探す1回だけに抑えている。
+        """
+        provider = str(entry["provider"])
+        limits = (int(entry["minimum"]), int(entry["maximum"]))
+        if provider in config.KYASH_PROVIDERS:
+            await self._begin_kyash_charge(
+                interaction, settings, provider=provider, limits=limits,
+                deferred=deferred,
+            )
+            return
+        if deferred:
+            await interaction.followup.send(
+                embed=ui.amount_prompt_embed(provider, limits, entry),
+                view=ui.AmountEntryView(
+                    provider, settings, limits, owner_id=interaction.user.id
+                ),
                 ephemeral=True,
             )
             return
-        await self._begin_kyash_charge(interaction, settings)
+        await interaction.response.send_modal(
+            ui.ManualAmountModal(provider, settings, limits)
+        )
 
     async def on_provider_selected(
         self, interaction: discord.Interaction, provider: str
     ) -> None:
-        """方式選択メニューの確定 (ステップ 1/4 → 2/4)。"""
-        settings = await self._guard_user_action(interaction)
-        if settings is None:
+        """方式選択メニューの確定。
+
+        選択メニューの操作も3秒以内に応答する必要がある。判断はキャッシュで
+        行い、無い場合は先に defer してから作り直す。
+        """
+        if interaction.guild is None:
+            await ui.safe_respond(
+                interaction, embed=ui.error_embed(config.ErrorCode.NOT_ALLOWED)
+            )
             return
-        guild = self._require_guild(interaction)
-        available = {
-            p["provider"] for p in await self.charge.usable_providers(guild.id, settings)
-        }
-        if provider not in available:
-            entries = await self.charge.provider_availability(guild.id, settings)
-            blocked = next((e for e in entries if e["provider"] == provider), None)
+        guild_id = interaction.guild.id
+        snapshot = self.charge.cached_panel_view(guild_id)
+        deferred = False
+        if snapshot is None:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            deferred = True
+            try:
+                snapshot = await self.charge.refresh_panel_view(guild_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("チャージ方式の取得に失敗しました guild=%s", guild_id)
+                await interaction.followup.send(
+                    embed=ui.error_embed(config.ErrorCode.UNKNOWN_ERROR), ephemeral=True
+                )
+                return
+        entry = next(
+            (e for e in snapshot["entries"] if e["provider"] == provider), None
+        )
+        if entry is None or not entry["available"]:
             code = (
-                str(blocked["error_code"]) if blocked and blocked["error_code"]
+                str(entry["error_code"]) if entry and entry["error_code"]
                 else config.ErrorCode.PROVIDER_DISABLED
             )
             await ui.safe_respond(interaction, embed=ui.error_embed(code))
             return
-        if provider == config.ChargeProvider.KYASH:
-            await self._begin_kyash_charge(interaction, settings)
-            return
-        if provider == config.ChargeProvider.KYASH_CLAIM:
-            active = await self.db.get_active_transaction(guild.id, interaction.user.id)
-            if active is not None and str(active["status"]) == config.TxStatus.WAITING_PAYMENT:
-                await self._show_claim_link(interaction, active, resumed=True)
-                return
-            await interaction.response.send_modal(
-                ui.ManualAmountModal(provider, settings, await self.charge.provider_limits(
-                    guild.id, provider, settings
-                ))
-            )
-            return
-        await interaction.response.send_modal(
-            ui.ManualAmountModal(provider, settings, await self.charge.provider_limits(
-                guild.id, provider, settings
-            ))
+        await self._start_provider(
+            interaction, entry, snapshot["settings"], deferred=deferred
         )
 
+    async def _lookup_active_charge(
+        self, guild_id: int, user_id: int, settings: Any
+    ) -> Any:
+        """事前確認と進行中の取引の取得をまとめて行う (時間制限つきで呼ばれる)。"""
+        await self.charge.preflight(guild_id, user_id, settings)
+        return await self.db.get_active_transaction(guild_id, user_id)
+
     async def _begin_kyash_charge(
-        self, interaction: discord.Interaction, settings: Any
+        self, interaction: discord.Interaction, settings: Any, *,
+        provider: str = config.ChargeProvider.KYASH,
+        limits: tuple[int, int] | None = None,
+        deferred: bool = False,
     ) -> None:
-        """Kyash (自動) のチャージを開始する (進行中の取引があれば再開)。"""
+        """Kyash のチャージを開始する (進行中の取引があれば再開する)。
+
+        進行中の取引を探す問い合わせが1回だけ入る。ここが3秒を超えることは
+        まず無いが、超えた場合に備えて呼び出し側が ``deferred`` を渡す。
+        """
+        guild = self._require_guild(interaction)
         try:
-            await self.charge.preflight(
-                self._require_guild(interaction).id, interaction.user.id, settings
-            )
+            self.charge.ensure_open_for_charge(settings)
         except ChargeError as exc:
             await ui.safe_respond(interaction, embed=ui.error_embed(exc.code))
             return
-        guild = self._require_guild(interaction)
-        active = await self.db.get_active_transaction(guild.id, interaction.user.id)
+        # DB が混み合っていても3秒以内に応答するため、ここでの待ち時間に上限を置く。
+        # 上限を超えたら「進行中の取引の再開」と事前確認をあきらめて入力欄を開く。
+        # 凍結・クールダウン・二重取引の判定は、金額送信後の start_charge が
+        # 必ずやり直すので、飛ばしても安全側は崩れない。
+        try:
+            active = await asyncio.wait_for(
+                self._lookup_active_charge(guild.id, interaction.user.id, settings),
+                timeout=config.INTERACTION_DB_BUDGET,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "DB が混み合っているため事前確認を省略しました guild=%s user=%s",
+                guild.id, interaction.user.id,
+            )
+            active = None
+        except ChargeError as exc:
+            await ui.safe_respond(interaction, embed=ui.error_embed(exc.code))
+            return
         if active is not None:
             # 請求リンクの支払い待ちなら、そのリンクを出し直す
             if str(active["status"]) == config.TxStatus.WAITING_PAYMENT:
@@ -726,7 +836,8 @@ class ChargeBot(commands.Bot):
                 remaining = max(30, int(active["expires_at"] or 0) - utils.now_ts())
                 amount = int(active["requested_amount"])
                 rate = utils.to_decimal(active["charge_rate"]) or settings.charge_rate
-                await interaction.response.send_message(
+                await ui.safe_respond(
+                    interaction,
                     embed=ui.link_wait_embed(
                         tx_id=str(active["id"]),
                         amount=amount,
@@ -736,16 +847,40 @@ class ChargeBot(commands.Bot):
                         resumed=True,
                     ),
                     view=ui.LinkSubmitView(
-                        str(active["id"]), owner_id=interaction.user.id, timeout=remaining
+                        str(active["id"]), owner_id=interaction.user.id,
+                        timeout=remaining,
                     ),
-                    ephemeral=True,
                 )
                 return
             await ui.safe_respond(
                 interaction,
-                embed=ui.error_embed(
-                    config.ErrorCode.ACTIVE_TRANSACTION_EXISTS,
+                embed=ui.error_embed(config.ErrorCode.ACTIVE_TRANSACTION_EXISTS),
+            )
+            return
+        if provider == config.ChargeProvider.KYASH_CLAIM:
+            bounds = limits or await self.charge.provider_limits(
+                guild.id, provider, settings
+            )
+            if deferred:
+                await interaction.followup.send(
+                    embed=ui.amount_prompt_embed(provider, bounds, None),
+                    view=ui.AmountEntryView(
+                        provider, settings, bounds, owner_id=interaction.user.id
+                    ),
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_modal(
+                ui.ManualAmountModal(provider, settings, bounds)
+            )
+            return
+        if deferred:
+            await interaction.followup.send(
+                embed=ui.amount_prompt_embed(provider, None, None),
+                view=ui.AmountEntryView(
+                    provider, settings, None, owner_id=interaction.user.id
                 ),
+                ephemeral=True,
             )
             return
         await interaction.response.send_modal(ui.AmountModal(settings))

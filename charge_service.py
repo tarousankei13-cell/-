@@ -116,6 +116,10 @@ class ChargeService:
         }
         # 目標パネルの前回の内容 (変わらないときは編集しない)
         self._goal_signatures: dict[int, str] = {}
+        #: パネル表示用のキャッシュ {guild_id: (失効時刻(monotonic), 内容)}
+        self._panel_cache: dict[int, tuple[float, dict[str, Any]]] = {}
+        # 設定が変わったら表示用キャッシュを捨てる (古い内容でボタンを出さない)
+        self.db.on_settings_changed = self.invalidate_panel_view
 
     # ==================================================================
     # 事前チェック
@@ -179,6 +183,20 @@ class ChargeService:
         if not await self.db.is_guild_allowed(guild_id):
             raise ChargeError(config.ErrorCode.GUILD_DISABLED)
         return await self.db.get_settings(guild_id)
+
+    def ensure_open_for_charge(self, settings: GuildSettings) -> None:
+        """受付中かどうかだけを **DB を触らずに** 確認する。
+
+        ボタンの最初の応答は3秒以内に返す必要があるため、キャッシュ済みの
+        設定だけで判断できるものはここで弾く。利用者ごとの確認 (凍結・
+        クールダウン) は :meth:`preflight` が行う。
+        """
+        if not self.accepting_new:
+            raise ChargeError(config.ErrorCode.MAINTENANCE, "Bot が終了処理中です")
+        if settings.emergency_stop:
+            raise ChargeError(config.ErrorCode.EMERGENCY_STOP)
+        if settings.maintenance:
+            raise ChargeError(config.ErrorCode.MAINTENANCE)
 
     async def preflight(
         self,
@@ -1874,6 +1892,8 @@ class ChargeService:
         await self.db.set_system_value(
             self.REVIEW_CHANNEL_KEY, str(int(channel_id)) if channel_id else ""
         )
+        # 審査チャンネルの有無で PayPay / LTC の利用可否が変わる
+        self.invalidate_panel_view()
 
     async def get_delegated_guilds(self) -> set[int]:
         """管理者にも承認を許可したサーバー。
@@ -2001,6 +2021,86 @@ class ChargeService:
         self, guild_id: int, settings: GuildSettings | None = None
     ) -> list[dict[str, Any]]:
         return [p for p in await self.provider_availability(guild_id, settings) if p["available"]]
+
+    # ==================================================================
+    # パネル表示用のキャッシュ (Discord の3秒制限を確実に守るため)
+    # ==================================================================
+    def cached_panel_view(self, guild_id: int) -> dict[str, Any] | None:
+        """ボタン押下の判断に必要な情報を、DB を触らずに返す。
+
+        Discord はボタン操作に **3秒以内**の応答を求める。DB は単一スレッドで
+        直列化しているため、重い処理と重なると応答前の問い合わせが待たされ、
+        「アプリケーションは応答しませんでした」となって操作が無効になる。
+
+        そこで「方式の一覧」「設定」を短時間キャッシュし、ボタンの判断を
+        **await ゼロ**で行えるようにする。キャッシュが無い・古い場合は None を
+        返し、呼び出し側は先に defer してから作り直す (必ず3秒以内に応答する)。
+
+        Returns:
+            有効なキャッシュ、無ければ None。
+        """
+        entry = self._panel_cache.get(guild_id)
+        if entry is None:
+            return None
+        expires_at, snapshot = entry
+        if time.monotonic() >= expires_at:
+            return None
+        return snapshot
+
+    async def refresh_panel_view(self, guild_id: int) -> dict[str, Any]:
+        """パネル表示用の情報を作り直してキャッシュする。"""
+        settings = await self.db.get_settings(guild_id)
+        entries = await self.provider_availability(guild_id, settings)
+        snapshot = {
+            "settings": settings,
+            "entries": entries,
+            "usable": [e for e in entries if e["available"]],
+            "built_at": utils.now_ts(),
+        }
+        self._panel_cache[guild_id] = (
+            time.monotonic() + config.PANEL_CACHE_TTL, snapshot
+        )
+        return snapshot
+
+    def invalidate_panel_view(self, guild_id: int | None = None) -> None:
+        """設定が変わったときにキャッシュを捨てる。
+
+        ``guild_id`` を省略すると全サーバーぶんを捨てる (入金先や審査チャンネルの
+        ような Bot 全体の設定を変えたとき用)。
+        """
+        if guild_id is None:
+            self._panel_cache.clear()
+        else:
+            self._panel_cache.pop(guild_id, None)
+
+    async def panel_view(self, guild_id: int) -> dict[str, Any]:
+        """キャッシュがあれば使い、無ければ作る。"""
+        cached = self.cached_panel_view(guild_id)
+        if cached is not None:
+            return cached
+        return await self.refresh_panel_view(guild_id)
+
+    async def warm_panel_views(self) -> int:
+        """よく使うサーバーのキャッシュを事前に温めておく。
+
+        利用者が最初に押した1回だけ遅くなるのを避けるため、定期タスクから呼ぶ。
+        """
+        warmed = 0
+        try:
+            guild_ids = await self.db.list_guilds_with_settings()
+        except Exception:  # noqa: BLE001
+            logger.exception("パネルキャッシュの対象取得に失敗しました")
+            return 0
+        for guild_id in guild_ids:
+            if not await self.db.is_guild_allowed(guild_id):
+                continue
+            try:
+                await self.refresh_panel_view(guild_id)
+                warmed += 1
+            except Exception:  # noqa: BLE001
+                logger.exception("パネルキャッシュの更新に失敗しました guild=%s", guild_id)
+        return warmed
+
 
     async def _ensure_provider_usable(
         self, guild_id: int, provider: str, settings: GuildSettings
