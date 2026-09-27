@@ -750,6 +750,68 @@ def safe_json_dumps(obj: Any, *, limit: int = 4000) -> str:
     return truncate(text, limit)
 
 
+#: Discord の表示名に使えない (使わせたくない) 文字
+#: 見た目を偽装したり、埋め込みを壊したりするものだけを落とす。
+_DISPLAY_NAME_BAN_RE = re.compile(r"[`@#\\\r\n\t\u200b-\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def clean_display_name(raw: Any, *, limit: int) -> str:
+    """利用者が入力したロール名・ニックネームを安全な形に整える。
+
+    Discord のメンション記法・コードブロック記法と、表示順を偽装できる
+    制御文字を落とす。空白の連続は1つにまとめ、前後の空白は削る。
+    残らなかった場合は空文字を返し、呼び出し側で入力エラーにする。
+    """
+    if raw is None:
+        return ""
+    text = _DISPLAY_NAME_BAN_RE.sub("", str(raw))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
+
+
+def parse_color(raw: Any) -> int | None:
+    """``#FF00AA`` 形式の色指定を整数へ変換する (不正なら None)。"""
+    if raw is None:
+        return None
+    if isinstance(raw, int):
+        return raw if 0 <= raw <= 0xFFFFFF else None
+    text = str(raw).strip().lstrip("#").lstrip("0x").lstrip("0X")
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", text):
+        return None
+    return int(text, 16)
+
+
+def channel_name_from(raw: Any, *, limit: int = 90) -> str:
+    """チャンネル名に使える文字列へ変換する。
+
+    Discord はチャンネル名の大文字・空白を自動で変換するが、変換後の名前が
+    こちらの想定と食い違うと後片付けで取り違える恐れがある。そのため
+    あらかじめ小文字・ハイフン区切りへ正規化しておく。
+    """
+    text = str(raw or "").lower()
+    text = re.sub(r"[^0-9a-z\u3040-\u30ff\u4e00-\u9fff\uff66-\uff9f-]+", "-", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-")
+    return text[:limit]
+
+
+def load_json_dict(text: Any) -> dict[str, Any]:
+    """DB に保存した JSON 文字列を辞書として読み戻す (壊れていても落ちない)。
+
+    商品の追加設定 (payload) のように「無ければ既定値で動く」データに使う。
+    dict 以外が入っていた場合も空の辞書として扱う。
+    """
+    if not text:
+        return {}
+    if isinstance(text, dict):
+        return dict(text)
+    try:
+        value = json.loads(str(text))
+    except (TypeError, ValueError):
+        logger.warning("JSON として読めない設定値を無視しました: %s", truncate(str(text), 120))
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def chunks(seq: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
     """シーケンスを size 件ずつに分割する。"""
     for i in range(0, len(seq), size):

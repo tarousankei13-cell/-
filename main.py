@@ -1440,7 +1440,7 @@ class ChargeBot(commands.Bot):
         )
 
     async def on_shop_select(self, interaction: discord.Interaction, item_id: int) -> None:
-        """商品を選択 → 確認 → 購入。"""
+        """商品を選択 → 確認 → (必要なら入力) → 購入。"""
         member = self._member_of(interaction)
         if interaction.guild is None or member is None:
             return
@@ -1459,24 +1459,45 @@ class ChargeBot(commands.Bot):
             owned=owned,
             already_has_role=bool(role is not None and role in member.roles),
         )
-        # 購入できない理由があるときは確認ボタンを出さず、理由だけを示す
+        # 販売側の設定・権限の問題も購入前に見せる (押しても失敗する状態を作らない)
+        if blocker is None:
+            problem = self.charge.shop_item_problem(interaction.guild, item)
+            if problem:
+                embed.title = "⚠️ いま購入できません"
+                embed.color = config.Color.WARNING
+                embed.insert_field_at(0, name="購入できない理由", value=problem, inline=False)
+                blocker = problem
         if blocker is not None:
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
-        view = ui.ConfirmView(
-            owner_id=interaction.user.id, confirm_label="購入する", danger=False, timeout=90
+        await interaction.response.send_message(
+            embed=embed,
+            view=ui.ShopConfirmView(item, owner_id=interaction.user.id),
+            ephemeral=True,
         )
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-        await view.wait()
-        if not view.value:
+
+    async def finish_shop_purchase(
+        self, interaction: discord.Interaction, item_id: int, *,
+        item_input: str | None = None, item_color: str | None = None,
+        defer: bool = False,
+    ) -> None:
+        """購入を確定して結果を返す (入力あり・なしで表示を揃える)。
+
+        Args:
+            defer: Modal 送信直後など、まだ応答していない場合に True。
+        """
+        member = self._member_of(interaction)
+        if interaction.guild is None or member is None:
             return
+        if defer:
+            await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            result = await self.charge.purchase_shop_item(member, item_id)
+            result = await self.charge.purchase_shop_item(
+                member, item_id, item_input=item_input, item_color=item_color
+            )
         except ChargeError as exc:
             logger.info("購入を拒否しました user=%s code=%s", interaction.user.id, exc.code)
-            await interaction.followup.send(
-                embed=ui.error_embed(exc.code), ephemeral=True
-            )
+            await interaction.followup.send(embed=ui.error_embed(exc.code), ephemeral=True)
             return
         except Exception:  # noqa: BLE001
             logger.exception("購入処理で予期しない例外が発生しました item=%s", item_id)
@@ -1486,9 +1507,13 @@ class ChargeBot(commands.Bot):
             return
         await interaction.followup.send(
             embed=ui.purchase_success_embed(
-                item_name=str(result["item_name"]), role_id=int(result["role_id"]),
+                item_name=str(result["item_name"]),
                 price=int(result["price"]), balance_after=int(result["balance_after"]),
                 expires_at=result["expires_at"], purchase_id=int(result["purchase_id"]),
+                role_id=result.get("role_id"), channel_id=result.get("channel_id"),
+                item_type=str(result["item_type"]), detail=result.get("detail"),
+                subscription=bool(result["subscription"]),
+                next_charge_at=result.get("next_charge_at"),
             ),
             ephemeral=True,
         )

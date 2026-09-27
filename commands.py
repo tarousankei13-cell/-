@@ -3398,7 +3398,9 @@ async def logs_command(
     total_pages = max(1, -(-total // per_page))
     lines = [
         f"{utils.format_jst(r['created_at'], with_seconds=True)} / `{r['action']}` / "
-        f"<@{r['actor_id']}>"
+        # 自動処理 (SYSTEM_ACTOR_ID) はメンションにしない
+        + ("🤖 自動処理" if int(r["actor_id"]) == config.SYSTEM_ACTOR_ID
+           else f"<@{r['actor_id']}>")
         + (f" → <@{r['target_user_id']}>" if r["target_user_id"] else "")
         + (f"\n　`{utils.truncate(str(r['detail']), 150)}`" if r["detail"] else "")
         for r in rows
@@ -3633,69 +3635,140 @@ class ShopGroup(app_commands.Group):
     """ロールショップの管理。"""
 
     def __init__(self) -> None:
-        super().__init__(name="shop", description="ロールショップの管理 (管理者)")
+        super().__init__(
+            name="shop", description="ショップの管理 (cancel のみ利用者も実行可)"
+        )
 
-    @app_commands.command(name="add", description="販売する商品 (ロール) を追加します")
+    @app_commands.command(name="add", description="販売する商品を追加します")
     @app_commands.describe(
-        role="付与するロール", name="商品名", price="価格 (内部残高)",
-        duration_days="有効期間 (0で無期限)", stock="在庫 (-1で無制限)",
+        name="商品名", price="価格 (内部残高)",
+        item_type="商品の種類 (既定: ロール付与)",
+        role="付与するロール (種類がロール付与のときだけ必要)",
+        duration_days="有効期間 (0で無期限)",
+        subscription="期限が来たら残高から自動で更新する (期間の指定が必要)",
+        stock="在庫 (-1で無制限)",
         purchase_limit="1人あたりの購入上限 (0で無制限)", description="説明",
         sort_order="並び順 (小さいほど先)",
+        bonus_rate="チャージ率ブーストの上げ幅 (%ポイント)",
+        boost_hours="チャージ率ブーストの時間",
+        role_color="カスタムロールの色を固定する (#RRGGBB・未指定なら購入者が選べる)",
+        category="専用チャンネルを作るカテゴリ",
     )
+    @app_commands.choices(item_type=[
+        app_commands.Choice(
+            name=f"{config.SHOP_ITEM_TYPE_EMOJI[t]} {config.SHOP_ITEM_TYPE_LABELS[t]}", value=t
+        )
+        for t in config.ALL_SHOP_ITEM_TYPES
+    ])
     @app_commands.guild_only()
     @require_admin()
     async def add(
         self,
         interaction: discord.Interaction,
-        role: discord.Role,
         name: str,
         price: app_commands.Range[int, config.SHOP_PRICE_MIN, config.SHOP_PRICE_MAX],
+        item_type: app_commands.Choice[str] | None = None,
+        role: discord.Role | None = None,
         duration_days: app_commands.Range[int, 0, config.SHOP_DURATION_MAX_DAYS] = 0,
+        subscription: bool = False,
         stock: app_commands.Range[int, -1, 1_000_000] = -1,
         purchase_limit: app_commands.Range[int, 0, 1000] = 1,
         description: str | None = None,
         sort_order: app_commands.Range[int, 0, 10_000] = 0,
+        bonus_rate: str | None = None,
+        boost_hours: app_commands.Range[int, 1, config.RATE_BOOST_MAX_HOURS] | None = None,
+        role_color: str | None = None,
+        category: discord.CategoryChannel | None = None,
     ) -> None:
-        """商品を追加する。Bot がそのロールを付与できるか事前に検証する。"""
+        """商品を追加する。種類ごとに必要な設定が揃っているかを事前に検証する。"""
         bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
         # 入口で長さを揃える。DB・Embed・ログで同じ値を使い、表示の食い違いを防ぐ。
         name = name.strip()[:config.SHOP_NAME_MAX_LEN]
         description = (description.strip()[:config.SHOP_DESC_MAX_LEN] or None) if description else None
+        kind = item_type.value if item_type else config.ShopItemType.ROLE
         await interaction.response.defer(ephemeral=True, thinking=True)
         guild = interaction.guild
         assert guild is not None
-        problem = _role_assignable_problem(guild, role)
+
+        payload: dict[str, Any] = {}
+        problem: str | None = None
+        if kind == config.ShopItemType.ROLE:
+            if role is None:
+                problem = "ロール付与の商品には `role` の指定が必要です。"
+            else:
+                problem = _role_assignable_problem(guild, role)
+        elif kind == config.ShopItemType.RATE_BOOST:
+            bonus = utils.to_decimal(bonus_rate)
+            cap = utils.to_decimal(config.RATE_BOOST_MAX_BONUS)
+            if bonus is None or bonus <= 0:
+                problem = "チャージ率ブーストには `bonus_rate` (上げ幅) の指定が必要です。"
+            elif cap is not None and bonus > cap:
+                problem = f"上げ幅は {config.RATE_BOOST_MAX_BONUS} までにしてください。"
+            elif boost_hours is None:
+                problem = "チャージ率ブーストには `boost_hours` (時間) の指定が必要です。"
+            else:
+                payload = {"bonus_rate": str(bonus), "hours": int(boost_hours)}
+        elif kind == config.ShopItemType.CUSTOM_ROLE:
+            if role_color:
+                color_value = utils.parse_color(role_color)
+                if color_value is None:
+                    problem = "色は `#RRGGBB` の形式で指定してください。"
+                else:
+                    payload = {"color": f"{color_value:06X}"}
+        elif kind == config.ShopItemType.PRIVATE_CHANNEL:
+            if category is not None:
+                payload = {"category_id": category.id}
+        if problem is None and subscription and int(duration_days) <= 0:
+            problem = "自動更新にするには `duration_days` (更新の間隔) を指定してください。"
         if problem:
             await interaction.followup.send(
-                embed=ui.info_embed("このロールは販売できません", problem, color=config.Color.DANGER),
+                embed=ui.info_embed("この設定では販売できません", problem,
+                                    color=config.Color.DANGER),
                 ephemeral=True,
             )
             return
+
         item_id = await bot.db.add_shop_item(
-            guild_id=guild.id, role_id=role.id, name=name, price=int(price),
+            guild_id=guild.id, role_id=role.id if role else 0, name=name, price=int(price),
             duration_days=int(duration_days), stock=int(stock),
             purchase_limit=int(purchase_limit),
             description=description,
             sort_order=int(sort_order), created_by=interaction.user.id,
+            item_type=kind, subscription=subscription, payload=payload or None,
         )
+        # 追加後に Bot 側の権限も確認する (販売してから気付くのを避ける)
+        saved = await bot.db.get_shop_item(item_id, guild.id)
+        warning = bot.charge.shop_item_problem(guild, saved) if saved else None
         op_id = await _audit(
             interaction, "SHOP_ITEM_ADD",
-            detail={"item_id": item_id, "role_id": role.id, "price": int(price),
-                    "duration_days": int(duration_days), "stock": int(stock)},
+            detail={"item_id": item_id, "item_type": kind,
+                    "role_id": role.id if role else None, "price": int(price),
+                    "duration_days": int(duration_days), "stock": int(stock),
+                    "subscription": bool(subscription), "payload": payload},
         )
         await bot.charge.refresh_shop_panels(guild.id)
-        await interaction.followup.send(
-            embed=ui.success_embed(
-                "✅ 商品を追加しました",
-                f"商品ID: `{item_id}`\n商品名: **{name}**\nロール: {role.mention}\n"
-                f"価格: **{utils.fmt_int(int(price))}**\n"
-                f"期間: {f'{duration_days}日' if duration_days else '無期限'}\n"
-                f"在庫: {'無制限' if stock < 0 else stock}\n"
-                f"購入上限: {'無制限' if purchase_limit == 0 else f'{purchase_limit}回'}\n"
-                f"操作ID: `{op_id}`",
-            ),
-            ephemeral=True,
+        embed = ui.success_embed(
+            "✅ 商品を追加しました",
+            f"商品ID: `{item_id}`\n商品名: **{name}**\n"
+            f"種類: {config.SHOP_ITEM_TYPE_EMOJI.get(kind, '🎫')} "
+            f"{config.SHOP_ITEM_TYPE_LABELS.get(kind, kind)}\n"
+            + (f"ロール: {role.mention}\n" if role else "")
+            + f"価格: **{utils.fmt_int(int(price))}**\n"
+            + (f"期間: {duration_days}日"
+               + (" ごとに自動更新" if subscription else "") + "\n"
+               if duration_days else "期間: 無期限\n")
+            + f"在庫: {'無制限' if stock < 0 else stock}\n"
+            f"購入上限: {'無制限' if purchase_limit == 0 else f'{purchase_limit}回'}\n"
+            + (f"追加設定: `{utils.safe_json_dumps(payload, limit=300)}`\n" if payload else "")
+            + f"操作ID: `{op_id}`",
         )
+        if warning:
+            embed.add_field(
+                name="⚠️ 今のままでは購入できません",
+                value=f"{warning}\n解消するまでこの商品は購入時に拒否されます。",
+                inline=False,
+            )
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="edit", description="商品の設定を変更します")
     @app_commands.describe(
@@ -3810,17 +3883,26 @@ class ShopGroup(app_commands.Group):
                 ephemeral=True,
             )
             return
+        guild = interaction.guild
+        assert guild is not None
         lines = []
         for item in items:
             duration = int(item["duration_days"])
             stock = int(item["stock"])
+            kind = str(item["item_type"] or config.ShopItemType.ROLE)
+            subscription = bool(int(item["subscription"] or 0)) and duration > 0
+            # 売っているつもりで買えない商品を見つけられるようにする
+            problem = bot.charge.shop_item_problem(guild, item) if item["active"] else None
             lines.append(
-                f"{'🟢' if item['active'] else '⚫'} `{item['id']}` **{item['name']}** "
-                f"→ <@&{int(item['role_id'])}>\n"
-                f"　{utils.fmt_int(int(item['price']))} / "
+                f"{'🟢' if item['active'] else '⚫'} `{item['id']}` "
+                f"{config.SHOP_ITEM_TYPE_EMOJI.get(kind, '🎫')} **{item['name']}**"
+                + (f" → <@&{int(item['role_id'])}>" if kind == config.ShopItemType.ROLE else "")
+                + (" 🔁" if subscription else "")
+                + f"\n　{utils.fmt_int(int(item['price']))} / "
                 f"{f'{duration}日' if duration else '無期限'} / "
                 f"在庫{'∞' if stock < 0 else stock} / "
                 f"上限{'∞' if int(item['purchase_limit']) == 0 else item['purchase_limit']}"
+                + (f"\n　⚠️ {problem}" if problem else "")
             )
         embed = ui.info_embed(
             "🛒 商品一覧",
@@ -3828,6 +3910,77 @@ class ShopGroup(app_commands.Group):
             + "\n".join(lines[:15]),
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="cancel", description="自動更新 (サブスク) を停止します"
+    )
+    @app_commands.describe(
+        purchase_id="購入ID (📦 購入履歴で確認できます)",
+        user="他の人の自動更新を止める (管理者のみ)",
+    )
+    @app_commands.guild_only()
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        purchase_id: app_commands.Range[int, 1, 10_000_000],
+        user: discord.User | None = None,
+    ) -> None:
+        """自動更新を止める (期限までは使える)。
+
+        自分の購入は誰でも止められる。他人の分を止めるのは管理者だけ。
+        """
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        target_id: int | None = interaction.user.id
+        if user is not None and user.id != interaction.user.id:
+            if not await bot.is_server_admin(interaction):
+                await interaction.followup.send(
+                    embed=ui.error_embed(config.ErrorCode.NOT_ALLOWED), ephemeral=True
+                )
+                return
+            target_id = user.id
+        try:
+            result = await bot.charge.cancel_subscription(
+                guild.id, int(purchase_id), user_id=target_id,
+                operator_id=interaction.user.id,
+            )
+        except ChargeError as exc:
+            await interaction.followup.send(embed=ui.error_embed(exc.code), ephemeral=True)
+            return
+        expires = result["expires_at"]
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "🚫 自動更新を停止しました",
+                f"商品: **{result['item_name']}**\n"
+                f"購入ID: `{purchase_id}`\n"
+                + (f"期限: {utils.format_jst(int(expires))} まで使えます\n"
+                   if expires else "")
+                + "次回以降の引き落としは行いません。",
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="subscriptions", description="自動更新中の購入を一覧します (管理者)"
+    )
+    @app_commands.describe(user="特定の利用者に絞り込む")
+    @app_commands.guild_only()
+    @require_admin()
+    async def subscriptions(
+        self, interaction: discord.Interaction, user: discord.User | None = None
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        rows = await bot.db.list_subscriptions(
+            guild.id, user_id=user.id if user else None
+        )
+        await interaction.followup.send(
+            embed=ui.subscription_list_embed(rows, guild_name=guild.name), ephemeral=True
+        )
 
     @app_commands.command(name="log", description="購入履歴を表示します")
     @app_commands.describe(status="状態で絞り込み", page="ページ番号")
@@ -4538,6 +4691,10 @@ async def inspect_command(interaction: discord.Interaction, user: discord.Member
     charge_rate, rate_role = await bot.charge.resolve_charge_rate(
         guild_id, user.id, await bot.db.get_settings(guild_id)
     )
+    charge_rate, rate_boost = await bot.charge.apply_rate_boost(
+        guild_id, user.id, charge_rate
+    )
+    subscriptions = await bot.db.list_subscriptions(guild_id, user_id=user.id)
     account_age_days = (utils.now_ts() - int(user.created_at.timestamp())) / 86400
 
     # 同じ Kyash 送金者名を共有している他ユーザー (名義貸し・転売の兆候)
@@ -4577,6 +4734,8 @@ async def inspect_command(interaction: discord.Interaction, user: discord.Member
             f"クールダウン: {f'{cooldown}秒' if cooldown else 'なし'}\n"
             f"適用レート: {utils.fmt_rate(charge_rate)}"
             + (f" (<@&{rate_role}>)" if rate_role else "")
+            + (f"\n⚡ ブースト中: +{utils.fmt_rate(rate_boost)}" if rate_boost else "")
+            + (f"\n🔁 自動更新: {len(subscriptions)}件" if subscriptions else "")
         ),
         inline=True,
     )

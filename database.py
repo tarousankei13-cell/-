@@ -3506,16 +3506,22 @@ class Database:
         description: str | None = None,
         sort_order: int = 0,
         created_by: int | None = None,
+        item_type: str = config.ShopItemType.ROLE,
+        subscription: bool = False,
+        payload: dict[str, Any] | None = None,
     ) -> int:
         now = utils.now_ts()
+        payload_text = utils.safe_json_dumps(payload, limit=1500) if payload else None
 
         def _fn(conn: sqlite3.Connection) -> int:
             cur = conn.execute(
                 "INSERT INTO shop_items(guild_id, role_id, name, description, price, "
-                "duration_days, stock, purchase_limit, sort_order, active, created_by, "
-                "created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,1,?,?,?)",
+                "duration_days, stock, purchase_limit, item_type, subscription, payload, "
+                "sort_order, active, created_by, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)",
                 (guild_id, role_id, name, description, price, duration_days, stock,
-                 purchase_limit, sort_order, created_by, now, now),
+                 purchase_limit, item_type, 1 if subscription else 0, payload_text,
+                 sort_order, created_by, now, now),
             )
             return _lastrowid(cur)
 
@@ -3523,7 +3529,7 @@ class Database:
 
     SHOP_UPDATABLE: frozenset[str] = frozenset({
         "role_id", "name", "description", "price", "duration_days", "stock",
-        "purchase_limit", "sort_order", "active",
+        "purchase_limit", "sort_order", "active", "subscription", "payload",
     })
 
     async def update_shop_item(self, item_id: int, guild_id: int, **values: Any) -> int:
@@ -3612,12 +3618,18 @@ class Database:
             after = before - price
             duration = int(item["duration_days"])
             expires_at = now + duration * 86400 if duration > 0 else None
+            item_type = str(item["item_type"] or config.ShopItemType.ROLE)
+            # サブスクは「期限が来たら自動で再課金」なので、次回課金日 = 期限
+            subscription = 1 if (int(item["subscription"] or 0) and duration > 0) else 0
+            next_charge_at = expires_at if subscription else None
 
             cur = conn.execute(
                 "INSERT INTO shop_purchases(guild_id, user_id, item_id, item_name, role_id, "
-                "price, status, expires_at, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "price, status, item_type, subscription, next_charge_at, expires_at, "
+                "created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (guild_id, user_id, item_id, item["name"], int(item["role_id"]), price,
-                 config.PurchaseStatus.PENDING, expires_at, now, now),
+                 config.PurchaseStatus.PENDING, item_type, subscription, next_charge_at,
+                 expires_at, now, now),
             )
             purchase_id = _lastrowid(cur)
             conn.execute(
@@ -3654,6 +3666,10 @@ class Database:
                 "balance_after": after,
                 "expires_at": expires_at,
                 "duration_days": duration,
+                "item_type": item_type,
+                "subscription": bool(subscription),
+                "next_charge_at": next_charge_at,
+                "payload": utils.load_json_dict(item["payload"]),
             }
 
         return await self.run(_fn, write=True)
@@ -3674,7 +3690,12 @@ class Database:
         reason: str,
         status: str = config.PurchaseStatus.REFUNDED,
     ) -> dict[str, Any]:
-        """購入を返金する (残高返却・在庫復元・状態更新を単一トランザクションで)。"""
+        """購入を返金する (残高返却・在庫復元・状態更新を単一トランザクションで)。
+
+        サブスクの場合は**購入時の1期間ぶん**だけを返金する。過去の更新料まで
+        まとめて返すと「使った分も返す」ことになるため、必要なら管理者が
+        ``/balance`` で個別に調整する。返金と同時に自動更新は解除する。
+        """
         now = utils.now_ts()
 
         def _fn(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -3712,9 +3733,10 @@ class Database:
                  config.BalanceChangeType.SPEND_REFUND, f"SHOP-{purchase_id}", operator_id,
                  utils.truncate(reason, 500), now),
             )
+            # 返金したものを翌期も課金しないよう、自動更新は必ず止める
             conn.execute(
                 "UPDATE shop_purchases SET status=?, refunded_at=?, refund_reason=?, "
-                "operator_id=?, updated_at=? WHERE id=?",
+                "operator_id=?, subscription=0, next_charge_at=NULL, updated_at=? WHERE id=?",
                 (status, now, utils.truncate(reason, 500), operator_id, now, purchase_id),
             )
             # 在庫を戻す (無制限の場合は何もしない)
@@ -3725,7 +3747,8 @@ class Database:
             return {
                 "guild_id": guild_id, "user_id": user_id, "role_id": int(row["role_id"]),
                 "price": price, "balance_before": before, "balance_after": after,
-                "item_name": row["item_name"],
+                "item_name": row["item_name"], "purchase_id": purchase_id,
+                "item_type": str(row["item_type"] or config.ShopItemType.ROLE),
             }
 
         return await self.run(_fn, write=True)
@@ -3776,10 +3799,15 @@ class Database:
         return await self.run(_fn)
 
     async def list_expired_purchases(self, now: int | None = None) -> list[sqlite3.Row]:
-        """期限切れでロールを剥奪すべき購入を返す。"""
+        """期限切れで後片付けすべき購入を返す。
+
+        サブスク (subscription=1) は更新タスクが自動課金を試すため除外する。
+        更新に失敗した時点で subscription=0 に落とすので、その後ここで拾われる。
+        """
         return await self.fetchall(
             "SELECT * FROM shop_purchases WHERE status=? AND expires_at IS NOT NULL "
-            "AND expires_at < ? ORDER BY expires_at ASC LIMIT 100",
+            "AND expires_at < ? AND COALESCE(subscription,0)=0 "
+            "ORDER BY expires_at ASC LIMIT 100",
             (config.PurchaseStatus.ACTIVE, now or utils.now_ts()),
         )
 
@@ -3798,6 +3826,294 @@ class Database:
             "AND status IN (?,?)",
             (guild_id, user_id, role_id, config.PurchaseStatus.PENDING,
              config.PurchaseStatus.ACTIVE),
+        )
+
+    # ------------------------------------------------------------------
+    # 購入で作った付随物 (カスタムロール・専用チャンネル・旧ニックネーム)
+    # ------------------------------------------------------------------
+    async def add_purchase_asset(
+        self,
+        *,
+        purchase_id: int,
+        guild_id: int,
+        user_id: int,
+        asset_type: str,
+        asset_id: int | None = None,
+        detail: str | None = None,
+    ) -> int:
+        """後片付けが必要な作成物を記録する。
+
+        購入と同時ではなく作成の**直後**に記録する。記録前に Bot が落ちた場合は
+        作成物が残るが、逆順にすると「消すべき対象が分からない」ため危険が大きい。
+        """
+        now = utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> int:
+            cur = conn.execute(
+                "INSERT INTO purchase_assets(purchase_id, guild_id, user_id, asset_type, "
+                "asset_id, detail, created_at) VALUES(?,?,?,?,?,?,?)",
+                (purchase_id, guild_id, user_id, asset_type, asset_id,
+                 utils.truncate(detail, 300) if detail else None, now),
+            )
+            return _lastrowid(cur)
+
+        return await self.run(_fn, write=True)
+
+    async def list_purchase_assets(
+        self, purchase_id: int, *, include_removed: bool = False
+    ) -> list[sqlite3.Row]:
+        where = "WHERE purchase_id=?" + ("" if include_removed else " AND removed_at IS NULL")
+        return await self.fetchall(
+            f"SELECT * FROM purchase_assets {where} ORDER BY id ASC", (purchase_id,)
+        )
+
+    async def mark_asset_removed(self, asset_id_row: int) -> int:
+        """後片付け済みとして記録する (二重削除を防ぐ)。"""
+        return await self.execute(
+            "UPDATE purchase_assets SET removed_at=? WHERE id=? AND removed_at IS NULL",
+            (utils.now_ts(), asset_id_row),
+        )
+
+    async def count_live_assets(self, guild_id: int, asset_type: str) -> int:
+        """未削除の作成物の件数 (作りすぎの上限判定に使う)。"""
+        row = await self.fetchone(
+            "SELECT COUNT(*) AS c FROM purchase_assets WHERE guild_id=? AND asset_type=? "
+            "AND removed_at IS NULL",
+            (guild_id, asset_type),
+        )
+        return int(row["c"]) if row else 0
+
+    # ------------------------------------------------------------------
+    # チャージ率ブースト
+    # ------------------------------------------------------------------
+    async def add_rate_boost(
+        self,
+        *,
+        guild_id: int,
+        user_id: int,
+        bonus_rate: str,
+        expires_at: int,
+        source: str | None = None,
+        purchase_id: int | None = None,
+    ) -> int:
+        now = utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> int:
+            cur = conn.execute(
+                "INSERT INTO rate_boosts(guild_id, user_id, bonus_rate, source, purchase_id, "
+                "expires_at, created_at) VALUES(?,?,?,?,?,?,?)",
+                (guild_id, user_id, str(bonus_rate), source, purchase_id, expires_at, now),
+            )
+            return _lastrowid(cur)
+
+        return await self.run(_fn, write=True)
+
+    async def list_active_rate_boosts(
+        self, guild_id: int, user_id: int, *, now: int | None = None
+    ) -> list[sqlite3.Row]:
+        return await self.fetchall(
+            "SELECT * FROM rate_boosts WHERE guild_id=? AND user_id=? AND expires_at > ? "
+            "ORDER BY expires_at DESC",
+            (guild_id, user_id, now or utils.now_ts()),
+        )
+
+    async def remove_rate_boosts_for_purchase(self, purchase_id: int) -> int:
+        """返金時にブーストを取り消す (期限を現在にして無効化する)。
+
+        行を消さずに期限を切るのは、後から「いつ何を付与したか」を追えるようにするため。
+        """
+        return await self.execute(
+            "UPDATE rate_boosts SET expires_at=? WHERE purchase_id=? AND expires_at > ?",
+            (utils.now_ts(), purchase_id, utils.now_ts()),
+        )
+
+    async def purge_expired_rate_boosts(self, *, keep_days: int = 30) -> int:
+        """十分に古い失効済みブーストを削除する (無限に溜めない)。"""
+        return await self.execute(
+            "DELETE FROM rate_boosts WHERE expires_at < ?",
+            (utils.now_ts() - keep_days * 86400,),
+        )
+
+    # ------------------------------------------------------------------
+    # サブスク (自動更新) の購入
+    # ------------------------------------------------------------------
+    async def list_subscription_due(
+        self, *, now: int | None = None, limit: int = 50
+    ) -> list[sqlite3.Row]:
+        """更新日を迎えたサブスクを返す。"""
+        return await self.fetchall(
+            "SELECT * FROM shop_purchases WHERE subscription=1 AND status=? "
+            "AND next_charge_at IS NOT NULL AND next_charge_at <= ? "
+            "ORDER BY next_charge_at ASC LIMIT ?",
+            (config.PurchaseStatus.ACTIVE, now or utils.now_ts(), limit),
+        )
+
+    async def list_subscription_notices(
+        self, *, now: int | None = None, lead: int = config.SUBSCRIPTION_NOTICE_SECONDS,
+        limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        """更新予告をまだ送っていないサブスクを返す。"""
+        now = now or utils.now_ts()
+        return await self.fetchall(
+            "SELECT * FROM shop_purchases WHERE subscription=1 AND status=? "
+            "AND next_charge_at IS NOT NULL AND next_charge_at <= ? AND next_charge_at > ? "
+            "AND (notified_at IS NULL OR notified_at < created_at) "
+            "ORDER BY next_charge_at ASC LIMIT ?",
+            (config.PurchaseStatus.ACTIVE, now + lead, now, limit),
+        )
+
+    async def mark_subscription_notified(self, purchase_id: int) -> int:
+        """予告を送ったことを記録する (同じ更新について二重に送らない)。"""
+        now = utils.now_ts()
+        return await self.execute(
+            "UPDATE shop_purchases SET notified_at=?, updated_at=? WHERE id=? "
+            "AND (notified_at IS NULL OR notified_at < created_at)",
+            (now, now, purchase_id),
+        )
+
+    async def renew_subscription(self, purchase_id: int, *, now: int | None = None) -> dict[str, Any]:
+        """サブスクを1期間ぶん自動更新する (引き落としと期限延長を同時に確定)。
+
+        同じ更新を二重に処理しないよう、``next_charge_at <= now`` を条件に
+        更新するので、同時に2回呼ばれても2回目は ``renewed=False`` になる。
+
+        Returns:
+            ``{"renewed": bool, "reason": str, ...}``。残高不足のときは
+            ``renewed=False`` で ``reason="INSUFFICIENT_BALANCE"`` を返し、
+            その購入のサブスクを解除する (期限切れ処理に回す)。
+        """
+        now = now or utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> dict[str, Any]:
+            row = conn.execute(
+                "SELECT * FROM shop_purchases WHERE id=? AND subscription=1 AND status=? "
+                "AND next_charge_at IS NOT NULL AND next_charge_at <= ?",
+                (purchase_id, config.PurchaseStatus.ACTIVE, now),
+            ).fetchone()
+            if row is None:
+                return {"renewed": False, "reason": "NOT_DUE"}
+            guild_id = int(row["guild_id"])
+            user_id = int(row["user_id"])
+            item = conn.execute(
+                "SELECT * FROM shop_items WHERE id=?", (int(row["item_id"]),)
+            ).fetchone()
+            # 商品が消えた/停止された/サブスクを解除された場合は更新しない
+            if item is None or not item["active"] or not int(item["subscription"] or 0):
+                conn.execute(
+                    "UPDATE shop_purchases SET subscription=0, next_charge_at=NULL, "
+                    "updated_at=? WHERE id=?", (now, purchase_id),
+                )
+                return {"renewed": False, "reason": "ITEM_UNAVAILABLE",
+                        "guild_id": guild_id, "user_id": user_id,
+                        "item_name": row["item_name"]}
+            price = int(item["price"])  # 更新時点の価格を使う (値上げは次回更新から)
+            duration = max(1, int(item["duration_days"]))
+            frozen = conn.execute(
+                "SELECT frozen FROM users WHERE guild_id=? AND user_id=?", (guild_id, user_id)
+            ).fetchone()
+            if frozen is not None and int(frozen["frozen"] or 0):
+                conn.execute(
+                    "UPDATE shop_purchases SET subscription=0, updated_at=? WHERE id=?",
+                    (now, purchase_id),
+                )
+                return {"renewed": False, "reason": "USER_FROZEN",
+                        "guild_id": guild_id, "user_id": user_id,
+                        "item_name": row["item_name"]}
+            bal_row = conn.execute(
+                "SELECT balance FROM balances WHERE guild_id=? AND user_id=?",
+                (guild_id, user_id),
+            ).fetchone()
+            before = int(bal_row["balance"]) if bal_row else 0
+            if before < price:
+                # 残高不足: サブスクを解除し、期限切れ処理に任せる
+                conn.execute(
+                    "UPDATE shop_purchases SET subscription=0, next_charge_at=NULL, "
+                    "updated_at=? WHERE id=?", (now, purchase_id),
+                )
+                return {"renewed": False, "reason": "INSUFFICIENT_BALANCE",
+                        "guild_id": guild_id, "user_id": user_id, "price": price,
+                        "balance": before, "item_name": row["item_name"],
+                        "item_type": row["item_type"], "role_id": int(row["role_id"])}
+            after = before - price
+            # 期限の起点は「今」ではなく元の期限。遅延しても期間が削られない。
+            base = int(row["expires_at"] or now)
+            new_expires = max(base, now) + duration * 86400
+            renewal_count = int(row["renewal_count"] or 0) + 1
+            conn.execute(
+                "INSERT INTO balances(guild_id, user_id, balance, updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(guild_id, user_id) DO UPDATE SET balance=excluded.balance, "
+                "updated_at=excluded.updated_at",
+                (guild_id, user_id, after, now),
+            )
+            conn.execute(
+                "INSERT INTO balance_history(guild_id, user_id, change_amount, balance_before, "
+                "balance_after, type, transaction_id, operator_id, reason, created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                # 更新ごとに別の transaction_id を使う。
+                # balance_history の UNIQUE(transaction_id, type) が効くため、
+                # 同じ回数の更新は二重に記録できない (課金の最終防壁)。
+                (guild_id, user_id, -price, before, after,
+                 config.BalanceChangeType.SUBSCRIPTION,
+                 f"SHOP-{purchase_id}-R{renewal_count}", None,
+                 utils.truncate(
+                     f"サブスク更新 ({renewal_count}回目): {row['item_name']}", 500), now),
+            )
+            conn.execute(
+                "UPDATE shop_purchases SET expires_at=?, next_charge_at=?, renewal_count=?, "
+                "notified_at=NULL, updated_at=? WHERE id=?",
+                (new_expires, new_expires, renewal_count, now, purchase_id),
+            )
+            return {
+                "renewed": True, "reason": "OK", "guild_id": guild_id, "user_id": user_id,
+                "purchase_id": purchase_id, "price": price, "balance_before": before,
+                "balance_after": after, "expires_at": new_expires,
+                "renewal_count": renewal_count, "item_name": row["item_name"],
+                "item_type": row["item_type"], "role_id": int(row["role_id"]),
+            }
+
+        return await self.run(_fn, write=True)
+
+    async def cancel_subscription(
+        self, purchase_id: int, *, guild_id: int, user_id: int | None = None
+    ) -> sqlite3.Row | None:
+        """自動更新を止める (期限までは使える)。
+
+        ``user_id`` を渡すと本人の購入だけを対象にする (他人の解約を防ぐ)。
+        """
+        now = utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> sqlite3.Row | None:
+            clauses = ["id=?", "guild_id=?", "subscription=1", "status=?"]
+            params: list[Any] = [purchase_id, guild_id, config.PurchaseStatus.ACTIVE]
+            if user_id is not None:
+                clauses.insert(2, "user_id=?")
+                params.insert(2, user_id)
+            where = " AND ".join(clauses)
+            row = conn.execute(
+                f"SELECT * FROM shop_purchases WHERE {where}", tuple(params)
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                "UPDATE shop_purchases SET subscription=0, next_charge_at=NULL, updated_at=? "
+                "WHERE id=?", (now, purchase_id),
+            )
+            return row
+
+        return await self.run(_fn, write=True)
+
+    async def list_subscriptions(
+        self, guild_id: int, *, user_id: int | None = None, limit: int = 25
+    ) -> list[sqlite3.Row]:
+        clauses = ["guild_id=?", "subscription=1", "status=?"]
+        params: list[Any] = [guild_id, config.PurchaseStatus.ACTIVE]
+        if user_id is not None:
+            clauses.append("user_id=?")
+            params.append(user_id)
+        return await self.fetchall(
+            f"SELECT * FROM shop_purchases WHERE {' AND '.join(clauses)} "
+            "ORDER BY next_charge_at ASC LIMIT ?",
+            (*params, limit),
         )
 
     # ==================================================================

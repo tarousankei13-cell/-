@@ -219,18 +219,42 @@ def main() -> None:
         campaign_name="春の招待祭"))
 
     print("\n=== 6. ショップ ===")
+    kinds = list(config.ALL_SHOP_ITEM_TYPES)
+    payloads = {
+        config.ShopItemType.RATE_BOOST: {"bonus_rate": "20", "hours": 24},
+        config.ShopItemType.CUSTOM_ROLE: {"color": "FF66AA"},
+        config.ShopItemType.PRIVATE_CHANNEL: {"category_id": 999},
+    }
     items = [
         Row(id=i, name=f"商品{i}" * 8, role_id=100 + i, price=1000 * (i + 1),
             duration_days=0 if i % 2 else 30, stock=-1 if i % 3 else 3,
             purchase_limit=0 if i % 2 else 1, description="説明" * 20,
-            active=1, sort_order=i)
+            active=1, sort_order=i,
+            item_type=kinds[i % len(kinds)],
+            subscription=1 if (i % 4 == 0) else 0,
+            payload=utils.safe_json_dumps(payloads.get(kinds[i % len(kinds)], {})) or None)
         for i in range(12)
     ]
     verify("shop_panel_embed (空)", ui.shop_panel_embed(settings, []))
     verify("shop_panel_embed (多数)", ui.shop_panel_embed(settings, items))
+    panel_dump = ui.shop_panel_embed(settings, items)
+    dumped = (panel_dump.description or "") + "".join(
+        f.name + f.value for f in panel_dump.fields
+    )
+    check("自動更新" in dumped, "自動更新つきの商品があると説明が出る")
+    check("チャージ率" in dumped, "ブースト商品の内容が読み取れる")
+    for kind in kinds:
+        row = Row(id=1, name="商品", role_id=101, price=1000, duration_days=30,
+                  stock=3, purchase_limit=1, description="説明", active=1,
+                  sort_order=0, item_type=kind, subscription=0,
+                  payload=utils.safe_json_dumps(payloads.get(kind, {})) or None)
+        text = ui.shop_item_reward_text(row)
+        check(bool(text) and "None" not in text,
+              f"商品タイプ {kind} の内容説明が作れる ({utils.truncate(text, 28)})")
     # 期限つき (30日/上限1回) と無期限の2種類で、購入可否の判定を確かめる
     timed = Row(id=1, name="期限つきロール", role_id=101, price=1000, duration_days=30,
-                stock=3, purchase_limit=1, description="説明", active=1, sort_order=0)
+                stock=3, purchase_limit=1, description="説明", active=1, sort_order=0,
+                item_type=config.ShopItemType.ROLE, subscription=0, payload=None)
     forever = Row(**{**timed, "duration_days": 0, "purchase_limit": 0, "stock": -1})
     cases = (
         ("購入可能", timed, 999_999, 0, False, False),
@@ -247,21 +271,92 @@ def main() -> None:
         verify(f"purchase_confirm_embed ({label})", embed)
         check((blocker is not None) == expect_blocked,
               f"購入可否の判定: {label} → {'不可' if expect_blocked else '可'}")
+    # サブスク商品の確認画面では、更新の仕組みを必ず説明する
+    sub_item = Row(**{**timed, "subscription": 1})
+    sub_embed, sub_blocker = ui.purchase_confirm_embed(
+        item=sub_item, balance=999_999, owned=0, already_has_role=False)
+    verify("purchase_confirm_embed (自動更新)", sub_embed)
+    sub_text = (sub_embed.description or "") + "".join(
+        f.name + f.value for f in sub_embed.fields)
+    check(sub_blocker is None and "自動更新" in sub_text and "/shop cancel" in sub_text,
+          "サブスク商品は更新と解約方法を説明する")
+    # 入力が必要な商品では「入力欄が開く」と先に伝える
+    input_item = Row(**{**timed, "item_type": config.ShopItemType.CUSTOM_ROLE})
+    input_embed, _ = ui.purchase_confirm_embed(
+        item=input_item, balance=999_999, owned=0, already_has_role=False)
+    verify("purchase_confirm_embed (入力あり)", input_embed)
+    check("入力欄" in (input_embed.description or ""),
+          "入力が必要な商品はその旨を先に伝える")
+    # 同じロールを持っていても、ロール販売以外なら購入できる
+    boost_item = Row(**{**forever, "item_type": config.ShopItemType.RATE_BOOST,
+                       "payload": utils.safe_json_dumps({"bonus_rate": "10", "hours": 3})})
+    _, boost_blocker = ui.purchase_confirm_embed(
+        item=boost_item, balance=999_999, owned=0, already_has_role=True)
+    check(boost_blocker is None, "ロール以外の商品は所持判定で弾かれない")
+
     verify("purchase_success_embed", ui.purchase_success_embed(
         item_name="VIP" * 50, role_id=7, price=5000, balance_after=1000,
         expires_at=now + 86400, purchase_id=1))
     verify("purchase_success_embed (無期限)", ui.purchase_success_embed(
         item_name="VIP", role_id=7, price=5000, balance_after=0,
         expires_at=None, purchase_id=1))
+    verify("purchase_success_embed (サブスク)", ui.purchase_success_embed(
+        item_name="月額VIP", price=5000, balance_after=1000,
+        expires_at=now + 30 * 86400, purchase_id=2, role_id=7,
+        subscription=True, next_charge_at=now + 30 * 86400))
+    verify("purchase_success_embed (専用チャンネル)", ui.purchase_success_embed(
+        item_name="自分の部屋", price=5000, balance_after=1000,
+        expires_at=None, purchase_id=3, channel_id=555,
+        item_type=config.ShopItemType.PRIVATE_CHANNEL, detail="my-room"))
+    verify("purchase_success_embed (ブースト)", ui.purchase_success_embed(
+        item_name="率ブースト", price=5000, balance_after=1000,
+        expires_at=now + 3600, purchase_id=4,
+        item_type=config.ShopItemType.RATE_BOOST, detail="+20% / 24時間"))
+    verify("purchase_success_embed (ニックネーム)", ui.purchase_success_embed(
+        item_name="改名権", price=500, balance_after=100,
+        expires_at=now + 86400, purchase_id=5,
+        item_type=config.ShopItemType.NICKNAME, detail="たろう"))
     verify("my_items_embed (空)", ui.my_items_embed([]))
-    verify("my_items_embed", ui.my_items_embed([
+    my_rows = [
         Row(id=i, item_name=f"商品{i}" * 8, role_id=100 + i, price=1000,
             status=st, expires_at=None if i % 2 else now + 86400,
-            created_at=now - i * 3600)
+            created_at=now - i * 3600,
+            item_type=kinds[i % len(kinds)],
+            subscription=1 if i % 3 == 0 else 0,
+            renewal_count=i, next_charge_at=now + 86400 if i % 3 == 0 else None)
         for i, st in enumerate([config.PurchaseStatus.ACTIVE,
                                 config.PurchaseStatus.EXPIRED,
                                 config.PurchaseStatus.REFUNDED] * 4)
-    ]))
+    ]
+    verify("my_items_embed", ui.my_items_embed(my_rows))
+    my_text = "".join(f.name + f.value for f in ui.my_items_embed(my_rows).fields)
+    check("次回更新" in my_text, "購入履歴に次回更新日が出る")
+
+    print("\n=== 6b. サブスクの通知 ===")
+    verify("subscription_notice_embed (足りる)", ui.subscription_notice_embed(
+        item_name="月額VIP", price=1000, next_charge_at=now + 86400,
+        balance=5000, purchase_id=1))
+    short = ui.subscription_notice_embed(
+        item_name="月額VIP" * 30, price=1000, next_charge_at=now + 3600,
+        balance=100, purchase_id=1)
+    verify("subscription_notice_embed (足りない)", short)
+    check("不足" in "".join(f.value for f in short.fields),
+          "残高不足のときは不足額を知らせる")
+    verify("subscription_renewed_embed", ui.subscription_renewed_embed(
+        item_name="月額VIP", price=1000, balance_after=4000,
+        expires_at=now + 30 * 86400, renewal_count=3, purchase_id=1))
+    for code in config.SUBSCRIPTION_STOP_REASONS:
+        verify(f"subscription_stopped_embed ({code})", ui.subscription_stopped_embed(
+            item_name="月額VIP", reason_code=code, price=1000, balance=10,
+            purchase_id=1))
+    verify("subscription_list_embed (空)", ui.subscription_list_embed(
+        [], guild_name="サーバー"))
+    verify("subscription_list_embed", ui.subscription_list_embed([
+        Row(id=i, user_id=1000 + i, item_name=f"商品{i}" * 6, price=1000 * (i + 1),
+            item_type=kinds[i % len(kinds)], next_charge_at=now + i * 86400,
+            renewal_count=i)
+        for i in range(20)
+    ], guild_name="サーバー" * 30))
 
     print("\n=== 7. 招待キャンペーン ===")
     verify("invite_panel_embed (未開催)", ui.invite_panel_embed(settings, None))

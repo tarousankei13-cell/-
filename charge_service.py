@@ -97,6 +97,7 @@ class ChargeService:
             "invites_hold": 0,
             "requests_created": 0, "requests_submitted": 0,
             "requests_approved": 0, "requests_rejected": 0, "requests_expired": 0,
+            "subscription_renewals": 0, "subscription_stops": 0,
         }
 
     # ==================================================================
@@ -317,6 +318,9 @@ class ChargeService:
             if active > 0:
                 raise ChargeError(config.ErrorCode.ACTIVE_TRANSACTION_EXISTS)
             charge_rate, role_id = await self.resolve_charge_rate(guild_id, user_id, settings)
+            # ブーストは最後に足す。ここで確定した率を取引に保存するので、
+            # ブーストが切れても進行中の取引には影響しない。
+            charge_rate, boost = await self.apply_rate_boost(guild_id, user_id, charge_rate)
             await self._check_limits(
                 guild_id, user_id, amount, settings, charge_rate=charge_rate
             )
@@ -341,7 +345,9 @@ class ChargeService:
                 ("取引ID", f"`{tx_id}`", True),
                 (
                     "適用レート",
-                    utils.fmt_rate(charge_rate) + (f" (<@&{role_id}>)" if role_id else ""),
+                    utils.fmt_rate(charge_rate)
+                    + (f" (<@&{role_id}>)" if role_id else "")
+                    + (f" ⚡+{utils.fmt_rate(boost)}" if boost else ""),
                     True,
                 ),
             ),
@@ -1898,12 +1904,16 @@ class ChargeService:
         row = await self.db.get_provider_settings(guild_id, provider)
         provider_rate = utils.to_decimal(row["charge_rate"]) if row else None
         if provider_rate is None:
-            return role_rate, role_id
-        if role_id is None:
-            return provider_rate, None
-        if role_rate >= provider_rate:
-            return role_rate, role_id
-        return provider_rate, None
+            base, used_role = role_rate, role_id
+        elif role_id is None:
+            base, used_role = provider_rate, None
+        elif role_rate >= provider_rate:
+            base, used_role = role_rate, role_id
+        else:
+            base, used_role = provider_rate, None
+        # ブーストは方式・ロールのどちらが採用されても最後に加算する
+        boosted, _bonus = await self.apply_rate_boost(guild_id, user_id, base)
+        return boosted, used_role
 
     async def provider_limits(
         self, guild_id: int, provider: str, settings: GuildSettings
@@ -2684,6 +2694,9 @@ class ChargeService:
             purchase_id=purchase_id,
             timestamp=int(purchase["created_at"]),
             status=str(purchase["status"]),
+            item_type=str(purchase["item_type"] or config.ShopItemType.ROLE),
+            subscription=bool(purchase["subscription"]),
+            renewal_count=int(purchase["renewal_count"] or 0),
         )
         if purchase["achievement_message_id"]:
             if await self.update_generic_achievement(
@@ -3094,12 +3107,19 @@ class ChargeService:
     # ショップ (内部残高でロールを購入)
     # ==================================================================
     async def purchase_shop_item(
-        self, member: discord.Member, item_id: int
+        self, member: discord.Member, item_id: int, *,
+        item_input: str | None = None, item_color: str | None = None,
     ) -> dict[str, Any]:
-        """内部残高で商品 (ロール) を購入する。
+        """内部残高で商品を購入する。
 
-        残高の引き落としは単一トランザクションで確定させ、その後ロールを付与する。
-        ロール付与に失敗した場合は自動で返金し、利用者へ明示する。
+        残高の引き落としは単一トランザクションで確定させ、その後に商品タイプごとの
+        特典を渡す。特典を渡せなかった場合は自動で返金し、利用者へ明示する。
+
+        Args:
+            item_input: 利用者の入力 (カスタムロール名・ニックネーム・チャンネル名)。
+                入力が必要なタイプで空の場合はエラーにする。
+            item_color: カスタムロールの色 (``#RRGGBB``)。管理者が色を固定している
+                場合は無視する。
         """
         guild = member.guild
         settings = await self.ensure_usable_guild(guild.id)
@@ -3113,21 +3133,18 @@ class ChargeService:
         item = await self.db.get_shop_item(item_id, guild.id)
         if item is None or not item["active"]:
             raise ChargeError(config.ErrorCode.SHOP_ITEM_UNAVAILABLE)
-        role = guild.get_role(int(item["role_id"]))
-        if role is None:
-            raise ChargeError(
-                config.ErrorCode.SHOP_ITEM_UNAVAILABLE, "商品のロールが存在しません"
-            )
-        me = guild.me
-        if me is None or not me.guild_permissions.manage_roles or role >= me.top_role \
-                or role.managed or role.is_default():
-            raise ChargeError(
-                config.ErrorCode.ROLE_ASSIGN_FAILED,
-                "Bot がこのロールを付与できません (ロールの位置・権限を確認してください)",
-            )
+        item_type = str(item["item_type"] or config.ShopItemType.ROLE)
+        # 「買えたのに渡せない」を避けるため、引き落とす前に販売可能かを確かめる
+        problem = self.shop_item_problem(guild, item)
+        if problem:
+            raise ChargeError(config.ErrorCode.SHOP_ITEM_UNAVAILABLE, problem)
+        if item_type in config.SHOP_TYPES_NEED_INPUT and not (item_input or "").strip():
+            raise ChargeError(config.ErrorCode.ITEM_INPUT_INVALID, "入力が必要な商品です")
         duration = int(item["duration_days"])
-        if duration == 0 and role in member.roles:
-            raise ChargeError(config.ErrorCode.SHOP_ALREADY_OWNED)
+        if item_type in config.SHOP_TYPES_UNIQUE and duration == 0:
+            role = guild.get_role(int(item["role_id"]))
+            if role is not None and role in member.roles:
+                raise ChargeError(config.ErrorCode.SHOP_ALREADY_OWNED)
 
         async with self._user_locks.acquire(f"shop:{guild.id}:{member.id}"):
             try:
@@ -3139,36 +3156,51 @@ class ChargeService:
 
             purchase_id = int(result["purchase_id"])
             try:
-                await member.add_roles(
-                    role, reason=f"ショップ購入 #{purchase_id} ({item['name']})"
+                granted = await self._setup_purchase(
+                    member, item, result, item_input=item_input, item_color=item_color
                 )
-            except Exception as exc:  # noqa: BLE001 - 付与失敗時は必ず返金する
+            except Exception as exc:  # noqa: BLE001 - 渡せなかったら必ず返金する
                 logger.error(
-                    "ロール付与に失敗したため返金します purchase=%s: %s",
-                    purchase_id, utils.safe_error_text(exc),
+                    "商品の用意に失敗したため返金します purchase=%s type=%s: %s",
+                    purchase_id, item_type, utils.safe_error_text(exc),
                 )
+                # 途中まで作った物 (ロール・チャンネル) が残らないよう片付ける
+                stale = await self.db.get_purchase(purchase_id)
+                if stale is not None:
+                    await self._safe(
+                        self._teardown_purchase(
+                            stale, reason=f"商品の用意に失敗 #{purchase_id}"),
+                        context="失敗した購入の後片付け",
+                    )
                 try:
                     refund = await self.db.refund_purchase(
                         purchase_id, operator_id=None,
-                        reason="ロール付与に失敗したため自動返金",
+                        reason="商品の用意に失敗したため自動返金",
                         status=config.PurchaseStatus.FAILED,
                     )
                     await self._log_balance_from_history(
                         guild.id, member.id,
                         change_type=config.BalanceChangeType.SPEND_REFUND,
-                        fallback=refund, reason="ロール付与失敗による自動返金",
+                        fallback=refund, reason="商品の用意に失敗したため自動返金",
                     )
                 except Exception:  # noqa: BLE001
                     logger.exception("自動返金に失敗しました purchase=%s", purchase_id)
                     await self.alert_admins(
                         guild.id, "ショップの自動返金に失敗",
-                        f"購入 `#{purchase_id}` のロール付与と返金の両方に失敗しました。"
+                        f"購入 `#{purchase_id}` の特典付与と返金の両方に失敗しました。"
                         "手動で `/shop refund` を実行してください。",
                     )
-                raise ChargeError(config.ErrorCode.ROLE_ASSIGN_FAILED) from exc
+                if isinstance(exc, ChargeError):
+                    raise
+                raise ChargeError(
+                    config.ErrorCode.ROLE_ASSIGN_FAILED
+                    if item_type == config.ShopItemType.ROLE
+                    else config.ErrorCode.ITEM_SETUP_FAILED
+                ) from exc
 
             await self.db.activate_purchase(purchase_id)
 
+        result.update(granted)
         self.metrics["purchases"] += 1
         await self._safe(self.post_shop_achievement(purchase_id), context="購入実績")
         await self.db.add_audit_log(
@@ -3176,7 +3208,11 @@ class ChargeService:
             target_user_id=member.id,
             detail={
                 "purchase_id": purchase_id, "item_id": item_id, "item": item["name"],
-                "price": result["price"], "role_id": role.id,
+                "price": result["price"], "item_type": item_type,
+                "role_id": granted.get("role_id"),
+                "channel_id": granted.get("channel_id"),
+                "detail": granted.get("detail"),
+                "subscription": bool(result["subscription"]),
                 "expires_at": result["expires_at"],
             },
         )
@@ -3191,7 +3227,11 @@ class ChargeService:
                 ("利用者", member.mention, True),
                 ("商品", str(item["name"]), True),
                 ("価格", utils.fmt_int(result["price"]), True),
-                ("ロール", role.mention, True),
+                ("種類", config.SHOP_ITEM_TYPE_LABELS.get(item_type, item_type)
+                 + (" / サブスク" if result["subscription"] else ""), True),
+                ("内容", (f"<@&{granted['role_id']}>" if granted.get("role_id")
+                          else f"<#{granted['channel_id']}>" if granted.get("channel_id")
+                          else str(granted.get("detail") or "-")), True),
                 ("期限", utils.format_jst(result["expires_at"]) if result["expires_at"] else "無期限", True),
                 ("残高", f"{utils.fmt_int(result['balance_before'])} → "
                          f"{utils.fmt_int(result['balance_after'])}", True),
@@ -3199,7 +3239,7 @@ class ChargeService:
             color=config.Color.ACCENT,
         ), context="購入ログ")
         self.request_ranking_refresh(guild.id)
-        return {**result, "role_id": role.id, "role_name": role.name}
+        return result
 
     async def refund_shop_purchase(
         self, purchase_id: int, *, operator_id: int, reason: str
@@ -3216,8 +3256,8 @@ class ChargeService:
             raise ChargeError(exc.code, exc.detail) from exc
         guild_id = int(result["guild_id"])
         user_id = int(result["user_id"])
-        await self._remove_purchase_role(guild_id, user_id, int(result["role_id"]),
-                                         reason=f"購入返金 #{purchase_id}")
+        # ロール以外 (カスタムロール・チャンネル・ニックネーム・ブースト) も片付ける
+        await self._teardown_purchase(purchase, reason=f"購入返金 #{purchase_id}")
         self.metrics["purchase_refunds"] += 1
         await self._safe(
             self.post_shop_achievement(purchase_id, post_if_missing=False),
@@ -3291,16 +3331,17 @@ class ChargeService:
                 self.post_shop_achievement(purchase_id, post_if_missing=False),
                 context="期限切れ実績の更新",
             )
-            await self._remove_purchase_role(
-                int(row["guild_id"]), int(row["user_id"]), int(row["role_id"]),
-                reason=f"購入期限切れ #{purchase_id}",
+            done = await self._teardown_purchase(
+                row, reason=f"購入期限切れ #{purchase_id}"
             )
+            item_type = str(row["item_type"] or config.ShopItemType.ROLE)
             await self._safe(self.log_event(
-                int(row["guild_id"]), "⌛ ロールの有効期限が切れました",
+                int(row["guild_id"]), "⌛ 購入した商品の有効期限が切れました",
                 fields=(
                     ("対象", f"<@{row['user_id']}>", True),
                     ("商品", str(row["item_name"]), True),
-                    ("ロール", f"<@&{row['role_id']}>", True),
+                    ("種類", config.SHOP_ITEM_TYPE_LABELS.get(item_type, item_type), True),
+                    ("片付け", "、".join(done) if done else "対象なし", False),
                 ),
                 color=config.Color.NEUTRAL,
             ), context="期限切れログ")
@@ -3308,6 +3349,466 @@ class ChargeService:
         if handled:
             logger.info("期限切れの購入 %s 件を処理しました", handled)
         return handled
+
+    # ------------------------------------------------------------------
+    # 商品タイプごとの用意 / 後片付け
+    # ------------------------------------------------------------------
+    def shop_item_problem(self, guild: discord.Guild, item: Any) -> str | None:
+        """その商品を今このサーバーで販売できるか (できない理由を返す)。
+
+        「買えたのに付与に失敗」を避けるため、購入前と商品追加時の両方で使う。
+        """
+        item_type = str(item["item_type"] or config.ShopItemType.ROLE)
+        me = guild.me
+        if me is None:
+            return "Bot の情報を取得できません。"
+        if item_type == config.ShopItemType.ROLE:
+            role = guild.get_role(int(item["role_id"]))
+            if role is None:
+                return "商品のロールが存在しません (削除された可能性があります)。"
+            return self.role_grant_problem(guild, role)
+        if item_type == config.ShopItemType.CUSTOM_ROLE:
+            if not me.guild_permissions.manage_roles:
+                return "Bot に「ロールの管理」権限がありません。"
+            if len(guild.roles) >= config.GUILD_ROLE_SOFT_LIMIT:
+                return "サーバーのロール数が上限に近いため、新しいロールを作れません。"
+            return None
+        if item_type == config.ShopItemType.NICKNAME:
+            if not me.guild_permissions.manage_nicknames:
+                return "Bot に「ニックネームの管理」権限がありません。"
+            return None
+        if item_type == config.ShopItemType.PRIVATE_CHANNEL:
+            if not me.guild_permissions.manage_channels:
+                return "Bot に「チャンネルの管理」権限がありません。"
+            payload = utils.load_json_dict(item["payload"])
+            category_id = payload.get("category_id")
+            if category_id:
+                category = guild.get_channel(int(category_id))
+                if category is None or not isinstance(category, discord.CategoryChannel):
+                    return "作成先のカテゴリが見つかりません。"
+            return None
+        if item_type == config.ShopItemType.RATE_BOOST:
+            payload = utils.load_json_dict(item["payload"])
+            bonus = utils.to_decimal(payload.get("bonus_rate"))
+            if bonus is None or bonus <= 0:
+                return "ブースト量 (bonus_rate) が設定されていません。"
+            if int(payload.get("hours") or 0) <= 0:
+                return "ブーストの時間 (hours) が設定されていません。"
+            return None
+        return f"未知の商品タイプです: {item_type}"
+
+    async def _setup_purchase(
+        self,
+        member: discord.Member,
+        item: Any,
+        purchase: dict[str, Any],
+        *,
+        item_input: str | None,
+        item_color: str | None = None,
+    ) -> dict[str, Any]:
+        """商品タイプに応じて購入者へ実際の特典を渡す。
+
+        失敗したら例外を投げる。呼び出し側 (:meth:`purchase_shop_item`) が
+        自動返金を行うため、ここでは「渡せたか」だけに集中する。
+
+        Returns:
+            表示とログに使う情報 (``role_id`` / ``channel_id`` / ``detail`` 等)。
+        """
+        guild = member.guild
+        item_type = str(purchase["item_type"])
+        purchase_id = int(purchase["purchase_id"])
+        payload: dict[str, Any] = dict(purchase.get("payload") or {})
+        reason = utils.truncate(f"ショップ購入 #{purchase_id} ({item['name']})", 400)
+
+        if item_type == config.ShopItemType.ROLE:
+            role = guild.get_role(int(item["role_id"]))
+            if role is None:
+                raise ChargeError(config.ErrorCode.SHOP_ITEM_UNAVAILABLE,
+                                  "商品のロールが存在しません")
+            await member.add_roles(role, reason=reason)
+            return {"role_id": role.id, "role_name": role.name}
+
+        if item_type == config.ShopItemType.CUSTOM_ROLE:
+            name = utils.clean_display_name(item_input, limit=config.CUSTOM_NAME_MAX_LEN)
+            if not name:
+                raise ChargeError(config.ErrorCode.ITEM_INPUT_INVALID, "ロール名が空です")
+            # 管理者が色を固定していればそれを使い、していなければ購入者の指定を使う
+            color_value = utils.parse_color(payload.get("color")) if payload.get("color") else None
+            if color_value is None and item_color and item_color.strip():
+                color_value = utils.parse_color(item_color)
+                if color_value is None:
+                    raise ChargeError(
+                        config.ErrorCode.ITEM_INPUT_INVALID,
+                        "色は #RRGGBB の形式で入力してください",
+                    )
+            role = await guild.create_role(
+                name=name,
+                colour=discord.Colour(color_value) if color_value is not None
+                else discord.Colour.default(),
+                hoist=bool(payload.get("hoist")),
+                mentionable=False,
+                reason=reason,
+            )
+            # 作成直後に記録する (記録より先に付与すると後片付けできなくなる)
+            await self.db.add_purchase_asset(
+                purchase_id=purchase_id, guild_id=guild.id, user_id=member.id,
+                asset_type=config.PurchaseAssetType.ROLE, asset_id=role.id, detail=name,
+            )
+            await member.add_roles(role, reason=reason)
+            return {"role_id": role.id, "role_name": role.name, "detail": name}
+
+        if item_type == config.ShopItemType.NICKNAME:
+            nickname = utils.clean_display_name(item_input, limit=config.NICKNAME_MAX_LEN)
+            if not nickname:
+                raise ChargeError(config.ErrorCode.ITEM_INPUT_INVALID, "ニックネームが空です")
+            previous = member.nick or ""
+            # 元に戻せるように、変更前の値を先に保存する
+            await self.db.add_purchase_asset(
+                purchase_id=purchase_id, guild_id=guild.id, user_id=member.id,
+                asset_type=config.PurchaseAssetType.NICKNAME, asset_id=member.id,
+                detail=previous,
+            )
+            await member.edit(nick=nickname, reason=reason)
+            return {"detail": nickname, "previous": previous}
+
+        if item_type == config.ShopItemType.RATE_BOOST:
+            bonus = utils.to_decimal(payload.get("bonus_rate"))
+            hours = int(payload.get("hours") or 0)
+            if bonus is None or bonus <= 0 or hours <= 0:
+                raise ChargeError(config.ErrorCode.SHOP_ITEM_UNAVAILABLE,
+                                  "ブーストの設定が不正です")
+            bonus = min(bonus, utils.to_decimal(config.RATE_BOOST_MAX_BONUS) or bonus)
+            hours = min(hours, config.RATE_BOOST_MAX_HOURS)
+            expires_at = utils.now_ts() + hours * 3600
+            boost_id = await self.db.add_rate_boost(
+                guild_id=guild.id, user_id=member.id, bonus_rate=str(bonus),
+                expires_at=expires_at, source=f"SHOP-{purchase_id}", purchase_id=purchase_id,
+            )
+            return {"boost_id": boost_id, "bonus_rate": str(bonus), "hours": hours,
+                    "boost_expires_at": expires_at,
+                    "detail": f"+{utils.fmt_rate(bonus)} / {hours}時間"}
+
+        if item_type == config.ShopItemType.PRIVATE_CHANNEL:
+            raw_name = utils.clean_display_name(item_input, limit=config.CUSTOM_NAME_MAX_LEN)
+            channel_name = utils.channel_name_from(raw_name or member.display_name)
+            if not channel_name:
+                raise ChargeError(config.ErrorCode.ITEM_INPUT_INVALID, "チャンネル名が空です")
+            category: discord.CategoryChannel | None = None
+            category_id = payload.get("category_id")
+            if category_id:
+                found = guild.get_channel(int(category_id))
+                if isinstance(found, discord.CategoryChannel):
+                    category = found
+            me = guild.me
+            overwrites: dict[Any, discord.PermissionOverwrite] = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                member: discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True,
+                    attach_files=True, embed_links=True,
+                ),
+            }
+            if me is not None:
+                overwrites[me] = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, manage_channels=True,
+                    read_message_history=True,
+                )
+            channel = await guild.create_text_channel(
+                name=f"{config.PRIVATE_CHANNEL_PREFIX}{channel_name}",
+                category=category, overwrites=overwrites, reason=reason,
+            )
+            await self.db.add_purchase_asset(
+                purchase_id=purchase_id, guild_id=guild.id, user_id=member.id,
+                asset_type=config.PurchaseAssetType.CHANNEL, asset_id=channel.id,
+                detail=channel.name,
+            )
+            return {"channel_id": channel.id, "detail": channel.name}
+
+        raise ChargeError(config.ErrorCode.SHOP_ITEM_UNAVAILABLE,
+                          f"未対応の商品タイプです: {item_type}")
+
+    async def _teardown_purchase(self, purchase: Any, *, reason: str) -> list[str]:
+        """購入で渡したものを取り消す (返金・期限切れの共通処理)。
+
+        片付けは「記録済みの作成物」を基準に行うので、同じ購入について
+        二重に実行しても副作用は起きない (``removed_at`` で弾く)。
+
+        Returns:
+            実際に行った片付けの説明 (ログ用)。
+        """
+        guild_id = int(purchase["guild_id"])
+        user_id = int(purchase["user_id"])
+        purchase_id = int(purchase["id"])
+        item_type = str(purchase["item_type"] or config.ShopItemType.ROLE)
+        done: list[str] = []
+        guild = self.bot.get_guild(guild_id)
+
+        if item_type == config.ShopItemType.ROLE:
+            if await self._remove_purchase_role(
+                guild_id, user_id, int(purchase["role_id"]), reason=reason
+            ):
+                done.append("ロールを剥奪")
+            return done
+
+        if item_type == config.ShopItemType.RATE_BOOST:
+            if await self.db.remove_rate_boosts_for_purchase(purchase_id):
+                done.append("チャージ率ブーストを無効化")
+            return done
+
+        assets = await self.db.list_purchase_assets(purchase_id)
+        for asset in assets:
+            asset_row_id = int(asset["id"])
+            asset_type = str(asset["asset_type"])
+            target_id = asset["asset_id"]
+            try:
+                if asset_type == config.PurchaseAssetType.ROLE and guild is not None:
+                    role = guild.get_role(int(target_id)) if target_id else None
+                    if role is not None:
+                        await role.delete(reason=utils.truncate(reason, 400))
+                        done.append(f"作成したロール @{role.name} を削除")
+                elif asset_type == config.PurchaseAssetType.CHANNEL and guild is not None:
+                    channel = guild.get_channel(int(target_id)) if target_id else None
+                    if channel is not None:
+                        await channel.delete(reason=utils.truncate(reason, 400))
+                        done.append(f"作成したチャンネル #{channel.name} を削除")
+                elif asset_type == config.PurchaseAssetType.NICKNAME and guild is not None:
+                    member = guild.get_member(user_id)
+                    if member is not None:
+                        previous = str(asset["detail"] or "") or None
+                        await member.edit(nick=previous, reason=utils.truncate(reason, 400))
+                        done.append("ニックネームを元に戻した")
+            except discord.NotFound:
+                done.append("対象は既に存在しませんでした")
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.warning(
+                    "購入物の後片付けに失敗しました purchase=%s asset=%s: %s",
+                    purchase_id, asset_row_id, utils.safe_error_text(exc),
+                )
+                await self.alert_admins(
+                    guild_id, "購入物の後片付けに失敗",
+                    f"購入 `#{purchase_id}` の {asset_type} (ID: `{target_id}`) を"
+                    "自動で片付けられませんでした。手動で削除してください。",
+                )
+                continue  # 消せていないので removed_at は立てない
+            await self.db.mark_asset_removed(asset_row_id)
+        return done
+
+    async def apply_rate_boost(
+        self, guild_id: int, user_id: int, rate: Decimal
+    ) -> tuple[Decimal, Decimal | None]:
+        """有効なチャージ率ブーストを反映する。
+
+        複数持っている場合は**最も大きい1つ**だけを適用する (合算しない)。
+        合算を許すと、ブーストを買い集めるだけで率を無制限に上げられてしまう。
+
+        Returns:
+            ``(適用後の率, 加算したブースト量 or None)``
+        """
+        try:
+            rows = await self.db.list_active_rate_boosts(guild_id, user_id)
+        except Exception:  # noqa: BLE001 - 率の解決は失敗しても既定値で続行する
+            logger.exception("チャージ率ブーストの取得に失敗しました guild=%s user=%s",
+                             guild_id, user_id)
+            return rate, None
+        best: Decimal | None = None
+        for row in rows:
+            bonus = utils.to_decimal(row["bonus_rate"])
+            if bonus is None or bonus <= 0:
+                continue
+            if best is None or bonus > best:
+                best = bonus
+        if best is None:
+            return rate, None
+        cap = utils.to_decimal(config.RATE_BOOST_MAX_BONUS)
+        if cap is not None and best > cap:
+            best = cap
+        return rate + best, best
+
+    # ------------------------------------------------------------------
+    # サブスク (自動更新)
+    # ------------------------------------------------------------------
+    async def run_subscriptions(self) -> dict[str, int]:
+        """サブスクの更新予告と自動更新をまとめて処理する。"""
+        result = {"notified": 0, "renewed": 0, "failed": 0}
+        try:
+            notices = await self.db.list_subscription_notices()
+        except Exception:  # noqa: BLE001
+            logger.exception("サブスク予告の取得に失敗しました")
+            notices = []
+        for row in notices:
+            purchase_id = int(row["id"])
+            # 先に「送った」印を付ける。送信に失敗しても連続通知にはしない。
+            if not await self.db.mark_subscription_notified(purchase_id):
+                continue
+            balance = await self.db.get_balance(int(row["guild_id"]), int(row["user_id"]))
+            await self._send_dm(
+                int(row["user_id"]),
+                ui.subscription_notice_embed(
+                    item_name=str(row["item_name"]), price=int(row["price"]),
+                    next_charge_at=int(row["next_charge_at"]), balance=balance,
+                    purchase_id=purchase_id,
+                ),
+                queue_on_failure=False,
+            )
+            result["notified"] += 1
+
+        try:
+            due = await self.db.list_subscription_due()
+        except Exception:  # noqa: BLE001
+            logger.exception("サブスク更新対象の取得に失敗しました")
+            return result
+        for row in due:
+            purchase_id = int(row["id"])
+            try:
+                outcome = await self.db.renew_subscription(purchase_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("サブスクの更新に失敗しました purchase=%s", purchase_id)
+                continue
+            if outcome.get("renewed"):
+                result["renewed"] += 1
+                await self._after_subscription_renewed(purchase_id, outcome)
+            elif outcome.get("reason") == "NOT_DUE":
+                continue
+            else:
+                result["failed"] += 1
+                await self._after_subscription_failed(purchase_id, outcome)
+        if result["renewed"] or result["failed"] or result["notified"]:
+            logger.info(
+                "サブスク処理: 予告 %s 件 / 更新 %s 件 / 停止 %s 件",
+                result["notified"], result["renewed"], result["failed"],
+            )
+        return result
+
+    async def _after_subscription_renewed(
+        self, purchase_id: int, outcome: dict[str, Any]
+    ) -> None:
+        """更新に成功したときの通知・ログ。"""
+        guild_id = int(outcome["guild_id"])
+        user_id = int(outcome["user_id"])
+        self.metrics["subscription_renewals"] += 1
+        await self._safe(
+            self.post_shop_achievement(purchase_id, post_if_missing=False),
+            context="サブスク更新の実績更新",
+        )
+        await self.db.add_audit_log(
+            actor_id=config.SYSTEM_ACTOR_ID, action="SUBSCRIPTION_RENEW", guild_id=guild_id,
+            target_user_id=user_id,
+            detail={"purchase_id": purchase_id, "price": outcome["price"],
+                    "renewal_count": outcome["renewal_count"],
+                    "expires_at": outcome["expires_at"]},
+        )
+        await self._log_balance_from_history(
+            guild_id, user_id, change_type=config.BalanceChangeType.SUBSCRIPTION,
+            fallback=outcome,
+            reason=f"サブスク更新 ({outcome['renewal_count']}回目): {outcome['item_name']}",
+            transaction_id=f"SHOP-{purchase_id}-R{outcome['renewal_count']}",
+        )
+        await self._send_dm(
+            user_id,
+            ui.subscription_renewed_embed(
+                item_name=str(outcome["item_name"]), price=int(outcome["price"]),
+                balance_after=int(outcome["balance_after"]),
+                expires_at=int(outcome["expires_at"]),
+                renewal_count=int(outcome["renewal_count"]), purchase_id=purchase_id,
+            ),
+            queue_on_failure=False,
+        )
+        await self._safe(self.log_event(
+            guild_id, "🔁 サブスクを更新しました",
+            fields=(
+                ("利用者", f"<@{user_id}>", True),
+                ("商品", str(outcome["item_name"]), True),
+                ("価格", utils.fmt_int(int(outcome["price"])), True),
+                ("回数", f"{outcome['renewal_count']}回目", True),
+                ("次回", utils.format_jst(int(outcome["expires_at"])), True),
+                ("残高", f"{utils.fmt_int(int(outcome['balance_before']))} → "
+                         f"{utils.fmt_int(int(outcome['balance_after']))}", True),
+            ),
+            color=config.Color.ACCENT,
+        ), context="サブスク更新ログ")
+        self.request_ranking_refresh(guild_id)
+
+    async def _after_subscription_failed(
+        self, purchase_id: int, outcome: dict[str, Any]
+    ) -> None:
+        """更新できなかったとき (残高不足・商品停止・凍結) の後処理。
+
+        自動更新は解除済みなので、特典はここで直ちに取り消す。
+        期限切れタスクを待つと、支払いのない期間が生まれてしまう。
+        """
+        guild_id = int(outcome.get("guild_id") or 0)
+        user_id = int(outcome.get("user_id") or 0)
+        reason_code = str(outcome.get("reason") or "UNKNOWN")
+        purchase = await self.db.get_purchase(purchase_id)
+        if purchase is not None:
+            await self.db.mark_purchase_expired(purchase_id)
+            await self._teardown_purchase(
+                purchase, reason=f"サブスク更新の失敗 #{purchase_id} ({reason_code})"
+            )
+            await self._safe(
+                self.post_shop_achievement(purchase_id, post_if_missing=False),
+                context="サブスク終了の実績更新",
+            )
+        await self.db.add_audit_log(
+            actor_id=config.SYSTEM_ACTOR_ID, action="SUBSCRIPTION_STOP", guild_id=guild_id,
+            target_user_id=user_id,
+            detail={"purchase_id": purchase_id, "reason": reason_code},
+        )
+        if user_id:
+            await self._send_dm(
+                user_id,
+                ui.subscription_stopped_embed(
+                    item_name=str(outcome.get("item_name") or "商品"),
+                    reason_code=reason_code,
+                    price=int(outcome.get("price") or 0),
+                    balance=int(outcome.get("balance") or 0),
+                    purchase_id=purchase_id,
+                ),
+                queue_on_failure=False,
+            )
+        await self._safe(self.log_event(
+            guild_id, "⏹ サブスクを終了しました",
+            fields=(
+                ("利用者", f"<@{user_id}>", True),
+                ("商品", str(outcome.get("item_name") or "-"), True),
+                ("理由", config.SUBSCRIPTION_STOP_REASONS.get(reason_code, reason_code), True),
+            ),
+            color=config.Color.WARNING,
+        ), context="サブスク終了ログ")
+
+    async def cancel_subscription(
+        self, guild_id: int, purchase_id: int, *, user_id: int | None, operator_id: int
+    ) -> dict[str, Any]:
+        """自動更新を停止する (期限までは使えるまま残す)。"""
+        row = await self.db.cancel_subscription(
+            purchase_id, guild_id=guild_id, user_id=user_id
+        )
+        if row is None:
+            raise ChargeError(config.ErrorCode.SUBSCRIPTION_NOT_FOUND)
+        await self.db.add_audit_log(
+            actor_id=operator_id, action="SUBSCRIPTION_CANCEL", guild_id=guild_id,
+            target_user_id=int(row["user_id"]),
+            detail={"purchase_id": purchase_id, "item": str(row["item_name"])},
+        )
+        await self._safe(
+            self.post_shop_achievement(purchase_id, post_if_missing=False),
+            context="サブスク解約の実績更新",
+        )
+        await self._safe(self.log_event(
+            guild_id, "🚫 サブスクの自動更新を停止",
+            fields=(
+                ("利用者", f"<@{int(row['user_id'])}>", True),
+                ("商品", str(row["item_name"]), True),
+                ("期限", utils.format_jst(int(row["expires_at"])) if row["expires_at"]
+                 else "無期限", True),
+                ("操作者", f"<@{operator_id}>", True),
+            ),
+            color=config.Color.NEUTRAL,
+        ), context="サブスク解約ログ")
+        return {
+            "purchase_id": purchase_id, "item_name": str(row["item_name"]),
+            "expires_at": row["expires_at"], "user_id": int(row["user_id"]),
+            "price": int(row["price"]),
+        }
 
     # ==================================================================
     # 招待キャンペーン

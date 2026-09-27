@@ -669,6 +669,8 @@ class ErrorCode:
     REFUND_NOT_ELIGIBLE = "REFUND_NOT_ELIGIBLE"
     REFUND_ALREADY_REQUESTED = "REFUND_ALREADY_REQUESTED"
     ITEM_INPUT_INVALID = "ITEM_INPUT_INVALID"
+    ITEM_SETUP_FAILED = "ITEM_SETUP_FAILED"
+    SUBSCRIPTION_NOT_FOUND = "SUBSCRIPTION_NOT_FOUND"
     NO_KYASH_CAPACITY = "NO_KYASH_CAPACITY"
     PAYMENT_NOT_FOUND = "PAYMENT_NOT_FOUND"
     UNKNOWN_ERROR = "UNKNOWN_ERROR"
@@ -732,6 +734,8 @@ USER_ERROR_MESSAGES: Final[dict[str, str]] = {
     ErrorCode.REFUND_NOT_ELIGIBLE: "この取引は返金を申請できません。",
     ErrorCode.REFUND_ALREADY_REQUESTED: "この取引はすでに返金を申請しています。",
     ErrorCode.ITEM_INPUT_INVALID: "入力内容が正しくありません。",
+    ErrorCode.ITEM_SETUP_FAILED: "商品の用意に失敗しました。代金は自動で返金されています。",
+    ErrorCode.SUBSCRIPTION_NOT_FOUND: "継続中の対象が見つかりません。",
     ErrorCode.NO_KYASH_CAPACITY: "現在チャージを受け付けられません。時間をおいてお試しください。",
 }
 
@@ -793,6 +797,9 @@ USER_ERROR_NEXT_ACTIONS: Final[dict[str, str]] = {
     ErrorCode.REFUND_NOT_ELIGIBLE: "完了したチャージのうち、まだ取消されていないものだけが対象です。期限を過ぎた取引は管理者へご相談ください。",
     ErrorCode.REFUND_ALREADY_REQUESTED: "`/refund list` で申請の状態を確認してください。",
     ErrorCode.ITEM_INPUT_INVALID: "入力欄の説明にある形式で、もう一度入力してください。",
+    ErrorCode.ITEM_SETUP_FAILED: "残高が戻っているか確認し、時間をおいてもう一度お試しください。"
+                                 "続く場合は管理者へご連絡ください。",
+    ErrorCode.SUBSCRIPTION_NOT_FOUND: "`📦 購入履歴` で継続中の商品と購入IDを確認してください。",
     ErrorCode.NO_KYASH_CAPACITY: "別のチャージ方法を選ぶか、時間をおいてもう一度お試しください。",
 }
 
@@ -1031,11 +1038,54 @@ SHOP_TYPES_NEED_ROLE: Final[tuple[str, ...]] = (ShopItemType.ROLE,)
 SHOP_TYPES_WITH_ASSET: Final[tuple[str, ...]] = (
     ShopItemType.CUSTOM_ROLE, ShopItemType.PRIVATE_CHANNEL,
 )
+#: 購入時に利用者の入力が必要な種類 (Modal を出す)
+SHOP_TYPES_NEED_INPUT: Final[tuple[str, ...]] = (
+    ShopItemType.CUSTOM_ROLE, ShopItemType.NICKNAME, ShopItemType.PRIVATE_CHANNEL,
+)
+#: 同じものを重複して持てない種類 (無期限の場合に所持チェックをする)
+SHOP_TYPES_UNIQUE: Final[tuple[str, ...]] = (ShopItemType.ROLE,)
+#: 購入時に利用者へ入力を求めるラベル (Modal の項目名)
+SHOP_INPUT_LABELS: Final[dict[str, str]] = {
+    ShopItemType.CUSTOM_ROLE: "ロール名",
+    ShopItemType.NICKNAME: "新しいニックネーム",
+    ShopItemType.PRIVATE_CHANNEL: "チャンネル名",
+}
+#: 各種類の説明 (管理者・利用者の双方に見せる)
+SHOP_ITEM_TYPE_DESCRIPTIONS: Final[dict[str, str]] = {
+    ShopItemType.ROLE: "設定済みのロールをそのまま付与します。",
+    ShopItemType.CUSTOM_ROLE: "購入者が名前と色を決めたロールを新しく作って付与します。",
+    ShopItemType.NICKNAME: "購入者のニックネームを変更します (期限が切れると元に戻します)。",
+    ShopItemType.RATE_BOOST: "一定時間だけチャージ率が上がります。",
+    ShopItemType.PRIVATE_CHANNEL: "購入者だけが見られる専用チャンネルを作ります。",
+}
+#: 全種類 (コマンドの選択肢生成に使う)
+ALL_SHOP_ITEM_TYPES: Final[tuple[str, ...]] = (
+    ShopItemType.ROLE, ShopItemType.CUSTOM_ROLE, ShopItemType.NICKNAME,
+    ShopItemType.RATE_BOOST, ShopItemType.PRIVATE_CHANNEL,
+)
+#: 専用チャンネル名の接頭辞 (作成物だと分かるようにする)
+PRIVATE_CHANNEL_PREFIX: Final[str] = "🔒"
+#: 監査ログで「Bot の自動処理」を表す実行者ID
+#: Discord のユーザーIDと衝突しない 0 を使い、表示時は「自動処理」と出す。
+SYSTEM_ACTOR_ID: Final[int] = 0
+
+#: 1サーバーで作れるロール数の安全上限 (Discord の上限 250 に余裕を持たせる)
+GUILD_ROLE_SOFT_LIMIT: Final[int] = 230
+#: サブスクが終了した理由の表示名
+SUBSCRIPTION_STOP_REASONS: Final[dict[str, str]] = {
+    "INSUFFICIENT_BALANCE": "残高不足",
+    "ITEM_UNAVAILABLE": "商品が販売停止になった",
+    "USER_FROZEN": "利用者が凍結されている",
+    "CANCELLED": "利用者が自動更新を停止した",
+    "UNKNOWN": "不明",
+}
 
 
 class PurchaseAssetType:
-    ROLE = "ROLE"        # Bot が作成したロール
-    CHANNEL = "CHANNEL"  # Bot が作成したチャンネル
+    ROLE = "ROLE"          # Bot が作成したロール
+    CHANNEL = "CHANNEL"    # Bot が作成したチャンネル
+    NICKNAME = "NICKNAME"  # 変更前のニックネーム (戻すために保存する)
+    RATE_BOOST = "RATE_BOOST"  # 付与したチャージ率ブースト
 
 
 #: カスタムロール・専用チャンネルの名前の長さ

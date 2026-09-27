@@ -527,6 +527,9 @@ def shop_achievement_embed(
     purchase_id: int,
     timestamp: int,
     status: str = config.PurchaseStatus.ACTIVE,
+    item_type: str = config.ShopItemType.ROLE,
+    subscription: bool = False,
+    renewal_count: int = 0,
 ) -> discord.Embed:
     """ショップ購入の実績 (実績チャンネルへ投稿)。
 
@@ -543,8 +546,21 @@ def shop_achievement_embed(
 
     embed = discord.Embed(title="🛒 ショップ購入実績", description=SEPARATOR, color=color)
     embed.add_field(name="ユーザー", value=user_mention, inline=False)
-    embed.add_field(name="商品", value=f"**{item_name}**", inline=True)
-    embed.add_field(name="ロール", value=f"<@&{role_id}>", inline=True)
+    embed.add_field(
+        name="商品",
+        value=f"**{item_name}**" + ("  🔁" if subscription else ""),
+        inline=True,
+    )
+    # ロール販売以外では role_id を使わないため、種類を表示する
+    if item_type == config.ShopItemType.ROLE:
+        embed.add_field(name="ロール", value=f"<@&{role_id}>", inline=True)
+    else:
+        embed.add_field(
+            name="種類",
+            value=f"{config.SHOP_ITEM_TYPE_EMOJI.get(item_type, '🎫')} "
+                  f"{config.SHOP_ITEM_TYPE_LABELS.get(item_type, item_type)}",
+            inline=True,
+        )
     embed.add_field(name="支払い", value=f"**{utils.fmt_int(price)}**", inline=True)
     embed.add_field(name="状態", value=state_text, inline=True)
     embed.add_field(
@@ -555,6 +571,8 @@ def shop_achievement_embed(
     embed.add_field(name="日時", value=utils.discord_ts(timestamp), inline=True)
     embed.add_field(name="購入後の残高", value=f"**{utils.fmt_int(balance_after)}**", inline=True)
     embed.add_field(name="購入ID", value=f"`{purchase_id}`", inline=True)
+    if renewal_count:
+        embed.add_field(name="自動更新", value=f"{renewal_count}回目", inline=True)
     embed.set_footer(text="内部残高システム")
     return embed
 
@@ -1139,23 +1157,29 @@ def shop_panel_embed(settings: "GuildSettings", items: Sequence[Any]) -> discord
             inline=False,
         )
         return embed
+    has_subscription = False
+    has_input = False
     for item in list(items)[:10]:
-        duration = int(item["duration_days"])
+        item_type = str(item["item_type"] or config.ShopItemType.ROLE)
         stock = int(item["stock"])
         limit = int(item["purchase_limit"])
+        subscription = bool(int(item["subscription"] or 0)) and int(item["duration_days"]) > 0
+        has_subscription = has_subscription or subscription
+        has_input = has_input or item_type in config.SHOP_TYPES_NEED_INPUT
         lines = [
             f"💰 **{utils.fmt_int(int(item['price']))}**",
-            f"⏳ {f'{duration}日間' if duration > 0 else '無期限 (買い切り)'}",
+            f"⏳ {shop_item_period_text(item)}",
         ]
         if stock >= 0:
             lines.append(f"📦 残り **{stock}** 個" if stock else "📦 **在庫切れ**")
         if limit > 0:
             lines.append(f"🔒 1人 {limit} 回まで")
-        detail = "　".join(lines)
+        detail = "　".join(lines) + f"\n🎁 {shop_item_reward_text(item)}"
         if item["description"]:
             detail += f"\n{utils.truncate(str(item['description']), 180)}"
         embed.add_field(
-            name=f"🎫 {item['name']} → <@&{int(item['role_id'])}>",
+            name=f"{config.SHOP_ITEM_TYPE_EMOJI.get(item_type, '🎫')} {item['name']}"
+                 + ("  🔁 自動更新" if subscription else ""),
             value=detail,
             inline=False,
         )
@@ -1164,23 +1188,50 @@ def shop_panel_embed(settings: "GuildSettings", items: Sequence[Any]) -> discord
         value=(
             "**1.** `🛒 ショップを開く` を押す\n"
             "**2.** 商品を選ぶ (残高も表示されます)\n"
-            "**3.** 内容を確認して `購入する` を押す\n"
-            "→ 残高が引かれ、ロールがすぐに付与されます"
+            + ("**3.** 名前などを入力する (必要な商品のみ)\n**4.** " if has_input else "**3.** ")
+            + "内容を確認して `購入する` を押す\n"
+            "→ 残高が引かれ、特典がすぐに反映されます"
         ),
         inline=False,
     )
+    if has_subscription:
+        embed.add_field(
+            name="🔁 自動更新つきの商品について",
+            value=(
+                "期限が来ると**残高から自動で同じ金額を引き落とし**、期間を延長します。\n"
+                "更新の1日前に DM でお知らせします。\n"
+                "止めたいときは `/shop cancel purchase_id:<購入ID>` を実行してください "
+                "(期限までは使えます)。\n"
+                "残高が足りない場合は自動で終了し、特典は取り消されます。"
+            ),
+            inline=False,
+        )
     embed.set_footer(text="購入後のキャンセルは管理者へご相談ください")
     return embed
 
 
 def purchase_success_embed(
-    *, item_name: str, role_id: int, price: int, balance_after: int,
+    *, item_name: str, price: int, balance_after: int,
     expires_at: int | None, purchase_id: int,
+    role_id: int | None = None, channel_id: int | None = None,
+    item_type: str = config.ShopItemType.ROLE, detail: str | None = None,
+    subscription: bool = False, next_charge_at: int | None = None,
 ) -> discord.Embed:
+    """購入完了の案内 (商品タイプごとに「何が起きたか」を書き分ける)。"""
+    if role_id:
+        granted = f"<@&{role_id}> を付与しました。"
+    elif channel_id:
+        granted = f"専用チャンネル <#{channel_id}> を作成しました。"
+    elif item_type == config.ShopItemType.NICKNAME:
+        granted = f"ニックネームを **{detail}** に変更しました。"
+    elif item_type == config.ShopItemType.RATE_BOOST:
+        granted = f"チャージ率ブースト **{detail}** を適用しました。"
+    else:
+        granted = f"{detail or '特典'} を適用しました。"
     embed = discord.Embed(
         title="✅ 購入が完了しました",
         description=(
-            f"{SEPARATOR}\n<@&{role_id}> を付与しました。\n"
+            f"{SEPARATOR}\n{granted}\n"
             f"残高が **-{utils.fmt_int(price)}** されました。\n{SEPARATOR}"
         ),
         color=config.Color.SUCCESS,
@@ -1196,10 +1247,20 @@ def purchase_success_embed(
         inline=True,
     )
     embed.add_field(name="購入ID", value=f"`{purchase_id}`", inline=True)
-    if expires_at:
+    if subscription and next_charge_at:
+        embed.add_field(
+            name="🔁 次回の自動更新",
+            value=(
+                f"{utils.discord_ts(next_charge_at)} に **{utils.fmt_int(price)}** を"
+                "残高から引き落とします。\n"
+                f"止めるときは `/shop cancel purchase_id:{purchase_id}`"
+            ),
+            inline=False,
+        )
+    elif expires_at:
         embed.add_field(
             name="ご注意",
-            value="有効期限が切れると**ロールは自動で外れます**。",
+            value="有効期限が切れると**特典は自動で取り消されます**。",
             inline=False,
         )
     embed.set_footer(text="購入履歴は 📦 ボタンから確認できます")
@@ -1223,9 +1284,11 @@ def purchase_confirm_embed(
     duration = int(item["duration_days"])
     stock = int(item["stock"])
     limit = int(item["purchase_limit"])
+    item_type = str(item["item_type"] or config.ShopItemType.ROLE)
+    subscription = bool(int(item["subscription"] or 0)) and duration > 0
 
     blocker: str | None = None
-    if duration == 0 and already_has_role:
+    if duration == 0 and already_has_role and item_type in config.SHOP_TYPES_UNIQUE:
         blocker = "すでにこのロールを持っています。"
     elif stock == 0:
         blocker = "在庫がありません。"
@@ -1237,22 +1300,38 @@ def purchase_confirm_embed(
             "`💰 チャージ` で残高を増やしてから、もう一度お試しください。"
         )
 
+    if blocker is None and item_type in config.SHOP_TYPES_NEED_INPUT:
+        action_text = (
+            f"下の `購入する` を押すと**{config.SHOP_INPUT_LABELS.get(item_type, '内容')}の"
+            "入力欄**が開きます。入力を送ると残高から引き落とします。\n"
+        )
+    elif blocker is None:
+        action_text = "下の `購入する` を押すと**すぐに残高から引き落とし**、特典が反映されます。\n"
+    else:
+        action_text = f"{blocker}\n"
     embed = discord.Embed(
         title="🛒 購入の確認" if blocker is None else "⚠️ いま購入できません",
-        description=(
-            f"{SEPARATOR}\n"
-            + ("下の `購入する` を押すと**すぐに残高から引き落とし**、ロールが付きます。\n"
-               if blocker is None else f"{blocker}\n")
-            + SEPARATOR
-        ),
+        description=f"{SEPARATOR}\n{action_text}{SEPARATOR}",
         color=config.Color.ACCENT if blocker is None else config.Color.WARNING,
     )
     embed.add_field(name="商品", value=f"**{item['name']}**", inline=True)
-    embed.add_field(name="もらえるロール", value=f"<@&{int(item['role_id'])}>", inline=True)
+    embed.add_field(
+        name="種類",
+        value=f"{config.SHOP_ITEM_TYPE_EMOJI.get(item_type, '🎫')} "
+              f"{config.SHOP_ITEM_TYPE_LABELS.get(item_type, item_type)}",
+        inline=True,
+    )
     embed.add_field(name="価格", value=f"**{utils.fmt_int(price)}**", inline=True)
+    embed.add_field(name="もらえるもの", value=shop_item_reward_text(item), inline=False)
     embed.add_field(
         name="有効期間",
-        value=(f"**{duration}日間** (期限が来ると自動で外れます)" if duration > 0 else "**無期限**"),
+        value=(
+            f"**{duration}日ごとに自動更新**\n"
+            f"期限のたびに **{utils.fmt_int(price)}** を残高から引き落とします。"
+            if subscription else
+            f"**{duration}日間** (期限が来ると自動で取り消されます)" if duration > 0
+            else "**無期限**"
+        ),
         inline=False,
     )
     embed.add_field(name="いまの残高", value=f"**{utils.fmt_int(balance)}**", inline=True)
@@ -1272,11 +1351,55 @@ def purchase_confirm_embed(
         embed.add_field(
             name="説明", value=utils.truncate(str(item["description"]), 900), inline=False
         )
+    if subscription and blocker is None:
+        embed.add_field(
+            name="🔁 自動更新の注意",
+            value=(
+                "更新の1日前に DM でお知らせします。\n"
+                "`/shop cancel purchase_id:<購入ID>` でいつでも停止できます (期限までは使えます)。\n"
+                "更新時に残高が足りない場合は自動で終了し、特典は取り消されます。"
+            ),
+            inline=False,
+        )
     embed.set_footer(
         text="購入後の返金は管理者の操作が必要です" if blocker is None
         else "条件を満たすと購入できるようになります"
     )
     return embed, blocker
+
+
+def shop_item_reward_text(item: Any) -> str:
+    """商品を買うと何が手に入るかを1行で説明する。
+
+    商品タイプごとに表示を切り替える。ロール販売以外では ``role_id`` を
+    使わないため、ロールのメンションを出さない。
+    """
+    item_type = str(item["item_type"] or config.ShopItemType.ROLE)
+    payload = utils.load_json_dict(item["payload"])
+    if item_type == config.ShopItemType.ROLE:
+        return f"<@&{int(item['role_id'])}> を付与"
+    if item_type == config.ShopItemType.CUSTOM_ROLE:
+        color = payload.get("color")
+        return "好きな名前のロールを作成" + (f" (色は #{color} に固定)" if color else " (色も指定可)")
+    if item_type == config.ShopItemType.NICKNAME:
+        return "ニックネームを変更"
+    if item_type == config.ShopItemType.RATE_BOOST:
+        bonus = payload.get("bonus_rate")
+        hours = payload.get("hours")
+        return f"チャージ率 **+{utils.fmt_rate(bonus)}** を **{hours}時間**"
+    if item_type == config.ShopItemType.PRIVATE_CHANNEL:
+        return "自分だけの専用チャンネルを作成"
+    return config.SHOP_ITEM_TYPE_LABELS.get(item_type, item_type)
+
+
+def shop_item_period_text(item: Any) -> str:
+    """有効期間の表示 (サブスクかどうかも含める)。"""
+    duration = int(item["duration_days"])
+    if duration <= 0:
+        return "無期限 (買い切り)"
+    if int(item["subscription"] or 0):
+        return f"{duration}日ごとに**自動更新** (残高から自動で引き落とし)"
+    return f"{duration}日間"
 
 
 def my_items_embed(rows: Sequence[Any]) -> discord.Embed:
@@ -1287,21 +1410,170 @@ def my_items_embed(rows: Sequence[Any]) -> discord.Embed:
         color=config.Color.INFO,
     )
     for row in list(rows)[:10]:
+        item_type = str(row["item_type"] or config.ShopItemType.ROLE)
+        emoji = config.SHOP_ITEM_TYPE_EMOJI.get(item_type, "🎫")
+        subscription = bool(row["subscription"])
+        lines = [
+            f"種類: {emoji} {config.SHOP_ITEM_TYPE_LABELS.get(item_type, item_type)}",
+        ]
+        if item_type == config.ShopItemType.ROLE:
+            lines.append(f"ロール: <@&{int(row['role_id'])}>")
+        lines.append(f"価格: {utils.fmt_int(int(row['price']))}")
+        lines.append(f"購入: {utils.discord_ts(int(row['created_at']))}")
+        if row["expires_at"]:
+            lines.append(
+                f"期限: {utils.discord_ts(row['expires_at'])} "
+                f"({utils.discord_ts(row['expires_at'], 'R')})"
+            )
+        else:
+            lines.append("期限: 無期限")
+        if subscription and row["next_charge_at"]:
+            lines.append(
+                f"🔁 次回更新: {utils.discord_ts(row['next_charge_at'])} — "
+                f"**{utils.fmt_int(int(row['price']))}** を自動で引き落とし"
+            )
+        elif int(row["renewal_count"] or 0):
+            lines.append(f"更新回数: {int(row['renewal_count'])}回 (自動更新は停止中)")
+        lines.append(f"購入ID: `{row['id']}`")
         embed.add_field(
             name=f"{config.PURCHASE_STATUS_LABELS.get(str(row['status']), str(row['status']))} "
-                 f"{row['item_name']}",
+                 f"{row['item_name']}" + ("  🔁" if subscription else ""),
+            value="\n".join(lines),
+            inline=False,
+        )
+    if any(bool(r["subscription"]) for r in rows):
+        embed.set_footer(text="自動更新を止めるには /shop cancel purchase_id:<購入ID>")
+    return embed
+
+
+def subscription_notice_embed(
+    *, item_name: str, price: int, next_charge_at: int, balance: int, purchase_id: int
+) -> discord.Embed:
+    """自動更新の予告 DM (引き落としの前に必ず知らせる)。"""
+    enough = balance >= price
+    embed = discord.Embed(
+        title="🔁 自動更新のお知らせ",
+        description=(
+            f"{SEPARATOR}\n**{item_name}** の自動更新が近づいています。\n"
+            f"{utils.discord_ts(next_charge_at)} "
+            f"({utils.discord_ts(next_charge_at, 'R')}) に "
+            f"**{utils.fmt_int(price)}** を残高から引き落とします。\n{SEPARATOR}"
+        ),
+        color=config.Color.INFO if enough else config.Color.WARNING,
+    )
+    embed.add_field(name="いまの残高", value=f"**{utils.fmt_int(balance)}**", inline=True)
+    embed.add_field(name="更新料", value=f"**{utils.fmt_int(price)}**", inline=True)
+    embed.add_field(
+        name="判定",
+        value=("🟢 残高は足りています" if enough
+               else f"🔴 **{utils.fmt_int(price - balance)}** 不足しています"),
+        inline=True,
+    )
+    if not enough:
+        embed.add_field(
+            name="このままだと",
             value=(
-                f"ロール: <@&{int(row['role_id'])}>\n"
-                f"価格: {utils.fmt_int(int(row['price']))}\n"
-                f"購入: {utils.discord_ts(int(row['created_at']))}\n"
-                + (
-                    f"期限: {utils.discord_ts(row['expires_at'])} "
-                    f"({utils.discord_ts(row['expires_at'], 'R')})\n"
-                    if row["expires_at"] else "期限: 無期限\n"
-                )
-                + f"購入ID: `{row['id']}`"
+                "更新できず、この商品の特典は**自動で取り消されます**。\n"
+                "続けたい場合は更新日までにチャージしてください。"
             ),
             inline=False,
+        )
+    embed.add_field(
+        name="自動更新を止めたいとき",
+        value=f"`/shop cancel purchase_id:{purchase_id}` (期限までは使えます)",
+        inline=False,
+    )
+    return embed
+
+
+def subscription_renewed_embed(
+    *, item_name: str, price: int, balance_after: int, expires_at: int,
+    renewal_count: int, purchase_id: int,
+) -> discord.Embed:
+    """自動更新に成功したときの DM。"""
+    embed = discord.Embed(
+        title="🔁 自動更新しました",
+        description=(
+            f"{SEPARATOR}\n**{item_name}** を更新しました "
+            f"({renewal_count}回目)。\n"
+            f"残高が **-{utils.fmt_int(price)}** されました。\n{SEPARATOR}"
+        ),
+        color=config.Color.SUCCESS,
+    )
+    embed.add_field(name="更新後の残高", value=f"**{utils.fmt_int(balance_after)}**", inline=True)
+    embed.add_field(
+        name="次回の更新",
+        value=f"{utils.discord_ts(expires_at)}\n({utils.discord_ts(expires_at, 'R')})",
+        inline=True,
+    )
+    embed.add_field(name="購入ID", value=f"`{purchase_id}`", inline=True)
+    embed.set_footer(text="止めるときは /shop cancel を実行してください")
+    return embed
+
+
+def subscription_stopped_embed(
+    *, item_name: str, reason_code: str, price: int, balance: int, purchase_id: int
+) -> discord.Embed:
+    """自動更新できずに終了したときの DM。"""
+    reason = config.SUBSCRIPTION_STOP_REASONS.get(reason_code, reason_code)
+    embed = discord.Embed(
+        title="⏹ 自動更新を終了しました",
+        description=(
+            f"{SEPARATOR}\n**{item_name}** の自動更新を終了し、特典を取り消しました。\n"
+            f"理由: **{reason}**\n{SEPARATOR}"
+        ),
+        color=config.Color.WARNING,
+    )
+    if reason_code == "INSUFFICIENT_BALANCE":
+        embed.add_field(name="必要だった額", value=f"**{utils.fmt_int(price)}**", inline=True)
+        embed.add_field(name="そのときの残高", value=f"**{utils.fmt_int(balance)}**", inline=True)
+        embed.add_field(
+            name="また使いたいときは",
+            value="チャージして残高を用意し、ショップからもう一度購入してください。",
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="また使いたいときは",
+            value="ショップの状況を確認するか、管理者へご相談ください。",
+            inline=False,
+        )
+    embed.add_field(name="購入ID", value=f"`{purchase_id}`", inline=True)
+    return embed
+
+
+def subscription_list_embed(rows: Sequence[Any], *, guild_name: str) -> discord.Embed:
+    """自動更新中の購入一覧 (管理者用)。"""
+    embed = discord.Embed(
+        title="🔁 自動更新中の購入",
+        description=(
+            f"{SEPARATOR}\n**{guild_name}**\n"
+            + (f"{len(rows)} 件が自動更新の対象です。" if rows else "自動更新中の購入はありません。")
+            + f"\n{SEPARATOR}"
+        ),
+        color=config.Color.INFO,
+    )
+    total = 0
+    for row in list(rows)[:15]:
+        price = int(row["price"])
+        total += price
+        item_type = str(row["item_type"] or config.ShopItemType.ROLE)
+        embed.add_field(
+            name=f"#{int(row['id'])} {row['item_name']}",
+            value=(
+                f"利用者: <@{int(row['user_id'])}>\n"
+                f"種類: {config.SHOP_ITEM_TYPE_EMOJI.get(item_type, '🎫')} "
+                f"{config.SHOP_ITEM_TYPE_LABELS.get(item_type, item_type)}\n"
+                f"更新料: {utils.fmt_int(price)}\n"
+                + (f"次回: {utils.discord_ts(row['next_charge_at'])}\n"
+                   if row["next_charge_at"] else "")
+                + f"更新回数: {int(row['renewal_count'] or 0)}回"
+            ),
+            inline=True,
+        )
+    if rows:
+        embed.add_field(
+            name="1周期あたりの合計", value=f"**{utils.fmt_int(total)}**", inline=False
         )
     return embed
 
@@ -3024,6 +3296,65 @@ class ShopPanelView(discord.ui.View):
         await bot_of(interaction).on_shop_myitems_button(interaction)
 
 
+class ItemInputModal(discord.ui.Modal):
+    """購入時に名前などを入力してもらう Modal。
+
+    カスタムロール・ニックネーム・専用チャンネルは利用者の入力が要るため、
+    「購入する」を押した後にこの画面を出す。入力を送った時点で購入を確定する。
+    """
+
+    def __init__(self, item: Any) -> None:
+        item_type = str(item["item_type"] or config.ShopItemType.ROLE)
+        label = config.SHOP_INPUT_LABELS.get(item_type, "内容")
+        super().__init__(
+            title=utils.truncate(f"{item['name']} の{label}", 45), timeout=300
+        )
+        self.item_id = int(item["id"])
+        self.item_type = item_type
+        limit = (
+            config.NICKNAME_MAX_LEN if item_type == config.ShopItemType.NICKNAME
+            else config.CUSTOM_NAME_MAX_LEN
+        )
+        if item_type == config.ShopItemType.PRIVATE_CHANNEL:
+            placeholder = "例: わたしの部屋 (記号は - に置き換わります)"
+        elif item_type == config.ShopItemType.NICKNAME:
+            placeholder = "例: たろう"
+        else:
+            placeholder = "例: 常連さん"
+        self.value_input: discord.ui.TextInput = discord.ui.TextInput(
+            label=utils.truncate(label, 45),
+            placeholder=placeholder,
+            required=True,
+            min_length=1,
+            max_length=limit,
+        )
+        self.add_item(self.value_input)
+        # カスタムロールのみ、色も選べるようにする (管理者が固定していれば無視される)
+        self.color_input: discord.ui.TextInput | None = None
+        if item_type == config.ShopItemType.CUSTOM_ROLE and not (
+            utils.load_json_dict(item["payload"]).get("color")
+        ):
+            self.color_input = discord.ui.TextInput(
+                label="色 (任意・#RRGGBB 形式)",
+                placeholder="例: #FF66AA / 空欄なら色なし",
+                required=False,
+                min_length=0,
+                max_length=7,
+            )
+            self.add_item(self.color_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        color = str(self.color_input.value) if self.color_input is not None else None
+        await bot_of(interaction).finish_shop_purchase(
+            interaction, self.item_id,
+            item_input=str(self.value_input.value), item_color=color, defer=True,
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
+        logger.error("購入入力Modalでエラー: %s", utils.safe_error_text(error))
+        await safe_respond(interaction, embed=error_embed(config.ErrorCode.UNKNOWN_ERROR))
+
+
 class ShopSelect(discord.ui.Select["ShopSelectView"]):
     """商品の選択メニュー (在庫や価格が変わるため都度生成する)。"""
 
@@ -3032,16 +3363,23 @@ class ShopSelect(discord.ui.Select["ShopSelectView"]):
         for item in list(items)[:25]:
             duration = int(item["duration_days"])
             stock = int(item["stock"])
+            item_type = str(item["item_type"] or config.ShopItemType.ROLE)
+            subscription = bool(int(item["subscription"] or 0)) and duration > 0
             details = [f"{utils.fmt_int(int(item['price']))}"]
-            details.append(f"{duration}日間" if duration > 0 else "無期限")
+            if subscription:
+                details.append(f"{duration}日ごと自動更新")
+            else:
+                details.append(f"{duration}日間" if duration > 0 else "無期限")
+            details.append(config.SHOP_ITEM_TYPE_LABELS.get(item_type, item_type))
             if stock >= 0:
                 details.append(f"残り{stock}個")
             options.append(
                 discord.SelectOption(
-                    label=utils.truncate(str(item["name"]), 90),
+                    label=utils.truncate(
+                        ("🔁 " if subscription else "") + str(item["name"]), 90),
                     value=str(int(item["id"])),
                     description=utils.truncate(" / ".join(details), 90),
-                    emoji="🎫",
+                    emoji=config.SHOP_ITEM_TYPE_EMOJI.get(item_type, "🎫"),
                 )
             )
         # 都度生成する一時 View なので custom_id は固定しない (永続 View ではない)
@@ -3063,6 +3401,59 @@ class ShopSelect(discord.ui.Select["ShopSelectView"]):
             )
             return
         await bot_of(interaction).on_shop_select(interaction, int(value))
+
+
+class ShopConfirmView(discord.ui.View):
+    """購入の最終確認 (Ephemeral)。
+
+    入力が必要な商品では、この確認ボタンから直接 Modal を開く。
+    一度応答した interaction では Modal を出せないため、``ConfirmView`` の
+    ように先に画面を書き換えてから待つ作り方はできない。
+    """
+
+    def __init__(self, item: Any, *, owner_id: int) -> None:
+        super().__init__(timeout=120)
+        self._owner_id = owner_id
+        self._item = item
+        self._item_id = int(item["id"])
+        self._needs_input = (
+            str(item["item_type"] or config.ShopItemType.ROLE)
+            in config.SHOP_TYPES_NEED_INPUT
+        )
+        self.confirm.label = "入力して購入する" if self._needs_input else "購入する"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:  # type: ignore[override]
+        if interaction.user.id != self._owner_id:
+            await safe_respond(interaction, embed=error_embed(config.ErrorCode.NOT_ALLOWED))
+            return False
+        return True
+
+    @discord.ui.button(label="購入する", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        for child in self.children:
+            child.disabled = True  # type: ignore[attr-defined]
+        if self._needs_input:
+            # Modal を先に出す (ここで応答してしまうと Modal を出せない)
+            await interaction.response.send_modal(ItemInputModal(self._item))
+            self.stop()
+            return
+        await interaction.response.edit_message(
+            embed=info_embed("⏳ 購入中", "処理を実行しています…", color=config.Color.WARNING),
+            view=self,
+        )
+        self.stop()
+        await bot_of(interaction).finish_shop_purchase(interaction, self._item_id)
+
+    @discord.ui.button(label="やめる", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        for child in self.children:
+            child.disabled = True  # type: ignore[attr-defined]
+        await interaction.response.edit_message(
+            embed=info_embed("キャンセルしました", "購入は行われていません。",
+                             color=config.Color.NEUTRAL),
+            view=self,
+        )
+        self.stop()
 
 
 class ShopSelectView(discord.ui.View):

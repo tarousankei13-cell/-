@@ -294,6 +294,7 @@ class StubInteraction:
         self.embeds: list[discord.Embed] = []
         self.files: list[object] = []
         self.modals: list[discord.ui.Modal] = []
+        self.views: list[discord.ui.View] = []
         self.response = StubResponse(self)
         self.followup = StubFollowup(self)
 
@@ -303,6 +304,9 @@ class StubInteraction:
             self.embeds.append(embed)
         if kwargs.get("file") is not None:
             self.files.append(kwargs["file"])
+        view = kwargs.get("view")
+        if isinstance(view, discord.ui.View):
+            self.views.append(view)
 
     @property
     def titles(self) -> list[str]:
@@ -770,8 +774,23 @@ async def main() -> None:
         select_interaction = fresh(rich)
         balance_before_purchase = await bot.db.get_balance(G, rich.id)
         purchases_before = (await bot.db.list_purchases(G, limit=1))[1]
-        await run_ui("ショップ: 商品選択→購入", select.callback(select_interaction),
+        await run_ui("ショップ: 商品選択", select.callback(select_interaction),
                      select_interaction)
+        # 確認画面の「購入する」を実際に押す (ここで初めて残高が動く)
+        confirm_views = [
+            v for v in select_interaction.views if isinstance(v, ui.ShopConfirmView)
+        ]
+        if confirm_views:
+            buy_button = next(
+                c for c in confirm_views[0].children
+                if isinstance(c, discord.ui.Button) and c.style == discord.ButtonStyle.success
+            )
+            buy_interaction = fresh(rich)
+            await run_ui("ショップ: 購入を確定", buy_button.callback(buy_interaction),
+                         buy_interaction)
+        else:
+            FAILURES.append(("ショップ: 商品選択", "確認Viewが返らなかった"))
+            print(" FAIL  ショップ: 確認Viewが出ない")
         purchases_after = (await bot.db.list_purchases(G, limit=1))[1]
         balance_after_purchase = await bot.db.get_balance(G, rich.id)
         price = int(items[0]["price"])

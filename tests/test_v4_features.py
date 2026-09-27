@@ -134,6 +134,7 @@ class StubChannel:
         self.sent: list[discord.Embed] = []
         self.messages: dict[int, Any] = {}
         self.deleted = False
+        self.overwrites: dict[Any, Any] = {}
 
     def permissions_for(self, member: object) -> StubPermissions:
         return StubPermissions()
@@ -225,6 +226,7 @@ class StubGuild:
                                   reason: str | None = None, **kw: Any) -> StubChannel:
         self._next_id += 1
         ch = StubChannel(self._next_id, self, name)
+        ch.overwrites = overwrites or {}  # 公開範囲の検証に使う
         self.text_channels.append(ch)
         self.created_channels.append(ch)
         return ch
@@ -599,7 +601,293 @@ async def main() -> None:
     check(len(bot.kyash.slots()) == 2, "削除できる")
     check(await bot.db.get_kyash_account_row(ids[2]) is None, "DB からも消える")
 
-    print("\n=== 4. 整合性 ===")
+    print("\n=== 4. 商品タイプの拡張 ===")
+    shopper = guild.add_member(StubMember(63_101, guild))
+    await bot.db.update_settings(G, shop_enabled=1)
+    await bot.db.adjust_balance(
+        guild_id=G, user_id=shopper.id, amount=500_000,
+        change_type=config.BalanceChangeType.ADMIN_ADD,
+        operator_id=OWNER_ID, reason="テスト用",
+    )
+
+    async def buy(item_id: int, *, value: str | None = None, color: str | None = None):
+        return await bot.charge.purchase_shop_item(
+            shopper, item_id, item_input=value, item_color=color
+        )
+
+    # --- カスタムロール: 名前と色を指定して新規作成 ---
+    custom_id = await bot.db.add_shop_item(
+        guild_id=G, role_id=0, name="好きな名前のロール", price=1_000,
+        duration_days=0, item_type=config.ShopItemType.CUSTOM_ROLE,
+        created_by=OWNER_ID,
+    )
+    before_roles = len(guild.roles)
+    result = await buy(custom_id, value="常連さん", color="#FF66AA")
+    created = guild.created_roles[-1]
+    check(len(guild.roles) == before_roles + 1 and created.name == "常連さん",
+          f"カスタムロールが作られる ({created.name})")
+    check(created in shopper.roles, "作ったロールが付与される")
+    check(getattr(created.colour, "value", None) == 0xFF66AA,
+          "指定した色が反映される")
+    assets = await bot.db.list_purchase_assets(int(result["purchase_id"]))
+    check(len(assets) == 1 and int(assets[0]["asset_id"]) == created.id,
+          "後片付け用に作成物が記録される")
+    # 危険な文字は落とす (メンションやコードブロックを名前にできない)
+    await buy(custom_id, value="@everyone `x`")
+    check(guild.created_roles[-1].name == "everyone x",
+          f"入力から危険な記号が除かれる ({guild.created_roles[-1].name})")
+    # 色の形式が違えば購入を拒否し、代金は引かれない
+    bal_before = await bot.db.get_balance(G, shopper.id)
+    try:
+        await buy(custom_id, value="色テスト", color="あか")
+        check(False, "不正な色が通ってしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.ITEM_INPUT_INVALID,
+              f"不正な色は拒否する ({exc.code})")
+    check(await bot.db.get_balance(G, shopper.id) == bal_before,
+          "拒否された購入では残高が減らない (自動返金)")
+    # 返金するとロールも消える
+    await bot.charge.refund_shop_purchase(
+        int(result["purchase_id"]), operator_id=OWNER_ID, reason="テスト返金"
+    )
+    check(created.deleted and guild.get_role(created.id) is None,
+          "返金で作成したロールが削除される")
+    left = await bot.db.list_purchase_assets(int(result["purchase_id"]))
+    check(not left, "片付け済みの作成物は未処理として残らない")
+
+    # --- ニックネーム: 変更と復元 ---
+    shopper.nick = "もとの名前"
+    nick_id = await bot.db.add_shop_item(
+        guild_id=G, role_id=0, name="改名権", price=500, duration_days=1,
+        item_type=config.ShopItemType.NICKNAME, created_by=OWNER_ID,
+        purchase_limit=0,
+    )
+    nick_result = await buy(nick_id, value="あたらしい名前")
+    check(shopper.nick == "あたらしい名前", f"ニックネームが変わる ({shopper.nick})")
+    nick_assets = await bot.db.list_purchase_assets(int(nick_result["purchase_id"]))
+    check(nick_assets and str(nick_assets[0]["detail"]) == "もとの名前",
+          "変更前のニックネームが保存される")
+    await bot.db.execute(
+        "UPDATE shop_purchases SET expires_at=? WHERE id=?",
+        (utils.now_ts() - 10, int(nick_result["purchase_id"])),
+    )
+    await bot.charge.expire_shop_purchases()
+    check(shopper.nick == "もとの名前", f"期限切れで元の名前に戻る ({shopper.nick})")
+
+    # --- チャージ率ブースト ---
+    boost_id = await bot.db.add_shop_item(
+        guild_id=G, role_id=0, name="率ブースト(+20/24h)", price=2_000,
+        duration_days=1, item_type=config.ShopItemType.RATE_BOOST,
+        payload={"bonus_rate": "20", "hours": 24}, created_by=OWNER_ID,
+        purchase_limit=0,
+    )
+    settings = await bot.db.get_settings(G)
+    base_rate, _ = await bot.charge.resolve_charge_rate(G, shopper.id, settings)
+    boost_result = await buy(boost_id)
+    boosted, bonus = await bot.charge.apply_rate_boost(G, shopper.id, base_rate)
+    check(boosted == base_rate + Decimal("20") and bonus == Decimal("20"),
+          f"ブースト分だけ率が上がる ({base_rate} → {boosted})")
+    # 2つ持っても合算しない (最大の1つだけ)
+    big_id = await bot.db.add_shop_item(
+        guild_id=G, role_id=0, name="率ブースト(+30/24h)", price=3_000,
+        duration_days=1, item_type=config.ShopItemType.RATE_BOOST,
+        payload={"bonus_rate": "30", "hours": 24}, created_by=OWNER_ID,
+        purchase_limit=0,
+    )
+    await buy(big_id)
+    boosted2, bonus2 = await bot.charge.apply_rate_boost(G, shopper.id, base_rate)
+    check(boosted2 == base_rate + Decimal("30") and bonus2 == Decimal("30"),
+          f"複数のブーストは合算せず最大を使う ({boosted2})")
+    # 実際のチャージ開始でも反映され、取引に保存される
+    tx_id, _amount, _s = await bot.charge.start_charge(G, shopper.id, "1000")
+    tx_row = await bot.db.get_transaction(tx_id)
+    check(utils.to_decimal(tx_row["charge_rate"]) == base_rate + Decimal("30"),
+          f"取引にブースト後の率が保存される ({tx_row['charge_rate']})")
+    await bot.charge.cancel_transaction(tx_id, shopper.id)
+    # 返金でブーストが無効になる
+    await bot.charge.refund_shop_purchase(
+        int(boost_result["purchase_id"]), operator_id=OWNER_ID, reason="テスト返金"
+    )
+    remaining = await bot.db.list_active_rate_boosts(G, shopper.id)
+    check(all(int(r["purchase_id"]) != int(boost_result["purchase_id"])
+              for r in remaining),
+          "返金したブーストは無効になる")
+
+    # --- 専用チャンネル ---
+    channel_item = await bot.db.add_shop_item(
+        guild_id=G, role_id=0, name="専用チャンネル", price=5_000,
+        duration_days=1, item_type=config.ShopItemType.PRIVATE_CHANNEL,
+        created_by=OWNER_ID,
+    )
+    ch_result = await buy(channel_item, value="わたしの部屋")
+    made = guild.created_channels[-1]
+    check(made.id == int(ch_result["channel_id"]), "専用チャンネルが作られる")
+    check("わたしの部屋" in made.name or "-" in made.name,
+          f"入力がチャンネル名に反映される ({made.name})")
+    check(guild.default_role in made.overwrites
+          and made.overwrites[guild.default_role].view_channel is False,
+          "@everyone からは見えない設定になる")
+    check(shopper in made.overwrites
+          and made.overwrites[shopper].view_channel is True,
+          "購入者だけが見られる")
+    await bot.db.execute(
+        "UPDATE shop_purchases SET expires_at=? WHERE id=?",
+        (utils.now_ts() - 10, int(ch_result["purchase_id"])),
+    )
+    await bot.charge.expire_shop_purchases()
+    check(made.deleted, "期限切れでチャンネルが削除される")
+
+    # --- 設定不備の商品は購入前に拒否する ---
+    broken = await bot.db.add_shop_item(
+        guild_id=G, role_id=0, name="設定不備ブースト", price=100,
+        duration_days=1, item_type=config.ShopItemType.RATE_BOOST,
+        payload=None, created_by=OWNER_ID,
+    )
+    bal_before = await bot.db.get_balance(G, shopper.id)
+    try:
+        await buy(broken)
+        check(False, "設定不備の商品が購入できてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.SHOP_ITEM_UNAVAILABLE,
+              f"設定不備の商品は購入前に拒否 ({exc.code})")
+    check(await bot.db.get_balance(G, shopper.id) == bal_before,
+          "拒否された時点で残高は動かない")
+    missing_role = await bot.db.add_shop_item(
+        guild_id=G, role_id=999_111, name="消えたロール", price=100,
+        item_type=config.ShopItemType.ROLE, created_by=OWNER_ID,
+    )
+    row = await bot.db.get_shop_item(missing_role, G)
+    check(bot.charge.shop_item_problem(guild, row) is not None,
+          "存在しないロールの商品は問題として検出される")
+
+    print("\n=== 5. サブスク (自動更新) ===")
+    sub_item = await bot.db.add_shop_item(
+        guild_id=G, role_id=0, name="月額ブースト", price=1_000,
+        duration_days=30, item_type=config.ShopItemType.RATE_BOOST,
+        payload={"bonus_rate": "5", "hours": 720}, subscription=True,
+        created_by=OWNER_ID, purchase_limit=0,
+    )
+    sub = await buy(sub_item)
+    purchase_id = int(sub["purchase_id"])
+    row = await bot.db.get_purchase(purchase_id)
+    check(bool(row["subscription"]) and row["next_charge_at"] == row["expires_at"],
+          "購入時に次回課金日が期限と同じになる")
+
+    # 予告 DM は更新日の1日前から、1回だけ
+    await bot.db.execute(
+        "UPDATE shop_purchases SET next_charge_at=?, expires_at=? WHERE id=?",
+        (utils.now_ts() + 3600, utils.now_ts() + 3600, purchase_id),
+    )
+    bot.dms.clear()
+    await bot.charge.run_subscriptions()
+    notices = [d for d in bot.dms if "自動更新" in d[1]]
+    check(len(notices) == 1, f"更新予告の DM が届く ({len(notices)}件)")
+    bot.dms.clear()
+    await bot.charge.run_subscriptions()
+    check(not [d for d in bot.dms if "お知らせ" in d[1]], "予告は1回だけ送る")
+
+    # 更新日を過ぎたら自動で引き落とす
+    await bot.db.execute(
+        "UPDATE shop_purchases SET next_charge_at=?, expires_at=? WHERE id=?",
+        (utils.now_ts() - 5, utils.now_ts() - 5, purchase_id),
+    )
+    bal_before = await bot.db.get_balance(G, shopper.id)
+    bot.dms.clear()
+    stats = await bot.charge.run_subscriptions()
+    row = await bot.db.get_purchase(purchase_id)
+    check(stats["renewed"] == 1, f"自動更新が1件行われる ({stats})")
+    check(await bot.db.get_balance(G, shopper.id) == bal_before - 1_000,
+          "更新料が残高から引かれる")
+    check(int(row["renewal_count"]) == 1, f"更新回数が増える ({row['renewal_count']})")
+    check(int(row["expires_at"]) > utils.now_ts(), "期限が先に延びる")
+    check(int(row["next_charge_at"]) == int(row["expires_at"]),
+          "次回課金日も一緒に延びる")
+
+    # 同じ更新を2回処理しない
+    bal_before = await bot.db.get_balance(G, shopper.id)
+    again = await bot.charge.run_subscriptions()
+    check(again["renewed"] == 0 and
+          await bot.db.get_balance(G, shopper.id) == bal_before,
+          "更新日が来ていなければ二重課金しない")
+
+    # 同時に走っても1回だけ課金する
+    await bot.db.execute(
+        "UPDATE shop_purchases SET next_charge_at=?, expires_at=? WHERE id=?",
+        (utils.now_ts() - 5, utils.now_ts() - 5, purchase_id),
+    )
+    bal_before = await bot.db.get_balance(G, shopper.id)
+    outcomes = await asyncio.gather(*[
+        bot.db.renew_subscription(purchase_id) for _ in range(8)
+    ])
+    ok_count = sum(1 for o in outcomes if o.get("renewed"))
+    check(ok_count == 1, f"同時8件でも更新は1回だけ ({ok_count}件)")
+    check(await bot.db.get_balance(G, shopper.id) == bal_before - 1_000,
+          "同時実行でも引き落としは1回")
+
+    # 残高不足なら終了し、特典も取り消す
+    await bot.db.execute(
+        "UPDATE shop_purchases SET next_charge_at=?, expires_at=? WHERE id=?",
+        (utils.now_ts() - 5, utils.now_ts() - 5, purchase_id),
+    )
+    current = await bot.db.get_balance(G, shopper.id)
+    await bot.db.adjust_balance(
+        guild_id=G, user_id=shopper.id, amount=current,
+        change_type=config.BalanceChangeType.ADMIN_REMOVE,
+        operator_id=OWNER_ID, reason="残高不足を作る",
+    )
+    bot.dms.clear()
+    stats = await bot.charge.run_subscriptions()
+    row = await bot.db.get_purchase(purchase_id)
+    check(stats["failed"] == 1, f"残高不足で更新が止まる ({stats})")
+    check(not bool(row["subscription"]) and row["next_charge_at"] is None,
+          "自動更新が解除される")
+    check(str(row["status"]) == config.PurchaseStatus.EXPIRED,
+          f"購入が終了状態になる ({row['status']})")
+    check(await bot.db.get_balance(G, shopper.id) == 0,
+          "残高不足のときはマイナスにしない")
+    check(any("終了" in d[1] for d in bot.dms), "終了を DM で知らせる")
+    boosts = await bot.db.list_active_rate_boosts(G, shopper.id)
+    check(all(int(b["purchase_id"] or 0) != purchase_id for b in boosts),
+          "終了と同時に特典 (ブースト) も取り消す")
+
+    # 自動更新の解約: 期限までは有効なまま
+    await bot.db.adjust_balance(
+        guild_id=G, user_id=shopper.id, amount=100_000,
+        change_type=config.BalanceChangeType.ADMIN_ADD,
+        operator_id=OWNER_ID, reason="テスト用",
+    )
+    sub2 = await buy(sub_item)
+    pid2 = int(sub2["purchase_id"])
+    cancelled = await bot.charge.cancel_subscription(
+        G, pid2, user_id=shopper.id, operator_id=shopper.id
+    )
+    row = await bot.db.get_purchase(pid2)
+    check(cancelled["purchase_id"] == pid2 and not bool(row["subscription"]),
+          "解約で自動更新が止まる")
+    check(str(row["status"]) == config.PurchaseStatus.ACTIVE and row["expires_at"],
+          "解約しても期限までは有効")
+    # 他人の購入は解約できない
+    try:
+        await bot.charge.cancel_subscription(
+            G, pid2, user_id=63_999, operator_id=63_999
+        )
+        check(False, "他人の自動更新を解約できてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.SUBSCRIPTION_NOT_FOUND,
+              f"他人の購入は解約できない ({exc.code})")
+    # 商品が販売停止になったら更新しない
+    sub3 = await buy(sub_item)
+    pid3 = int(sub3["purchase_id"])
+    await bot.db.update_shop_item(sub_item, G, active=0)
+    await bot.db.execute(
+        "UPDATE shop_purchases SET next_charge_at=?, expires_at=? WHERE id=?",
+        (utils.now_ts() - 5, utils.now_ts() - 5, pid3),
+    )
+    outcome = await bot.db.renew_subscription(pid3)
+    check(not outcome["renewed"] and outcome["reason"] == "ITEM_UNAVAILABLE",
+          f"販売停止中の商品は更新しない ({outcome['reason']})")
+
+    print("\n=== 6. 整合性 ===")
     integrity = await bot.db.integrity_check()
     check(integrity["pragma"] == "ok", "PRAGMA quick_check OK")
     check(not integrity["balance_mismatch"], "残高と履歴合計が一致")

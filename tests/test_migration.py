@@ -199,6 +199,34 @@ async def main() -> None:
     )
     purchase = await db.purchase_shop_item(guild_id=1, user_id=10, item_id=item_id)
     check(purchase["balance_after"] == 3200, "移行後の DB でショップ購入ができる")
+    check(purchase["item_type"] == config.ShopItemType.ROLE
+          and purchase["subscription"] is False,
+          "v1 由来の商品は既定でロール販売・自動更新なしとして扱われる")
+
+    # --- v4: 商品タイプとサブスクの列が移行後の DB でも使える ---
+    sub_item = await db.add_shop_item(
+        guild_id=1, role_id=0, name="月額ブースト", price=100, duration_days=30,
+        item_type=config.ShopItemType.RATE_BOOST, subscription=True,
+        payload={"bonus_rate": "10", "hours": 720}, purchase_limit=0, created_by=2,
+    )
+    sub_purchase = await db.purchase_shop_item(guild_id=1, user_id=10, item_id=sub_item)
+    check(sub_purchase["subscription"] is True
+          and sub_purchase["next_charge_at"] == sub_purchase["expires_at"],
+          "移行後の DB でサブスク商品を購入できる")
+    check(sub_purchase["payload"].get("bonus_rate") == "10",
+          "商品の追加設定 (payload) が読み書きできる")
+    asset_id = await db.add_purchase_asset(
+        purchase_id=int(sub_purchase["purchase_id"]), guild_id=1, user_id=10,
+        asset_type=config.PurchaseAssetType.ROLE, asset_id=4242, detail="テスト",
+    )
+    check(len(await db.list_purchase_assets(int(sub_purchase["purchase_id"]))) == 1,
+          f"移行後の DB で作成物を記録できる (id={asset_id})")
+    await db.add_rate_boost(
+        guild_id=1, user_id=10, bonus_rate="10", expires_at=utils.now_ts() + 3600,
+        purchase_id=int(sub_purchase["purchase_id"]),
+    )
+    check(len(await db.list_active_rate_boosts(1, 10)) == 1,
+          "移行後の DB でチャージ率ブーストを登録できる")
     await db.set_role_rate(1, 77, Decimal("150"), 10)
     check(len(await db.list_role_rates(1)) == 1, "移行後の DB でロール別レートを登録できる")
     campaign_id = await db.create_campaign(
@@ -260,7 +288,7 @@ async def main() -> None:
         charge_rate=Decimal("120"), source=config.TxSource.MANUAL_PAYPAY,
     )
     credited = await db.credit_transaction(manual_tx, 1200)
-    check(credited["balance_after"] == 4900,
+    check(credited["balance_after"] == 4800,
           f"移行後の DB で申請の承認と残高付与ができる ({credited['balance_after']})")
     audit = await db.audit_balance(1, 10)
     check(audit["diff"] == 0, "申請の承認後も残高と履歴合計が一致")
@@ -290,9 +318,10 @@ async def main() -> None:
     await db.close()
     db2 = database.Database(config.DB_PATH)
     await db2.connect()
-    # 4200 (v1) − 1000 (ショップ購入) + 500 (招待報酬) + 1200 (PayPay承認) = 4900
+    # 4200 (v1) − 1000 (ショップ購入) − 100 (サブスク購入) + 500 (招待報酬)
+    #   + 1200 (PayPay承認) = 4800
     final_balance = await db2.get_balance(1, 10)
-    check(final_balance == 4900, f"再接続してもデータが保持される ({final_balance})")
+    check(final_balance == 4800, f"再接続してもデータが保持される ({final_balance})")
     check((await db2.get_request(request_id))["status"] == config.RequestStatus.APPROVED,
           "再接続後も申請の状態が保持される")
     await db2.close()

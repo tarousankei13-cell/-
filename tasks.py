@@ -95,6 +95,7 @@ class BackgroundTasks:
             self.backup_task,
             self.integrity_task,
             self.shop_expiry,
+            self.subscription_task,
             self.request_task,
             self.claim_task,
             self.tier_task,
@@ -517,6 +518,23 @@ class BackgroundTasks:
 
     @shop_expiry.before_loop
     async def _before_shop(self) -> None:
+        await self._wait_ready()
+
+    @tasks.loop(seconds=config.TASK_SUBSCRIPTION_INTERVAL)
+    async def subscription_task(self) -> None:
+        """サブスクの更新予告と自動更新を処理する。"""
+        try:
+            await self.charge.run_subscriptions()
+        except Exception:  # noqa: BLE001
+            logger.exception("サブスクの処理に失敗しました")
+        try:
+            # 失効したブーストの行を溜め込まないよう、ここで一緒に掃除する
+            await self.db.purge_expired_rate_boosts()
+        except Exception:  # noqa: BLE001
+            logger.exception("失効したチャージ率ブーストの掃除に失敗しました")
+
+    @subscription_task.before_loop
+    async def _before_subscription(self) -> None:
         await self._wait_ready()
 
     @tasks.loop(seconds=config.TASK_TIER_INTERVAL)
