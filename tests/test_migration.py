@@ -265,6 +265,27 @@ async def main() -> None:
     audit = await db.audit_balance(1, 10)
     check(audit["diff"] == 0, "申請の承認後も残高と履歴合計が一致")
 
+    # --- v4: 単一の受取用アカウントが複数アカウント表へ移る ---
+    await db.execute(
+        "INSERT INTO kyash_account(id, email, client_uuid, installation_uuid, "
+        "access_token_enc, status, username, wallet_uuid, token_issued_at, "
+        "created_at, updated_at) VALUES(1,?,?,?,?,?,?,?,?,?,?)",
+        ("old@example.com", "cu", "iu", "ENC", config.KyashAccountStatus.ACTIVE,
+         "olduser", "W-OLD", utils.now_ts(), utils.now_ts(), utils.now_ts()),
+    )
+    await db.set_system_value("kyash_wallet_threshold", "30000")
+    moved = await db.migrate_kyash_account()
+    accounts = await db.list_kyash_accounts()
+    check(moved == 1 and len(accounts) == 1 and accounts[0]["label"] == "main",
+          f"単一の受取用アカウントが移行された ({moved}件)")
+    check(int(accounts[0]["threshold"]) == 30_000,
+          f"残高しきい値が引き継がれた ({accounts[0]['threshold']})")
+    check(accounts[0]["access_token_enc"] == "ENC", "保存済みトークンが引き継がれた")
+    check(await db.migrate_kyash_account() == 0, "移行は冪等 (2回目は何もしない)")
+    second = await db.add_kyash_account(label="sub1", threshold=10_000, priority=1)
+    check(len(await db.list_kyash_accounts()) == 2,
+          f"移行後に2台目を追加できる (id={second})")
+
     # --- 再接続しても壊れない (冪等なマイグレーション) ---
     await db.close()
     db2 = database.Database(config.DB_PATH)

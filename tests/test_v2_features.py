@@ -341,8 +341,13 @@ async def main() -> None:
         balance_log_scope="ALL", achievement_channel_id=guild.channel.id,
     )
     client = kyash_service.Kyash(access_token="t")
-    bot.kyash._client = client
-    bot.kyash._status = config.KyashAccountStatus.ACTIVE
+    # v4: 受取用アカウントは複数登録できるため、テストでは1件だけ差し込む
+    bot.kyash._slots = {
+        1: kyash_service.AccountSlot(
+            id=1, label="main", client=client,
+            status=config.KyashAccountStatus.ACTIVE, wallet_balance=STATE["wallet"],
+        )
+    }
 
     vip_role = guild.add_role(StubRole(8001, "VIP", position=10))
     member = guild.add_member(StubMember(9001, guild))
@@ -783,8 +788,13 @@ async def main() -> None:
     print("\n=== 15. 管理ダッシュボード / トークン期限 ===")
     embed = await bot.charge.build_admin_panel_embed(G)
     check("管理ダッシュボード" in (embed.title or ""), "管理ダッシュボードを生成")
-    bot.kyash._token_issued_at = utils.now_ts() - 28 * 86400
-    check(bot.kyash.token_expiring_soon, f"トークン失効が近い ({bot.kyash.token_days_left:.1f}日)")
+    # v4: トークンの発行時刻はアカウントごとに持つ
+    bot.kyash._slots[1].token_issued_at = utils.now_ts() - 28 * 86400
+    days_left = bot.kyash.token_days_left
+    check(bot.kyash.token_expiring_soon and days_left is not None,
+          f"トークン失効が近い ({days_left:.1f}日)" if days_left is not None else "トークン残日数が取れない")
+    check([s.label for s in bot.kyash.expiring_slots] == ["main"],
+          "失効が近いアカウントを特定できる")
     snapshot = bot.kyash.status_snapshot()
     check("token_days_left" in snapshot and "wallet_headroom" in snapshot,
           "状態スナップショットに期限・しきい値情報を含む")

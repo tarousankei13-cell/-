@@ -426,7 +426,98 @@ async def main() -> None:
     check(frozen.id not in [int(r["user_id"]) for r in ranking],
           "凍結された利用者はランキングに載らない")
 
-    print("\n=== 3. 整合性 ===")
+    print("\n=== 3. 受取用 Kyash アカウントの複数登録 ===")
+    import kyash_service
+
+    # 3件の枠を用意する (優先度 0,1,2)
+    ids = []
+    for i, (label, threshold) in enumerate(
+        (("main", 10_000), ("sub1", 20_000), ("sub2", 0))
+    ):
+        account_id = await bot.kyash.add_account(label, threshold=threshold, priority=i)
+        ids.append(account_id)
+        slot = bot.kyash.get_slot(account_id)
+        assert slot is not None
+        slot.client = object()  # type: ignore[assignment]
+        slot.status = config.KyashAccountStatus.ACTIVE
+        slot.wallet_balance = 0
+    check([s.label for s in bot.kyash.slots()] == ["main", "sub1", "sub2"],
+          "優先度順に並ぶ")
+    check(len(bot.kyash.usable_slots()) == 3, "3件すべて利用可")
+    check(bot.kyash.is_usable, "1件でも使えれば受付可")
+
+    picked = bot.kyash.pick_slot(5_000)
+    check(picked.label == "main", f"優先度の高い順に選ぶ ({picked.label})")
+
+    # main がしきい値に達したら sub1 が選ばれる
+    bot.kyash.get_slot(ids[0]).wallet_balance = 9_000  # type: ignore[union-attr]
+    picked = bot.kyash.pick_slot(5_000)
+    check(picked.label == "sub1", f"余裕が無ければ次のアカウントへ ({picked.label})")
+    check(bot.kyash.is_usable and not bot.kyash.wallet_limit_reached,
+          "1件が上限でもチャージは止まらない")
+
+    # main/sub1 が上限 → しきい値なしの sub2 が選ばれる
+    bot.kyash.get_slot(ids[1]).wallet_balance = 19_500  # type: ignore[union-attr]
+    picked = bot.kyash.pick_slot(5_000)
+    check(picked.label == "sub2", f"しきい値なしのアカウントが受ける ({picked.label})")
+
+    # sub2 を無効化すると受け取れるアカウントが無くなる
+    await bot.kyash.set_account_options(ids[2], enabled=False)
+    try:
+        bot.kyash.pick_slot(5_000)
+        check(False, "全て上限なのに選べてしまう")
+    except kyash_service.NoCapacityError as exc:
+        check("しきい値" in str(exc) or "ありません" in str(exc),
+              f"受け取れるアカウントが無いことを検出 ({exc})")
+    # 「その額が入らない」と「もう何も受け取れない」は別の状態として扱う
+    check(not bot.kyash.wallet_limit_reached,
+          "しきい値に未達なら wallet_limit_reached は False (少額はまだ受けられる)")
+    try:
+        bot.kyash.check_wallet_capacity(5_000)
+        check(False, "容量チェックが通ってしまう")
+    except kyash_service.WalletLimitError:
+        check(True, "その額が入らないことは容量チェックで拒否される")
+    picked = bot.kyash.pick_slot(500)
+    check(picked.label == "main", f"少額なら余裕のあるアカウントで受ける ({picked.label})")
+    # しきい値に完全に到達させると「もう受け取れない」状態になる
+    bot.kyash.get_slot(ids[0]).wallet_balance = 10_000   # type: ignore[union-attr]
+    bot.kyash.get_slot(ids[1]).wallet_balance = 20_000   # type: ignore[union-attr]
+    check(bot.kyash.wallet_limit_reached,
+          "全アカウントがしきい値に到達すると wallet_limit_reached が True")
+    bot.kyash.get_slot(ids[0]).wallet_balance = 9_000    # type: ignore[union-attr]
+    bot.kyash.get_slot(ids[1]).wallet_balance = 19_500   # type: ignore[union-attr]
+
+    await bot.kyash.set_account_options(ids[2], enabled=True)
+    check(bot.kyash.pick_slot(5_000).label == "sub2", "再有効化で再び使える")
+
+    # 集約された状態
+    snapshot = bot.kyash.status_snapshot()
+    check(snapshot["account_count"] == 3 and snapshot["usable_count"] == 3,
+          f"スナップショットに件数が入る ({snapshot['account_count']}/{snapshot['usable_count']})")
+    check(len(snapshot["accounts"]) == 3, "アカウント明細が入る")
+    check(snapshot["wallet_balance"] == 28_500,
+          f"残高は合計で表示 ({snapshot['wallet_balance']})")
+    check(all("access_token" not in str(a) for a in snapshot["accounts"]),
+          "スナップショットにトークンを含まない")
+
+    # 永続化されているか (再読込しても優先度としきい値が残る)
+    rows = await bot.db.list_kyash_accounts()
+    check([r["label"] for r in rows] == ["main", "sub1", "sub2"], "DB にも優先度順で保存")
+    check([int(r["threshold"]) for r in rows] == [10_000, 20_000, 0],
+          "しきい値が保存されている")
+
+    # 識別名で引ける / 未知の ID は最古へフォールバックする
+    check(bot.kyash.find_slot_by_label("sub1") is not None, "識別名で引ける")
+    fallback = bot.kyash.get_slot(999_999)
+    check(fallback is not None and fallback.id == ids[0],
+          "未知のIDは最古のアカウントへフォールバック (v3以前の取引用)")
+
+    # 削除
+    await bot.kyash.remove_account(ids[2])
+    check(len(bot.kyash.slots()) == 2, "削除できる")
+    check(await bot.db.get_kyash_account_row(ids[2]) is None, "DB からも消える")
+
+    print("\n=== 4. 整合性 ===")
     integrity = await bot.db.integrity_check()
     check(integrity["pragma"] == "ok", "PRAGMA quick_check OK")
     check(not integrity["balance_mismatch"], "残高と履歴合計が一致")

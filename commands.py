@@ -747,6 +747,19 @@ def _resolve_guild_id(interaction: discord.Interaction, raw: str | None) -> int 
 # ---------------------------------------------------------------------------
 # /kyash (受取用アカウント / Bot Owner 専用。status のみ管理者も参照可)
 # ---------------------------------------------------------------------------
+def _resolve_kyash_slot(bot: "ChargeBot", account: str | None) -> Any:
+    """識別名またはアカウントIDから受取用アカウントを引く。"""
+    if not account:
+        return bot.kyash.primary
+    text = account.strip()
+    if text.isdigit():
+        slot = bot.kyash.get_slot(int(text))
+        # get_slot は未知の ID でフォールバックするため、一致を確認する
+        if slot is not None and slot.id == int(text):
+            return slot
+    return bot.kyash.find_slot_by_label(text)
+
+
 class KyashGroup(app_commands.Group):
     """受取用 Kyash アカウントの管理。"""
 
@@ -754,101 +767,261 @@ class KyashGroup(app_commands.Group):
         super().__init__(name="kyash", description="受取用Kyashアカウントの管理")
 
     @app_commands.command(name="login", description="受取用Kyashアカウントへログインします (Bot Owner)")
+    @app_commands.describe(account="ログイン先のアカウント (省略時は代表アカウント)")
     @require_owner()
-    async def login(self, interaction: discord.Interaction) -> None:
+    async def login(
+        self, interaction: discord.Interaction, account: str | None = None
+    ) -> None:
         """認証情報は Ephemeral Modal で受け取り、ログにも DB にも平文で残さない。"""
-        await interaction.response.send_modal(ui.KyashLoginModal())
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        slot = _resolve_kyash_slot(bot, account) if account else None
+        if account and slot is None:
+            await ui.safe_respond(
+                interaction,
+                embed=ui.info_embed(
+                    "見つかりません",
+                    f"アカウント `{utils.truncate(account, 40)}` は登録されていません。"
+                    "`/kyash add` で枠を追加してください。",
+                    color=config.Color.DANGER),
+            )
+            return
+        await interaction.response.send_modal(
+            ui.KyashLoginModal(account_id=slot.id if slot else None)
+        )
 
     @app_commands.command(name="status", description="受取用Kyashアカウントの状態を表示します (管理者)")
     @require_admin()
     async def status(self, interaction: discord.Interaction) -> None:
+        """登録されている受取用アカウントをまとめて表示する。"""
         bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
         await interaction.response.defer(ephemeral=True, thinking=True)
-        snapshot = bot.kyash.status_snapshot()
-        record = await bot.db.get_kyash_account()
-        embed = ui.info_embed(
-            "🔐 受取用Kyashアカウント",
-            f"{ui.SEPARATOR}\n状態: **{config.KYASH_STATUS_LABELS.get(snapshot['status'], snapshot['status'])}**",
-            color=config.Color.SUCCESS if snapshot["status"] == config.KyashAccountStatus.ACTIVE
-            else config.Color.WARNING,
-        )
-        embed.add_field(name="セッション", value="保持中" if snapshot["logged_in"] else "なし", inline=True)
-        embed.add_field(name="ユーザー名", value=f"`{snapshot['username'] or '-'}`", inline=True)
-        embed.add_field(name="最終確認", value=utils.format_jst(snapshot["last_checked_at"]), inline=True)
-        embed.add_field(
-            name="保存情報",
-            value=(
-                f"トークン: {'保存済み' if record.access_token_enc else '未保存'}\n"
-                f"端末情報: {'保存済み' if record.client_uuid and record.installation_uuid else '未保存'}\n"
-                "※パスワードは保存していません"
+        await interaction.followup.send(
+            embed=ui.kyash_accounts_embed(
+                bot.kyash.status_snapshot(),
+                show_balance=bot.is_bot_owner(interaction.user),
             ),
-            inline=False,
+            ephemeral=True,
         )
-        # 残高照会の可否のみ確認する (金額は Bot Owner にのみ表示)
-        wallet_state = "-"
-        if snapshot["logged_in"]:
-            try:
-                wallet = await bot.kyash.get_wallet()
-                wallet_state = (
-                    f"可能 (残高 {utils.fmt_yen(wallet.all_balance)})"
-                    if bot.is_bot_owner(interaction.user) else "可能"
-                )
-            except kyash_service.KyashServiceError as exc:
-                wallet_state = f"不可 ({utils.sanitize_for_log(exc, limit=100)})"
-        embed.add_field(name="Wallet取得", value=wallet_state, inline=True)
-        embed.add_field(name="モジュール", value=f"Kyasher {snapshot['module_version']}", inline=True)
-        if snapshot["last_error"]:
-            embed.add_field(
-                name="最終エラー",
-                value=utils.truncate(utils.sanitize_for_log(snapshot["last_error"]), 900),
-                inline=False,
+
+    @app_commands.command(name="add", description="受取用アカウントの枠を追加します (Bot Owner)")
+    @app_commands.describe(
+        label="識別名 (例: main / sub1)",
+        threshold="残高しきい値 (円)。0で無制限",
+        priority="使う順番 (小さいほど先に使う)",
+    )
+    @require_owner()
+    async def add_account(
+        self,
+        interaction: discord.Interaction,
+        label: str,
+        threshold: app_commands.Range[int, 0, 100_000_000] = 0,
+        priority: app_commands.Range[int, 0, 1000] = 0,
+    ) -> None:
+        """アカウント枠を追加する。ログインは `/kyash login` で行う。"""
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            account_id = await bot.kyash.add_account(
+                label, threshold=int(threshold), priority=int(priority)
             )
-        embed.set_footer(text="パスワード・トークン等の秘密情報は表示されません")
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        except (kyash_service.KyashServiceError, DatabaseError) as exc:
+            await interaction.followup.send(
+                embed=ui.info_embed("追加できません", str(exc), color=config.Color.DANGER),
+                ephemeral=True,
+            )
+            return
+        op_id = await _audit(
+            interaction, "KYASH_ACCOUNT_ADD",
+            detail={"account_id": account_id, "label": label,
+                    "threshold": int(threshold), "priority": int(priority)},
+        )
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "✅ アカウント枠を追加しました",
+                f"アカウントID: `{account_id}`\n識別名: **{label}**\n"
+                f"しきい値: {utils.fmt_yen(int(threshold)) if threshold else '無制限'}\n"
+                f"優先度: {priority}\n操作ID: `{op_id}`\n\n"
+                f"続けて `/kyash login account:{label}` でログインしてください。",
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="remove", description="受取用アカウントを削除します (Bot Owner)")
+    @app_commands.describe(account="識別名またはアカウントID")
+    @require_owner()
+    async def remove_account(self, interaction: discord.Interaction, account: str) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        slot = _resolve_kyash_slot(bot, account)
+        if slot is None:
+            await ui.safe_respond(
+                interaction,
+                embed=ui.info_embed("見つかりません", "そのアカウントは登録されていません。",
+                                    color=config.Color.DANGER),
+            )
+            return
+        used = await bot.db.count_transactions_by_account(slot.id)
+        approved = await _confirm(
+            interaction,
+            title=f"受取用アカウント「{slot.label}」を削除します",
+            description=(
+                "保存済みのトークンと端末情報も削除されます。\n"
+                + (f"⚠️ このアカウントで受け取った取引が **{used} 件**あります。\n"
+                   "取引の記録は残りますが、その取引の**受取確認ができなくなります**。\n"
+                   if used else "")
+                + "残りのアカウントが無くなると、Kyash のチャージを受け付けられません。"
+            ),
+            confirm_label="削除する",
+        )
+        if not approved:
+            return
+        removed = await bot.kyash.remove_account(slot.id)
+        op_id = await _audit(
+            interaction, "KYASH_ACCOUNT_REMOVE",
+            detail={"account_id": slot.id, "label": slot.label, "transactions": used},
+        )
+        for guild in bot.guilds:
+            if await bot.db.is_guild_allowed(guild.id):
+                await bot.charge.refresh_charge_panels(guild.id)
+        await interaction.followup.send(
+            embed=ui.info_embed(
+                "削除しました" if removed else "見つかりません",
+                f"識別名: **{slot.label}**\n操作ID: `{op_id}`",
+                color=config.Color.NEUTRAL,
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="priority", description="受取用アカウントの使う順番と有効/無効を変えます (Bot Owner)"
+    )
+    @app_commands.describe(
+        account="識別名またはアカウントID",
+        priority="使う順番 (小さいほど先に使う)",
+        enabled="受取に使うかどうか",
+    )
+    @require_owner()
+    async def priority(
+        self,
+        interaction: discord.Interaction,
+        account: str,
+        priority: app_commands.Range[int, 0, 1000] | None = None,
+        enabled: bool | None = None,
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        slot = _resolve_kyash_slot(bot, account)
+        if slot is None:
+            await interaction.followup.send(
+                embed=ui.info_embed("見つかりません", "そのアカウントは登録されていません。",
+                                    color=config.Color.DANGER),
+                ephemeral=True,
+            )
+            return
+        if priority is None and enabled is None:
+            await interaction.followup.send(
+                embed=ui.info_embed("変更内容がありません",
+                                    "priority か enabled のどちらかを指定してください。",
+                                    color=config.Color.DANGER),
+                ephemeral=True,
+            )
+            return
+        await bot.kyash.set_account_options(
+            slot.id,
+            priority=int(priority) if priority is not None else None,
+            enabled=enabled,
+        )
+        op_id = await _audit(
+            interaction, "KYASH_ACCOUNT_OPTIONS",
+            detail={"account_id": slot.id, "priority": priority, "enabled": enabled},
+        )
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "✅ 設定を変更しました",
+                f"識別名: **{slot.label}**\n"
+                f"優先度: {slot.priority}\n"
+                f"受取に使う: {'はい' if slot.enabled else 'いいえ'}\n"
+                f"操作ID: `{op_id}`",
+            ),
+            ephemeral=True,
+        )
 
     @app_commands.command(
         name="threshold", description="受取用アカウントの残高しきい値を設定します (Bot Owner)"
     )
-    @app_commands.describe(amount="しきい値 (円)。0で無効。到達すると新規チャージを停止します")
+    @app_commands.describe(
+        amount="しきい値 (円)。0で無効。到達するとそのアカウントは使われません",
+        account="対象アカウント (省略時は代表アカウント)",
+    )
     @require_owner()
     async def threshold(
         self, interaction: discord.Interaction,
         amount: app_commands.Range[int, 0, 100_000_000],
+        account: str | None = None,
     ) -> None:
-        """Kyash 側の残高上限に達して受取が失敗する前に、新規チャージを止めるための設定。"""
+        """Kyash 側の残高上限に達して受取が失敗する前に、そのアカウントの使用を止める設定。
+
+        複数登録している場合、1つが上限に達しても他のアカウントで受取を続けられる。
+        """
         bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await bot.kyash.set_wallet_threshold(int(amount))
-        await _audit(interaction, "KYASH_THRESHOLD", detail={"threshold": int(amount)})
-        balance = bot.kyash.last_wallet_balance
-        headroom = bot.kyash.wallet_headroom()
+        slot = _resolve_kyash_slot(bot, account) if account else bot.kyash.primary
+        if slot is None:
+            await interaction.followup.send(
+                embed=ui.info_embed(
+                    "アカウントがありません",
+                    "`/kyash add` で枠を追加してから設定してください。",
+                    color=config.Color.DANGER),
+                ephemeral=True,
+            )
+            return
+        await bot.kyash.set_wallet_threshold(int(amount), account_id=slot.id)
+        await _audit(
+            interaction, "KYASH_THRESHOLD",
+            detail={"account_id": slot.id, "threshold": int(amount)},
+        )
+        headroom = slot.headroom()
         await interaction.followup.send(
             embed=ui.success_embed(
                 "✅ 残高しきい値を設定しました",
-                f"しきい値: **{utils.fmt_yen(int(amount)) if amount else '無効'}**\n"
-                + (f"現在残高: {utils.fmt_yen(balance)}\n" if balance is not None else "")
+                f"アカウント: **{slot.label}**\n"
+                f"しきい値: **{utils.fmt_yen(int(amount)) if amount else '無効 (無制限)'}**\n"
+                + (f"現在残高: {utils.fmt_yen(int(slot.wallet_balance))}\n"
+                   if slot.wallet_balance is not None else "")
                 + (f"しきい値まで: {utils.fmt_yen(headroom)}" if headroom is not None else ""),
             ),
             ephemeral=True,
         )
 
     @app_commands.command(name="logout", description="受取用Kyashアカウントをログアウトします (Bot Owner)")
+    @app_commands.describe(account="対象アカウント (省略時はすべて)")
     @require_owner()
-    async def logout(self, interaction: discord.Interaction) -> None:
+    async def logout(
+        self, interaction: discord.Interaction, account: str | None = None
+    ) -> None:
         bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        slot = _resolve_kyash_slot(bot, account) if account else None
+        if account and slot is None:
+            await ui.safe_respond(
+                interaction,
+                embed=ui.info_embed("見つかりません", "そのアカウントは登録されていません。",
+                                    color=config.Color.DANGER),
+            )
+            return
+        target = f"**{slot.label}**" if slot else "**すべてのアカウント**"
         approved = await _confirm(
             interaction,
             title="⚠️ Kyash アカウントをログアウトします",
             description=(
+                f"対象: {target}\n\n"
                 "保存済みのアクセストークンと端末情報を削除します。\n"
-                "ログアウト後は新規チャージを受け付けられません。\n"
+                "使えるアカウントが無くなると新規チャージを受け付けられません。\n"
                 "受取待ちのチャージは保留され、再ログイン後に処理されます。"
             ),
             confirm_label="ログアウトする",
         )
         if not approved:
             return
-        await bot.kyash.logout()
+        await bot.kyash.logout(slot.id if slot else None)
         op_id = await _audit(interaction, "KYASH_LOGOUT")
         for guild in bot.guilds:
             if await bot.db.is_guild_allowed(guild.id):
@@ -862,8 +1035,9 @@ class KyashGroup(app_commands.Group):
     async def reconnect(self, interaction: discord.Interaction) -> None:
         bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
         await interaction.response.defer(ephemeral=True, thinking=True)
-        if bot.kyash.status == config.KyashAccountStatus.UNCONFIGURED:
-            status = await bot.kyash.restore_from_db()
+        # 全アカウントを読み直して健康確認する
+        if not bot.kyash.slots():
+            status = await bot.kyash.load_accounts()
         else:
             status = await bot.kyash.health_check()
         await _audit(interaction, "KYASH_RECONNECT", detail={"status": status})

@@ -1814,6 +1814,89 @@ def request_list_embed(
     return embed
 
 
+def kyash_accounts_embed(
+    snapshot: dict[str, Any], *, show_balance: bool = False
+) -> discord.Embed:
+    """受取用アカウントの一覧 (複数登録に対応)。
+
+    残高の金額は Bot Owner にのみ見せる (``show_balance``)。
+    """
+    accounts = list(snapshot.get("accounts") or [])
+    usable = int(snapshot.get("usable_count") or 0)
+    problems: list[str] = []
+    if not accounts:
+        problems.append("🔴 アカウントが登録されていません (`/kyash add`)")
+    elif usable == 0:
+        problems.append("🔴 利用できるアカウントがありません (`/kyash login`)")
+    for account in accounts:
+        if account.get("enabled") and account.get("limit_reached"):
+            problems.append(f"🟠 `{account['label']}` が残高しきい値に達しています")
+        if account.get("enabled") and account.get("token_expiring_soon"):
+            days = account.get("token_days_left")
+            problems.append(
+                f"🟠 `{account['label']}` のトークン残り "
+                + (f"{days:.1f}日" if isinstance(days, (int, float)) else "わずか")
+            )
+    embed = discord.Embed(
+        title="🔐 受取用 Kyash アカウント",
+        description=(
+            f"{SEPARATOR}\n"
+            f"登録 **{len(accounts)}** 件 / 利用可 **{usable}** 件\n"
+            + ("\n".join(problems) if problems else "🟢 異常はありません")
+            + f"\n{SEPARATOR}"
+        ),
+        color=config.Color.DANGER if problems else config.Color.SUCCESS,
+    )
+    for account in accounts[:10]:
+        state = config.KYASH_STATUS_LABELS.get(
+            str(account["status"]), str(account["status"])
+        )
+        lines = [
+            f"状態: **{state}**" + ("" if account.get("enabled") else "  ⏸ 無効化中"),
+            f"ユーザー名: `{account.get('username') or '-'}`",
+            f"優先度: {account.get('priority')}  (小さいほど先に使う)",
+        ]
+        threshold = int(account.get("threshold") or 0)
+        if threshold:
+            headroom = account.get("headroom")
+            lines.append(
+                f"しきい値: {utils.fmt_yen(threshold)}"
+                + (f" / 残り {utils.fmt_yen(int(headroom))}" if headroom is not None else "")
+            )
+        else:
+            lines.append("しきい値: 未設定 (無制限)")
+        if show_balance and account.get("wallet_balance") is not None:
+            lines.append(f"残高: **{utils.fmt_yen(int(account['wallet_balance']))}**")
+        days = account.get("token_days_left")
+        if isinstance(days, (int, float)):
+            lines.append(f"トークン残り: {days:.1f}日")
+        if account.get("last_error"):
+            lines.append(
+                "直近のエラー: "
+                + utils.truncate(utils.sanitize_for_log(str(account["last_error"])), 150)
+            )
+        embed.add_field(
+            name=f"#{account['id']} {account['label']}",
+            value="\n".join(lines),
+            inline=False,
+        )
+    embed.add_field(
+        name="▶ 使い方",
+        value=(
+            "`/kyash add` で枠を追加 → `/kyash login` でログイン\n"
+            "`/kyash threshold` で受取上限、`/kyash priority` で使う順番を設定\n"
+            "余裕のあるアカウントが**自動で選ばれます**。"
+            "全部が上限に達したときだけチャージが止まります。"
+        ),
+        inline=False,
+    )
+    embed.set_footer(
+        text=f"Kyasher {snapshot.get('module_version')} / "
+             "パスワード・トークン等の秘密情報は表示されません"
+    )
+    return embed
+
+
 def provider_status_embed(
     entries: Sequence[dict[str, Any]], *, guild_name: str,
     review_channel_id: int | None, price: dict[str, Any] | None,
@@ -2642,14 +2725,18 @@ class KyashLoginModal(discord.ui.Modal, title="受取用Kyashアカウントの�
         label="パスワード", placeholder="保存されません", required=True, max_length=200
     )
 
-    def __init__(self) -> None:
+    def __init__(self, *, account_id: int | None = None) -> None:
         super().__init__(timeout=300)
+        #: ログイン先の受取用アカウント (None なら代表アカウント)
+        self.account_id = account_id
 
     async def on_submit(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
         email = str(self.email.value).strip()
         password = str(self.password.value)
         self.password.default = None
-        await bot_of(interaction).handle_kyash_login(interaction, email, password)
+        await bot_of(interaction).handle_kyash_login(
+            interaction, email, password, account_id=self.account_id
+        )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
         logger.error("Kyashログの入力でエラー: %s", utils.safe_error_text(error))

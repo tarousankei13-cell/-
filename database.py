@@ -1358,7 +1358,7 @@ class Database:
             "received_amount", "credited_amount", "link_hash", "link_uuid",
             "retry_count", "balance_before", "balance_after", "wallet_before",
             "achievement_channel_id", "achievement_message_id", "expires_at",
-            "processing_started_at", "completed_at",
+            "processing_started_at", "completed_at", "kyash_account_id", "sender_name",
         }
         invalid = set(columns) - allowed_columns
         if invalid:
@@ -1663,6 +1663,7 @@ class Database:
         claim_link_id: str,
         wallet_before: int | None,
         expires_at: int,
+        kyash_account_id: int | None = None,
     ) -> str:
         """請求リンクの支払い待ち (WAITING_PAYMENT) 取引を作る。
 
@@ -1683,14 +1684,14 @@ class Database:
                         "INSERT INTO charge_transactions("
                         "id, guild_id, user_id, requested_amount, charge_rate, status, "
                         "source, provider, link_hash, link_uuid, claim_link_id, "
-                        "wallet_before, expires_at, created_at, updated_at) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "wallet_before, kyash_account_id, expires_at, created_at, updated_at) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             tx_id, guild_id, user_id, int(requested_amount),
                             utils.rate_to_db(charge_rate), config.TxStatus.WAITING_PAYMENT,
                             config.TxSource.KYASH_CLAIM, config.ChargeProvider.KYASH_CLAIM,
                             link_hash, link_uuid, claim_link_id, wallet_before,
-                            int(expires_at), now, now,
+                            kyash_account_id, int(expires_at), now, now,
                         ),
                     )
                     return tx_id
@@ -3003,6 +3004,211 @@ class Database:
 
     async def clear_kyash_account(self) -> None:
         await self.execute("DELETE FROM kyash_account WHERE id=1")
+
+    # ------------------------------------------------------------------
+    # 受取用 Kyash アカウント (複数登録)
+    # ------------------------------------------------------------------
+    async def migrate_kyash_account(self) -> int:
+        """単一アカウント (kyash_account) を複数アカウント表へ移す。
+
+        v3 までは受取アカウントが1つだけだった。その1行を ``kyash_accounts``
+        の最小 ID として取り込み、以後は複数運用できるようにする。
+        旧テーブルは監査のため残す (参照はしない)。
+
+        Returns:
+            移行した件数 (0 か 1)。
+        """
+        def _fn(conn: sqlite3.Connection) -> int:
+            existing = conn.execute("SELECT COUNT(*) AS c FROM kyash_accounts").fetchone()
+            if int(existing["c"]) > 0:
+                return 0
+            old = conn.execute("SELECT * FROM kyash_account WHERE id=1").fetchone()
+            if old is None or not (old["email"] or old["access_token_enc"]):
+                return 0
+            threshold_row = conn.execute(
+                "SELECT value FROM system_settings WHERE key='kyash_wallet_threshold'"
+            ).fetchone()
+            threshold = 0
+            if threshold_row and str(threshold_row["value"]).isdigit():
+                threshold = int(threshold_row["value"])
+            now = utils.now_ts()
+            conn.execute(
+                "INSERT INTO kyash_accounts("
+                "label, email, client_uuid, installation_uuid, access_token_enc, status, "
+                "username, wallet_uuid, threshold, priority, enabled, last_checked_at, "
+                "last_error, token_issued_at, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?)",
+                (
+                    "main", old["email"], old["client_uuid"], old["installation_uuid"],
+                    old["access_token_enc"], old["status"], old["username"],
+                    old["wallet_uuid"], threshold, 0, old["last_checked_at"],
+                    old["last_error"], old["token_issued_at"],
+                    old["created_at"] or now, now,
+                ),
+            )
+            return 1
+
+        moved = await self.run(_fn, write=True)
+        if moved:
+            logger.info("既存の受取用 Kyash アカウントを複数アカウント表へ移行しました")
+        return moved
+
+    async def list_kyash_accounts(self, *, enabled_only: bool = False) -> list[sqlite3.Row]:
+        """受取用アカウントを優先度順に返す。"""
+        where = "WHERE enabled=1" if enabled_only else ""
+        return await self.fetchall(
+            f"SELECT * FROM kyash_accounts {where} ORDER BY priority ASC, id ASC"
+        )
+
+    async def get_kyash_account_row(self, account_id: int) -> sqlite3.Row | None:
+        return await self.fetchone(
+            "SELECT * FROM kyash_accounts WHERE id=?", (account_id,)
+        )
+
+    async def find_kyash_account_by_label(self, label: str) -> sqlite3.Row | None:
+        return await self.fetchone(
+            "SELECT * FROM kyash_accounts WHERE label=?", (label,)
+        )
+
+    async def add_kyash_account(
+        self, *, label: str, threshold: int = 0, priority: int = 0
+    ) -> int:
+        """空のアカウント枠を作る (ログインは別途 /kyash login で行う)。"""
+        now = utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> int:
+            try:
+                cur = conn.execute(
+                    "INSERT INTO kyash_accounts(label, status, threshold, priority, "
+                    "created_at, updated_at) VALUES(?,?,?,?,?,?)",
+                    (label, config.KyashAccountStatus.UNCONFIGURED, int(threshold),
+                     int(priority), now, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DatabaseError(f"同じ名前のアカウントが既にあります: {label}") from exc
+            return _lastrowid(cur)
+
+        return await self.run(_fn, write=True)
+
+    async def save_kyash_session(
+        self,
+        account_id: int,
+        *,
+        email: str | None,
+        client_uuid: str | None,
+        installation_uuid: str | None,
+        access_token_enc: str | None,
+        status: str,
+        username: str | None = None,
+        wallet_uuid: str | None = None,
+        last_error: str | None = None,
+        token_issued_at: int | None = None,
+    ) -> None:
+        """ログイン結果を保存する。パスワードは保存しない。"""
+        now = utils.now_ts()
+        await self.execute(
+            "UPDATE kyash_accounts SET email=?, client_uuid=?, installation_uuid=?, "
+            "access_token_enc=?, status=?, username=COALESCE(?, username), "
+            "wallet_uuid=COALESCE(?, wallet_uuid), last_checked_at=?, last_error=?, "
+            "token_issued_at=?, updated_at=? WHERE id=?",
+            (
+                email, client_uuid, installation_uuid, access_token_enc, status,
+                username, wallet_uuid, now,
+                utils.sanitize_for_log(last_error, limit=500) if last_error else None,
+                token_issued_at or now, now, account_id,
+            ),
+        )
+
+    async def update_kyash_account_status(
+        self,
+        account_id: int,
+        status: str,
+        *,
+        last_error: str | None = None,
+        wallet_uuid: str | None = None,
+        username: str | None = None,
+        wallet_balance: int | None = None,
+    ) -> None:
+        now = utils.now_ts()
+        sets = ["status=?", "last_checked_at=?", "updated_at=?", "last_error=?"]
+        params: list[Any] = [
+            status, now, now,
+            utils.sanitize_for_log(last_error, limit=500) if last_error else None,
+        ]
+        for column, value in (
+            ("wallet_uuid", wallet_uuid), ("username", username),
+            ("wallet_balance", wallet_balance),
+        ):
+            if value is not None:
+                sets.append(f"{column}=?")
+                params.append(value)
+        params.append(account_id)
+        await self.execute(
+            f"UPDATE kyash_accounts SET {', '.join(sets)} WHERE id=?", params
+        )
+
+    async def set_kyash_account_options(
+        self,
+        account_id: int,
+        *,
+        threshold: int | None = None,
+        priority: int | None = None,
+        enabled: bool | None = None,
+        label: str | None = None,
+    ) -> bool:
+        sets: list[str] = []
+        params: list[Any] = []
+        if threshold is not None:
+            sets.append("threshold=?")
+            params.append(max(0, int(threshold)))
+        if priority is not None:
+            sets.append("priority=?")
+            params.append(int(priority))
+        if enabled is not None:
+            sets.append("enabled=?")
+            params.append(1 if enabled else 0)
+        if label is not None:
+            sets.append("label=?")
+            params.append(label)
+        if not sets:
+            return False
+        sets.append("updated_at=?")
+        params.append(utils.now_ts())
+        params.append(account_id)
+
+        def _fn(conn: sqlite3.Connection) -> bool:
+            try:
+                cur = conn.execute(
+                    f"UPDATE kyash_accounts SET {', '.join(sets)} WHERE id=?", tuple(params)
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DatabaseError("同じ名前のアカウントが既にあります") from exc
+            return cur.rowcount > 0
+
+        return await self.run(_fn, write=True)
+
+    async def clear_kyash_session(self, account_id: int) -> None:
+        """セッション情報だけを消す (枠は残す)。"""
+        await self.execute(
+            "UPDATE kyash_accounts SET access_token_enc=NULL, client_uuid=NULL, "
+            "installation_uuid=NULL, status=?, last_error=NULL, updated_at=? WHERE id=?",
+            (config.KyashAccountStatus.UNCONFIGURED, utils.now_ts(), account_id),
+        )
+
+    async def delete_kyash_account(self, account_id: int) -> bool:
+        def _fn(conn: sqlite3.Connection) -> bool:
+            cur = conn.execute("DELETE FROM kyash_accounts WHERE id=?", (account_id,))
+            return cur.rowcount > 0
+
+        return await self.run(_fn, write=True)
+
+    async def count_transactions_by_account(self, account_id: int) -> int:
+        """そのアカウントで受け取った取引の件数 (削除前の確認用)。"""
+        row = await self.fetchone(
+            "SELECT COUNT(*) AS c FROM charge_transactions WHERE kyash_account_id=?",
+            (account_id,),
+        )
+        return int(row["c"]) if row else 0
 
     # ------------------------------------------------------------------
     # 通知キュー

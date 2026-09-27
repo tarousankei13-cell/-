@@ -41,6 +41,7 @@ from discord import app_commands  # noqa: E402
 
 import requests  # noqa: E402
 
+import kyash_service  # noqa: E402
 import ui  # noqa: E402
 import utils  # noqa: E402
 
@@ -641,8 +642,13 @@ async def main() -> None:
                 operator_id=owner.id, reason="UIテスト用",
             )
     # Kyash を利用可能な状態に見せる (チャージボタンの事前チェック通過用)
-    bot.kyash._client = object()  # type: ignore[assignment]
-    bot.kyash._status = config.KyashAccountStatus.ACTIVE
+    # v4: 受取用アカウントの枠を1件だけ差し込む (実通信はしない)
+    bot.kyash._slots = {
+        1: kyash_service.AccountSlot(
+            id=1, label="main", client=object(),  # type: ignore[arg-type]
+            status=config.KyashAccountStatus.ACTIVE, wallet_balance=0,
+        )
+    }
 
     async def run_ui(label: str, coro, interaction: StubInteraction | None = None) -> None:
         try:

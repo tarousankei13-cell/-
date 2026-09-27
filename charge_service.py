@@ -625,10 +625,25 @@ class ChargeService:
             await self._defer(tx_id, attempts, 60, f"Kyash状態: {self.kyash.status}")
             return
 
+        # 受け取るアカウントを先に決める。複数登録されている場合は
+        # しきい値に余裕のあるものが選ばれる。以後の確認は必ず同じ
+        # アカウントに対して行う (他のアカウントの残高で誤判定しないため)。
+        try:
+            account = self.kyash.pick_slot(expected_amount)
+        except kyash_service.NoCapacityError as exc:
+            queue_logger.warning("受取可能なアカウントがありません tx=%s: %s", tx_id, exc)
+            await self._defer(tx_id, attempts, 120, str(exc))
+            await self._safe(self.bot.alert_owner(
+                f"**受取用アカウントに余裕がありません**\n{exc}\n"
+                "`/kyash list` で状態を確認し、必要なら `/kyash add` で追加してください。"
+            ), context="Owner通知")
+            return
+        account_id = account.id
+
         # 受取前の残高を記録 (受取確認の基準になる)
         wallet_before: int | None = None
         try:
-            wallet = await self.kyash.get_wallet()
+            wallet = await self.kyash.get_wallet(account_id)
             wallet_before = wallet.all_balance
         except kyash_service.KyashServiceError as exc:
             queue_logger.warning("受取前の残高照会に失敗しました tx=%s: %s", tx_id, exc)
@@ -639,23 +654,28 @@ class ChargeService:
             expected=(config.TxStatus.QUEUED,),
             processing_started_at=utils.now_ts(),
             wallet_before=wallet_before,
+            kyash_account_id=account_id,
         )
-        queue_logger.info("受取処理を開始します tx=%s uuid=%s amount=%s",
-                          tx_id, utils.mask_identifier(link_uuid), expected_amount)
+        queue_logger.info("受取処理を開始します tx=%s uuid=%s amount=%s account=%s",
+                          tx_id, utils.mask_identifier(link_uuid), expected_amount,
+                          account.label)
 
         receive_started = time.monotonic()
         try:
-            await self.kyash.link_receive(link_uuid)
+            await self.kyash.link_receive(
+                link_uuid, amount=expected_amount, account_id=account_id
+            )
             self.metrics["receive_count"] += 1
             self.metrics["receive_seconds"] += time.monotonic() - receive_started
         except kyash_service.KyashRejectedError as exc:
             # Kyash が受取を拒否 (使用済み・無効など)。実状態を確認してから判断する。
             await self._resolve_after_rejection(
-                tx_id, link_uuid, expected_amount, wallet_before, str(exc)
+                tx_id, link_uuid, expected_amount, wallet_before, str(exc),
+                account_id=account_id,
             )
             return
         except kyash_service.KyashAuthError as exc:
-            await self.kyash.deactivate(str(exc))
+            await self.kyash.deactivate(str(exc), account_id=account_id)
             await self.alert_admins(
                 guild_id, "Kyash 認証切れ",
                 "受取処理中に認証エラーが発生しました。`/kyash login` で再ログインしてください。",
@@ -669,24 +689,26 @@ class ChargeService:
             # 結果不明: 必ず実状態を確認し、成功していれば再受取しない
             await self._resolve_unknown_outcome(
                 tx_id, link_uuid, expected_amount, wallet_before, attempts,
-                exc.error_code, str(exc),
+                exc.error_code, str(exc), account_id=account_id,
             )
             return
         except kyash_service.KyashServiceError as exc:
             await self._resolve_unknown_outcome(
                 tx_id, link_uuid, expected_amount, wallet_before, attempts,
-                exc.error_code, str(exc),
+                exc.error_code, str(exc), account_id=account_id,
             )
             return
 
         # 受取APIは成功を返した。実際に受け取れたかを確認する。
         verification = await self.kyash.verify_receipt(
-            link_uuid=link_uuid, amount=expected_amount, wallet_before=wallet_before
+            link_uuid=link_uuid, amount=expected_amount, wallet_before=wallet_before,
+            account_id=account_id,
         )
         if verification.verdict == kyash_service.Verdict.NO_EVIDENCE:
             await asyncio.sleep(config.KYASH_RECEIPT_RECHECK_DELAY)
             verification = await self.kyash.verify_receipt(
-                link_uuid=link_uuid, amount=expected_amount, wallet_before=wallet_before
+                link_uuid=link_uuid, amount=expected_amount, wallet_before=wallet_before,
+                account_id=account_id,
             )
         if verification.verdict == kyash_service.Verdict.NO_EVIDENCE:
             queue_logger.error(
@@ -706,11 +728,13 @@ class ChargeService:
         await self._mark_received_and_credit(tx_id, expected_amount)
 
     async def _resolve_after_rejection(
-        self, tx_id: str, link_uuid: str, amount: int, wallet_before: int | None, message: str
+        self, tx_id: str, link_uuid: str, amount: int, wallet_before: int | None,
+        message: str, *, account_id: int | None = None,
     ) -> None:
         """受取拒否時の判定 (既に自分で受け取っていた可能性を排除する)。"""
         verification = await self.kyash.verify_receipt(
-            link_uuid=link_uuid, amount=amount, wallet_before=wallet_before
+            link_uuid=link_uuid, amount=amount, wallet_before=wallet_before,
+            account_id=account_id,
         )
         if verification.verdict == kyash_service.Verdict.CONFIRMED:
             queue_logger.warning(
@@ -740,10 +764,13 @@ class ChargeService:
         attempts: int,
         error_code: str,
         message: str,
+        *,
+        account_id: int | None = None,
     ) -> None:
         """タイムアウト等で結果が不明な場合の判定。"""
         verification = await self.kyash.verify_receipt(
-            link_uuid=link_uuid, amount=amount, wallet_before=wallet_before
+            link_uuid=link_uuid, amount=amount, wallet_before=wallet_before,
+            account_id=account_id,
         )
         if verification.verdict == kyash_service.Verdict.CONFIRMED:
             queue_logger.warning("通信エラー後に受取済みを確認しました tx=%s", tx_id)
@@ -1220,6 +1247,8 @@ class ChargeService:
         return await self.kyash.verify_receipt(
             link_uuid=str(row["link_uuid"]), amount=amount,
             wallet_before=row["wallet_before"] if row["wallet_before"] is not None else None,
+            # 受け取ったアカウントで確認する (他のアカウントの残高では判定できない)
+            account_id=row["kyash_account_id"],
         )
 
     async def requeue_manual_review(self, tx_id: str, operator_id: int) -> None:
@@ -1543,15 +1572,20 @@ class ChargeService:
             active = await self.db.count_active_transactions(guild_id, user_id)
             if active > 0:
                 raise ChargeError(config.ErrorCode.ACTIVE_TRANSACTION_EXISTS)
+            # 請求リンクを発行するアカウントを先に決める
+            try:
+                account = self.kyash.pick_slot(amount)
+            except kyash_service.NoCapacityError as exc:
+                raise ChargeError(config.ErrorCode.NO_KYASH_CAPACITY, str(exc)) from exc
             wallet_before: int | None = None
             try:
-                wallet = await self.kyash.get_wallet()
+                wallet = await self.kyash.get_wallet(account.id)
                 wallet_before = wallet.all_balance
             except kyash_service.KyashServiceError as exc:
                 # 残高が取れなくても履歴照合で確認できるため続行する
                 logger.info("請求リンク発行前の残高取得に失敗しました: %s", exc)
             try:
-                claim = await self.kyash.create_claim_link(amount)
+                claim = await self.kyash.create_claim_link(amount, account_id=account.id)
             except kyash_service.KyashServiceError as exc:
                 logger.warning("請求リンクの発行に失敗しました guild=%s user=%s: %s",
                                guild_id, user_id, exc)
@@ -1569,12 +1603,14 @@ class ChargeService:
                     link_uuid=claim.link_uuid,
                     claim_link_id=claim.link_id,
                     wallet_before=wallet_before,
+                    kyash_account_id=claim.account_id,
                     expires_at=utils.now_ts() + config.CLAIM_WAIT_SECONDS,
                 )
             except Exception:
                 # 取引を作れなかったリンクは残さない
                 await self._safe(
-                    self.kyash.cancel_link(claim.link_uuid), context="請求リンク破棄"
+                    self.kyash.cancel_link(claim.link_uuid, account_id=claim.account_id),
+                    context="請求リンク破棄",
                 )
                 raise
         logger.info(
@@ -1647,6 +1683,7 @@ class ChargeService:
             amount=amount,
             wallet_before=row["wallet_before"],
             allow_wallet_delta=False,
+            account_id=row["kyash_account_id"],
         )
         if verification.verdict == kyash_service.Verdict.CONFIRMED:
             return await self._settle_claim(tx_id, amount, verification.detail)
@@ -1672,7 +1709,10 @@ class ChargeService:
         row = await self.db.get_transaction(tx_id)
         if row is not None and row["link_uuid"]:
             await self._safe(
-                self.kyash.cancel_link(str(row["link_uuid"])), context="請求リンク無効化"
+                self.kyash.cancel_link(
+                    str(row["link_uuid"]), account_id=row["kyash_account_id"]
+                ),
+                context="請求リンク無効化",
             )
         await self.credit_transaction(tx_id)
         return "CREDITED"
@@ -1691,16 +1731,25 @@ class ChargeService:
             return 0
         if not self.kyash.is_usable:
             return 0
-        try:
-            timelines = await self.kyash.get_history(config.KYASH_HISTORY_LIMIT)
-        except kyash_service.KyashServiceError as exc:
-            logger.info("請求リンクの自動確認をスキップしました (履歴取得失敗): %s", exc)
+        # 履歴の取得はアカウントごとに1回だけ行う (問い合わせ回数を抑える)
+        histories: dict[int | None, Any] = {}
+        for account_id in {row["kyash_account_id"] for row in rows}:
+            try:
+                histories[account_id] = await self.kyash.get_history(
+                    config.KYASH_HISTORY_LIMIT, account_id=account_id
+                )
+            except kyash_service.KyashServiceError as exc:
+                logger.info("請求リンクの自動確認をスキップしました (履歴取得失敗): %s", exc)
+        if not histories:
             return 0
         credited = 0
         for row in rows:
             tx_id = str(row["id"])
             link_uuid = str(row["link_uuid"] or "")
             if not link_uuid:
+                continue
+            timelines = histories.get(row["kyash_account_id"])
+            if timelines is None:
                 continue
             if not utils.json_contains_text(timelines, link_uuid):
                 continue
@@ -1734,7 +1783,10 @@ class ChargeService:
                 logger.debug("期限切れ直前の支払い確認に失敗しました tx=%s: %s", tx_id, exc.code)
             if row["link_uuid"]:
                 await self._safe(
-                    self.kyash.cancel_link(str(row["link_uuid"])), context="請求リンク無効化"
+                    self.kyash.cancel_link(
+                        str(row["link_uuid"]), account_id=row["kyash_account_id"]
+                    ),
+                    context="請求リンク無効化",
                 )
             try:
                 await self.db.transition_status(
@@ -1766,7 +1818,10 @@ class ChargeService:
             )
         if row["link_uuid"]:
             await self._safe(
-                self.kyash.cancel_link(str(row["link_uuid"])), context="請求リンク無効化"
+                self.kyash.cancel_link(
+                    str(row["link_uuid"]), account_id=row["kyash_account_id"]
+                ),
+                context="請求リンク無効化",
             )
         await self.db.transition_status(
             tx_id, config.TxStatus.CANCELLED,

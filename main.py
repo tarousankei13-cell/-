@@ -237,7 +237,7 @@ class ChargeBot(commands.Bot):
         )
 
         # 10) Kyash セッションの復元と状態確認
-        status = await self.kyash.restore_from_db()
+        status = await self.kyash.load_accounts()
         logger.info("Kyash アカウント状態: %s", status)
 
         # 8-9) キュー復旧 / 停滞 Transaction の確認
@@ -1679,7 +1679,12 @@ class ChargeBot(commands.Bot):
     # Kyash ログインハンドラ (Bot Owner 専用)
     # ------------------------------------------------------------------
     async def handle_kyash_login(
-        self, interaction: discord.Interaction, email: str, password: str
+        self,
+        interaction: discord.Interaction,
+        email: str,
+        password: str,
+        *,
+        account_id: int | None = None,
     ) -> None:
         """受取用 Kyash アカウントのログイン (Ephemeral)。"""
         if not self.is_bot_owner(interaction.user):
@@ -1687,7 +1692,9 @@ class ChargeBot(commands.Bot):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            needs_otp = await self.kyash.begin_login(interaction.user.id, email, password)
+            needs_otp = await self.kyash.begin_login(
+                interaction.user.id, email, password, account_id=account_id
+            )
         except kyash_service.KyashServiceError as exc:
             logger.error("Kyash ログインに失敗しました: %s", utils.sanitize_for_log(exc, limit=200))
             await interaction.followup.send(

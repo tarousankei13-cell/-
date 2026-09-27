@@ -183,8 +183,13 @@ async def main() -> None:
 
     # Kyash セッションを有効化 (トークンのみでクライアント生成 → 通信なし)
     client = kyash_service.Kyash(access_token="test-token")
-    bot.kyash._client = client
-    bot.kyash._status = config.KyashAccountStatus.ACTIVE
+    # v4: 受取用アカウントは複数登録できるため、テストでは1件だけ差し込む
+    bot.kyash._slots = {
+        1: kyash_service.AccountSlot(
+            id=1, label="main", client=client,
+            status=config.KyashAccountStatus.ACTIVE, wallet_balance=STATE["wallet"],
+        )
+    }
     bot.kyash._username = "bot_receiver"
 
     print("\n=== 1. 金額検証 ===")

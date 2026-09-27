@@ -298,8 +298,13 @@ async def main() -> None:
         achievement_channel_id=guild.channel.id, log_channel_id=guild.channel.id,
     )
     client = kyash_service.Kyash(access_token="t")
-    bot.kyash._client = client
-    bot.kyash._status = config.KyashAccountStatus.ACTIVE
+    # v4: 受取用アカウントは複数登録できるため、テストでは1件だけ差し込む
+    bot.kyash._slots = {
+        1: kyash_service.AccountSlot(
+            id=1, label="main", client=client,
+            status=config.KyashAccountStatus.ACTIVE, wallet_balance=STATE["wallet"],
+        )
+    }
 
     member = guild.add_member(StubMember(41_001, guild))
     await bot.db.ensure_user(G, member.id)
