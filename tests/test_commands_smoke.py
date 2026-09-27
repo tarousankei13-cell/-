@@ -807,6 +807,61 @@ async def main() -> None:
             ))
             print(" FAIL  検証: ショップ購入が成立していない")
 
+    # --- 返金申請: カードのボタンから却下する ---
+    refund_tx = await bot.db.create_proxy_transaction(
+        guild_id=G, user_id=target.id, requested_amount=1_000,
+        received_amount=1_000, charge_rate=Decimal("130"),
+    )
+    await bot.db.credit_transaction(refund_tx, 1_300)
+    refund_created = await bot.charge.request_refund(
+        G, target.id, refund_tx, "スモークテストの返金申請"
+    )
+    smoke_request_id = int(refund_created["request_id"])
+    refund_message = await guild.channel.send(
+        embed=ui.refund_card_embed(
+            await bot.db.get_refund_request(smoke_request_id),  # type: ignore[arg-type]
+            await bot.db.get_transaction(refund_tx),
+            guild_name=guild.name,
+        )
+    )
+    await bot.db.set_refund_message(
+        smoke_request_id, channel_id=guild.channel.id, message_id=refund_message.id
+    )
+    refund_view = ui.RefundCardView()
+    reject_button = next(
+        c for c in refund_view.children
+        if isinstance(c, discord.ui.Button) and c.style == discord.ButtonStyle.secondary
+    )
+    reject_interaction = fresh(owner)
+    reject_interaction.message = refund_message
+    await run_ui("返金カード: 却下", reject_button.callback(reject_interaction),
+                 reject_interaction)
+    if reject_interaction.modals:
+        reject_modal = reject_interaction.modals[0]
+        reject_modal.reason._value = "スモークテストのため却下"  # type: ignore[attr-defined]
+        reject_done = fresh(owner)
+        await run_ui("返金カード: 却下を確定", reject_modal.on_submit(reject_done),
+                     reject_done)
+    refund_after = await bot.db.get_refund_request(smoke_request_id, G)
+    balance_kept = await bot.db.get_balance(G, target.id)
+    if refund_after is not None \
+            and str(refund_after["status"]) == config.RefundRequestStatus.REJECTED:
+        OK.append("返金カードの却下で状態が変わり残高は動かない")
+        print(f"  ok   検証: 返金の却下 (残高 {balance_kept})")
+    else:
+        FAILURES.append(("返金カード", "却下が反映されなかった"))
+        print(" FAIL  検証: 返金申請の却下が反映されない")
+
+    # --- レシートの発行と検証 ---
+    receipt_info = await bot.charge.issue_receipt(G, target.id, refund_tx)
+    receipt_check = await bot.charge.verify_receipt_code(str(receipt_info["code"]))
+    if receipt_check.get("valid"):
+        OK.append("発行した控えを検証できる")
+        print(f"  ok   検証: 控えの検証 ({str(receipt_info['code'])[:14]}…)")
+    else:
+        FAILURES.append(("レシート", f"検証に失敗 ({receipt_check.get('reason')})"))
+        print(" FAIL  検証: 控えを検証できない")
+
     # --- 不正検知: カードのボタンを押す ---
     fraud_flag_id, _created = await bot.db.create_fraud_flag(
         guild_id=G, user_id=target.id, kind=config.FraudKind.BURST_CHARGE,

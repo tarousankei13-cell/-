@@ -74,6 +74,15 @@ class GoalError(DatabaseError):
         self.detail = detail
 
 
+class RefundError(DatabaseError):
+    """返金申請を受け付けられない (利用者向けエラーコードを持つ)。"""
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        super().__init__(detail or code)
+        self.code = code
+        self.detail = detail
+
+
 # ---------------------------------------------------------------------------
 # データクラス
 # ---------------------------------------------------------------------------
@@ -4764,6 +4773,210 @@ class Database:
             "GROUP BY day ORDER BY day ASC",
             tuple(params),
         )
+
+    # ==================================================================
+    # 返金申請
+    # ==================================================================
+    async def create_refund_request(
+        self,
+        *,
+        guild_id: int,
+        user_id: int,
+        transaction_id: str,
+        reason: str,
+        window: int = config.REFUND_REQUEST_WINDOW,
+        max_open: int = config.MAX_OPEN_REFUND_REQUESTS,
+    ) -> dict[str, Any]:
+        """返金 (チャージ取消) を申請する。
+
+        対象の確認・重複の確認・件数の制限をすべて同じトランザクションで行う。
+        別々に確認すると、同時に2回押されたときに二重申請が通ってしまう。
+
+        Raises:
+            RefundError: 申請できない理由 (エラーコード付き)。
+        """
+        now = utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> dict[str, Any]:
+            tx = conn.execute(
+                "SELECT * FROM charge_transactions WHERE id=? AND guild_id=? AND user_id=?",
+                (transaction_id, guild_id, user_id),
+            ).fetchone()
+            if tx is None:
+                raise RefundError(
+                    config.ErrorCode.REFUND_NOT_ELIGIBLE, "対象の取引が見つかりません"
+                )
+            if str(tx["status"]) != config.TxStatus.COMPLETED:
+                raise RefundError(
+                    config.ErrorCode.REFUND_NOT_ELIGIBLE,
+                    f"完了した取引のみ申請できます (状態: {tx['status']})",
+                )
+            if tx["refunded_at"]:
+                raise RefundError(
+                    config.ErrorCode.REFUND_NOT_ELIGIBLE, "この取引は取消済みです"
+                )
+            completed_at = int(tx["completed_at"] or tx["created_at"] or 0)
+            if window > 0 and now - completed_at > window:
+                raise RefundError(
+                    config.ErrorCode.REFUND_NOT_ELIGIBLE,
+                    f"申請できる期間 ({window // 86400}日) を過ぎています",
+                )
+            duplicate = conn.execute(
+                "SELECT id FROM refund_requests WHERE transaction_id=? AND status=?",
+                (transaction_id, config.RefundRequestStatus.PENDING),
+            ).fetchone()
+            if duplicate is not None:
+                raise RefundError(
+                    config.ErrorCode.REFUND_ALREADY_REQUESTED,
+                    f"申請 #{int(duplicate['id'])} が審査待ちです",
+                )
+            handled = conn.execute(
+                "SELECT status FROM refund_requests WHERE transaction_id=? "
+                "AND status=? LIMIT 1",
+                (transaction_id, config.RefundRequestStatus.APPROVED),
+            ).fetchone()
+            if handled is not None:
+                raise RefundError(
+                    config.ErrorCode.REFUND_NOT_ELIGIBLE, "この取引は返金済みです"
+                )
+            open_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM refund_requests WHERE guild_id=? AND user_id=? "
+                "AND status=?",
+                (guild_id, user_id, config.RefundRequestStatus.PENDING),
+            ).fetchone()
+            if max_open > 0 and int(open_count["c"]) >= max_open:
+                raise RefundError(
+                    config.ErrorCode.OPEN_REQUEST_LIMIT,
+                    f"審査待ちの申請が {int(open_count['c'])} 件あります",
+                )
+            cur = conn.execute(
+                "INSERT INTO refund_requests(guild_id, user_id, transaction_id, amount, "
+                "reason, status, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                (guild_id, user_id, transaction_id, int(tx["credited_amount"] or 0),
+                 utils.truncate(reason, 900), config.RefundRequestStatus.PENDING, now, now),
+            )
+            request_id = _lastrowid(cur)
+            return {
+                "request_id": request_id,
+                "transaction_id": transaction_id,
+                "amount": int(tx["credited_amount"] or 0),
+                "received_amount": int(tx["received_amount"] or 0),
+                "completed_at": completed_at,
+                "provider": str(tx["provider"] or config.ChargeProvider.KYASH),
+            }
+
+        return await self.run(_fn, write=True)
+
+    async def get_refund_request(
+        self, request_id: int, guild_id: int | None = None
+    ) -> sqlite3.Row | None:
+        if guild_id is None:
+            return await self.fetchone(
+                "SELECT * FROM refund_requests WHERE id=?", (request_id,)
+            )
+        return await self.fetchone(
+            "SELECT * FROM refund_requests WHERE id=? AND guild_id=?",
+            (request_id, guild_id),
+        )
+
+    async def get_refund_request_by_message(self, message_id: int) -> sqlite3.Row | None:
+        return await self.fetchone(
+            "SELECT * FROM refund_requests WHERE message_id=?", (message_id,)
+        )
+
+    async def list_refund_requests(
+        self, guild_id: int | None = None, *, status: str | None = None,
+        user_id: int | None = None, offset: int = 0, limit: int = 10,
+    ) -> tuple[list[sqlite3.Row], int]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if guild_id is not None:
+            clauses.append("guild_id=?")
+            params.append(guild_id)
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        if user_id is not None:
+            clauses.append("user_id=?")
+            params.append(user_id)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+        def _fn(conn: sqlite3.Connection) -> tuple[list[sqlite3.Row], int]:
+            total = conn.execute(
+                f"SELECT COUNT(*) AS c FROM refund_requests {where}", tuple(params)
+            ).fetchone()["c"]
+            rows = conn.execute(
+                f"SELECT * FROM refund_requests {where} "
+                "ORDER BY CASE status WHEN 'PENDING' THEN 0 ELSE 1 END, created_at DESC "
+                "LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()
+            return rows, int(total)
+
+        return await self.run(_fn)
+
+    async def transition_refund_request(
+        self, request_id: int, *, status: str, reviewed_by: int | None = None,
+        reject_reason: str | None = None, operation_id: str | None = None,
+    ) -> sqlite3.Row:
+        """申請の状態を進める (許可された遷移のみ)。
+
+        Raises:
+            IllegalStateTransition: 許可されていない遷移。
+        """
+        now = utils.now_ts()
+
+        def _fn(conn: sqlite3.Connection) -> sqlite3.Row:
+            row = conn.execute(
+                "SELECT * FROM refund_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            if row is None:
+                raise DatabaseError(f"返金申請が見つかりません: {request_id}")
+            current = str(row["status"])
+            if status not in config.REFUND_TRANSITIONS.get(current, ()):
+                raise IllegalStateTransition(
+                    f"返金申請 {request_id}: {current} → {status} は許可されていません"
+                )
+            conn.execute(
+                "UPDATE refund_requests SET status=?, reviewed_by=?, reviewed_at=?, "
+                "reject_reason=?, operation_id=COALESCE(?, operation_id), updated_at=? "
+                "WHERE id=? AND status=?",
+                (status, reviewed_by, now,
+                 utils.truncate(reject_reason, 500) if reject_reason else None,
+                 operation_id, now, request_id, current),
+            )
+            updated = conn.execute(
+                "SELECT * FROM refund_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            if str(updated["status"]) != status:
+                # 同時に別の処理が状態を進めた場合
+                raise IllegalStateTransition(
+                    f"返金申請 {request_id}: 競合により {status} へ進められませんでした"
+                )
+            return updated
+
+        return await self.run(_fn, write=True)
+
+    async def set_refund_message(
+        self, request_id: int, *, channel_id: int, message_id: int
+    ) -> None:
+        await self.execute(
+            "UPDATE refund_requests SET channel_id=?, message_id=?, updated_at=? WHERE id=?",
+            (channel_id, message_id, utils.now_ts(), request_id),
+        )
+
+    async def count_refund_requests(self, guild_id: int | None = None) -> dict[str, int]:
+        if guild_id is None:
+            rows = await self.fetchall(
+                "SELECT status, COUNT(*) AS c FROM refund_requests GROUP BY status"
+            )
+        else:
+            rows = await self.fetchall(
+                "SELECT status, COUNT(*) AS c FROM refund_requests WHERE guild_id=? "
+                "GROUP BY status",
+                (guild_id,),
+            )
+        return {str(r["status"]): int(r["c"]) for r in rows}
 
     # ==================================================================
     # 不正検知

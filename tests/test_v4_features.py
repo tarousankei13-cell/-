@@ -1693,7 +1693,213 @@ async def main() -> None:
         chart_module.Image = real_image  # type: ignore[assignment]
     check(chart_module.available(), "後始末でグラフ機能が戻る")
 
-    print("\n=== 10. 整合性 ===")
+    print("\n=== 10. 返金申請とレシート ===")
+    refunder = guild.add_member(StubMember(68_101, guild))
+    tx_a = await give_charge(refunder.id, 5_000)
+    bal_after_charge = await bot.db.get_balance(G, refunder.id)
+
+    # --- 申請 ---
+    created = await bot.charge.request_refund(
+        G, refunder.id, tx_a, "間違えてチャージしました"
+    )
+    req_id = int(created["request_id"])
+    check(created["amount"] == 6_500,
+          f"取消される残高は付与額と同じ ({created['amount']})")
+    check(await bot.db.get_balance(G, refunder.id) == bal_after_charge,
+          "申請しただけでは残高は動かない")
+    check(any("返金" in (e.title or "") for e in guild.review.sent),
+          "審査カードが審査チャンネルへ投稿される")
+    stored = await bot.db.get_refund_request(req_id, G)
+    check(stored is not None and stored["message_id"] is not None,
+          "カードのメッセージIDを保存する")
+
+    # 同じ取引で二重に申請できない
+    try:
+        await bot.charge.request_refund(G, refunder.id, tx_a, "もう一度")
+        check(False, "同じ取引で二重申請できてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.REFUND_ALREADY_REQUESTED,
+              f"審査待ちの取引は再申請できない ({exc.code})")
+
+    # 他人の取引は申請できない
+    other = guild.add_member(StubMember(68_102, guild))
+    try:
+        await bot.charge.request_refund(G, other.id, tx_a, "他人の取引")
+        check(False, "他人の取引を申請できてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.REFUND_NOT_ELIGIBLE,
+              f"他人の取引は申請できない ({exc.code})")
+
+    # 期限を過ぎた取引は申請できない
+    old_tx = await give_charge(
+        refunder.id, 1_000, when=utils.now_ts() - config.REFUND_REQUEST_WINDOW - 86_400
+    )
+    await bot.db.execute(
+        "UPDATE charge_transactions SET completed_at=? WHERE id=?",
+        (utils.now_ts() - config.REFUND_REQUEST_WINDOW - 86_400, old_tx),
+    )
+    try:
+        await bot.charge.request_refund(G, refunder.id, old_tx, "古い取引")
+        check(False, "期限切れの取引を申請できてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.REFUND_NOT_ELIGIBLE,
+              f"期限を過ぎた取引は申請できない ({exc.code})")
+
+    # 同時に出せる申請の数に上限がある
+    extra_txs = [await give_charge(refunder.id, 1_000) for _ in range(3)]
+    accepted = 0
+    for tx in extra_txs:
+        try:
+            await bot.charge.request_refund(G, refunder.id, tx, "上限テスト")
+            accepted += 1
+        except ChargeError as exc:
+            check(exc.code == config.ErrorCode.OPEN_REQUEST_LIMIT,
+                  f"審査待ちの上限で止まる ({exc.code})")
+            break
+    check(accepted == config.MAX_OPEN_REFUND_REQUESTS - 1,
+          f"審査待ちは {config.MAX_OPEN_REFUND_REQUESTS} 件まで (追加 {accepted} 件)")
+
+    # --- 却下では残高が動かない ---
+    pending_rows, _ = await bot.db.list_refund_requests(
+        G, status=config.RefundRequestStatus.PENDING, user_id=refunder.id
+    )
+    reject_id = next(int(r["id"]) for r in pending_rows if int(r["id"]) != req_id)
+    bal_before_reject = await bot.db.get_balance(G, refunder.id)
+    bot.dms.clear()
+    await bot.charge.reject_refund(reject_id, operator_id=OWNER_ID, reason="対象外です")
+    rejected = await bot.db.get_refund_request(reject_id, G)
+    check(str(rejected["status"]) == config.RefundRequestStatus.REJECTED,  # type: ignore[index]
+          "却下できる")
+    check(await bot.db.get_balance(G, refunder.id) == bal_before_reject,
+          "却下では残高が動かない")
+    check(any("承認されませんでした" in d[1] for d in bot.dms),
+          "却下を DM で知らせる")
+    try:
+        await bot.charge.reject_refund(reject_id, operator_id=OWNER_ID, reason="再度")
+        check(False, "却下済みを再度処理できてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.REQUEST_ALREADY_HANDLED,
+              f"処理済みの申請は再処理できない ({exc.code})")
+
+    # --- 承認すると残高が取り消される ---
+    bal_before_approve = await bot.db.get_balance(G, refunder.id)
+    bot.dms.clear()
+    approved = await bot.charge.approve_refund(req_id, operator_id=OWNER_ID)
+    check(int(approved["credited_amount"]) == 6_500,
+          f"付与した額を回収する ({approved['credited_amount']})")
+    check(await bot.db.get_balance(G, refunder.id) == bal_before_approve - 6_500,
+          "承認で残高が減る")
+    tx_row = await bot.db.get_transaction(tx_a)
+    check(tx_row["refunded_at"] is not None, "取引が取消済みになる")  # type: ignore[index]
+    check(any("承認されました" in d[1] for d in bot.dms), "承認を DM で知らせる")
+    # 取消済みの取引は再申請できない
+    bot.charge._request_rate_limiter.reset(f"refund:{G}:{refunder.id}")
+    try:
+        await bot.charge.request_refund(G, refunder.id, tx_a, "もう一度")
+        check(False, "取消済みの取引を申請できてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.REFUND_NOT_ELIGIBLE,
+              f"取消済みの取引は申請できない ({exc.code})")
+
+    # --- 取り下げ ---
+    # ここまでで連投制限に触れているため、テストの続きのために解除する
+    # (制限そのものは「連投を止める」ことを上で確認済み)
+    bot.charge._request_rate_limiter.reset(f"refund:{G}:{refunder.id}")
+    cancel_tx = await give_charge(refunder.id, 2_000)
+    cancel_created = await bot.charge.request_refund(
+        G, refunder.id, cancel_tx, "やっぱり取り下げます"
+    )
+    cancel_id = int(cancel_created["request_id"])
+    try:
+        await bot.charge.cancel_refund_request(cancel_id, user_id=other.id)
+        check(False, "他人の申請を取り下げられてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.REQUEST_NOT_FOUND,
+              f"他人の申請は取り下げられない ({exc.code})")
+    await bot.charge.cancel_refund_request(cancel_id, user_id=refunder.id)
+    cancelled = await bot.db.get_refund_request(cancel_id, G)
+    check(str(cancelled["status"]) == config.RefundRequestStatus.CANCELLED,  # type: ignore[index]
+          "本人は取り下げられる")
+    # 取り下げたあとは同じ取引で再申請できる
+    again = await bot.charge.request_refund(G, refunder.id, cancel_tx, "再申請")
+    check(int(again["request_id"]) != cancel_id, "取り下げ後は再申請できる")
+    await bot.charge.cancel_refund_request(
+        int(again["request_id"]), user_id=refunder.id
+    )
+
+    # --- 不正検知が返金の繰り返しを拾う ---
+    repeat_rows = await bot.db.find_rapid_refunders(G, minimum=1)
+    check(any(int(r["user_id"]) == refunder.id for r in repeat_rows),
+          "返金申請の回数を検知ルールから数えられる")
+
+    print("\n=== 10b. レシート ===")
+    receipt_tx = await give_charge(refunder.id, 3_000)
+    receipt = await bot.charge.issue_receipt(G, refunder.id, receipt_tx)
+    code = str(receipt["code"])
+    check(code.startswith(f"{config.RECEIPT_VERSION}."),
+          f"控えはバージョンから始まる ({code[:12]}…)")
+    check(len(code) < 400, f"控えは Discord に貼れる長さ ({len(code)}文字)")
+    verified = await bot.charge.verify_receipt_code(code)
+    check(verified["valid"] and verified["reason"] == "OK", "発行した控えは有効")
+    check(int(verified["payload"]["credited"]) == 3_900,
+          f"控えに付与額が入る ({verified['payload']['credited']})")
+
+    # 改ざんした控えは通らない
+    tampered = code[:-2] + ("AA" if code[-2:] != "AA" else "BB")
+    bad = await bot.charge.verify_receipt_code(tampered)
+    check(not bad["valid"] and bad["reason"] == "SIGNATURE",
+          f"改ざんした控えは署名で弾く ({bad['reason']})")
+    for junk in ("", "R1", "R1.x.y", "まったく別の文字列", code.replace("R1", "R9", 1)):
+        result = await bot.charge.verify_receipt_code(junk)
+        check(not result["valid"], f"壊れた入力を拒否する ({junk[:12]!r})")
+
+    # 別のサーバー・別の人の取引は発行できない
+    try:
+        await bot.charge.issue_receipt(G, other.id, receipt_tx)
+        check(False, "他人の控えを発行できてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.REFUND_NOT_ELIGIBLE,
+              f"他人の取引の控えは発行できない ({exc.code})")
+
+    # 取消された取引の控えは「無効」と判定する
+    await bot.charge.refund_charge_transaction(
+        receipt_tx, operator_id=OWNER_ID, reason="控えの検証テスト"
+    )
+    after_refund = await bot.charge.verify_receipt_code(code)
+    check(not after_refund["valid"] and after_refund["reason"] == "REFUNDED",
+          f"取消後の控えは無効になる ({after_refund['reason']})")
+
+    # 記録を書き換えると不一致として検出する
+    mismatch_tx = await give_charge(refunder.id, 4_000)
+    mismatch_code = str(
+        (await bot.charge.issue_receipt(G, refunder.id, mismatch_tx))["code"]
+    )
+    await bot.db.execute(
+        "UPDATE charge_transactions SET credited_amount=? WHERE id=?",
+        (999_999, mismatch_tx),
+    )
+    mismatch = await bot.charge.verify_receipt_code(mismatch_code)
+    check(not mismatch["valid"] and mismatch["reason"] == "MISMATCH",
+          f"記録と食い違う控えは無効 ({mismatch['reason']})")
+    await bot.db.execute(
+        "UPDATE charge_transactions SET credited_amount=? WHERE id=?",
+        (5_200, mismatch_tx),
+    )
+
+    # 別の鍵で発行された控えは通らない
+    from pathlib import Path as _Path
+
+    foreign = utils.ReceiptSigner(_Path(str(config.DB_PATH) + ".foreign.key"))
+    foreign_code = foreign.issue(
+        guild_id=G, user_id=refunder.id, tx_id=mismatch_tx,
+        received=4_000, credited=5_200, completed_at=utils.now_ts(),
+    )
+    foreign_result = await bot.charge.verify_receipt_code(foreign_code)
+    check(not foreign_result["valid"] and foreign_result["reason"] == "SIGNATURE",
+          "別の鍵で作られた控えは受け付けない")
+    _Path(str(config.DB_PATH) + ".foreign.key").unlink(missing_ok=True)
+
+    print("\n=== 11. 整合性 ===")
     integrity = await bot.db.integrity_check()
     check(integrity["pragma"] == "ok", "PRAGMA quick_check OK")
     check(not integrity["balance_mismatch"], "残高と履歴合計が一致")

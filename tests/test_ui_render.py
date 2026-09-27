@@ -358,6 +358,74 @@ def main() -> None:
         for i in range(20)
     ], guild_name="サーバー" * 30))
 
+    print("\n=== 6f. 返金申請とレシート ===")
+    verify("refund_request_embed", ui.refund_request_embed(
+        request_id=1, tx_id="TX-ABC", amount=6_500, received=5_000,
+        completed_at=now - 3600, reason="間違えてチャージしました" * 30))
+    req_embed = ui.refund_request_embed(
+        request_id=1, tx_id="TX-ABC", amount=6_500, received=5_000,
+        completed_at=now, reason="理由")
+    req_text = "".join(f.value for f in req_embed.fields)
+    check("手作業" in req_text and "残高の取消" in req_text,
+          "返金の範囲 (残高取消のみ) を明記する")
+    refund_row = Row(
+        id=1, guild_id=1, user_id=42, transaction_id="TX-ABC", amount=6_500,
+        reason="理由" * 200, status=config.RefundRequestStatus.PENDING,
+        reviewed_by=None, reviewed_at=None, reject_reason=None,
+        created_at=now - 600, channel_id=None, message_id=None,
+    )
+    tx_row = Row(
+        id="TX-ABC", received_amount=5_000, credited_amount=6_500,
+        completed_at=now - 3600, created_at=now - 3700,
+        provider=config.ChargeProvider.KYASH,
+    )
+    verify("refund_card_embed (審査待ち)", ui.refund_card_embed(
+        refund_row, tx_row, guild_name="サーバー" * 20, past_requests=3))
+    card_text = "".join(f.name + f.value for f in
+                        ui.refund_card_embed(refund_row, tx_row, guild_name="S").fields)
+    check("マイナスにはしません" in card_text, "残高が不足する場合の扱いを説明する")
+    for status in (config.RefundRequestStatus.APPROVED,
+                   config.RefundRequestStatus.REJECTED,
+                   config.RefundRequestStatus.CANCELLED):
+        verify(f"refund_card_embed ({status})", ui.refund_card_embed(
+            Row(**{**refund_row, "status": status, "reviewed_by": 7,
+                   "reviewed_at": now, "reject_reason": "理由" * 200}),
+            tx_row, guild_name="サーバー"))
+    verify("refund_card_embed (取引が消えている)", ui.refund_card_embed(
+        refund_row, None, guild_name="サーバー"))
+    verify("refund_result_dm_embed (承認)", ui.refund_result_dm_embed(
+        guild_name="サーバー" * 20, request_id=1, tx_id="TX-ABC", approved=True,
+        amount=6_500, balance_after=0, reason=None))
+    verify("refund_result_dm_embed (却下)", ui.refund_result_dm_embed(
+        guild_name="サーバー", request_id=1, tx_id="TX-ABC", approved=False,
+        amount=6_500, balance_after=6_500, reason="理由" * 200))
+    verify("refund_list_embed (空)", ui.refund_list_embed(
+        [], title="返金申請", total=0, page=1, total_pages=1))
+    verify("refund_list_embed", ui.refund_list_embed([
+        Row(**{**refund_row, "id": i,
+               "status": list(config.REFUND_STATUS_LABELS)[i % 4]})
+        for i in range(1, 8)
+    ], title="返金申請の一覧", total=30, page=2, total_pages=5))
+    long_code = "R1." + "A" * 120 + "." + "B" * 26
+    verify("receipt_embed", ui.receipt_embed(
+        code=long_code, tx_id="TX-ABC", received=5_000, credited=6_500,
+        completed_at=now - 3600, provider=config.ChargeProvider.KYASH,
+        refunded=False, guild_name="サーバー" * 20))
+    verify("receipt_embed (取消済み)", ui.receipt_embed(
+        code=long_code, tx_id="TX-ABC", received=5_000, credited=6_500,
+        completed_at=now, provider=config.ChargeProvider.LTC,
+        refunded=True, guild_name="サーバー"))
+    payload = {"tx_id": "TX-ABC", "user_id": 42, "completed_at": now,
+               "received": 5_000, "credited": 6_500, "guild_id": 1}
+    verify("receipt_verify_embed (有効)", ui.receipt_verify_embed(
+        {"valid": True, "reason": "OK", "payload": payload}, guild_name="サーバー"))
+    for reason in ("SIGNATURE", "NOT_FOUND", "MISMATCH", "REFUNDED", "NOT_COMPLETED"):
+        verify(f"receipt_verify_embed ({reason})", ui.receipt_verify_embed(
+            {"valid": False, "reason": reason, "payload": payload},
+            guild_name="サーバー" * 20))
+    verify("receipt_verify_embed (中身なし)", ui.receipt_verify_embed(
+        {"valid": False, "reason": "SIGNATURE"}, guild_name="サーバー"))
+
     print("\n=== 6e. 不正検知 ===")
     for kind in config.FRAUD_KIND_LABELS:
         for severity in config.FRAUD_SEVERITY_LABELS:

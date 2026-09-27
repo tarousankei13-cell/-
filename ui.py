@@ -1579,6 +1579,337 @@ def subscription_list_embed(rows: Sequence[Any], *, guild_name: str) -> discord.
 
 
 # ---------------------------------------------------------------------------
+# 返金申請とレシート
+# ---------------------------------------------------------------------------
+
+#: 返金で「お金が戻る」わけではないことの説明 (誤解を生まないよう必ず添える)
+REFUND_SCOPE_NOTE = (
+    "この手続きで戻るのは**サーバー内の残高の取消**です。\n"
+    "Kyash へ実際にお金を返す作業は、承認後に管理者が手作業で行います。"
+)
+
+
+def refund_request_embed(
+    *, request_id: int, tx_id: str, amount: int, received: int,
+    completed_at: int, reason: str,
+) -> discord.Embed:
+    """申請を受け付けたときに利用者へ返す画面。"""
+    embed = discord.Embed(
+        title="↩️ 返金の申請を受け付けました",
+        description=(
+            f"{SEPARATOR}\n審査が終わるまでお待ちください。\n"
+            f"結果は DM でお知らせします。\n{SEPARATOR}"
+        ),
+        color=config.Color.WARNING,
+    )
+    embed.add_field(name="申請ID", value=f"`{request_id}`", inline=True)
+    embed.add_field(name="対象の取引", value=f"`{tx_id}`", inline=True)
+    embed.add_field(
+        name="送金額 / 取消される残高",
+        value=f"{utils.fmt_yen(received)} / **{utils.fmt_int(amount)}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="チャージ日時", value=utils.discord_ts(completed_at), inline=True
+    )
+    embed.add_field(name="理由", value=utils.truncate(reason, 500) or "-", inline=False)
+    embed.add_field(name="ご注意", value=REFUND_SCOPE_NOTE, inline=False)
+    embed.add_field(
+        name="取り下げたいとき",
+        value=f"`/refund cancel request_id:{request_id}` (審査前のみ)",
+        inline=False,
+    )
+    return embed
+
+
+def refund_card_embed(
+    request: Any, transaction: Any = None, *, guild_name: str,
+    past_requests: int = 0,
+) -> discord.Embed:
+    """返金申請の審査カード。
+
+    承認すると残高が減るため、判断に必要な材料 (取引の内容・過去の申請数) を
+    1枚にまとめる。
+    """
+    status = str(request["status"])
+    color = {
+        config.RefundRequestStatus.PENDING: config.Color.WARNING,
+        config.RefundRequestStatus.APPROVED: config.Color.SUCCESS,
+        config.RefundRequestStatus.REJECTED: config.Color.DANGER,
+        config.RefundRequestStatus.CANCELLED: config.Color.NEUTRAL,
+    }.get(status, config.Color.NEUTRAL)
+    embed = discord.Embed(
+        title="↩️ 返金申請の審査",
+        description=(
+            f"{SEPARATOR}\n**{guild_name}**\n"
+            f"{config.REFUND_STATUS_LABELS.get(status, status)}\n{SEPARATOR}"
+        ),
+        color=color,
+    )
+    embed.add_field(name="申請ID", value=f"`{int(request['id'])}`", inline=True)
+    embed.add_field(name="利用者", value=f"<@{int(request['user_id'])}>", inline=True)
+    embed.add_field(
+        name="申請日時", value=utils.discord_ts(int(request["created_at"])), inline=True
+    )
+    embed.add_field(
+        name="対象の取引", value=f"`{request['transaction_id']}`", inline=True
+    )
+    embed.add_field(
+        name="取消される残高",
+        value=f"**{utils.fmt_int(int(request['amount'] or 0))}**",
+        inline=True,
+    )
+    if transaction is not None:
+        embed.add_field(
+            name="送金額 / 方式",
+            value=(
+                f"{utils.fmt_yen(int(transaction['received_amount'] or 0))} / "
+                f"{config.PROVIDER_LABELS.get(str(transaction['provider']), str(transaction['provider']))}"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="チャージ日時",
+            value=utils.discord_ts(
+                int(transaction["completed_at"] or transaction["created_at"] or 0)
+            ),
+            inline=True,
+        )
+    if past_requests > 1:
+        embed.add_field(
+            name="この利用者の申請",
+            value=f"過去を含めて **{past_requests}** 件",
+            inline=True,
+        )
+    embed.add_field(
+        name="申請理由",
+        value=utils.truncate(str(request["reason"] or "-"), 900),
+        inline=False,
+    )
+    if status == config.RefundRequestStatus.PENDING:
+        embed.add_field(
+            name="▶ 承認すると何が起きますか？",
+            value=(
+                "・対象のチャージを**取消**し、付与した残高を回収します\n"
+                "・残高が足りない場合は 0 までしか戻せません (マイナスにはしません)\n"
+                f"・{REFUND_SCOPE_NOTE}"
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="処理",
+            value=(
+                f"担当: <@{int(request['reviewed_by'])}>\n"
+                f"日時: {utils.discord_ts(int(request['reviewed_at']))}"
+                if request["reviewed_by"] and request["reviewed_at"] else "-"
+            ),
+            inline=True,
+        )
+        if request["reject_reason"]:
+            embed.add_field(
+                name="却下の理由",
+                value=utils.truncate(str(request["reject_reason"]), 500),
+                inline=False,
+            )
+    return embed
+
+
+def refund_result_dm_embed(
+    *, guild_name: str, request_id: int, tx_id: str, approved: bool,
+    amount: int, balance_after: int, reason: str | None,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="✅ 返金申請が承認されました" if approved else "🔴 返金申請は承認されませんでした",
+        description=(
+            f"{SEPARATOR}\n**{guild_name}**\n"
+            + (
+                f"取引 `{tx_id}` を取り消し、残高 **{utils.fmt_int(amount)}** を"
+                "回収しました。\n"
+                if approved else
+                f"取引 `{tx_id}` の返金は承認されませんでした。\n"
+            )
+            + SEPARATOR
+        ),
+        color=config.Color.SUCCESS if approved else config.Color.DANGER,
+    )
+    embed.add_field(name="申請ID", value=f"`{request_id}`", inline=True)
+    embed.add_field(name="いまの残高", value=f"**{utils.fmt_int(balance_after)}**", inline=True)
+    if approved:
+        embed.add_field(name="この先", value=REFUND_SCOPE_NOTE, inline=False)
+    elif reason:
+        embed.add_field(name="理由", value=utils.truncate(reason, 500), inline=False)
+    embed.add_field(
+        name="ご不明な点があれば",
+        value="サーバーの管理者へお問い合わせください。",
+        inline=False,
+    )
+    return embed
+
+
+def refund_list_embed(
+    rows: Sequence[Any], *, title: str, total: int, page: int, total_pages: int
+) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"↩️ {title}",
+        description=(
+            f"{SEPARATOR}\n該当 **{utils.fmt_int(total)}** 件"
+            f"　ページ {page}/{total_pages}\n{SEPARATOR}"
+        ),
+        color=config.Color.INFO,
+    )
+    if not rows:
+        embed.add_field(name="該当なし", value="返金申請はありません。", inline=False)
+        return embed
+    for row in rows:
+        status = str(row["status"])
+        embed.add_field(
+            name=f"`{int(row['id'])}` "
+                 f"{config.REFUND_STATUS_LABELS.get(status, status)}",
+            value=(
+                f"利用者: <@{int(row['user_id'])}>\n"
+                f"取引: `{row['transaction_id']}`\n"
+                f"取消額: {utils.fmt_int(int(row['amount'] or 0))}\n"
+                f"申請: {utils.discord_ts(int(row['created_at']))}\n"
+                f"理由: {utils.truncate(str(row['reason'] or '-'), 120)}"
+            ),
+            inline=False,
+        )
+    return embed
+
+
+def receipt_embed(
+    *, code: str, tx_id: str, received: int, credited: int, completed_at: int,
+    provider: str, refunded: bool, guild_name: str,
+) -> discord.Embed:
+    """チャージの控え (本人向け)。"""
+    embed = discord.Embed(
+        title="🧾 チャージの控え",
+        description=(
+            f"{SEPARATOR}\n**{guild_name}**\n"
+            + ("⚠️ この取引は**取消済み**です。\n" if refunded else "")
+            + "下のコードは改ざんできない署名つきです。\n"
+            "`/receipt verify` で誰でも内容を確認できます。\n"
+            f"{SEPARATOR}"
+        ),
+        color=config.Color.NEUTRAL if refunded else config.Color.SUCCESS,
+    )
+    embed.add_field(name="取引ID", value=f"`{tx_id}`", inline=True)
+    embed.add_field(
+        name="方式",
+        value=config.PROVIDER_LABELS.get(provider, provider),
+        inline=True,
+    )
+    embed.add_field(name="チャージ日時", value=utils.discord_ts(completed_at), inline=True)
+    embed.add_field(name="送金額", value=f"**{utils.fmt_yen(received)}**", inline=True)
+    embed.add_field(name="付与された残高", value=f"**{utils.fmt_int(credited)}**", inline=True)
+    embed.add_field(
+        name="控えのコード",
+        value=copy_block(code, hint="長押し (PCは選択) でコピーできます"),
+        inline=False,
+    )
+    embed.set_footer(text="控えのコードは他人に見せても残高を操作されることはありません")
+    return embed
+
+
+def receipt_verify_embed(result: dict[str, Any], *, guild_name: str) -> discord.Embed:
+    """控えの検証結果。"""
+    reason = str(result.get("reason") or "")
+    payload = result.get("payload") or {}
+    if result.get("valid"):
+        embed = discord.Embed(
+            title="🧾 控えは有効です",
+            description=(
+                f"{SEPARATOR}\n署名が一致し、いまの記録とも一致しました。\n{SEPARATOR}"
+            ),
+            color=config.Color.SUCCESS,
+        )
+    else:
+        messages = {
+            "SIGNATURE": "署名が一致しません。コードが壊れているか、このサーバーで発行されたものではありません。",
+            "NOT_FOUND": "署名は正しいものの、記録が見つかりません。",
+            "MISMATCH": "署名は正しいものの、いまの記録と内容が一致しません。",
+            "REFUNDED": "この取引は**取消済み**です。控えとしては無効です。",
+            "NOT_COMPLETED": "この取引はまだ完了していません。",
+        }
+        embed = discord.Embed(
+            title="⚠️ 控えを確認できませんでした",
+            description=(
+                f"{SEPARATOR}\n"
+                f"{messages.get(reason, '確認できませんでした。')}\n{SEPARATOR}"
+            ),
+            color=config.Color.DANGER,
+        )
+    if payload:
+        embed.add_field(name="取引ID", value=f"`{payload.get('tx_id')}`", inline=True)
+        embed.add_field(
+            name="利用者", value=f"<@{int(payload.get('user_id', 0))}>", inline=True
+        )
+        embed.add_field(
+            name="チャージ日時",
+            value=utils.discord_ts(int(payload.get("completed_at", 0))),
+            inline=True,
+        )
+        embed.add_field(
+            name="送金額", value=utils.fmt_yen(int(payload.get("received", 0))), inline=True
+        )
+        embed.add_field(
+            name="付与された残高",
+            value=utils.fmt_int(int(payload.get("credited", 0))),
+            inline=True,
+        )
+        embed.add_field(name="サーバー", value=guild_name, inline=True)
+    embed.set_footer(text="控えの内容は発行時点の記録です")
+    return embed
+
+
+class RefundRejectModal(discord.ui.Modal):
+    """返金申請を却下するときの理由入力。"""
+
+    def __init__(self, request_id: int) -> None:
+        super().__init__(title="返金申請を却下する", timeout=300)
+        self.request_id = request_id
+        self.reason: discord.ui.TextInput = discord.ui.TextInput(
+            label="却下の理由 (利用者へ通知されます)",
+            placeholder="例: 利用規約に基づき返金の対象外です",
+            required=True,
+            max_length=400,
+            style=discord.TextStyle.paragraph,
+        )
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await bot_of(interaction).handle_refund_reject(
+            interaction, self.request_id, str(self.reason.value)
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
+        logger.error("返金却下Modalでエラー: %s", utils.safe_error_text(error))
+        await safe_respond(interaction, embed=error_embed(config.ErrorCode.UNKNOWN_ERROR))
+
+
+class RefundCardView(discord.ui.View):
+    """返金申請の審査カード (Persistent View)。"""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="承認して取消", emoji="✅", style=discord.ButtonStyle.danger,
+        custom_id=config.CustomID.REFUND_APPROVE,
+    )
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await bot_of(interaction).on_refund_approve(interaction)
+
+    @discord.ui.button(
+        label="却下", emoji="🔴", style=discord.ButtonStyle.secondary,
+        custom_id=config.CustomID.REFUND_REJECT,
+    )
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await bot_of(interaction).on_refund_reject(interaction)
+
+
+# ---------------------------------------------------------------------------
 # 不正検知
 # ---------------------------------------------------------------------------
 

@@ -34,6 +34,7 @@ from database import (
     AuctionError,
     Database,
     GoalError,
+    RefundError,
     GuildSettings,
     IllegalStateTransition,
     RequestError,
@@ -84,6 +85,13 @@ class ChargeService:
         self._button_rate_limiter = utils.RateLimiter(
             config.RATE_LIMIT_BUTTON_COUNT, config.RATE_LIMIT_BUTTON_WINDOW
         )
+        # 返金申請の連打を抑える (審査する人の負担を守る)。
+        # 本来の歯止めは「審査待ちの同時件数」なので、ここは連投だけを止める。
+        self._request_rate_limiter = utils.RateLimiter(
+            config.RATE_LIMIT_REFUND_COUNT, config.RATE_LIMIT_REFUND_WINDOW
+        )
+        #: レシートの署名 (鍵はトークン暗号鍵とは別ファイル)
+        self.receipts = utils.ReceiptSigner(config.RECEIPT_KEY_PATH)
         self._link_locks = utils.KeyedLocks()
         self._user_locks = utils.KeyedLocks()
         self._ranking_tasks: dict[int, asyncio.Task[None]] = {}
@@ -103,7 +111,8 @@ class ChargeService:
             "requests_approved": 0, "requests_rejected": 0, "requests_expired": 0,
             "subscription_renewals": 0, "subscription_stops": 0,
             "auctions_closed": 0, "bids": 0, "goal_rewards": 0,
-            "fraud_flags": 0,
+            "fraud_flags": 0, "refund_requests": 0,
+            "refunds_approved": 0, "refunds_rejected": 0,
         }
         # 目標パネルの前回の内容 (変わらないときは編集しない)
         self._goal_signatures: dict[int, str] = {}
@@ -4849,6 +4858,321 @@ class ChargeService:
         await self._safe(self.refresh_fraud_card(flag_id), context="検知カード更新")
         return {"flag_id": flag_id, "status": status,
                 "user_id": int(flag["user_id"]), "kind": str(flag["kind"])}
+
+    # ==================================================================
+    # 返金申請
+    # ==================================================================
+    async def request_refund(
+        self, guild_id: int, user_id: int, tx_id: str, reason: str
+    ) -> dict[str, Any]:
+        """利用者からの返金 (チャージ取消) 申請を受け付ける。
+
+        ここで承認されても、**Kyash での送金は自動では行わない**。
+        添付モジュールに送金の手段が無いため、実際の返金は管理者が
+        Kyash 側で手作業で行い、Bot は内部残高の取消だけを担当する。
+        この点は申請の受付時と審査カードの双方に明記する。
+        """
+        settings = await self.ensure_usable_guild(guild_id)
+        if settings.emergency_stop:
+            raise ChargeError(config.ErrorCode.EMERGENCY_STOP)
+        if await self.db.is_frozen(guild_id, user_id):
+            raise ChargeError(config.ErrorCode.USER_FROZEN)
+        if not self._request_rate_limiter.check(f"refund:{guild_id}:{user_id}"):
+            raise ChargeError(config.ErrorCode.RATE_LIMITED)
+        try:
+            created = await self.db.create_refund_request(
+                guild_id=guild_id, user_id=user_id, transaction_id=tx_id,
+                reason=reason,
+            )
+        except RefundError as exc:
+            raise ChargeError(exc.code, exc.detail) from exc
+        request_id = int(created["request_id"])
+        self.metrics["refund_requests"] += 1
+        await self.db.add_audit_log(
+            actor_id=user_id, action="REFUND_REQUEST", guild_id=guild_id,
+            target_user_id=user_id,
+            detail={"request_id": request_id, "transaction_id": tx_id,
+                    "amount": created["amount"],
+                    "reason": utils.truncate(reason, 300)},
+        )
+        await self._safe(self.post_refund_card(request_id), context="返金審査カード")
+        await self._safe(self.log_event(
+            guild_id, "↩️ 返金の申請",
+            fields=(
+                ("申請ID", f"`{request_id}`", True),
+                ("利用者", f"<@{user_id}>", True),
+                ("取引ID", f"`{tx_id}`", True),
+                ("取消される残高", utils.fmt_int(int(created["amount"])), True),
+                ("理由", utils.truncate(reason, 200), False),
+            ),
+            color=config.Color.WARNING,
+        ), context="返金申請ログ")
+        return created
+
+    async def post_refund_card(self, request_id: int) -> None:
+        """返金申請の審査カードを投稿する。"""
+        request = await self.db.get_refund_request(request_id)
+        if request is None:
+            return
+        guild_id = int(request["guild_id"])
+        transaction = await self.db.get_transaction(str(request["transaction_id"]))
+        history = await self.db.list_refund_requests(
+            guild_id, user_id=int(request["user_id"]), limit=5
+        )
+        embed = ui.refund_card_embed(
+            request, transaction, guild_name=self.guild_name(guild_id),
+            past_requests=history[1],
+        )
+        channel_id = await self.get_review_channel_id()
+        channel = (
+            await self._resolve_global_channel(channel_id) if channel_id else None
+        )
+        if channel is None:
+            settings = await self.db.get_settings(guild_id)
+            if settings.log_channel_id:
+                channel = await self._resolve_channel(
+                    guild_id, settings.log_channel_id, "log_channel_id"
+                )
+        if channel is None:
+            await self._safe(self.bot.alert_owner(
+                f"↩️ **返金の申請があります** (申請ID `{request_id}`)\n"
+                f"利用者: <@{int(request['user_id'])}>\n"
+                f"取引: `{request['transaction_id']}`\n"
+                "`/refund list` で確認してください。"
+            ), context="返金申請の Owner 通知")
+            return
+        try:
+            message = await channel.send(embed=embed, view=ui.RefundCardView())
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning("返金審査カードの投稿に失敗しました request=%s: %s",
+                           request_id, utils.safe_error_text(exc))
+            return
+        await self.db.set_refund_message(
+            request_id, channel_id=channel.id, message_id=message.id
+        )
+
+    async def refresh_refund_card(self, request_id: int) -> bool:
+        """審査カードを最新の状態に書き換える。"""
+        request = await self.db.get_refund_request(request_id)
+        if request is None or not request["message_id"]:
+            return False
+        guild_id = int(request["guild_id"])
+        transaction = await self.db.get_transaction(str(request["transaction_id"]))
+        embed = ui.refund_card_embed(
+            request, transaction, guild_name=self.guild_name(guild_id)
+        )
+        channel = await self._resolve_global_channel(int(request["channel_id"] or 0))
+        if channel is None:
+            return False
+        view = (
+            ui.RefundCardView()
+            if str(request["status"]) == config.RefundRequestStatus.PENDING else None
+        )
+        try:
+            message = await channel.fetch_message(int(request["message_id"]))
+            await message.edit(embed=embed, view=view)
+            return True
+        except discord.NotFound:
+            return False
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning("返金審査カードの更新に失敗しました request=%s: %s",
+                           request_id, utils.safe_error_text(exc))
+            return False
+
+    async def approve_refund(
+        self, request_id: int, *, operator_id: int
+    ) -> dict[str, Any]:
+        """返金申請を承認し、内部残高を取り消す。
+
+        先に申請の状態を進めてから残高を取り消す。逆順にすると、
+        取消の直後に落ちた場合に「残高は減ったが申請は審査待ち」という
+        取り違えやすい状態が残る。
+        """
+        request = await self.db.get_refund_request(request_id)
+        if request is None:
+            raise ChargeError(config.ErrorCode.REQUEST_NOT_FOUND)
+        tx_id = str(request["transaction_id"])
+        try:
+            await self.db.transition_refund_request(
+                request_id, status=config.RefundRequestStatus.APPROVED,
+                reviewed_by=operator_id,
+            )
+        except IllegalStateTransition as exc:
+            raise ChargeError(config.ErrorCode.REQUEST_ALREADY_HANDLED, str(exc)) from exc
+        try:
+            result = await self.refund_charge_transaction(
+                tx_id, operator_id=operator_id,
+                reason=f"返金申請 #{request_id} の承認",
+            )
+        except Exception as exc:  # noqa: BLE001 - 取消できなければ申請を戻せない
+            logger.exception("返金の取消処理に失敗しました request=%s tx=%s",
+                             request_id, tx_id)
+            await self.alert_admins(
+                int(request["guild_id"]), "返金の取消処理に失敗",
+                f"返金申請 `#{request_id}` は承認済みですが、取引 `{tx_id}` の"
+                "残高取消に失敗しました。\n"
+                "`/balance refund` で手動の取消を行ってください。",
+            )
+            raise ChargeError(config.ErrorCode.DATABASE_ERROR, str(exc)) from exc
+        self.metrics["refunds_approved"] += 1
+        guild_id = int(request["guild_id"])
+        user_id = int(request["user_id"])
+        await self.db.add_audit_log(
+            actor_id=operator_id, action="REFUND_APPROVE", guild_id=guild_id,
+            target_user_id=user_id,
+            detail={"request_id": request_id, "transaction_id": tx_id,
+                    "credited_amount": result["credited_amount"]},
+        )
+        await self._send_dm(
+            user_id,
+            ui.refund_result_dm_embed(
+                guild_name=self.guild_name(guild_id), request_id=request_id,
+                tx_id=tx_id, approved=True,
+                amount=int(result["credited_amount"]),
+                balance_after=int(result["balance_after"]),
+                reason=None,
+            ),
+            queue_on_failure=False,
+        )
+        await self._safe(self.refresh_refund_card(request_id), context="返金カード更新")
+        return {"request_id": request_id, "transaction_id": tx_id, **result}
+
+    async def reject_refund(
+        self, request_id: int, *, operator_id: int, reason: str
+    ) -> dict[str, Any]:
+        """返金申請を却下する (残高は動かさない)。"""
+        request = await self.db.get_refund_request(request_id)
+        if request is None:
+            raise ChargeError(config.ErrorCode.REQUEST_NOT_FOUND)
+        try:
+            await self.db.transition_refund_request(
+                request_id, status=config.RefundRequestStatus.REJECTED,
+                reviewed_by=operator_id, reject_reason=reason,
+            )
+        except IllegalStateTransition as exc:
+            raise ChargeError(config.ErrorCode.REQUEST_ALREADY_HANDLED, str(exc)) from exc
+        self.metrics["refunds_rejected"] += 1
+        guild_id = int(request["guild_id"])
+        user_id = int(request["user_id"])
+        await self.db.add_audit_log(
+            actor_id=operator_id, action="REFUND_REJECT", guild_id=guild_id,
+            target_user_id=user_id,
+            detail={"request_id": request_id,
+                    "transaction_id": str(request["transaction_id"]),
+                    "reason": utils.truncate(reason, 300)},
+        )
+        await self._send_dm(
+            user_id,
+            ui.refund_result_dm_embed(
+                guild_name=self.guild_name(guild_id), request_id=request_id,
+                tx_id=str(request["transaction_id"]), approved=False,
+                amount=int(request["amount"] or 0),
+                balance_after=await self.db.get_balance(guild_id, user_id),
+                reason=reason,
+            ),
+            queue_on_failure=False,
+        )
+        await self._safe(self.log_event(
+            guild_id, "🔴 返金申請を却下",
+            fields=(
+                ("申請ID", f"`{request_id}`", True),
+                ("利用者", f"<@{user_id}>", True),
+                ("取引ID", f"`{request['transaction_id']}`", True),
+                ("担当", f"<@{operator_id}>", True),
+                ("理由", utils.truncate(reason, 200), False),
+            ),
+            color=config.Color.WARNING,
+        ), context="返金却下ログ")
+        await self._safe(self.refresh_refund_card(request_id), context="返金カード更新")
+        return {"request_id": request_id, "status": config.RefundRequestStatus.REJECTED}
+
+    async def cancel_refund_request(
+        self, request_id: int, *, user_id: int
+    ) -> dict[str, Any]:
+        """利用者自身が申請を取り下げる。"""
+        request = await self.db.get_refund_request(request_id)
+        if request is None or int(request["user_id"]) != user_id:
+            raise ChargeError(config.ErrorCode.REQUEST_NOT_FOUND)
+        try:
+            await self.db.transition_refund_request(
+                request_id, status=config.RefundRequestStatus.CANCELLED,
+                reviewed_by=user_id,
+            )
+        except IllegalStateTransition as exc:
+            raise ChargeError(config.ErrorCode.REQUEST_ALREADY_HANDLED, str(exc)) from exc
+        await self.db.add_audit_log(
+            actor_id=user_id, action="REFUND_CANCEL",
+            guild_id=int(request["guild_id"]), target_user_id=user_id,
+            detail={"request_id": request_id,
+                    "transaction_id": str(request["transaction_id"])},
+        )
+        await self._safe(self.refresh_refund_card(request_id), context="返金カード更新")
+        return {"request_id": request_id, "status": config.RefundRequestStatus.CANCELLED}
+
+    # ==================================================================
+    # レシート (チャージの控え)
+    # ==================================================================
+    async def issue_receipt(
+        self, guild_id: int, user_id: int, tx_id: str
+    ) -> dict[str, Any]:
+        """完了したチャージの控えを発行する。
+
+        控えには署名を付けるため、後から改ざんを検出できる。
+        本人以外の取引は発行しない。
+        """
+        row = await self.db.get_transaction(tx_id)
+        if row is None or int(row["guild_id"]) != guild_id \
+                or int(row["user_id"]) != user_id:
+            raise ChargeError(config.ErrorCode.REFUND_NOT_ELIGIBLE, "取引が見つかりません")
+        if str(row["status"]) != config.TxStatus.COMPLETED:
+            raise ChargeError(
+                config.ErrorCode.REFUND_NOT_ELIGIBLE,
+                f"完了した取引のみ発行できます (状態: {row['status']})",
+            )
+        completed_at = int(row["completed_at"] or row["created_at"] or 0)
+        code = self.receipts.issue(
+            guild_id=guild_id, user_id=user_id, tx_id=tx_id,
+            received=int(row["received_amount"] or 0),
+            credited=int(row["credited_amount"] or 0),
+            completed_at=completed_at,
+        )
+        return {
+            "code": code,
+            "tx_id": tx_id,
+            "received": int(row["received_amount"] or 0),
+            "credited": int(row["credited_amount"] or 0),
+            "completed_at": completed_at,
+            "provider": str(row["provider"] or config.ChargeProvider.KYASH),
+            "refunded": bool(row["refunded_at"]),
+        }
+
+    async def verify_receipt_code(self, code: str) -> dict[str, Any]:
+        """控えを検証する。
+
+        署名が正しいことに加えて、**いまの記録と一致するか**も確かめる。
+        署名は発行時点の内容を保証するだけなので、その後に取消された取引を
+        「有効な控え」として扱わないようにする。
+        """
+        payload = self.receipts.verify(code)
+        if payload is None:
+            return {"valid": False, "reason": "SIGNATURE"}
+        row = await self.db.get_transaction(str(payload["tx_id"]))
+        if row is None:
+            return {"valid": False, "reason": "NOT_FOUND", "payload": payload}
+        mismatch = (
+            int(row["guild_id"]) != int(payload["guild_id"])
+            or int(row["user_id"]) != int(payload["user_id"])
+            or int(row["received_amount"] or 0) != int(payload["received"])
+            or int(row["credited_amount"] or 0) != int(payload["credited"])
+        )
+        if mismatch:
+            return {"valid": False, "reason": "MISMATCH", "payload": payload, "row": row}
+        if row["refunded_at"]:
+            return {"valid": False, "reason": "REFUNDED", "payload": payload, "row": row}
+        if str(row["status"]) != config.TxStatus.COMPLETED:
+            return {"valid": False, "reason": "NOT_COMPLETED", "payload": payload,
+                    "row": row}
+        return {"valid": True, "reason": "OK", "payload": payload, "row": row}
 
     # ==================================================================
     # 招待キャンペーン

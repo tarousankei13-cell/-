@@ -23,6 +23,8 @@ DATA_DIR: Final[Path] = BASE_DIR / "data"
 DB_PATH: Final[Path] = DATA_DIR / "charge_bot.db"
 BACKUP_DIR: Final[Path] = DATA_DIR / "backups"
 SECRET_KEY_PATH: Final[Path] = DATA_DIR / "secret.key"
+#: レシート署名の鍵 (トークン暗号鍵とは別に持ち、片方が漏れても他方に影響させない)
+RECEIPT_KEY_PATH: Final[Path] = DATA_DIR / "receipt.key"
 VENDOR_DIR: Final[Path] = BASE_DIR / "vendor"
 
 # ---------------------------------------------------------------------------
@@ -93,6 +95,9 @@ RATE_LIMIT_CHARGE_COUNT: Final[int] = 5          # チャージ開始
 RATE_LIMIT_CHARGE_WINDOW: Final[int] = 60        # 秒
 RATE_LIMIT_BUTTON_COUNT: Final[int] = 20         # 一般ボタン操作
 RATE_LIMIT_BUTTON_WINDOW: Final[int] = 60
+# 返金申請。実際の歯止めは「審査待ちの同時件数」なので、ここは連投だけを止める
+RATE_LIMIT_REFUND_COUNT: Final[int] = 10
+RATE_LIMIT_REFUND_WINDOW: Final[int] = 600
 
 # 連続失敗によるクールダウン (不正探索・いたずら対策)
 FAILURE_COOLDOWN_THRESHOLD: Final[int] = 5       # 連続失敗回数

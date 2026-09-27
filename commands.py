@@ -3661,6 +3661,317 @@ class RateGroup(app_commands.Group):
 
 
 # ---------------------------------------------------------------------------
+# /refund (返金申請) と /receipt (チャージの控え)
+# ---------------------------------------------------------------------------
+class RefundGroup(app_commands.Group):
+    """返金 (チャージ取消) の申請と審査。"""
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="refund", description="返金の申請と確認 (request / list は利用者も実行可)"
+        )
+
+    @app_commands.command(name="request", description="チャージの返金を申請します")
+    @app_commands.describe(
+        transaction_id="取引ID (`/history` や控えで確認できます)",
+        reason="返金を希望する理由",
+    )
+    @app_commands.guild_only()
+    async def request(
+        self, interaction: discord.Interaction, transaction_id: str, reason: str
+    ) -> None:
+        """自分のチャージについて返金を申請する。"""
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        text = reason.strip()[:900]
+        if not text:
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.ITEM_INPUT_INVALID), ephemeral=True
+            )
+            return
+        try:
+            created = await bot.charge.request_refund(
+                guild.id, interaction.user.id, transaction_id.strip(), text
+            )
+        except ChargeError as exc:
+            await interaction.followup.send(
+                embed=ui.error_embed(exc.code, next_action=exc.detail or None),
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            embed=ui.refund_request_embed(
+                request_id=int(created["request_id"]),
+                tx_id=str(created["transaction_id"]),
+                amount=int(created["amount"]),
+                received=int(created["received_amount"]),
+                completed_at=int(created["completed_at"]),
+                reason=text,
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="cancel", description="自分の返金申請を取り下げます")
+    @app_commands.describe(request_id="申請ID")
+    @app_commands.guild_only()
+    async def cancel(
+        self, interaction: discord.Interaction,
+        request_id: app_commands.Range[int, 1, 10_000_000],
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await bot.charge.cancel_refund_request(
+                int(request_id), user_id=interaction.user.id
+            )
+        except ChargeError as exc:
+            await interaction.followup.send(embed=ui.error_embed(exc.code), ephemeral=True)
+            return
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "⚪ 返金申請を取り下げました",
+                f"申請ID: `{request_id}`\n残高は変わっていません。",
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="list", description="返金申請の一覧を表示します")
+    @app_commands.describe(
+        status="状態で絞り込み", user="利用者で絞り込み (管理者のみ)", page="ページ番号",
+    )
+    @app_commands.choices(status=[
+        app_commands.Choice(name=label, value=key)
+        for key, label in config.REFUND_STATUS_LABELS.items()
+    ])
+    @app_commands.guild_only()
+    async def list_requests(
+        self,
+        interaction: discord.Interaction,
+        status: app_commands.Choice[str] | None = None,
+        user: discord.User | None = None,
+        page: app_commands.Range[int, 1, 200] = 1,
+    ) -> None:
+        """自分の申請を確認する (管理者は全員ぶんを見られる)。"""
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        is_admin = await bot.is_server_admin(interaction)
+        if not is_admin:
+            target_user: int | None = interaction.user.id
+            title = "あなたの返金申請"
+        elif user is not None:
+            target_user = user.id
+            title = f"{user.display_name} の返金申請"
+        else:
+            target_user = None
+            title = "返金申請の一覧"
+        per_page = 6
+        rows, total = await bot.db.list_refund_requests(
+            guild.id, status=status.value if status else None, user_id=target_user,
+            offset=(page - 1) * per_page, limit=per_page,
+        )
+        await interaction.followup.send(
+            embed=ui.refund_list_embed(
+                rows, title=title, total=total, page=page,
+                total_pages=max(1, -(-total // per_page)),
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="approve", description="返金申請を承認します (管理者)")
+    @app_commands.describe(request_id="申請ID")
+    @app_commands.guild_only()
+    @require_admin()
+    async def approve(
+        self, interaction: discord.Interaction,
+        request_id: app_commands.Range[int, 1, 10_000_000],
+    ) -> None:
+        """承認して内部残高を取り消す (実際の送金は管理者が別途行う)。"""
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        request = await bot.db.get_refund_request(int(request_id), guild.id)
+        if request is None:
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.REQUEST_NOT_FOUND), ephemeral=True
+            )
+            return
+        if not await bot.charge.can_review(guild.id, interaction.user):
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.NOT_ALLOWED), ephemeral=True
+            )
+            return
+        view = ui.ConfirmView(
+            owner_id=interaction.user.id, confirm_label="取消を実行する", danger=True
+        )
+        await interaction.followup.send(
+            embed=ui.info_embed(
+                "⚠️ 返金の承認",
+                f"申請 `#{request_id}` を承認すると、取引 "
+                f"`{request['transaction_id']}` を取り消し、"
+                f"**{utils.fmt_int(int(request['amount'] or 0))}** を回収します。\n\n"
+                f"{ui.REFUND_SCOPE_NOTE}",
+                color=config.Color.DANGER,
+            ),
+            view=view, ephemeral=True,
+        )
+        await view.wait()
+        if not view.value:
+            return
+        try:
+            result = await bot.charge.approve_refund(
+                int(request_id), operator_id=interaction.user.id
+            )
+        except ChargeError as exc:
+            await interaction.followup.send(
+                embed=ui.error_embed(exc.code, admin_detail=exc.detail or None),
+                ephemeral=True,
+            )
+            return
+        op_id = await _audit(
+            interaction, "REFUND_APPROVE_CMD",
+            target_user_id=int(request["user_id"]),
+            detail={"request_id": int(request_id),
+                    "transaction_id": str(request["transaction_id"])},
+        )
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "✅ 返金を承認しました",
+                f"申請ID: `{request_id}`\n"
+                f"回収した残高: **{utils.fmt_int(int(result['credited_amount']))}**\n"
+                f"利用者の残高: {utils.fmt_int(int(result['balance_before']))} → "
+                f"**{utils.fmt_int(int(result['balance_after']))}**\n"
+                f"操作ID: `{op_id}`\n\n{ui.REFUND_SCOPE_NOTE}",
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="reject", description="返金申請を却下します (管理者)")
+    @app_commands.describe(request_id="申請ID", reason="却下の理由 (利用者へ通知します)")
+    @app_commands.guild_only()
+    @require_admin()
+    async def reject(
+        self, interaction: discord.Interaction,
+        request_id: app_commands.Range[int, 1, 10_000_000],
+        reason: str,
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not await bot.charge.can_review(guild.id, interaction.user):
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.NOT_ALLOWED), ephemeral=True
+            )
+            return
+        request = await bot.db.get_refund_request(int(request_id), guild.id)
+        if request is None:
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.REQUEST_NOT_FOUND), ephemeral=True
+            )
+            return
+        try:
+            await bot.charge.reject_refund(
+                int(request_id), operator_id=interaction.user.id,
+                reason=reason.strip()[:400],
+            )
+        except ChargeError as exc:
+            await interaction.followup.send(embed=ui.error_embed(exc.code), ephemeral=True)
+            return
+        op_id = await _audit(
+            interaction, "REFUND_REJECT_CMD",
+            target_user_id=int(request["user_id"]),
+            detail={"request_id": int(request_id), "reason": reason[:300]},
+        )
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "🔴 返金申請を却下しました",
+                f"申請ID: `{request_id}`\n利用者へ DM で通知しました。\n"
+                f"操作ID: `{op_id}`",
+            ),
+            ephemeral=True,
+        )
+
+
+class ReceiptGroup(app_commands.Group):
+    """チャージの控え (署名つき)。"""
+
+    def __init__(self) -> None:
+        super().__init__(name="receipt", description="チャージの控えの発行と確認")
+
+    @app_commands.command(name="show", description="自分のチャージの控えを発行します")
+    @app_commands.describe(transaction_id="取引ID (省略すると直近のチャージ)")
+    @app_commands.guild_only()
+    async def show(
+        self, interaction: discord.Interaction, transaction_id: str | None = None
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        tx_id = (transaction_id or "").strip()
+        if not tx_id:
+            rows, _ = await bot.db.search_transactions(
+                guild_id=guild.id, user_id=interaction.user.id,
+                status=config.TxStatus.COMPLETED, limit=1,
+            )
+            if not rows:
+                await interaction.followup.send(
+                    embed=ui.info_embed(
+                        "控えを発行できる取引がありません",
+                        "完了したチャージがまだありません。",
+                        color=config.Color.WARNING,
+                    ),
+                    ephemeral=True,
+                )
+                return
+            tx_id = str(rows[0]["id"])
+        try:
+            receipt = await bot.charge.issue_receipt(
+                guild.id, interaction.user.id, tx_id
+            )
+        except ChargeError as exc:
+            await interaction.followup.send(
+                embed=ui.error_embed(exc.code, next_action=exc.detail or None),
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            embed=ui.receipt_embed(
+                code=str(receipt["code"]), tx_id=str(receipt["tx_id"]),
+                received=int(receipt["received"]), credited=int(receipt["credited"]),
+                completed_at=int(receipt["completed_at"]),
+                provider=str(receipt["provider"]), refunded=bool(receipt["refunded"]),
+                guild_name=guild.name,
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="verify", description="控えのコードを確認します")
+    @app_commands.describe(code="控えのコード (R1. で始まる文字列)")
+    @app_commands.guild_only()
+    async def verify(self, interaction: discord.Interaction, code: str) -> None:
+        """控えが本物か、いまも有効かを確認する。"""
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        result = await bot.charge.verify_receipt_code(code)
+        payload = result.get("payload") or {}
+        guild_name = guild.name
+        if payload and int(payload.get("guild_id", 0)) != guild.id:
+            guild_name = f"別のサーバー (`{payload.get('guild_id')}`)"
+        await interaction.followup.send(
+            embed=ui.receipt_verify_embed(result, guild_name=guild_name),
+            ephemeral=True,
+        )
+
+
+# ---------------------------------------------------------------------------
 # /fraud (不正検知の確認と処理)
 # ---------------------------------------------------------------------------
 class FraudGroup(app_commands.Group):
@@ -7162,7 +7473,7 @@ async def setup_commands(bot: "ChargeBot") -> None:
         ServerGroup(), KyashGroup(), SettingsGroup(), BalanceGroup(), UserGroup(),
         MaintenanceGroup(), EmergencyStopGroup(), AchievementGroup(), TransactionGroup(),
         DataGroup(), ConfigGroup(), SystemGroup(), RateGroup(), ShopGroup(),
-        AuctionGroup(), GoalGroup(), FraudGroup(),
+        AuctionGroup(), GoalGroup(), FraudGroup(), RefundGroup(), ReceiptGroup(),
         CampaignGroup(), ExportGroup(), GlobalGroup(),
         ProviderGroup(), RequestGroup(), TierGroup(), RankingRewardGroup(),
     ):

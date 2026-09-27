@@ -8,7 +8,9 @@
 """
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -710,6 +712,126 @@ class TokenCipher:
         if not self._fernet:
             raise RuntimeError("暗号化が利用できません (cryptography 未インストール)")
         return self._fernet.decrypt(ciphertext.encode("ascii")).decode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# レシート (チャージの控え) の署名
+# ---------------------------------------------------------------------------
+
+class ReceiptSigner:
+    """チャージの控えに署名して、後から真正性を確認できるようにする。
+
+    利用者が「たしかにこの取引で残高を受け取った」と示せる文字列を作る。
+    署名鍵はサーバー側だけが持つため、利用者は控えを**偽造できない**。
+
+    形式: ``R1.<payload>.<signature>``
+
+    * ``payload`` … 取引ID・金額・時刻を並べた文字列を base32 化したもの
+    * ``signature`` … payload の HMAC-SHA256 の先頭を base32 化したもの
+
+    鍵はトークン暗号鍵とは別に保存する。控えの検証と、Kyash トークンの
+    復号を、同じ鍵に頼らせないため。
+    """
+
+    #: 署名の長さ (base32 の文字数)。総当たりに対して十分な強度を確保する。
+    SIGNATURE_CHARS = 26
+
+    def __init__(self, key_path: Path) -> None:
+        self._key_path = key_path
+        self._key: bytes | None = None
+
+    def _load_key(self) -> bytes:
+        if self._key is not None:
+            return self._key
+        path = self._key_path
+        if path.exists():
+            data = path.read_bytes().strip()
+            if data:
+                self._key = data
+                return data
+        key = secrets.token_bytes(32)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, key)
+        finally:
+            os.close(fd)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        logger.info("レシート署名の鍵を作成しました: %s", path)
+        self._key = key
+        return key
+
+    @staticmethod
+    def _canonical(
+        *, guild_id: int, user_id: int, tx_id: str, received: int, credited: int,
+        completed_at: int,
+    ) -> str:
+        """署名の対象になる文字列 (順序と区切りを固定する)。"""
+        return "|".join((
+            config.RECEIPT_VERSION, str(int(guild_id)), str(int(user_id)),
+            str(tx_id), str(int(received)), str(int(credited)), str(int(completed_at)),
+        ))
+
+    def issue(
+        self, *, guild_id: int, user_id: int, tx_id: str, received: int,
+        credited: int, completed_at: int,
+    ) -> str:
+        """控えの文字列を発行する。"""
+        canonical = self._canonical(
+            guild_id=guild_id, user_id=user_id, tx_id=tx_id, received=received,
+            credited=credited, completed_at=completed_at,
+        )
+        payload = base64.b32encode(canonical.encode("utf-8")).decode("ascii").rstrip("=")
+        signature = self._sign(payload)
+        return f"{config.RECEIPT_VERSION}.{payload}.{signature}"
+
+    def _sign(self, payload: str) -> str:
+        digest = hmac.new(
+            self._load_key(), payload.encode("ascii"), hashlib.sha256
+        ).digest()
+        return base64.b32encode(digest).decode("ascii").rstrip("=")[: self.SIGNATURE_CHARS]
+
+    def verify(self, code: str) -> dict[str, Any] | None:
+        """控えを検証して中身を返す (壊れている・署名が合わなければ None)。
+
+        入力は利用者が貼り付けたものなので、どんな文字列でも例外を投げない。
+        """
+        text = re.sub(r"\s+", "", str(code or ""))
+        parts = text.split(".")
+        if len(parts) != 3:
+            return None
+        version, payload, signature = parts
+        if version != config.RECEIPT_VERSION:
+            return None
+        if not re.fullmatch(r"[A-Z2-7]+", payload or "") or not signature:
+            return None
+        expected = self._sign(payload)
+        # 比較は定数時間で行う (署名の総当たりに時間差の手がかりを与えない)
+        if not hmac.compare_digest(expected, signature):
+            return None
+        try:
+            padding = "=" * (-len(payload) % 8)
+            canonical = base64.b32decode(payload + padding).decode("utf-8")
+        except Exception:  # noqa: BLE001 - 壊れた入力でも落とさない
+            return None
+        fields = canonical.split("|")
+        if len(fields) != 7 or fields[0] != config.RECEIPT_VERSION:
+            return None
+        try:
+            return {
+                "version": fields[0],
+                "guild_id": int(fields[1]),
+                "user_id": int(fields[2]),
+                "tx_id": fields[3],
+                "received": int(fields[4]),
+                "credited": int(fields[5]),
+                "completed_at": int(fields[6]),
+            }
+        except ValueError:
+            return None
 
 
 # ---------------------------------------------------------------------------

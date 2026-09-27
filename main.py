@@ -227,6 +227,7 @@ class ChargeBot(commands.Bot):
         self.add_view(ui.AuctionView())
         self.add_view(ui.GoalPanelView())
         self.add_view(ui.FraudCardView())
+        self.add_view(ui.RefundCardView())
         charge_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_CHARGE)
         shop_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_SHOP)
         invite_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_INVITE)
@@ -1521,6 +1522,127 @@ class ChargeBot(commands.Bot):
             ephemeral=True,
         )
         await self.charge.refresh_shop_panels(interaction.guild.id)
+
+    # ------------------------------------------------------------------
+    # 返金申請カードの操作ハンドラ
+    # ------------------------------------------------------------------
+    async def _refund_target(
+        self, interaction: discord.Interaction
+    ) -> sqlite3.Row | None:
+        """審査カードのボタンから申請を引き、権限と状態を確認する。"""
+        if interaction.message is None:
+            await ui.safe_respond(
+                interaction, embed=ui.error_embed(config.ErrorCode.REQUEST_NOT_FOUND)
+            )
+            return None
+        row = await self.db.get_refund_request_by_message(interaction.message.id)
+        if row is None:
+            await ui.safe_respond(
+                interaction, embed=ui.error_embed(config.ErrorCode.REQUEST_NOT_FOUND)
+            )
+            return None
+        if not await self.charge.can_review(int(row["guild_id"]), interaction.user):
+            logger.info("権限のない返金操作を拒否しました user=%s request=%s",
+                        interaction.user.id, int(row["id"]))
+            await ui.safe_respond(
+                interaction,
+                embed=ui.info_embed(
+                    "操作できません",
+                    "この申請を処理できるのは Bot Owner "
+                    "(または Owner が承認を委任したサーバーの管理者) だけです。",
+                    color=config.Color.DANGER,
+                ),
+            )
+            return None
+        if str(row["status"]) != config.RefundRequestStatus.PENDING:
+            await ui.safe_respond(
+                interaction,
+                embed=ui.error_embed(config.ErrorCode.REQUEST_ALREADY_HANDLED),
+            )
+            return None
+        return row
+
+    async def on_refund_approve(self, interaction: discord.Interaction) -> None:
+        """✅ 承認して取消。残高が減るため二段階で確認する。"""
+        row = await self._refund_target(interaction)
+        if row is None:
+            return
+        request_id = int(row["id"])
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        view = ui.ConfirmView(
+            owner_id=interaction.user.id, confirm_label="取消を実行する",
+            danger=True, timeout=90,
+        )
+        await interaction.followup.send(
+            embed=ui.info_embed(
+                "⚠️ 返金の承認",
+                f"申請 `#{request_id}` を承認すると、取引 "
+                f"`{row['transaction_id']}` を取り消し、"
+                f"**{utils.fmt_int(int(row['amount'] or 0))}** を回収します。\n\n"
+                f"{ui.REFUND_SCOPE_NOTE}",
+                color=config.Color.DANGER,
+            ),
+            view=view, ephemeral=True,
+        )
+        await view.wait()
+        if not view.value:
+            return
+        try:
+            result = await self.charge.approve_refund(
+                request_id, operator_id=interaction.user.id
+            )
+        except ChargeError as exc:
+            await interaction.followup.send(
+                embed=ui.error_embed(exc.code, admin_detail=exc.detail or None),
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "✅ 返金を承認しました",
+                f"申請ID: `{request_id}`\n"
+                f"取引: `{result['transaction_id']}`\n"
+                f"回収した残高: **{utils.fmt_int(int(result['credited_amount']))}**\n"
+                f"利用者の残高: {utils.fmt_int(int(result['balance_before']))} → "
+                f"**{utils.fmt_int(int(result['balance_after']))}**\n\n"
+                f"{ui.REFUND_SCOPE_NOTE}",
+            ),
+            ephemeral=True,
+        )
+
+    async def on_refund_reject(self, interaction: discord.Interaction) -> None:
+        """🔴 却下 → 理由を入力する。"""
+        row = await self._refund_target(interaction)
+        if row is None:
+            return
+        await interaction.response.send_modal(ui.RefundRejectModal(int(row["id"])))
+
+    async def handle_refund_reject(
+        self, interaction: discord.Interaction, request_id: int, reason: str
+    ) -> None:
+        """却下の理由を受け取って確定する。"""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        text = reason.strip()[:400]
+        if not text:
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.ITEM_INPUT_INVALID), ephemeral=True
+            )
+            return
+        try:
+            await self.charge.reject_refund(
+                request_id, operator_id=interaction.user.id, reason=text
+            )
+        except ChargeError as exc:
+            await interaction.followup.send(embed=ui.error_embed(exc.code), ephemeral=True)
+            return
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "🔴 返金申請を却下しました",
+                f"申請ID: `{request_id}`\n理由: {utils.truncate(text, 300)}\n"
+                "利用者へ DM で通知しました。",
+            ),
+            ephemeral=True,
+        )
 
     # ------------------------------------------------------------------
     # 不正検知カードの操作ハンドラ
