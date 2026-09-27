@@ -101,6 +101,7 @@ class ChargeService:
             "requests_approved": 0, "requests_rejected": 0, "requests_expired": 0,
             "subscription_renewals": 0, "subscription_stops": 0,
             "auctions_closed": 0, "bids": 0, "goal_rewards": 0,
+            "fraud_flags": 0,
         }
         # 目標パネルの前回の内容 (変わらないときは編集しない)
         self._goal_signatures: dict[int, str] = {}
@@ -507,6 +508,8 @@ class ChargeService:
                     link_hash_value=link_hash_value,
                     link_uuid=info.uuid,
                     received_amount=info.amount,
+                    # 送金者名は不正検知 (名義貸し・転売) の判断材料として残す
+                    sender_name=info.sender_name,
                 )
             except sqlite3.IntegrityError as exc:
                 # UNIQUE 制約違反 = 同じリンクが並行して登録された
@@ -4523,6 +4526,327 @@ class ChargeService:
         await self._safe(self.refresh_goal_panels(guild_id), context="目標パネル更新")
         self._goal_signatures.pop(guild_id, None)
         return {"status": status, "total": total, "granted": 0}
+
+    # ==================================================================
+    # 不正検知
+    # ==================================================================
+    async def run_fraud_scan(self) -> dict[str, int]:
+        """すべての許可サーバーで兆候を洗い出す。"""
+        result = {"flagged": 0, "updated": 0}
+        try:
+            guild_ids = await self.db.list_fraud_guilds()
+        except Exception:  # noqa: BLE001
+            logger.exception("検知対象サーバーの取得に失敗しました")
+            return result
+        for guild_id in guild_ids:
+            try:
+                outcome = await self.scan_guild_fraud(guild_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("不正検知に失敗しました guild=%s", guild_id)
+                continue
+            result["flagged"] += int(outcome.get("flagged", 0))
+            result["updated"] += int(outcome.get("updated", 0))
+        if result["flagged"]:
+            logger.info("不正の兆候を %s 件検知しました", result["flagged"])
+        return result
+
+    async def scan_guild_fraud(self, guild_id: int) -> dict[str, int]:
+        """1サーバーぶんの兆候を洗い出してフラグを立てる。
+
+        ここでは「疑わしい」を機械的に拾うだけで、**自動で凍結などの処分は
+        行わない**。誤検知で利用者を止めてしまう方が害が大きいため、
+        判断は必ず管理者が行う。
+        """
+        flagged = 0
+        updated = 0
+        for candidate in await self._collect_fraud_candidates(guild_id):
+            flag_id, created = await self.db.create_fraud_flag(
+                guild_id=guild_id,
+                user_id=int(candidate["user_id"]),
+                kind=str(candidate["kind"]),
+                severity=str(candidate["severity"]),
+                detail=str(candidate["detail"]),
+                evidence=candidate.get("evidence"),
+            )
+            if created:
+                flagged += 1
+                await self._safe(self.post_fraud_card(flag_id), context="検知カード")
+            else:
+                updated += 1
+        return {"flagged": flagged, "updated": updated}
+
+    async def _collect_fraud_candidates(self, guild_id: int) -> list[dict[str, Any]]:
+        """各検知ルールを回して候補を集める。
+
+        1つのルールが失敗しても他のルールは動かす (検知が全部止まらないように)。
+        """
+        candidates: list[dict[str, Any]] = []
+        rules = (
+            ("BURST_CHARGE", self._detect_burst_charge),
+            ("SHARED_SENDER", self._detect_shared_sender),
+            ("DRAIN_AND_LEAVE", self._detect_drain_and_leave),
+            ("INVITE_ONLY", self._detect_invite_only),
+            ("RAPID_REFUND", self._detect_rapid_refund),
+        )
+        for name, rule in rules:
+            try:
+                candidates.extend(await rule(guild_id))
+            except Exception:  # noqa: BLE001
+                logger.exception("検知ルールの実行に失敗しました rule=%s guild=%s",
+                                 name, guild_id)
+        return candidates
+
+    async def _detect_burst_charge(self, guild_id: int) -> list[dict[str, Any]]:
+        """短時間に何度もチャージしている (不正入手した資金の現金化の疑い)。"""
+        rows = await self.db.find_burst_chargers(
+            guild_id, window=config.FRAUD_BURST_WINDOW, minimum=config.FRAUD_BURST_COUNT
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            count = int(row["count"])
+            total = int(row["total"] or 0)
+            minutes = max(1, config.FRAUD_BURST_WINDOW // 60)
+            out.append({
+                "user_id": int(row["user_id"]),
+                "kind": config.FraudKind.BURST_CHARGE,
+                "severity": (
+                    config.FraudSeverity.HIGH if count >= config.FRAUD_BURST_COUNT * 2
+                    else config.FraudSeverity.WARN
+                ),
+                "detail": (
+                    f"直近 {minutes} 分で **{count} 件** "
+                    f"({utils.fmt_yen(total)}) のチャージが完了しています。"
+                ),
+                "evidence": {
+                    "count": count, "total": total,
+                    "first_at": utils.format_jst(int(row["first_at"])),
+                    "last_at": utils.format_jst(int(row["last_at"])),
+                    "window_seconds": config.FRAUD_BURST_WINDOW,
+                },
+            })
+        return out
+
+    async def _detect_shared_sender(self, guild_id: int) -> list[dict[str, Any]]:
+        """同じ Kyash 送金者名を複数の利用者が使っている (名義貸し・転売の疑い)。"""
+        rows = await self.db.find_shared_senders(
+            guild_id, minimum_users=config.FRAUD_SHARED_SENDER_USERS
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            user_ids = [
+                int(v) for v in str(row["user_ids"] or "").split(",") if v.strip().isdigit()
+            ]
+            others = len(user_ids)
+            for user_id in user_ids:
+                partners = [str(u) for u in user_ids if u != user_id][:10]
+                out.append({
+                    "user_id": user_id,
+                    "kind": config.FraudKind.SHARED_SENDER,
+                    "severity": (
+                        config.FraudSeverity.HIGH if others >= 3
+                        else config.FraudSeverity.WARN
+                    ),
+                    "detail": (
+                        f"同じ送金者名を **{others} 人** が使っています。\n"
+                        f"他の利用者: {', '.join(f'<@{u}>' for u in partners) or '-'}"
+                    ),
+                    # 送金者名そのものは伏せて記録する (第三者の氏名を広めない)
+                    "evidence": {
+                        "sender": utils.mask_identifier(str(row["sender_name"]), keep=2),
+                        "users": others,
+                        "user_ids": user_ids[:20],
+                        "charges": int(row["count"]),
+                        "total": int(row["total"] or 0),
+                    },
+                })
+        return out
+
+    async def _detect_drain_and_leave(self, guild_id: int) -> list[dict[str, Any]]:
+        """チャージ直後に使い切って退出している (荒らし・転売の疑い)。"""
+        rows = await self.db.find_drain_and_leave(
+            guild_id, window=config.FRAUD_DRAIN_WINDOW
+        )
+        ratio = utils.to_decimal(config.FRAUD_DRAIN_RATIO) or Decimal("0.9")
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            user_id = int(row["user_id"])
+            left_at = int(row["left_at"])
+            credited = int(row["credited"] or 0)
+            spent = await self.db.sum_spending(
+                guild_id, user_id,
+                since=left_at - config.FRAUD_DRAIN_WINDOW, until=left_at,
+            )
+            if credited <= 0 or Decimal(spent) < Decimal(credited) * ratio:
+                continue
+            out.append({
+                "user_id": user_id,
+                "kind": config.FraudKind.DRAIN_AND_LEAVE,
+                "severity": config.FraudSeverity.WARN,
+                "detail": (
+                    f"退出前に取得した **{utils.fmt_int(credited)}** のうち "
+                    f"**{utils.fmt_int(spent)}** を使い切って退出しています。"
+                ),
+                "evidence": {
+                    "credited": credited, "spent": spent,
+                    "left_at": utils.format_jst(left_at),
+                    "window_seconds": config.FRAUD_DRAIN_WINDOW,
+                },
+            })
+        return out
+
+    async def _detect_invite_only(self, guild_id: int) -> list[dict[str, Any]]:
+        """招待報酬だけを集めてチャージしない (自作アカウントによる周回の疑い)。"""
+        rows = await self.db.find_invite_only_users(
+            guild_id, minimum=config.FRAUD_INVITE_ONLY_COUNT
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            invites = int(row["invites"])
+            out.append({
+                "user_id": int(row["user_id"]),
+                "kind": config.FraudKind.INVITE_ONLY,
+                "severity": (
+                    config.FraudSeverity.WARN
+                    if invites >= config.FRAUD_INVITE_ONLY_COUNT * 2
+                    else config.FraudSeverity.INFO
+                ),
+                "detail": (
+                    f"確定した招待が **{invites} 件** ある一方で、"
+                    "チャージが1件もありません。"
+                ),
+                "evidence": {
+                    "invites": invites, "rewards": int(row["rewards"] or 0),
+                },
+            })
+        return out
+
+    async def _detect_rapid_refund(self, guild_id: int) -> list[dict[str, Any]]:
+        """返金申請を繰り返している (規約の悪用の疑い)。"""
+        rows = await self.db.find_rapid_refunders(
+            guild_id, minimum=config.FRAUD_REFUND_COUNT
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            requests = int(row["requests"])
+            rejected = int(row["rejected"] or 0)
+            out.append({
+                "user_id": int(row["user_id"]),
+                "kind": config.FraudKind.RAPID_REFUND,
+                "severity": (
+                    config.FraudSeverity.WARN if rejected else config.FraudSeverity.INFO
+                ),
+                "detail": (
+                    f"返金申請が **{requests} 件** あります "
+                    f"(うち却下 {rejected} 件)。"
+                ),
+                "evidence": {"requests": requests, "rejected": rejected},
+            })
+        return out
+
+    async def post_fraud_card(self, flag_id: int) -> None:
+        """検知カードを審査チャンネルへ投稿する (無ければ Owner へ通知)。"""
+        flag = await self.db.get_fraud_flag(flag_id)
+        if flag is None:
+            return
+        guild_id = int(flag["guild_id"])
+        embed = ui.fraud_card_embed(flag, guild_name=self.guild_name(guild_id))
+        channel_id = await self.get_review_channel_id()
+        channel = (
+            await self._resolve_global_channel(channel_id) if channel_id else None
+        )
+        if channel is None:
+            settings = await self.db.get_settings(guild_id)
+            if settings.log_channel_id:
+                channel = await self._resolve_channel(
+                    guild_id, settings.log_channel_id, "log_channel_id"
+                )
+        if channel is None:
+            # 投稿先が無い場合でも埋もれさせない (テキストで Owner へ知らせる)
+            await self._safe(self.bot.alert_owner(
+                f"🛡 **不正の兆候を検知しました** (検知ID `{flag_id}`)\n"
+                f"対象: <@{int(flag['user_id'])}>\n"
+                f"種別: {config.FRAUD_KIND_LABELS.get(str(flag['kind']), str(flag['kind']))}\n"
+                f"{utils.truncate(str(flag['detail'] or ''), 500)}\n"
+                "`/fraud list` で確認してください。"
+            ), context="検知の Owner 通知")
+            return
+        try:
+            message = await channel.send(embed=embed, view=ui.FraudCardView())
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning("検知カードの投稿に失敗しました flag=%s: %s",
+                           flag_id, utils.safe_error_text(exc))
+            await self._safe(self.bot.alert_owner(
+                f"🛡 検知カードを投稿できませんでした (検知ID `{flag_id}`)。"
+                "`/fraud list` で確認してください。"
+            ), context="検知の Owner 通知")
+            return
+        await self.db.set_fraud_message(
+            flag_id, channel_id=channel.id, message_id=message.id
+        )
+
+    async def refresh_fraud_card(self, flag_id: int) -> bool:
+        """検知カードを最新の状態に書き換える。"""
+        flag = await self.db.get_fraud_flag(flag_id)
+        if flag is None or not flag["message_id"]:
+            return False
+        guild_id = int(flag["guild_id"])
+        embed = ui.fraud_card_embed(flag, guild_name=self.guild_name(guild_id))
+        channel = await self._resolve_global_channel(int(flag["channel_id"] or 0))
+        if channel is None:
+            return False
+        view = (
+            ui.FraudCardView() if str(flag["status"]) == config.FraudStatus.OPEN else None
+        )
+        try:
+            message = await channel.fetch_message(int(flag["message_id"]))
+            await message.edit(embed=embed, view=view)
+            return True
+        except discord.NotFound:
+            return False
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning("検知カードの更新に失敗しました flag=%s: %s",
+                           flag_id, utils.safe_error_text(exc))
+            return False
+
+    async def review_fraud_flag(
+        self, flag_id: int, *, status: str, reviewed_by: int, note: str | None = None
+    ) -> dict[str, Any]:
+        """フラグを「対処済み」または「問題なし」にする。"""
+        flag = await self.db.get_fraud_flag(flag_id)
+        if flag is None:
+            raise ChargeError(config.ErrorCode.FRAUD_FLAG_NOT_FOUND)
+        if not await self.db.resolve_fraud_flag(
+            flag_id, status=status, reviewed_by=reviewed_by, note=note
+        ):
+            raise ChargeError(
+                config.ErrorCode.FRAUD_FLAG_NOT_FOUND, "この検知はすでに処理されています"
+            )
+        guild_id = int(flag["guild_id"])
+        await self.db.add_audit_log(
+            actor_id=reviewed_by,
+            action="FRAUD_RESOLVE" if status == config.FraudStatus.RESOLVED
+            else "FRAUD_IGNORE",
+            guild_id=guild_id, target_user_id=int(flag["user_id"]),
+            detail={"flag_id": flag_id, "kind": str(flag["kind"]),
+                    "note": utils.truncate(note, 300) if note else None},
+        )
+        await self._safe(self.log_event(
+            guild_id,
+            "🛡 検知を対処済みにしました" if status == config.FraudStatus.RESOLVED
+            else "🛡 検知を問題なしにしました",
+            fields=(
+                ("検知ID", f"`{flag_id}`", True),
+                ("対象", f"<@{int(flag['user_id'])}>", True),
+                ("種別", config.FRAUD_KIND_LABELS.get(
+                    str(flag["kind"]), str(flag["kind"])), True),
+                ("担当", f"<@{reviewed_by}>", True),
+                ("メモ", utils.truncate(note, 200) if note else "-", False),
+            ),
+            color=config.Color.NEUTRAL,
+        ), context="検知の処理ログ")
+        await self._safe(self.refresh_fraud_card(flag_id), context="検知カード更新")
+        return {"flag_id": flag_id, "status": status,
+                "user_id": int(flag["user_id"]), "kind": str(flag["kind"])}
 
     # ==================================================================
     # 招待キャンペーン

@@ -226,6 +226,7 @@ class ChargeBot(commands.Bot):
         self.add_view(ui.ReviewCardView())
         self.add_view(ui.AuctionView())
         self.add_view(ui.GoalPanelView())
+        self.add_view(ui.FraudCardView())
         charge_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_CHARGE)
         shop_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_SHOP)
         invite_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_INVITE)
@@ -1520,6 +1521,129 @@ class ChargeBot(commands.Bot):
             ephemeral=True,
         )
         await self.charge.refresh_shop_panels(interaction.guild.id)
+
+    # ------------------------------------------------------------------
+    # 不正検知カードの操作ハンドラ
+    # ------------------------------------------------------------------
+    async def _fraud_target(
+        self, interaction: discord.Interaction
+    ) -> sqlite3.Row | None:
+        """検知カードのボタンから対象を引き、権限を確認する。"""
+        if interaction.message is None:
+            await ui.safe_respond(
+                interaction, embed=ui.error_embed(config.ErrorCode.FRAUD_FLAG_NOT_FOUND)
+            )
+            return None
+        row = await self.db.get_fraud_flag_by_message(interaction.message.id)
+        if row is None:
+            await ui.safe_respond(
+                interaction, embed=ui.error_embed(config.ErrorCode.FRAUD_FLAG_NOT_FOUND)
+            )
+            return None
+        if not await self.charge.can_review(int(row["guild_id"]), interaction.user):
+            logger.info("権限のない検知操作を拒否しました user=%s flag=%s",
+                        interaction.user.id, int(row["id"]))
+            await ui.safe_respond(
+                interaction,
+                embed=ui.info_embed(
+                    "操作できません",
+                    "この検知を処理できるのは Bot Owner "
+                    "(または Owner が承認を委任したサーバーの管理者) だけです。",
+                    color=config.Color.DANGER,
+                ),
+            )
+            return None
+        return row
+
+    async def on_fraud_button(
+        self, interaction: discord.Interaction, *, status: str
+    ) -> None:
+        """✅ 対処済み / ⚪ 問題なし → メモを入力して確定する。"""
+        row = await self._fraud_target(interaction)
+        if row is None:
+            return
+        if str(row["status"]) != config.FraudStatus.OPEN:
+            await ui.safe_respond(
+                interaction,
+                embed=ui.error_embed(
+                    config.ErrorCode.FRAUD_FLAG_NOT_FOUND,
+                    next_action="この検知はすでに処理済みです。",
+                ),
+            )
+            return
+        await interaction.response.send_modal(
+            ui.FraudNoteModal(int(row["id"]), status=status)
+        )
+
+    async def handle_fraud_review(
+        self, interaction: discord.Interaction, flag_id: int, *, status: str, note: str
+    ) -> None:
+        """メモの入力を受けて検知を処理する。"""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await self.charge.review_fraud_flag(
+                flag_id, status=status, reviewed_by=interaction.user.id,
+                note=note.strip() or None,
+            )
+        except ChargeError as exc:
+            await interaction.followup.send(embed=ui.error_embed(exc.code), ephemeral=True)
+            return
+        resolved = status == config.FraudStatus.RESOLVED
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "✅ 対処済みにしました" if resolved else "⚪ 問題なしにしました",
+                f"検知ID: `{flag_id}`\n"
+                f"対象: <@{result['user_id']}>\n"
+                f"種別: {config.FRAUD_KIND_LABELS.get(str(result['kind']), str(result['kind']))}",
+            ),
+            ephemeral=True,
+        )
+
+    async def on_fraud_detail(self, interaction: discord.Interaction) -> None:
+        """🔎 詳細 → 対象利用者の調査ビューへの入口を示す。"""
+        row = await self._fraud_target(interaction)
+        if row is None:
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild_id = int(row["guild_id"])
+        user_id = int(row["user_id"])
+        flags, total = await self.db.list_fraud_flags(
+            guild_id, status=None, user_id=user_id, limit=5
+        )
+        summary = await self.db.get_user_charge_summary(guild_id, user_id)
+        balance = await self.db.get_balance(guild_id, user_id)
+        embed = ui.info_embed(
+            f"🔎 検知 `{int(row['id'])}` の詳細",
+            f"{ui.SEPARATOR}\n対象: <@{user_id}> (`{user_id}`)\n{ui.SEPARATOR}",
+            color=config.Color.INFO,
+        )
+        embed.add_field(
+            name="この利用者の検知",
+            value=f"合計 **{total}** 件\n"
+                  + "\n".join(
+                      f"`{int(f['id'])}` "
+                      f"{config.FRAUD_KIND_LABELS.get(str(f['kind']), str(f['kind']))} / "
+                      f"{config.FRAUD_STATUS_LABELS.get(str(f['status']), str(f['status']))}"
+                      for f in flags
+                  ) or "-",
+            inline=False,
+        )
+        embed.add_field(
+            name="チャージ",
+            value=(
+                f"完了: {summary['count']}回\n"
+                f"送金累計: {utils.fmt_yen(summary['sent'])}\n"
+                f"獲得累計: {utils.fmt_int(summary['credited'])}"
+            ),
+            inline=True,
+        )
+        embed.add_field(name="現在残高", value=f"**{utils.fmt_int(balance)}**", inline=True)
+        embed.add_field(
+            name="さらに詳しく調べる",
+            value=f"`/user inspect user:<@{user_id}>` で参加履歴や取引まで確認できます。",
+            inline=False,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ------------------------------------------------------------------
     # チャージ目標の操作ハンドラ

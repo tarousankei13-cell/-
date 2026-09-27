@@ -1413,7 +1413,197 @@ async def main() -> None:
         check(exc.code == config.ErrorCode.ROLE_ASSIGN_FAILED,
               f"付与できないロールは報酬にできない ({exc.code})")
 
-    print("\n=== 8. 整合性 ===")
+    print("\n=== 8. 不正検知 ===")
+    await bot.charge.set_review_channel_id(guild.review.id)
+    guild.review.sent.clear()
+
+    # --- 短時間の大量チャージ ---
+    burst_user = guild.add_member(StubMember(66_101, guild))
+    for _ in range(config.FRAUD_BURST_COUNT):
+        await give_charge(burst_user.id, 1_000)
+    found = await bot.db.find_burst_chargers(
+        G, window=config.FRAUD_BURST_WINDOW, minimum=config.FRAUD_BURST_COUNT
+    )
+    check(any(int(r["user_id"]) == burst_user.id for r in found),
+          "短時間の大量チャージを見つける")
+    outcome = await bot.charge.scan_guild_fraud(G)
+    flags, total = await bot.db.list_fraud_flags(G, user_id=burst_user.id)
+    check(outcome["flagged"] >= 1 and total >= 1,
+          f"検知フラグが立つ ({outcome})")
+    burst_flag = next(
+        f for f in flags if str(f["kind"]) == config.FraudKind.BURST_CHARGE
+    )
+    check(str(burst_flag["status"]) == config.FraudStatus.OPEN, "初期状態は未処理")
+    check(str(burst_flag["severity"]) in config.FRAUD_SEVERITY_LABELS,
+          f"重要度が入る ({burst_flag['severity']})")
+    check(any("検知" in (e.title or "") for e in guild.review.sent),
+          "検知カードが審査チャンネルへ投稿される")
+    check(burst_flag["message_id"] is not None, "カードのメッセージIDを保存する")
+
+    # 同じ兆候を二重にフラグしない (内容だけ更新する)
+    before_total = (await bot.db.list_fraud_flags(G, user_id=burst_user.id))[1]
+    again = await bot.charge.scan_guild_fraud(G)
+    after_total = (await bot.db.list_fraud_flags(G, user_id=burst_user.id))[1]
+    check(after_total == before_total and again["updated"] >= 1,
+          f"同じ兆候は重ねて立てず更新する (新規 {again['flagged']} / 更新 {again['updated']})")
+
+    # 自動処分はしない
+    user_row = await bot.db.get_user(G, burst_user.id)
+    check(not (user_row and int(user_row["frozen"] or 0)),
+          "検知しただけでは凍結しない (判断は人が行う)")
+
+    # 処理すると状態が変わり、再検知で新しいフラグが立つ
+    flag_id = int(burst_flag["id"])
+    result = await bot.charge.review_fraud_flag(
+        flag_id, status=config.FraudStatus.IGNORED, reviewed_by=OWNER_ID,
+        note="テストのため問題なし",
+    )
+    reviewed = await bot.db.get_fraud_flag(flag_id, G)
+    check(result["status"] == config.FraudStatus.IGNORED
+          and str(reviewed["status"]) == config.FraudStatus.IGNORED,  # type: ignore[index]
+          "問題なしにできる")
+    check(int(reviewed["reviewed_by"]) == OWNER_ID and reviewed["reviewed_at"],  # type: ignore[index]
+          "担当者と日時が残る")
+    try:
+        await bot.charge.review_fraud_flag(
+            flag_id, status=config.FraudStatus.RESOLVED, reviewed_by=OWNER_ID
+        )
+        check(False, "処理済みの検知を二重に処理できてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.FRAUD_FLAG_NOT_FOUND,
+              f"処理済みの検知は再処理できない ({exc.code})")
+    rescan = await bot.charge.scan_guild_fraud(G)
+    check(rescan["flagged"] >= 1,
+          "処理済みのあとに同じ兆候が続けば新しく立てる")
+
+    # --- 送金者名の共有 ---
+    share_a = guild.add_member(StubMember(66_201, guild))
+    share_b = guild.add_member(StubMember(66_202, guild))
+    for who in (share_a, share_b):
+        tx = await bot.db.create_proxy_transaction(
+            guild_id=G, user_id=who.id, requested_amount=3_000,
+            received_amount=3_000, charge_rate=Decimal("130"),
+        )
+        await bot.db.credit_transaction(tx, 3_900)
+        await bot.db.execute(
+            "UPDATE charge_transactions SET sender_name=? WHERE id=?",
+            ("ヤマダ タロウ", tx),
+        )
+    shared = await bot.db.find_shared_senders(
+        G, minimum_users=config.FRAUD_SHARED_SENDER_USERS
+    )
+    check(any(int(r["users"]) >= 2 for r in shared),
+          f"同じ送金者名の共有を見つける ({len(shared)}件)")
+    await bot.charge.scan_guild_fraud(G)
+    for who in (share_a, share_b):
+        rows, _ = await bot.db.list_fraud_flags(G, user_id=who.id)
+        check(any(str(r["kind"]) == config.FraudKind.SHARED_SENDER for r in rows),
+              f"{who.id} に送金者名共有の検知が立つ")
+    share_flag = next(
+        r for r in (await bot.db.list_fraud_flags(G, user_id=share_a.id))[0]
+        if str(r["kind"]) == config.FraudKind.SHARED_SENDER
+    )
+    evidence = utils.load_json_dict(share_flag["evidence"])
+    check("ヤマダ タロウ" not in str(share_flag["detail"])
+          and "ヤマダ タロウ" not in str(evidence),
+          "送金者名そのものは記録に残さない (第三者の氏名を広めない)")
+    masked = str(evidence.get("sender", ""))
+    check(masked.endswith("…") and len(masked) < len("ヤマダ タロウ"),
+          f"送金者名は先頭だけ残して伏せる ({masked})")
+
+    # --- 招待報酬のみ ---
+    invite_only = guild.add_member(StubMember(66_301, guild))
+    campaign_id = await bot.db.create_campaign(
+        guild_id=G, name="検知テスト", inviter_reward=100, invited_reward=50,
+        min_account_age_days=0, daily_limit=0, total_limit=0, require_charge=False,
+        require_days=0, require_review=False, starts_at=None, ends_at=None,
+        created_by=OWNER_ID,
+    )
+    for i in range(config.FRAUD_INVITE_ONLY_COUNT):
+        record_id, _ = await bot.db.record_invite(
+            guild_id=G, campaign_id=campaign_id, inviter_id=invite_only.id,
+            invited_id=66_400 + i, code=f"code{i}",
+            status=config.InviteStatus.PENDING, reason=None,
+        )
+        await bot.db.confirm_invite_and_reward(record_id)
+    only_rows = await bot.db.find_invite_only_users(
+        G, minimum=config.FRAUD_INVITE_ONLY_COUNT
+    )
+    check(any(int(r["user_id"]) == invite_only.id for r in only_rows),
+          "チャージなしで招待報酬だけを集めている人を見つける")
+    # チャージがある人は対象にならない
+    check(all(int(r["user_id"]) != burst_user.id for r in only_rows),
+          "チャージしている人は招待報酬のみの対象にしない")
+
+    # --- チャージ直後に使い切って退出 ---
+    drain = guild.add_member(StubMember(66_501, guild))
+    drain_tx = await bot.db.create_proxy_transaction(
+        guild_id=G, user_id=drain.id, requested_amount=10_000,
+        received_amount=10_000, charge_rate=Decimal("100"),
+    )
+    await bot.db.credit_transaction(drain_tx, 10_000)
+    await bot.db.adjust_balance(
+        guild_id=G, user_id=drain.id, amount=9_500,
+        change_type=config.BalanceChangeType.ADMIN_REMOVE,
+        operator_id=OWNER_ID, reason="使い切りを再現",
+    )
+    # 支出として数えるのは SPEND 系なので、履歴の種別を差し替える
+    await bot.db.execute(
+        "UPDATE balance_history SET type=? WHERE guild_id=? AND user_id=? AND type=?",
+        (config.BalanceChangeType.SPEND, G, drain.id,
+         config.BalanceChangeType.ADMIN_REMOVE),
+    )
+    await bot.db.record_member_leave(G, drain.id)
+    drained = await bot.db.find_drain_and_leave(G, window=config.FRAUD_DRAIN_WINDOW)
+    check(any(int(r["user_id"]) == drain.id for r in drained),
+          "退出前にチャージしていた人を候補に挙げる")
+    spent = await bot.db.sum_spending(
+        G, drain.id, since=utils.now_ts() - config.FRAUD_DRAIN_WINDOW,
+        until=utils.now_ts(),
+    )
+    check(spent == 9_500, f"期間内の支出を合計できる ({spent})")
+    await bot.charge.scan_guild_fraud(G)
+    drain_rows, _ = await bot.db.list_fraud_flags(G, user_id=drain.id)
+    check(any(str(r["kind"]) == config.FraudKind.DRAIN_AND_LEAVE for r in drain_rows),
+          "使い切って退出した人に検知が立つ")
+    # 使い切っていない人は検知しない
+    keeper = guild.add_member(StubMember(66_502, guild))
+    keep_tx = await bot.db.create_proxy_transaction(
+        guild_id=G, user_id=keeper.id, requested_amount=10_000,
+        received_amount=10_000, charge_rate=Decimal("100"),
+    )
+    await bot.db.credit_transaction(keep_tx, 10_000)
+    await bot.db.record_member_leave(G, keeper.id)
+    await bot.charge.scan_guild_fraud(G)
+    keep_rows, _ = await bot.db.list_fraud_flags(G, user_id=keeper.id)
+    check(all(str(r["kind"]) != config.FraudKind.DRAIN_AND_LEAVE for r in keep_rows),
+          "残高を使っていなければ検知しない")
+
+    # --- 1つのルールが壊れても他は動く ---
+    broken_called = {"count": 0}
+
+    async def broken_rule(_guild_id: int) -> list[Any]:
+        broken_called["count"] += 1
+        raise RuntimeError("テスト用の故障")
+
+    original = bot.charge._detect_burst_charge  # type: ignore[attr-defined]
+    bot.charge._detect_burst_charge = broken_rule  # type: ignore[assignment]
+    safe_outcome = await bot.charge.scan_guild_fraud(G)
+    bot.charge._detect_burst_charge = original  # type: ignore[assignment]
+    check(broken_called["count"] == 1 and isinstance(safe_outcome, dict),
+          "1つのルールが失敗しても検知全体は止まらない")
+
+    # --- 一覧と件数 ---
+    open_count = await bot.db.count_open_fraud_flags(G)
+    all_rows, all_total = await bot.db.list_fraud_flags(G, status=None, limit=50)
+    check(open_count > 0 and all_total >= open_count,
+          f"未処理件数と全件数を数えられる (未処理 {open_count} / 全 {all_total})")
+    high_first = [str(r["severity"]) for r in all_rows]
+    check(high_first == sorted(
+        high_first, key=lambda s: {"HIGH": 0, "WARN": 1, "INFO": 2}.get(s, 3)),
+        "重要度の高い順に並ぶ")
+
+    print("\n=== 9. 整合性 ===")
     integrity = await bot.db.integrity_check()
     check(integrity["pragma"] == "ok", "PRAGMA quick_check OK")
     check(not integrity["balance_mismatch"], "残高と履歴合計が一致")

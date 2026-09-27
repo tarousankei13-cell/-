@@ -807,6 +807,44 @@ async def main() -> None:
             ))
             print(" FAIL  検証: ショップ購入が成立していない")
 
+    # --- 不正検知: カードのボタンを押す ---
+    fraud_flag_id, _created = await bot.db.create_fraud_flag(
+        guild_id=G, user_id=target.id, kind=config.FraudKind.BURST_CHARGE,
+        severity=config.FraudSeverity.WARN, detail="スモークテスト用の検知",
+        evidence={"count": 9},
+    )
+    fraud_message = await guild.channel.send(
+        embed=ui.fraud_card_embed(
+            await bot.db.get_fraud_flag(fraud_flag_id),  # type: ignore[arg-type]
+            guild_name=guild.name,
+        )
+    )
+    await bot.db.set_fraud_message(
+        fraud_flag_id, channel_id=guild.channel.id, message_id=fraud_message.id
+    )
+    fraud_view = ui.FraudCardView()
+    for item in fraud_view.children:
+        if not isinstance(item, discord.ui.Button):
+            continue
+        fraud_interaction = fresh(owner)
+        fraud_interaction.message = fraud_message
+        await run_ui(f"検知カード: {item.label}", item.callback(fraud_interaction),
+                     fraud_interaction)
+        if fraud_interaction.modals:
+            note_modal = fraud_interaction.modals[0]
+            note_modal.note._value = "スモークテスト"  # type: ignore[attr-defined]
+            note_interaction = fresh(owner)
+            await run_ui(f"検知カード: {item.label} を確定",
+                         note_modal.on_submit(note_interaction), note_interaction)
+            break
+    handled = await bot.db.get_fraud_flag(fraud_flag_id, G)
+    if handled is not None and str(handled["status"]) != config.FraudStatus.OPEN:
+        OK.append("検知カードのボタンで状態が変わる")
+        print(f"  ok   検証: 検知の処理 (→ {handled['status']})")
+    else:
+        FAILURES.append(("検知カード", "状態が変わらなかった"))
+        print(" FAIL  検証: 検知の状態が変わらない")
+
     # --- チャージ目標: パネルのボタンで進捗を見る ---
     goal_panel_view = ui.GoalPanelView()
     goal_button = next(

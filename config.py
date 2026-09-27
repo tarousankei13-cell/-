@@ -669,6 +669,7 @@ class ErrorCode:
     AUCTION_LIMIT_REACHED = "AUCTION_LIMIT_REACHED"
     GOAL_ALREADY_OPEN = "GOAL_ALREADY_OPEN"
     GOAL_NOT_FOUND = "GOAL_NOT_FOUND"
+    FRAUD_FLAG_NOT_FOUND = "FRAUD_FLAG_NOT_FOUND"
     REFUND_NOT_ELIGIBLE = "REFUND_NOT_ELIGIBLE"
     REFUND_ALREADY_REQUESTED = "REFUND_ALREADY_REQUESTED"
     ITEM_INPUT_INVALID = "ITEM_INPUT_INVALID"
@@ -739,6 +740,7 @@ USER_ERROR_MESSAGES: Final[dict[str, str]] = {
     ErrorCode.AUCTION_LIMIT_REACHED: "同時に開催できるオークションの数を超えています。",
     ErrorCode.GOAL_ALREADY_OPEN: "すでに集計中のチャージ目標があります。",
     ErrorCode.GOAL_NOT_FOUND: "対象のチャージ目標が見つかりません。",
+    ErrorCode.FRAUD_FLAG_NOT_FOUND: "対象の検知が見つからない、または既に処理済みです。",
     ErrorCode.ITEM_INPUT_INVALID: "入力内容が正しくありません。",
     ErrorCode.ITEM_SETUP_FAILED: "商品の用意に失敗しました。代金は自動で返金されています。",
     ErrorCode.SUBSCRIPTION_NOT_FOUND: "継続中の対象が見つかりません。",
@@ -806,6 +808,7 @@ USER_ERROR_NEXT_ACTIONS: Final[dict[str, str]] = {
     ErrorCode.GOAL_ALREADY_OPEN: "`/goal list` で確認し、"
                                  "先に `/goal close` か `/goal cancel` で終了してください。",
     ErrorCode.GOAL_NOT_FOUND: "`/goal list` で目標IDを確認してください。",
+    ErrorCode.FRAUD_FLAG_NOT_FOUND: "`/fraud list` で未処理の検知を確認してください。",
     ErrorCode.ITEM_INPUT_INVALID: "入力欄の説明にある形式で、もう一度入力してください。",
     ErrorCode.ITEM_SETUP_FAILED: "残高が戻っているか確認し、時間をおいてもう一度お試しください。"
                                  "続く場合は管理者へご連絡ください。",

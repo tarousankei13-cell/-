@@ -98,6 +98,7 @@ class BackgroundTasks:
             self.subscription_task,
             self.auction_task,
             self.goal_task,
+            self.fraud_task,
             self.request_task,
             self.claim_task,
             self.tier_task,
@@ -565,6 +566,18 @@ class BackgroundTasks:
 
     @goal_task.before_loop
     async def _before_goal(self) -> None:
+        await self._wait_ready()
+
+    @tasks.loop(seconds=config.TASK_FRAUD_INTERVAL)
+    async def fraud_task(self) -> None:
+        """不正の兆候を洗い出して管理者へ知らせる (自動処分はしない)。"""
+        try:
+            await self.charge.run_fraud_scan()
+        except Exception:  # noqa: BLE001
+            logger.exception("不正検知に失敗しました")
+
+    @fraud_task.before_loop
+    async def _before_fraud(self) -> None:
         await self._wait_ready()
 
     @tasks.loop(seconds=config.TASK_TIER_INTERVAL)

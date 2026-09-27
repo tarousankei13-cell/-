@@ -358,6 +358,53 @@ def main() -> None:
         for i in range(20)
     ], guild_name="サーバー" * 30))
 
+    print("\n=== 6e. 不正検知 ===")
+    for kind in config.FRAUD_KIND_LABELS:
+        for severity in config.FRAUD_SEVERITY_LABELS:
+            flag = Row(
+                id=1, guild_id=1, user_id=42, kind=kind, severity=severity,
+                detail="検知の説明" * 40, status=config.FraudStatus.OPEN,
+                evidence=utils.safe_json_dumps({
+                    "count": 9, "total": 90_000, "sender": "ヤマ…",
+                    "long": "x" * 400,
+                }),
+                reviewed_by=None, reviewed_at=None, note=None,
+                created_at=now - 600, channel_id=None, message_id=None,
+            )
+            verify(f"fraud_card_embed ({kind}/{severity})",
+                   ui.fraud_card_embed(flag, guild_name="サーバー" * 10))
+    open_card = ui.fraud_card_embed(
+        Row(id=1, guild_id=1, user_id=42, kind=config.FraudKind.BURST_CHARGE,
+            severity=config.FraudSeverity.HIGH, detail="短時間に9件",
+            status=config.FraudStatus.OPEN, evidence=None, reviewed_by=None,
+            reviewed_at=None, note=None, created_at=now, channel_id=None,
+            message_id=None),
+        guild_name="サーバー")
+    card_text = "".join(f.name + f.value for f in open_card.fields)
+    check("自動的な処分は行っていません" in card_text,
+          "検知だけでは処分しないと明記する")
+    check("/user inspect" in card_text, "次の確認手段を案内する")
+    for status in (config.FraudStatus.RESOLVED, config.FraudStatus.IGNORED):
+        verify(f"fraud_card_embed (処理後/{status})", ui.fraud_card_embed(
+            Row(id=1, guild_id=1, user_id=42, kind=config.FraudKind.SHARED_SENDER,
+                severity=config.FraudSeverity.WARN, detail="共有あり",
+                status=status, evidence=None, reviewed_by=7, reviewed_at=now,
+                note="メモ" * 200, created_at=now - 3600, channel_id=1,
+                message_id=2),
+            guild_name="サーバー"))
+    verify("fraud_list_embed (空)", ui.fraud_list_embed(
+        [], guild_name="サーバー", total=0, page=1, total_pages=1,
+        status=config.FraudStatus.OPEN))
+    verify("fraud_list_embed", ui.fraud_list_embed([
+        Row(id=i, guild_id=1, user_id=40 + i,
+            kind=list(config.FRAUD_KIND_LABELS)[i % 5],
+            severity=list(config.FRAUD_SEVERITY_LABELS)[i % 3],
+            detail="説明" * 60, status=list(config.FRAUD_STATUS_LABELS)[i % 3],
+            evidence=None, reviewed_by=None, reviewed_at=None, note=None,
+            created_at=now - i * 600, channel_id=None, message_id=None)
+        for i in range(1, 8)
+    ], guild_name="サーバー" * 30, total=42, page=2, total_pages=7, status=None))
+
     print("\n=== 6d. チャージ目標 ===")
     verify("goal_panel_embed (目標なし)", ui.goal_panel_embed(None, None))
     goal_open = Row(

@@ -533,6 +533,7 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         last_joined_at  INTEGER NOT NULL DEFAULT 0,
         join_count      INTEGER NOT NULL DEFAULT 0,
         leave_count     INTEGER NOT NULL DEFAULT 0,
+        last_left_at    INTEGER,
         updated_at      INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (guild_id, user_id)
     )
@@ -1433,12 +1434,17 @@ class Database:
         return await self.run(_fn, write=True)
 
     async def attach_link(
-        self, tx_id: str, *, link_hash_value: str, link_uuid: str, received_amount: int
+        self, tx_id: str, *, link_hash_value: str, link_uuid: str, received_amount: int,
+        sender_name: str | None = None,
     ) -> sqlite3.Row:
         """検証済みリンク情報を保存して QUEUED にし、同時にキューへ登録する。
 
         ``link_hash`` / ``link_uuid`` の UNIQUE 制約により、同じリンクが二重に
         受取対象となることを DB レベルで防ぐ。完全なURLは保存しない。
+
+        ``sender_name`` は Kyash 側に表示される送金者の名前。名義貸し・転売の
+        検知に使うため保存する。認証情報ではないが表示名なので、利用者向けの
+        画面には出さず管理者向けの調査でのみ使う。
         """
         now = utils.now_ts()
 
@@ -1453,8 +1459,10 @@ class Database:
                 raise IllegalStateTransition(f"{tx_id}: {current} → QUEUED は許可されていません")
             conn.execute(
                 "UPDATE charge_transactions SET status=?, link_hash=?, link_uuid=?, "
-                "received_amount=?, updated_at=? WHERE id=?",
-                (config.TxStatus.QUEUED, link_hash_value, link_uuid, received_amount, now, tx_id),
+                "received_amount=?, sender_name=COALESCE(?, sender_name), updated_at=? "
+                "WHERE id=?",
+                (config.TxStatus.QUEUED, link_hash_value, link_uuid, received_amount,
+                 utils.truncate(sender_name, 100) if sender_name else None, now, tx_id),
             )
             conn.execute(
                 "INSERT INTO charge_queue(transaction_id, status, attempts, next_attempt_at, "
@@ -4732,6 +4740,237 @@ class Database:
         return (int(row["c"]), int(row["total"])) if row else (0, 0)
 
     # ==================================================================
+    # 不正検知
+    # ==================================================================
+    async def create_fraud_flag(
+        self,
+        *,
+        guild_id: int,
+        user_id: int,
+        kind: str,
+        severity: str,
+        detail: str,
+        evidence: dict[str, Any] | None = None,
+    ) -> tuple[int, bool]:
+        """兆候を記録する (同じ利用者・同じ種別の未処理フラグは1つだけ)。
+
+        すでに未処理のフラグがある場合は内容だけ最新にする。同じことを
+        何度も通知して埋もれさせないため。
+
+        Returns:
+            ``(flag_id, created)``。``created`` が False なら既存の更新。
+        """
+        now = utils.now_ts()
+        evidence_text = utils.safe_json_dumps(evidence or {}, limit=1500)
+
+        def _fn(conn: sqlite3.Connection) -> tuple[int, bool]:
+            existing = conn.execute(
+                "SELECT id FROM fraud_flags WHERE guild_id=? AND user_id=? AND kind=? "
+                "AND status=?",
+                (guild_id, user_id, kind, config.FraudStatus.OPEN),
+            ).fetchone()
+            if existing is not None:
+                conn.execute(
+                    "UPDATE fraud_flags SET severity=?, detail=?, evidence=?, updated_at=? "
+                    "WHERE id=?",
+                    (severity, utils.truncate(detail, 900), evidence_text, now,
+                     int(existing["id"])),
+                )
+                return int(existing["id"]), False
+            cur = conn.execute(
+                "INSERT INTO fraud_flags(guild_id, user_id, kind, severity, detail, "
+                "evidence, status, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (guild_id, user_id, kind, severity, utils.truncate(detail, 900),
+                 evidence_text, config.FraudStatus.OPEN, now, now),
+            )
+            return _lastrowid(cur), True
+
+        return await self.run(_fn, write=True)
+
+    async def get_fraud_flag(
+        self, flag_id: int, guild_id: int | None = None
+    ) -> sqlite3.Row | None:
+        if guild_id is None:
+            return await self.fetchone("SELECT * FROM fraud_flags WHERE id=?", (flag_id,))
+        return await self.fetchone(
+            "SELECT * FROM fraud_flags WHERE id=? AND guild_id=?", (flag_id, guild_id)
+        )
+
+    async def get_fraud_flag_by_message(self, message_id: int) -> sqlite3.Row | None:
+        return await self.fetchone(
+            "SELECT * FROM fraud_flags WHERE message_id=?", (message_id,)
+        )
+
+    async def list_fraud_flags(
+        self, guild_id: int, *, status: str | None = config.FraudStatus.OPEN,
+        kind: str | None = None, user_id: int | None = None,
+        offset: int = 0, limit: int = 10,
+    ) -> tuple[list[sqlite3.Row], int]:
+        clauses = ["guild_id=?"]
+        params: list[Any] = [guild_id]
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        if kind:
+            clauses.append("kind=?")
+            params.append(kind)
+        if user_id is not None:
+            clauses.append("user_id=?")
+            params.append(user_id)
+        where = "WHERE " + " AND ".join(clauses)
+
+        def _fn(conn: sqlite3.Connection) -> tuple[list[sqlite3.Row], int]:
+            total = conn.execute(
+                f"SELECT COUNT(*) AS c FROM fraud_flags {where}", tuple(params)
+            ).fetchone()["c"]
+            rows = conn.execute(
+                f"SELECT * FROM fraud_flags {where} "
+                "ORDER BY CASE severity WHEN 'HIGH' THEN 0 WHEN 'WARN' THEN 1 ELSE 2 END, "
+                "created_at DESC LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()
+            return rows, int(total)
+
+        return await self.run(_fn)
+
+    async def count_open_fraud_flags(self, guild_id: int | None = None) -> int:
+        if guild_id is None:
+            row = await self.fetchone(
+                "SELECT COUNT(*) AS c FROM fraud_flags WHERE status=?",
+                (config.FraudStatus.OPEN,),
+            )
+        else:
+            row = await self.fetchone(
+                "SELECT COUNT(*) AS c FROM fraud_flags WHERE guild_id=? AND status=?",
+                (guild_id, config.FraudStatus.OPEN),
+            )
+        return int(row["c"]) if row else 0
+
+    async def resolve_fraud_flag(
+        self, flag_id: int, *, status: str, reviewed_by: int, note: str | None = None
+    ) -> bool:
+        """フラグを処理済み・問題なしにする (未処理からのみ)。"""
+        now = utils.now_ts()
+        changed = await self.execute(
+            "UPDATE fraud_flags SET status=?, reviewed_by=?, reviewed_at=?, "
+            "note=?, updated_at=? WHERE id=? AND status=?",
+            (status, reviewed_by, now, utils.truncate(note, 500) if note else None,
+             now, flag_id, config.FraudStatus.OPEN),
+        )
+        return changed > 0
+
+    async def set_fraud_message(
+        self, flag_id: int, *, channel_id: int, message_id: int
+    ) -> None:
+        await self.execute(
+            "UPDATE fraud_flags SET channel_id=?, message_id=?, updated_at=? WHERE id=?",
+            (channel_id, message_id, utils.now_ts(), flag_id),
+        )
+
+    async def list_fraud_guilds(self) -> list[int]:
+        """検知の対象となるサーバー (許可済みのサーバー)。"""
+        rows = await self.fetchall(
+            "SELECT guild_id FROM allowed_guilds WHERE status='ALLOWED'"
+        )
+        return [int(r["guild_id"]) for r in rows]
+
+    # ------------------------------------------------------------------
+    # 兆候の検出 (判定は charge_service 側。ここは事実を集めるだけ)
+    # ------------------------------------------------------------------
+    async def find_burst_chargers(
+        self, guild_id: int, *, window: int, minimum: int, now: int | None = None
+    ) -> list[sqlite3.Row]:
+        """短時間に何度もチャージしている利用者。"""
+        since = (now or utils.now_ts()) - window
+        return await self.fetchall(
+            "SELECT user_id, COUNT(*) AS count, SUM(received_amount) AS total, "
+            "MIN(created_at) AS first_at, MAX(created_at) AS last_at "
+            "FROM charge_transactions WHERE guild_id=? AND status=? "
+            "AND refunded_at IS NULL AND created_at>=? "
+            "GROUP BY user_id HAVING count>=? ORDER BY count DESC",
+            (guild_id, config.TxStatus.COMPLETED, since, minimum),
+        )
+
+    async def find_shared_senders(
+        self, guild_id: int, *, minimum_users: int
+    ) -> list[sqlite3.Row]:
+        """同じ送金者名を複数の利用者が使っている組み合わせ。"""
+        return await self.fetchall(
+            "SELECT sender_name, COUNT(DISTINCT user_id) AS users, COUNT(*) AS count, "
+            "SUM(received_amount) AS total, GROUP_CONCAT(DISTINCT user_id) AS user_ids "
+            "FROM charge_transactions WHERE guild_id=? AND status=? "
+            "AND refunded_at IS NULL AND sender_name IS NOT NULL AND sender_name<>'' "
+            "GROUP BY sender_name HAVING users>=? ORDER BY users DESC",
+            (guild_id, config.TxStatus.COMPLETED, minimum_users),
+        )
+
+    async def find_drain_and_leave(
+        self, guild_id: int, *, window: int, now: int | None = None, lookback: int = 86_400
+    ) -> list[sqlite3.Row]:
+        """退出前にチャージしていた利用者 (使い切りの判定は呼び出し側)。"""
+        now = now or utils.now_ts()
+        return await self.fetchall(
+            "SELECT h.user_id AS user_id, h.last_left_at AS left_at, "
+            "SUM(t.credited_amount) AS credited, COUNT(t.id) AS charges "
+            "FROM guild_member_history h "
+            "JOIN charge_transactions t ON t.guild_id=h.guild_id AND t.user_id=h.user_id "
+            "WHERE h.guild_id=? AND h.last_left_at IS NOT NULL AND h.last_left_at>=? "
+            "AND t.status=? AND t.refunded_at IS NULL "
+            "AND t.created_at <= h.last_left_at AND t.created_at >= h.last_left_at - ? "
+            "GROUP BY h.user_id HAVING credited > 0",
+            (guild_id, now - lookback, config.TxStatus.COMPLETED, window),
+        )
+
+    async def sum_spending(
+        self, guild_id: int, user_id: int, *, since: int, until: int
+    ) -> int:
+        """期間内の支出の合計 (ショップ・サブスク・入札)。"""
+        placeholders = ",".join("?" for _ in _SPEND_TYPES)
+        row = await self.fetchone(
+            f"SELECT COALESCE(SUM(-change_amount),0) AS spent FROM balance_history "
+            f"WHERE guild_id=? AND user_id=? AND type IN ({placeholders}) "
+            "AND created_at>=? AND created_at<=?",
+            (guild_id, user_id, *_SPEND_TYPES, since, until),
+        )
+        return int(row["spent"]) if row else 0
+
+    async def find_invite_only_users(
+        self, guild_id: int, *, minimum: int
+    ) -> list[sqlite3.Row]:
+        """招待報酬だけを集めていてチャージが1件も無い利用者。"""
+        return await self.fetchall(
+            "SELECT i.inviter_id AS user_id, COUNT(*) AS invites, "
+            "SUM(i.reward_inviter) AS rewards FROM invite_records i "
+            "WHERE i.guild_id=? AND i.status=? AND i.inviter_id IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM charge_transactions t WHERE t.guild_id=i.guild_id "
+            "AND t.user_id=i.inviter_id AND t.status=?) "
+            "GROUP BY i.inviter_id HAVING invites>=? ORDER BY invites DESC",
+            (guild_id, config.InviteStatus.CONFIRMED, config.TxStatus.COMPLETED, minimum),
+        )
+
+    async def find_rapid_refunders(
+        self, guild_id: int, *, minimum: int
+    ) -> list[sqlite3.Row]:
+        """返金申請を繰り返している利用者。"""
+        return await self.fetchall(
+            "SELECT user_id, COUNT(*) AS requests, "
+            "SUM(CASE WHEN status=? THEN 1 ELSE 0 END) AS rejected "
+            "FROM refund_requests WHERE guild_id=? "
+            "GROUP BY user_id HAVING requests>=? ORDER BY requests DESC",
+            (config.RefundRequestStatus.REJECTED, guild_id, minimum),
+        )
+
+    async def list_transactions_by_sender(
+        self, guild_id: int, sender_name: str, *, limit: int = 20
+    ) -> list[sqlite3.Row]:
+        """同じ送金者名の取引 (調査ビュー用)。"""
+        return await self.fetchall(
+            "SELECT * FROM charge_transactions WHERE guild_id=? AND sender_name=? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (guild_id, sender_name, limit),
+        )
+
+    # ==================================================================
     # 招待キャンペーン
     # ==================================================================
     async def create_campaign(
@@ -5184,13 +5423,18 @@ class Database:
         return await self.run(_fn, write=True)
 
     async def record_member_leave(self, guild_id: int, user_id: int) -> None:
+        """退出を記録する。
+
+        退出した時刻も残す。「チャージ直後に使い切って退出した」という
+        不正の兆候を、後から時系列で判断できるようにするため。
+        """
         now = utils.now_ts()
         await self.execute(
             "INSERT INTO guild_member_history(guild_id, user_id, first_joined_at, last_joined_at, "
-            "join_count, leave_count, updated_at) VALUES(?,?,?,?,0,1,?) "
+            "join_count, leave_count, last_left_at, updated_at) VALUES(?,?,?,?,0,1,?,?) "
             "ON CONFLICT(guild_id, user_id) DO UPDATE SET leave_count=leave_count+1, "
-            "updated_at=excluded.updated_at",
-            (guild_id, user_id, now, now, now),
+            "last_left_at=excluded.last_left_at, updated_at=excluded.updated_at",
+            (guild_id, user_id, now, now, now, now),
         )
 
     async def get_member_history(self, guild_id: int, user_id: int) -> sqlite3.Row | None:
@@ -5796,6 +6040,15 @@ _FORWARD_COMPAT_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("shop_purchases", "item_type", "TEXT NOT NULL DEFAULT 'ROLE'"),
     ("shop_purchases", "subscription", "INTEGER NOT NULL DEFAULT 0"),
     ("auctions", "role_expires_at", "INTEGER"),
+    ("guild_member_history", "last_left_at", "INTEGER"),
+)
+
+
+#: 「使った額」として数える履歴の種別 (不正検知の使い切り判定に使う)
+_SPEND_TYPES: tuple[str, ...] = (
+    config.BalanceChangeType.SPEND,
+    config.BalanceChangeType.SUBSCRIPTION,
+    config.BalanceChangeType.AUCTION_BID,
 )
 
 

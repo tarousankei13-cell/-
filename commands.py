@@ -3630,6 +3630,203 @@ class RateGroup(app_commands.Group):
 
 
 # ---------------------------------------------------------------------------
+# /fraud (不正検知の確認と処理)
+# ---------------------------------------------------------------------------
+class FraudGroup(app_commands.Group):
+    """不正の兆候の確認と処理 (管理者)。"""
+
+    def __init__(self) -> None:
+        super().__init__(name="fraud", description="不正検知の確認と処理 (管理者)")
+
+    @app_commands.command(name="list", description="検知の一覧を表示します")
+    @app_commands.describe(
+        status="状態で絞り込み (既定: 未処理)", kind="種別で絞り込み",
+        user="利用者で絞り込み", page="ページ番号",
+    )
+    @app_commands.choices(
+        status=[
+            app_commands.Choice(name=label, value=key)
+            for key, label in config.FRAUD_STATUS_LABELS.items()
+        ] + [app_commands.Choice(name="すべて", value="ALL")],
+        kind=[
+            app_commands.Choice(name=label, value=key)
+            for key, label in config.FRAUD_KIND_LABELS.items()
+        ],
+    )
+    @app_commands.guild_only()
+    @require_admin()
+    async def list_flags(
+        self,
+        interaction: discord.Interaction,
+        status: app_commands.Choice[str] | None = None,
+        kind: app_commands.Choice[str] | None = None,
+        user: discord.User | None = None,
+        page: app_commands.Range[int, 1, 200] = 1,
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        per_page = 6
+        chosen = status.value if status else config.FraudStatus.OPEN
+        filter_status = None if chosen == "ALL" else chosen
+        rows, total = await bot.db.list_fraud_flags(
+            guild.id, status=filter_status, kind=kind.value if kind else None,
+            user_id=user.id if user else None,
+            offset=(page - 1) * per_page, limit=per_page,
+        )
+        total_pages = max(1, -(-total // per_page))
+        await interaction.followup.send(
+            embed=ui.fraud_list_embed(
+                rows, guild_name=guild.name, total=total, page=page,
+                total_pages=total_pages, status=filter_status,
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="resolve", description="検知を対処済みにします"
+    )
+    @app_commands.describe(flag_id="検知ID", note="メモ (任意)")
+    @app_commands.guild_only()
+    @require_admin()
+    async def resolve(
+        self,
+        interaction: discord.Interaction,
+        flag_id: app_commands.Range[int, 1, 10_000_000],
+        note: str | None = None,
+    ) -> None:
+        await _review_fraud(
+            interaction, int(flag_id), status=config.FraudStatus.RESOLVED, note=note
+        )
+
+    @app_commands.command(
+        name="ignore", description="検知を問題なしにします"
+    )
+    @app_commands.describe(flag_id="検知ID", note="メモ (任意)")
+    @app_commands.guild_only()
+    @require_admin()
+    async def ignore(
+        self,
+        interaction: discord.Interaction,
+        flag_id: app_commands.Range[int, 1, 10_000_000],
+        note: str | None = None,
+    ) -> None:
+        await _review_fraud(
+            interaction, int(flag_id), status=config.FraudStatus.IGNORED, note=note
+        )
+
+    @app_commands.command(
+        name="scan", description="いますぐ検知を実行します (定期実行とは別に)"
+    )
+    @app_commands.guild_only()
+    @require_admin()
+    async def scan(self, interaction: discord.Interaction) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        outcome = await bot.charge.scan_guild_fraud(guild.id)
+        open_count = await bot.db.count_open_fraud_flags(guild.id)
+        op_id = await _audit(interaction, "FRAUD_SCAN", detail=outcome)
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "🛡 検知を実行しました",
+                f"新しく検知: **{outcome.get('flagged', 0)}** 件\n"
+                f"既存の検知を更新: {outcome.get('updated', 0)} 件\n"
+                f"未処理の検知: **{open_count}** 件\n"
+                f"`/fraud list` で内容を確認できます。\n"
+                f"操作ID: `{op_id}`",
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="thresholds", description="検知の条件を表示します"
+    )
+    @app_commands.guild_only()
+    @require_admin()
+    async def thresholds(self, interaction: discord.Interaction) -> None:
+        """どの条件で検知しているかを明示する (誤検知の判断材料)。"""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        embed = ui.info_embed(
+            "🛡 検知の条件",
+            f"{ui.SEPARATOR}\n"
+            "検知は**目安**です。自動的な処分は一切行いません。\n"
+            f"{ui.SEPARATOR}",
+        )
+        embed.add_field(
+            name=config.FRAUD_KIND_LABELS[config.FraudKind.BURST_CHARGE],
+            value=f"{config.FRAUD_BURST_WINDOW // 60} 分以内に "
+                  f"{config.FRAUD_BURST_COUNT} 件以上のチャージ完了",
+            inline=False,
+        )
+        embed.add_field(
+            name=config.FRAUD_KIND_LABELS[config.FraudKind.SHARED_SENDER],
+            value=f"同じ Kyash 送金者名を {config.FRAUD_SHARED_SENDER_USERS} 人以上が使用",
+            inline=False,
+        )
+        embed.add_field(
+            name=config.FRAUD_KIND_LABELS[config.FraudKind.DRAIN_AND_LEAVE],
+            value=f"退出前 {config.FRAUD_DRAIN_WINDOW // 60} 分のチャージ分の "
+                  f"{float(config.FRAUD_DRAIN_RATIO) * 100:.0f}% 以上を使って退出",
+            inline=False,
+        )
+        embed.add_field(
+            name=config.FRAUD_KIND_LABELS[config.FraudKind.INVITE_ONLY],
+            value=f"確定招待が {config.FRAUD_INVITE_ONLY_COUNT} 件以上でチャージが0件",
+            inline=False,
+        )
+        embed.add_field(
+            name=config.FRAUD_KIND_LABELS[config.FraudKind.RAPID_REFUND],
+            value=f"返金申請が {config.FRAUD_REFUND_COUNT} 件以上",
+            inline=False,
+        )
+        embed.add_field(
+            name="実行の間隔",
+            value=f"{config.TASK_FRAUD_INTERVAL // 60} 分ごと "
+                  "(`/fraud scan` で手動実行もできます)",
+            inline=False,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+async def _review_fraud(
+    interaction: discord.Interaction, flag_id: int, *, status: str, note: str | None
+) -> None:
+    """``/fraud resolve`` と ``/fraud ignore`` の共通処理。"""
+    bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+    guild = interaction.guild
+    assert guild is not None
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    flag = await bot.db.get_fraud_flag(flag_id, guild.id)
+    if flag is None:
+        await interaction.followup.send(
+            embed=ui.error_embed(config.ErrorCode.FRAUD_FLAG_NOT_FOUND), ephemeral=True
+        )
+        return
+    try:
+        result = await bot.charge.review_fraud_flag(
+            flag_id, status=status, reviewed_by=interaction.user.id,
+            note=note.strip()[:400] if note else None,
+        )
+    except ChargeError as exc:
+        await interaction.followup.send(
+            embed=ui.error_embed(exc.code, admin_detail=exc.detail or None), ephemeral=True
+        )
+        return
+    resolved = status == config.FraudStatus.RESOLVED
+    await interaction.followup.send(
+        embed=ui.success_embed(
+            "✅ 対処済みにしました" if resolved else "⚪ 問題なしにしました",
+            f"検知ID: `{flag_id}`\n対象: <@{result['user_id']}>\n"
+            f"種別: {config.FRAUD_KIND_LABELS.get(str(result['kind']), str(result['kind']))}",
+        ),
+        ephemeral=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # /goal (サーバー全体のチャージ目標)
 # ---------------------------------------------------------------------------
 class GoalGroup(app_commands.Group):
@@ -5312,8 +5509,13 @@ async def inspect_command(interaction: discord.Interaction, user: discord.Member
     )
     subscriptions = await bot.db.list_subscriptions(guild_id, user_id=user.id)
     account_age_days = (utils.now_ts() - int(user.created_at.timestamp())) / 86400
+    fraud_rows, fraud_total = await bot.db.list_fraud_flags(
+        guild_id, status=None, user_id=user.id, limit=5
+    )
+    fraud_open = sum(
+        1 for f in fraud_rows if str(f["status"]) == config.FraudStatus.OPEN
+    )
 
-    # 同じ Kyash 送金者名を共有している他ユーザー (名義貸し・転売の兆候)
     embed = ui.info_embed(
         f"🔎 {user.display_name} の調査ビュー",
         f"{ui.SEPARATOR}\n{user.mention} (`{user.id}`)\n{ui.SEPARATOR}",
@@ -5355,6 +5557,20 @@ async def inspect_command(interaction: discord.Interaction, user: discord.Member
         ),
         inline=True,
     )
+    if fraud_total:
+        embed.add_field(
+            name="🛡 不正検知",
+            value=(
+                f"検知 **{fraud_total}** 件 (未処理 **{fraud_open}** 件)\n"
+                + "\n".join(
+                    f"`{int(f['id'])}` "
+                    f"{config.FRAUD_KIND_LABELS.get(str(f['kind']), str(f['kind']))} / "
+                    f"{config.FRAUD_STATUS_LABELS.get(str(f['status']), str(f['status']))}"
+                    for f in fraud_rows
+                )
+            ),
+            inline=False,
+        )
     embed.add_field(
         name="アカウント",
         value=(
@@ -6915,7 +7131,7 @@ async def setup_commands(bot: "ChargeBot") -> None:
         ServerGroup(), KyashGroup(), SettingsGroup(), BalanceGroup(), UserGroup(),
         MaintenanceGroup(), EmergencyStopGroup(), AchievementGroup(), TransactionGroup(),
         DataGroup(), ConfigGroup(), SystemGroup(), RateGroup(), ShopGroup(),
-        AuctionGroup(), GoalGroup(),
+        AuctionGroup(), GoalGroup(), FraudGroup(),
         CampaignGroup(), ExportGroup(), GlobalGroup(),
         ProviderGroup(), RequestGroup(), TierGroup(), RankingRewardGroup(),
     ):

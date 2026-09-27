@@ -1579,6 +1579,184 @@ def subscription_list_embed(rows: Sequence[Any], *, guild_name: str) -> discord.
 
 
 # ---------------------------------------------------------------------------
+# 不正検知
+# ---------------------------------------------------------------------------
+
+def fraud_card_embed(flag: Any, *, guild_name: str) -> discord.Embed:
+    """検知カード (審査チャンネルへ投稿し、処理後は書き換える)。
+
+    「疑わしい」を知らせるだけで、処分は管理者が決める。断定的な表現は
+    使わず、根拠と次の確認先を必ず添える。
+    """
+    kind = str(flag["kind"])
+    severity = str(flag["severity"])
+    status = str(flag["status"])
+    color = {
+        config.FraudSeverity.HIGH: config.Color.DANGER,
+        config.FraudSeverity.WARN: config.Color.WARNING,
+        config.FraudSeverity.INFO: config.Color.INFO,
+    }.get(severity, config.Color.INFO)
+    if status != config.FraudStatus.OPEN:
+        color = config.Color.NEUTRAL
+    embed = discord.Embed(
+        title=f"🛡 検知: {config.FRAUD_KIND_LABELS.get(kind, kind)}",
+        description=(
+            f"{SEPARATOR}\n**{guild_name}**\n"
+            f"{config.FRAUD_SEVERITY_LABELS.get(severity, severity)}　"
+            f"{config.FRAUD_STATUS_LABELS.get(status, status)}\n"
+            f"{SEPARATOR}"
+        ),
+        color=color,
+    )
+    embed.add_field(name="対象", value=f"<@{int(flag['user_id'])}>", inline=True)
+    embed.add_field(name="検知ID", value=f"`{int(flag['id'])}`", inline=True)
+    embed.add_field(
+        name="検知時刻", value=utils.discord_ts(int(flag["created_at"])), inline=True
+    )
+    embed.add_field(
+        name="内容", value=utils.truncate(str(flag["detail"] or "-"), 900), inline=False
+    )
+    evidence = utils.load_json_dict(flag["evidence"])
+    if evidence:
+        lines = [
+            f"{key}: {utils.truncate(str(value), 120)}"
+            for key, value in list(evidence.items())[:8]
+        ]
+        embed.add_field(
+            name="根拠", value=utils.truncate("\n".join(lines), 900), inline=False
+        )
+    if status == config.FraudStatus.OPEN:
+        embed.add_field(
+            name="▶ 確認のしかた",
+            value=(
+                f"`/user inspect user:<@{int(flag['user_id'])}>` で詳細を確認\n"
+                "問題があれば `/user freeze`、問題なければ `⚪ 問題なし` を押してください。\n"
+                "**この検知だけで自動的な処分は行っていません。**"
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="処理",
+            value=(
+                f"担当: <@{int(flag['reviewed_by'])}>\n"
+                f"日時: {utils.discord_ts(int(flag['reviewed_at']))}"
+                if flag["reviewed_by"] and flag["reviewed_at"] else "-"
+            ),
+            inline=True,
+        )
+        if flag["note"]:
+            embed.add_field(
+                name="メモ", value=utils.truncate(str(flag["note"]), 500), inline=False
+            )
+    embed.set_footer(text="不正検知は目安です。判断は必ず人が行ってください")
+    return embed
+
+
+def fraud_list_embed(
+    rows: Sequence[Any], *, guild_name: str, total: int, page: int, total_pages: int,
+    status: str | None,
+) -> discord.Embed:
+    label = config.FRAUD_STATUS_LABELS.get(status or "", "すべて") if status else "すべて"
+    embed = discord.Embed(
+        title="🛡 不正検知の一覧",
+        description=(
+            f"{SEPARATOR}\n**{guild_name}**\n"
+            f"絞り込み: {label}　該当 **{utils.fmt_int(total)}** 件"
+            f"　ページ {page}/{total_pages}\n{SEPARATOR}"
+        ),
+        color=config.Color.INFO,
+    )
+    if not rows:
+        embed.add_field(
+            name="該当なし",
+            value="条件に合う検知はありません。",
+            inline=False,
+        )
+        return embed
+    for row in rows:
+        kind = str(row["kind"])
+        embed.add_field(
+            name=f"`{int(row['id'])}` "
+                 f"{config.FRAUD_SEVERITY_LABELS.get(str(row['severity']), '')} "
+                 f"{config.FRAUD_KIND_LABELS.get(kind, kind)}",
+            value=(
+                f"対象: <@{int(row['user_id'])}>\n"
+                f"状態: {config.FRAUD_STATUS_LABELS.get(str(row['status']), str(row['status']))}\n"
+                f"検知: {utils.discord_ts(int(row['created_at']))}\n"
+                f"{utils.truncate(str(row['detail'] or '-'), 200)}"
+            ),
+            inline=False,
+        )
+    embed.set_footer(text="処理は /fraud resolve か /fraud ignore で行えます")
+    return embed
+
+
+class FraudNoteModal(discord.ui.Modal):
+    """検知を処理するときのメモ入力。"""
+
+    def __init__(self, flag_id: int, *, status: str) -> None:
+        resolved = status == config.FraudStatus.RESOLVED
+        super().__init__(
+            title="対処済みにする" if resolved else "問題なしにする", timeout=300
+        )
+        self.flag_id = flag_id
+        self.status = status
+        self.note: discord.ui.TextInput = discord.ui.TextInput(
+            label="メモ (任意・後から見返せます)",
+            placeholder="例: 本人確認済み / 凍結して対応済み",
+            required=False,
+            max_length=400,
+            style=discord.TextStyle.paragraph,
+        )
+        self.add_item(self.note)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await bot_of(interaction).handle_fraud_review(
+            interaction, self.flag_id, status=self.status, note=str(self.note.value)
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
+        logger.error("検知メモModalでエラー: %s", utils.safe_error_text(error))
+        await safe_respond(interaction, embed=error_embed(config.ErrorCode.UNKNOWN_ERROR))
+
+
+class FraudCardView(discord.ui.View):
+    """検知カードのボタン (Persistent View)。
+
+    押下時に毎回権限を確認する。対象はメッセージIDから引く。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="対処済みにする", emoji="✅", style=discord.ButtonStyle.success,
+        custom_id=config.CustomID.FRAUD_RESOLVE,
+    )
+    async def resolve(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await bot_of(interaction).on_fraud_button(
+            interaction, status=config.FraudStatus.RESOLVED
+        )
+
+    @discord.ui.button(
+        label="問題なし", emoji="⚪", style=discord.ButtonStyle.secondary,
+        custom_id=config.CustomID.FRAUD_IGNORE,
+    )
+    async def ignore(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await bot_of(interaction).on_fraud_button(
+            interaction, status=config.FraudStatus.IGNORED
+        )
+
+    @discord.ui.button(
+        label="詳細", emoji="🔎", style=discord.ButtonStyle.primary,
+        custom_id=config.CustomID.FRAUD_DETAIL,
+    )
+    async def detail(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await bot_of(interaction).on_fraud_detail(interaction)
+
+
+# ---------------------------------------------------------------------------
 # サーバー全体のチャージ目標
 # ---------------------------------------------------------------------------
 
