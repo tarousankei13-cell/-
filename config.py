@@ -12,8 +12,8 @@ from typing import Final
 # ---------------------------------------------------------------------------
 # バージョン
 # ---------------------------------------------------------------------------
-BOT_VERSION: Final[str] = "4.1.0"
-SCHEMA_VERSION: Final[int] = 5
+BOT_VERSION: Final[str] = "4.2.0"
+SCHEMA_VERSION: Final[int] = 6
 
 # ---------------------------------------------------------------------------
 # パス
@@ -394,11 +394,16 @@ PROVIDER_DESCRIPTIONS: Final[dict[str, str]] = {
     ChargeProvider.LTC: "その時のレートで送金 → 申請 → 管理者の承認で反映されます",
 }
 
+#: ボタン・選択メニューに出す絵文字。
+#: **必ず Unicode の絵文字にすること。** 記号や文字 (例: Litecoin の "Ł" = U+0141) を
+#: 入れると Discord が 400 Invalid Form Body を返し、そのメッセージ全体が送れなくなる。
+#: 結果として利用者には「アプリケーションは応答しませんでした」と表示され、
+#: ボタンが押せなくなる。tests/test_static_audit.py で機械的に検査している。
 PROVIDER_EMOJI: Final[dict[str, str]] = {
     ChargeProvider.KYASH: "💰",
     ChargeProvider.KYASH_CLAIM: "🧾",
     ChargeProvider.PAYPAY: "🅿️",
-    ChargeProvider.LTC: "Ł",
+    ChargeProvider.LTC: "🪙",
 }
 
 #: すべての方式 (表示順)
@@ -414,6 +419,62 @@ KYASH_PROVIDERS: Final[tuple[str, ...]] = (
 
 #: 管理者承認が必要な方式
 MANUAL_PROVIDERS: Final[tuple[str, ...]] = (ChargeProvider.PAYPAY, ChargeProvider.LTC)
+
+# ---------------------------------------------------------------------------
+# 方式の系統 (family)
+# ---------------------------------------------------------------------------
+# Kyash には「送金リンク」「請求リンク」の2つの受け取り方があるが、
+# 利用者に見せるのは常にどちらか一方だけ (/provider kyash_mode で決める)。
+#
+# そのため **設定 (有効無効・チャージ率・金額上下限) は受け取り方ごとに分けない**。
+# 分けてしまうと、受け取り方を切り替えた瞬間にレートや上限が別の値へ化け、
+# 管理者が意図しない条件でチャージされてしまう。
+# ここでは「系統 (family)」という代表キーを1つ決め、設定はその1行だけを使う。
+
+#: 利用者に見せる方式 → 設定をまとめる代表キー
+PROVIDER_FAMILY: Final[dict[str, str]] = {
+    ChargeProvider.KYASH: ChargeProvider.KYASH,
+    ChargeProvider.KYASH_CLAIM: ChargeProvider.KYASH,
+    ChargeProvider.PAYPAY: ChargeProvider.PAYPAY,
+    ChargeProvider.LTC: ChargeProvider.LTC,
+}
+
+#: 代表キー → その系統に属する方式 (表示順)
+FAMILY_PROVIDERS: Final[dict[str, tuple[str, ...]]] = {
+    ChargeProvider.KYASH: (ChargeProvider.KYASH, ChargeProvider.KYASH_CLAIM),
+    ChargeProvider.PAYPAY: (ChargeProvider.PAYPAY,),
+    ChargeProvider.LTC: (ChargeProvider.LTC,),
+}
+
+#: 管理コマンドで選ばせる単位。Kyash は1つだけ並べ、
+#: 受け取り方は /provider kyash_mode で決める (2つ並べると設定が分かれて混乱する)
+ADMIN_PROVIDERS: Final[tuple[str, ...]] = (
+    ChargeProvider.KYASH, ChargeProvider.PAYPAY, ChargeProvider.LTC,
+)
+
+#: 代表キーの表示名 (受け取り方を含まない名前)
+FAMILY_LABELS: Final[dict[str, str]] = {
+    ChargeProvider.KYASH: "Kyash",
+    ChargeProvider.PAYPAY: "PayPay",
+    ChargeProvider.LTC: "Litecoin (LTC)",
+}
+
+#: 系統ごとの「受け取り方を決めるコマンド」(未設定の系統は None)
+FAMILY_MODE_COMMANDS: Final[dict[str, str | None]] = {
+    ChargeProvider.KYASH: "/provider kyash_mode",
+    ChargeProvider.PAYPAY: "/provider paypay_mode",
+    ChargeProvider.LTC: None,
+}
+
+
+def provider_family(provider: str) -> str:
+    """方式から代表キーを返す (未知の値はそのまま返す)。"""
+    return PROVIDER_FAMILY.get(provider, provider)
+
+
+def family_label(family: str) -> str:
+    """代表キーの表示名 (未知の値は方式名で代替する)。"""
+    return FAMILY_LABELS.get(family) or PROVIDER_LABELS.get(family, family)
 
 
 class KyashMode:
@@ -718,6 +779,7 @@ class ErrorCode:
     # --- チャージ方式 / 申請 ---
     PROVIDER_DISABLED = "PROVIDER_DISABLED"
     PROVIDER_NOT_CONFIGURED = "PROVIDER_NOT_CONFIGURED"
+    PROVIDER_MODE_MISMATCH = "PROVIDER_MODE_MISMATCH"
     DUPLICATE_PROOF = "DUPLICATE_PROOF"
     INVALID_PROOF = "INVALID_PROOF"
     OPEN_REQUEST_LIMIT = "OPEN_REQUEST_LIMIT"
@@ -786,6 +848,7 @@ USER_ERROR_MESSAGES: Final[dict[str, str]] = {
     ErrorCode.UNKNOWN_ERROR: "予期しないエラーが発生しました。管理者にお問い合わせください。",
     ErrorCode.PROVIDER_DISABLED: "この方法でのチャージは現在受け付けていません。",
     ErrorCode.PROVIDER_NOT_CONFIGURED: "この方法はまだ利用できる状態になっていません。",
+    ErrorCode.PROVIDER_MODE_MISMATCH: "この受け取り方は現在使われていません (管理者が別の方式に変更しました)。",
     ErrorCode.DUPLICATE_PROOF: "その取引は既に申請されています。同じものを二重に申請することはできません。",
     ErrorCode.INVALID_PROOF: "入力された情報の形式が正しくありません。",
     ErrorCode.OPEN_REQUEST_LIMIT: "未処理の申請が多すぎます。先の申請が処理されるまでお待ちください。",
@@ -853,6 +916,7 @@ USER_ERROR_NEXT_ACTIONS: Final[dict[str, str]] = {
     ErrorCode.UNKNOWN_ERROR: "時間をおいてもう一度お試しください。続く場合は取引IDを添えて管理者にお知らせください。",
     ErrorCode.PROVIDER_DISABLED: "別のチャージ方法を選ぶか、再開までお待ちください。",
     ErrorCode.PROVIDER_NOT_CONFIGURED: "別のチャージ方法を選んでください (管理者の設定待ちです)。",
+    ErrorCode.PROVIDER_MODE_MISMATCH: "パネルの `🔄 更新` を押してから、もう一度 `💰 チャージ` を押してください。",
     ErrorCode.DUPLICATE_PROOF: "`📜 履歴` で前の申請の状態を確認してください。取引IDの打ち間違いなら、正しいIDで再申請してください。",
     ErrorCode.INVALID_PROOF: "取引ID / txid を、余分な文字を入れずにそのまま貼り付けてください。",
     ErrorCode.OPEN_REQUEST_LIMIT: "`📜 履歴` で未処理の申請を確認し、不要なものは取り消してください。",

@@ -787,8 +787,8 @@ class KyashGroup(app_commands.Group):
                     color=config.Color.DANGER),
             )
             return
-        await interaction.response.send_modal(
-            ui.KyashLoginModal(account_id=slot.id if slot else None)
+        await ui.safe_send_modal(
+            interaction, ui.KyashLoginModal(account_id=slot.id if slot else None)
         )
 
     @app_commands.command(name="status", description="受取用Kyashアカウントの状態を表示します (管理者)")
@@ -6718,9 +6718,13 @@ class RankingRewardGroup(app_commands.Group):
 # ---------------------------------------------------------------------------
 # /provider (チャージ方式の設定)
 # ---------------------------------------------------------------------------
+# 管理コマンドでは Kyash を1つだけ並べる。
+# 「送金リンク」「請求リンク」を別々に並べると設定が方式ごとに分かれてしまい、
+# /provider kyash_mode で切り替えた瞬間にレートや上限が別の値へ化ける。
+# 受け取り方は必ず /provider kyash_mode で決める。
 _PROVIDER_CHOICES = [
-    app_commands.Choice(name=config.PROVIDER_LABELS[p], value=p)
-    for p in config.ALL_PROVIDERS
+    app_commands.Choice(name=config.family_label(p), value=p)
+    for p in config.ADMIN_PROVIDERS
 ]
 _MANUAL_PROVIDER_CHOICES = [
     app_commands.Choice(name=config.PROVIDER_LABELS[p], value=p)
@@ -6797,13 +6801,26 @@ class ProviderGroup(app_commands.Group):
                 ("操作ID", f"`{op_id}`", True),
             ),
         )
-        await interaction.followup.send(
-            embed=ui.success_embed(
-                "✅ 受付状態を変更しました",
-                f"{provider.name}: **{'受付中' if enabled else '停止'}**\n操作ID: `{op_id}`",
-            ),
-            ephemeral=True,
+        embed = ui.success_embed(
+            "✅ 受付状態を変更しました",
+            f"{provider.name}: **{'受付中' if enabled else '停止'}**\n操作ID: `{op_id}`",
         )
+        # Kyash は受け取り方が2つあるので、片方だけ止めたつもりにさせない
+        family = config.provider_family(provider.value)
+        methods = config.FAMILY_PROVIDERS.get(family, ())
+        if len(methods) > 1:
+            names = " / ".join(config.PROVIDER_LABELS.get(m, m) for m in methods)
+            embed.add_field(
+                name="対象",
+                value=(
+                    f"{names} の**両方**が対象です。\n"
+                    + ("受け取り方を変えたいだけなら "
+                       f"`{config.FAMILY_MODE_COMMANDS.get(family)}` を使ってください。"
+                       if not enabled else "")
+                ),
+                inline=False,
+            )
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="rate", description="方式ごとのチャージ率を設定します")
     @app_commands.describe(
@@ -6914,6 +6931,8 @@ class ProviderGroup(app_commands.Group):
         )
         settings = await bot.db.get_settings(guild.id)
         low, high = await bot.charge.provider_limits(guild.id, provider.value, settings)
+        # パネルには受付範囲を出しているため、投稿済みのパネルも作り直す
+        await bot.charge.refresh_charge_panels(guild.id)
         await interaction.followup.send(
             embed=ui.success_embed(
                 "✅ 金額の範囲を設定しました",
@@ -6967,6 +6986,38 @@ class ProviderGroup(app_commands.Group):
                 value="受取用 Kyash アカウントが未ログインです。`/kyash login` を先に実行してください。",
                 inline=False,
             )
+        # 受付停止のままだと、方式を変えても利用者には何も出ない
+        row = await bot.db.get_provider_settings(guild.id, config.ChargeProvider.KYASH)
+        if row is not None and not row["enabled"]:
+            embed.add_field(
+                name="⚠️ Kyash は受付停止中です",
+                value=(
+                    "いま Kyash は受付を止めているため、方式を変えても利用者には出ません。\n"
+                    "`/provider enable provider:Kyash enabled:True` で再開してください。"
+                ),
+                inline=False,
+            )
+        # 前の受け取り方で進行中の取引は、そのまま続けられる (勝手に消さない)
+        pending = await bot.db.count_transactions_by_provider(
+            guild.id,
+            statuses=(config.TxStatus.CREATED, config.TxStatus.WAITING_LINK,
+                      config.TxStatus.WAITING_PAYMENT),
+        )
+        stale = sum(
+            count for name, count in pending.items()
+            if config.provider_family(name) == config.ChargeProvider.KYASH
+            and name != provider
+        )
+        if stale:
+            embed.add_field(
+                name="進行中の取引について",
+                value=(
+                    f"前の受け取り方で進行中の取引が **{stale} 件** あります。\n"
+                    "すでに送金されている可能性があるため取り消しません。"
+                    "利用者は前の方式のままその取引を完了できます。"
+                ),
+                inline=False,
+            )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(
@@ -6992,6 +7043,8 @@ class ProviderGroup(app_commands.Group):
             interaction, "PROVIDER_PAYPAY_MODE", detail={"mode": mode.value}
         )
         destination = await bot.db.get_destination(config.ChargeProvider.PAYPAY)
+        # パネルとヘルプの手順が受け取り方で変わるため、投稿済みのパネルも作り直す
+        await bot.charge.refresh_charge_panels(guild.id)
         embed = ui.success_embed(
             "✅ PayPay の受け取り方を変更しました",
             f"方式: **{mode.name}**\n操作ID: `{op_id}`",
@@ -7065,6 +7118,8 @@ class ProviderGroup(app_commands.Group):
             interaction, "PROVIDER_PAYPAY_LINK",
             detail={"registered": bool(value)},
         )
+        # 入金先は全サーバー共通なので、すべてのパネルの内容が変わる
+        await bot.charge.refresh_all_charge_panels()
         if not value:
             await interaction.followup.send(
                 embed=ui.success_embed(
@@ -7126,6 +7181,8 @@ class ProviderGroup(app_commands.Group):
             detail={"provider": provider.value,
                     "address": utils.mask_identifier(value, keep=6)},
         )
+        # 入金先は全サーバー共通なので、すべてのパネルで使える方式が変わる
+        await bot.charge.refresh_all_charge_panels()
         await interaction.followup.send(
             embed=ui.success_embed(
                 "✅ 入金先を登録しました",
@@ -7159,6 +7216,7 @@ class ProviderGroup(app_commands.Group):
         op_id = await _audit(
             interaction, "PROVIDER_DESTINATION_CLEAR", detail={"provider": provider.value}
         )
+        await bot.charge.refresh_all_charge_panels()
         await interaction.followup.send(
             embed=ui.info_embed(
                 "削除しました" if removed else "登録されていません",
@@ -7195,6 +7253,8 @@ class ProviderGroup(app_commands.Group):
             interaction, "PROVIDER_REVIEW_CHANNEL",
             detail={"channel_id": channel.id if channel else None},
         )
+        # 審査チャンネルの有無で PayPay / LTC が使えるかが変わる
+        await bot.charge.refresh_all_charge_panels()
         await interaction.followup.send(
             embed=ui.success_embed(
                 "✅ 審査チャンネルを設定しました" if channel else "審査チャンネルを解除しました",
@@ -7408,7 +7468,10 @@ class RequestGroup(app_commands.Group):
         status="状態で絞り込み", provider="方式で絞り込み",
         user="利用者で絞り込み", page="ページ",
     )
-    @app_commands.choices(status=_REQUEST_STATUS_CHOICES, provider=_PROVIDER_CHOICES)
+    # 申請 (requests) が作られるのは承認制の方式だけなので、Kyash は並べない
+    @app_commands.choices(
+        status=_REQUEST_STATUS_CHOICES, provider=_MANUAL_PROVIDER_CHOICES
+    )
     @require_admin()
     async def list_requests(
         self,

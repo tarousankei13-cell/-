@@ -344,6 +344,10 @@ class ChargeService:
             raise ChargeError(config.ErrorCode.INVALID_AMOUNT)
         if not self._charge_rate_limiter.check(f"charge:{guild_id}:{user_id}"):
             raise ChargeError(config.ErrorCode.RATE_LIMITED)
+        provider = config.ChargeProvider.KYASH
+        # 受付停止と受け取り方の切り替えは、表示を絞るだけでは守れない。
+        # 手元に古い入力欄が残っていても通さないよう、ここで必ず確認する。
+        await self.ensure_provider_allowed(guild_id, provider, settings)
 
         async with self._user_locks.acquire(f"{guild_id}:{user_id}"):
             await self.preflight(guild_id, user_id, settings)
@@ -352,12 +356,16 @@ class ChargeService:
             )
             if active > 0:
                 raise ChargeError(config.ErrorCode.ACTIVE_TRANSACTION_EXISTS)
-            charge_rate, role_id = await self.resolve_charge_rate(guild_id, user_id, settings)
-            # ブーストは最後に足す。ここで確定した率を取引に保存するので、
-            # ブーストが切れても進行中の取引には影響しない。
-            charge_rate, boost = await self.apply_rate_boost(guild_id, user_id, charge_rate)
+            # 方式別レート (/provider rate) とロール別レートの高い方を採る。
+            # ブーストもこの中で加算される。ここで確定した率を取引に保存するので、
+            # 後から設定やブーストが変わっても進行中の取引には影響しない。
+            charge_rate, role_id, boost = await self.resolve_provider_rate_parts(
+                guild_id, user_id, provider, settings
+            )
+            low, high = await self.provider_limits(guild_id, provider, settings)
             await self._check_limits(
-                guild_id, user_id, amount, settings, charge_rate=charge_rate
+                guild_id, user_id, amount, settings,
+                charge_rate=charge_rate, minimum=low, maximum=high,
             )
             await self.db.ensure_user(guild_id, user_id)
             tx_id = await self.db.create_transaction(
@@ -1611,9 +1619,7 @@ class ChargeService:
         # 請求リンク方式でも Kyash の受取用アカウントは必要
         await self.preflight(guild_id, user_id, settings)
         provider = config.ChargeProvider.KYASH_CLAIM
-        row = await self.db.get_provider_settings(guild_id, provider)
-        if row is not None and not row["enabled"]:
-            raise ChargeError(config.ErrorCode.PROVIDER_DISABLED)
+        await self.ensure_provider_allowed(guild_id, provider, settings)
         charge_rate, role_id = await self.resolve_provider_rate(
             guild_id, user_id, provider, settings
         )
@@ -1950,6 +1956,22 @@ class ChargeService:
             ``(charge_rate, role_id or None)``。role_id はロール別レートを
             採用した場合のみ。
         """
+        rate, role_id, _boost = await self.resolve_provider_rate_parts(
+            guild_id, user_id, provider, settings
+        )
+        return rate, role_id
+
+    async def resolve_provider_rate_parts(
+        self, guild_id: int, user_id: int, provider: str, settings: GuildSettings
+    ) -> tuple[Decimal, int | None, Decimal | None]:
+        """``resolve_provider_rate`` と同じ計算に、加算したブースト量を添えて返す。
+
+        ログや通知で「ブーストで何ポイント増えたか」を正しく出せるようにする
+        (差分から逆算すると、方式別レートの上乗せをブーストと誤表示してしまう)。
+
+        Returns:
+            ``(charge_rate, role_id or None, boost or None)``
+        """
         role_rate, role_id = await self.resolve_charge_rate(guild_id, user_id, settings)
         row = await self.db.get_provider_settings(guild_id, provider)
         provider_rate = utils.to_decimal(row["charge_rate"]) if row else None
@@ -1962,8 +1984,53 @@ class ChargeService:
         else:
             base, used_role = provider_rate, None
         # ブーストは方式・ロールのどちらが採用されても最後に加算する
-        boosted, _bonus = await self.apply_rate_boost(guild_id, user_id, base)
-        return boosted, used_role
+        boosted, bonus = await self.apply_rate_boost(guild_id, user_id, base)
+        return boosted, used_role, bonus
+
+    def selected_provider(self, family: str, settings: GuildSettings) -> str:
+        """その系統でいま利用者に見せている受け取り方を返す。
+
+        Kyash は ``kyash_mode`` で「送金リンク」「請求リンク」のどちらか一方だけを
+        見せる。他の系統は受け取り方が1つなので、代表キーがそのまま答えになる。
+        """
+        if family == config.ChargeProvider.KYASH:
+            return config.KYASH_MODE_PROVIDER.get(
+                settings.kyash_mode, config.ChargeProvider.KYASH
+            )
+        return family
+
+    def is_selected_provider(self, provider: str, settings: GuildSettings) -> bool:
+        """``provider`` がいま受け付けている受け取り方かどうか。"""
+        family = config.provider_family(provider)
+        return provider == self.selected_provider(family, settings)
+
+    async def ensure_provider_allowed(
+        self, guild_id: int, provider: str, settings: GuildSettings
+    ) -> None:
+        """その方式で新しい取引を作ってよいか確認する。
+
+        表示を絞るだけでは足りない。古い画面やタイミングによっては、選ばれて
+        いない受け取り方の入力欄が利用者の手元に残っていることがある。
+        取引を作る直前にもう一度確認しないと、
+
+        * 受付停止にした方式でチャージできてしまう
+        * 請求リンク方式に切り替えたのに送金リンクの取引が作られてしまう
+
+        という抜け道になる。
+
+        Raises:
+            ChargeError: 受付停止中か、いま使っていない受け取り方のとき。
+        """
+        family = config.provider_family(provider)
+        selected = self.selected_provider(family, settings)
+        if provider != selected:
+            raise ChargeError(
+                config.ErrorCode.PROVIDER_MODE_MISMATCH,
+                f"いまは {config.PROVIDER_LABELS.get(selected, selected)} のみ受け付けています",
+            )
+        row = await self.db.get_provider_settings(guild_id, family)
+        if row is not None and not row["enabled"]:
+            raise ChargeError(config.ErrorCode.PROVIDER_DISABLED)
 
     async def provider_limits(
         self, guild_id: int, provider: str, settings: GuildSettings
@@ -1992,8 +2059,8 @@ class ChargeService:
         review_channel = await self.get_review_channel_id()
         result: list[dict[str, Any]] = []
         # Kyash はサーバー設定でどちらか一方だけを見せる
-        kyash_provider = config.KYASH_MODE_PROVIDER.get(
-            settings.kyash_mode, config.ChargeProvider.KYASH
+        kyash_provider = self.selected_provider(
+            config.ChargeProvider.KYASH, settings
         )
         for provider in config.ALL_PROVIDERS:
             row = rows.get(provider)
@@ -2133,9 +2200,7 @@ class ChargeService:
         self, guild_id: int, provider: str, settings: GuildSettings
     ) -> sqlite3.Row:
         """方式が使える状態か確認し、入金先を返す。"""
-        row = await self.db.get_provider_settings(guild_id, provider)
-        if row is not None and not row["enabled"]:
-            raise ChargeError(config.ErrorCode.PROVIDER_DISABLED)
+        await self.ensure_provider_allowed(guild_id, provider, settings)
         destination = await self.db.get_destination(provider)
         if destination is None:
             raise ChargeError(
@@ -3107,6 +3172,29 @@ class ChargeService:
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             return None
         return channel
+
+    async def refresh_all_charge_panels(self) -> int:
+        """全サーバーのチャージパネルを作り直す。
+
+        入金先・請求リンク・審査チャンネルは Bot Owner が全サーバー共通で
+        設定するため、1つの変更がすべてのパネルの内容を変える。
+        表示キャッシュを捨てるだけでは、すでに投稿済みのパネルが古い案内を
+        出し続けてしまう。
+
+        Returns:
+            更新できたパネルの数。
+        """
+        self.invalidate_panel_view()
+        guild_ids = await self.db.list_guilds_with_panels(
+            panel_type=config.PANEL_TYPE_CHARGE
+        )
+        updated = 0
+        for guild_id in guild_ids:
+            try:
+                updated += await self.refresh_charge_panels(guild_id)
+            except Exception:  # noqa: BLE001 - 1サーバーの失敗で他を止めない
+                logger.exception("チャージパネルの更新に失敗しました guild=%s", guild_id)
+        return updated
 
     async def refresh_charge_panels(self, guild_id: int) -> int:
         """チャージパネルへ最新の設定値を反映する。"""

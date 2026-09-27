@@ -18,6 +18,41 @@ Bot は管理者が登録した **受取用 Kyash アカウント** でリンク
 - トークン失効の事前警告 / 受取アカウント残高しきい値 / 連続失敗クールダウン
 - 死活監視 (ハートビート) / バックアップの外部保存 / GitHub Actions による自動テスト
 
+**v4.2 の修正 (最終版)**
+
+- **チャージボタンが押せなくなる不具合を修正 (原因を特定)**
+  方式選択メニューの Litecoin に、絵文字ではない文字 `Ł` (U+0141) を
+  使っていました。Discord はこれを受け付けず
+  `400 Invalid Form Body / In components.0.components.0.options.2.emoji.name`
+  を返すため、**メニューごと送信できず**、利用者には
+  「アプリケーションは応答しませんでした」と表示されていました
+  (Litecoin を含む3方式が並ぶときだけ起きる=「一定の条件下で」の正体)
+  - 絵文字を `🪙` に修正
+  - 絵文字の妥当性を検証する `utils.is_discord_emoji()` を追加
+  - 設定から取る絵文字は `utils.safe_emoji()` を通し、
+    不正な値なら**絵文字を出さないだけ**で済むようにした
+  - Discord に拒否されても、内容を削って必ず応答するようにした
+    (ボタンを外す → 文字だけ、の順に送り直す)
+  - 入力欄 (Modal) も同様に、開けなければ理由を返す
+  - CI で全コンポーネントの絵文字と文字数上限を機械的に検査する
+- **受け取り方を切り替えるとレート・金額範囲が化ける不具合を修正**
+  設定が「送金リンク」「請求リンク」で別々に保存されていたため、
+  `/provider kyash_mode` で切り替えた瞬間に条件が変わっていました
+  - 設定は Kyash / PayPay / LTC ごとに**1つ**に統一 (スキーマ v6 で自動統合)
+  - 管理コマンドの選択肢も Kyash 1つに集約 (受け取り方はモードで決める)
+- **受付停止と受け取り方を、取引を作る直前にも検証するようにした**
+  古い画面が手元に残っていると、停止中の方式や選ばれていない方式で
+  チャージできてしまう抜け道がありました
+- **`/provider rate` と `/provider limits` が送金リンク方式に効いていなかったのを修正**
+- **パネル・ヘルプが、実際に適用される条件を出すようにした**
+  方式が1つのときはその方式のレート・金額範囲を表示します
+- **受け取り方を変えた後に前の取引で詰まらないようにした**
+  進行中の取引は取り消さず、変更されたことと次の一手を画面に出します
+- **設定変更が投稿済みパネルへ反映されていなかったのを修正**
+  (`/provider limits` `/provider paypay_mode` `/provider paypay_link`
+  `/provider destination` `/provider review_channel`)
+- **受付停止のままの方式を起動時に知らせるようにした**
+
 **v4.1 の修正・追加**
 
 - **ボタンが「応答しませんでした」となる不具合を修正**
@@ -576,7 +611,7 @@ cd /opt/discord-charge-bot
 ./venv/bin/python3 tests/test_concurrency.py     #  26 件  同時実行でお金が増減しないこと
 ./venv/bin/python3 tests/test_static_audit.py    # 118 件  静的監査 (起動せずに不整合を検出)
 ./venv/bin/python3 tests/test_interaction_timeout.py  # 16 件  ボタンが3秒以内に応答すること
-# → 合計 1352 件成功 / 0 件失敗
+# → 合計 1509 件成功 / 0 件失敗
 ```
 
 まとめて実行する場合:
@@ -749,7 +784,31 @@ Discord が両方を別枠で表示するため二重に見えます)。
 
 ### ボタンを押すと「応答しませんでした」と出る
 
-v4.1 で根本的に直しました。まず Bot を更新してください。
+原因は2つあり、どちらも修正済みです。まず Bot を更新してください。
+
+**1) 内容を Discord に拒否されていた (v4.2 で修正)**
+
+ログに次が出ていた場合がこれです。
+
+```
+Interaction への応答に失敗しました: HTTPException: 400 Bad Request (error code: 50035)
+In components.0.components.0.options.2.emoji.name: Invalid emoji
+```
+
+方式選択メニューの Litecoin に、絵文字でない文字を使っていたため、
+メニューごと送信できず無応答になっていました。
+v4.2 では絵文字を検証し、拒否されても内容を削って必ず応答します。
+
+確認:
+
+```bash
+sudo journalctl -u discord-charge-bot | grep "Invalid Form Body"
+```
+
+出なくなっていれば解消しています。
+自分で絵文字を変えた場合は `python3 tests/test_static_audit.py` で検査できます。
+
+**2) DB が混んで3秒に間に合わなかった (v4.1 で修正)**
 
 それでも出る場合の確認:
 
@@ -1407,6 +1466,38 @@ PayPay は PayPay 側の操作で対応してください (Bot は内部残高�
 sudo apt-get install -y fonts-noto-cjk    # または fonts-ipafont-gothic
 ```
 
+## v4.1 から v4.2 への更新
+
+1. Bot を停止する
+   ```bash
+   sudo systemctl stop discord-charge-bot
+   ```
+2. DB をバックアップする (念のため)
+   ```bash
+   cp /opt/discord-charge-bot/data/charge.db /opt/discord-charge-bot/data/charge.db.bak
+   ```
+3. ファイルを差し替えて起動する
+   ```bash
+   sudo systemctl start discord-charge-bot
+   sudo journalctl -u discord-charge-bot -f
+   ```
+
+起動時にスキーマが v5 → v6 へ自動移行します。
+Kyash の設定が「送金リンク」「請求リンク」で分かれていた場合は、
+**そのサーバーが実際に使っていた側の値**を残して1つにまとめます
+(使っていない側の値は持ち込みません)。
+
+移行後に次のログが出たら、その方式は**受付停止のまま**です。
+
+```
+Kyash は受付停止のままです guild=... (再開するには /provider enable provider:Kyash enabled:True)
+```
+
+v4.1 以前に「送金リンクだけを止める」つもりで
+`/provider enable provider:Kyash (送金リンク) enabled:False` を実行していた場合、
+v4.2 ではそれが **Kyash 全体の停止**という意味になります。
+上のコマンドで再開してください。
+
 ## 受け取り方の切り替え (v4.1)
 
 利用者に2つの方式を同時に見せると「どちらを使えばいいか」で迷うため、
@@ -1427,6 +1518,12 @@ sudo apt-get install -y fonts-noto-cjk    # または fonts-ipafont-gothic
 
 選ばれていない方式は選択肢から消えます。方式が1つだけになると、
 選択画面を挟まずに金額入力まで一気に進みます。
+
+> **チャージ率・金額範囲・受付の停止は「Kyash」に1つだけ設定します** (v4.2)。
+> 受け取り方を切り替えても条件は変わりません。
+> `/provider enable provider:Kyash enabled:False` は
+> **送金リンク・請求リンクの両方**を止めます。
+> 受け取り方を変えたいだけなら `/provider kyash_mode` を使ってください。
 
 ### PayPay
 

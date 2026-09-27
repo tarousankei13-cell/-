@@ -296,6 +296,9 @@ async def main() -> None:
     await bot.db.update_settings(
         G, charge_rate="130", minimum_charge=100, maximum_charge=50_000, daily_limit=0,
         achievement_channel_id=guild.channel.id, log_channel_id=guild.channel.id,
+        # 請求リンク方式を受け付ける設定にする。取引作成時に受け取り方を検証するため、
+        # ここを送金リンク方式のままにすると請求リンクは発行できない (v4.2 の仕様)。
+        kyash_mode=config.KyashMode.CLAIM,
     )
     client = kyash_service.Kyash(access_token="t")
     # v4: 受取用アカウントは複数登録できるため、テストでは1件だけ差し込む

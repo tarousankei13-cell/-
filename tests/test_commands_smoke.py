@@ -623,8 +623,17 @@ async def main() -> None:
     await bot.db.update_settings(
         G, maintenance=0, emergency_stop=0, shop_enabled=1, ranking_enabled=1,
         achievement_channel_id=guild.channel.id, log_channel_id=guild.channel.id,
-        admin_role_id=role.id,
+        admin_role_id=role.id, kyash_mode=config.KyashMode.TRANSFER,
+        paypay_mode=config.PayPayMode.ID,
     )
+    # コマンド総当たりで /provider enable が enabled:False を、
+    # /provider limits が 1〜1 を書き込んでいるため元に戻す。
+    # (取引作成時に受付状態と方式を必ず検証するので、戻さないと先へ進めない)
+    for family in config.ADMIN_PROVIDERS:
+        await bot.db.set_provider_settings(
+            G, family, enabled=True, clear_rate=True, clear_limits=True,
+            updated_by=owner.id,
+        )
     if await bot.db.get_active_campaign(G) is None:
         await bot.db.create_campaign(
             guild_id=G, name="ボタンテスト", inviter_reward=500, invited_reward=300,

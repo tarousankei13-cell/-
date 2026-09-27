@@ -113,7 +113,9 @@ def _find_font_path() -> str | None:
         if Path(candidate).exists():
             _jp_font_path = candidate
             logger.warning(
-                "日本語フォントが見つかりません。英字ラベルで描画します: %s", candidate
+                "日本語フォントが見つかりません。グラフは英字ラベルで描画します。"
+                "日本語で表示するには `sudo apt install fonts-noto-cjk` を実行して"
+                "Bot を再起動してください (使用中: %s)", candidate
             )
             return candidate
     _jp_font_path = None

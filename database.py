@@ -1093,6 +1093,10 @@ class Database:
             # 3) インデックスを作成する
             for statement in indexes:
                 conn.execute(statement)
+            # 4) データの移行 (列追加では表せないもの)
+            #    既存 DB のみ対象。新規作成では統合するデータが無い。
+            if 0 < current < 6:
+                _merge_provider_families(conn)
             if current != config.SCHEMA_VERSION:
                 conn.execute(
                     "INSERT INTO system_settings(key, value, updated_at) VALUES('schema_version', ?, ?) "
@@ -1441,6 +1445,32 @@ class Database:
             (guild_id, user_id, *statuses),
         )
         return int(row["c"]) if row else 0
+
+    async def count_transactions_by_provider(
+        self, guild_id: int, *, statuses: Sequence[str]
+    ) -> dict[str, int]:
+        """指定した状態の Transaction を方式ごとに数える。
+
+        受け取り方を切り替えるときに「前の方式で進行中の取引が何件あるか」を
+        管理者へ知らせるために使う。
+
+        Returns:
+            ``{provider: 件数}``。provider が未記録の行は送金リンク方式として数える
+            (請求リンク方式より前に作られた取引は provider 列を持たない)。
+        """
+        if not statuses:
+            return {}
+        placeholders = ",".join("?" for _ in statuses)
+        rows = await self.fetchall(
+            f"SELECT provider, COUNT(*) AS c FROM charge_transactions "
+            f"WHERE guild_id=? AND status IN ({placeholders}) GROUP BY provider",
+            (guild_id, *statuses),
+        )
+        result: dict[str, int] = {}
+        for row in rows:
+            provider = str(row["provider"] or config.ChargeProvider.KYASH)
+            result[provider] = result.get(provider, 0) + int(row["c"])
+        return result
 
     async def list_stale_manual_reviews(self, threshold: int) -> list[sqlite3.Row]:
         """一定時間解決されていない MANUAL_REVIEW を返す (再通知用)。"""
@@ -2078,16 +2108,32 @@ class Database:
     # チャージ方式 (provider_settings / payment_destinations)
     # ------------------------------------------------------------------
     async def get_provider_settings(self, guild_id: int, provider: str) -> sqlite3.Row | None:
+        """方式の設定を返す。
+
+        Kyash の「送金リンク」「請求リンク」は同じ系統として1行を共有する。
+        受け取り方を切り替えてもチャージ率や金額上下限が変わらないようにするため、
+        問い合わせのキーは必ず代表キー (family) へ寄せる。
+        """
         return await self.fetchone(
             "SELECT * FROM provider_settings WHERE guild_id=? AND provider=?",
-            (guild_id, provider),
+            (guild_id, config.provider_family(provider)),
         )
 
     async def list_provider_settings(self, guild_id: int) -> dict[str, sqlite3.Row]:
+        """方式ごとの設定を、方式名でも代表キーでも引ける形で返す。
+
+        同じ系統の方式 (Kyash の送金リンク / 請求リンク) には同じ行を返す。
+        """
         rows = await self.fetchall(
             "SELECT * FROM provider_settings WHERE guild_id=?", (guild_id,)
         )
-        return {str(r["provider"]): r for r in rows}
+        stored = {str(r["provider"]): r for r in rows}
+        result: dict[str, sqlite3.Row] = dict(stored)
+        for provider in config.ALL_PROVIDERS:
+            row = stored.get(config.provider_family(provider))
+            if row is not None:
+                result[provider] = row
+        return result
 
     async def set_provider_settings(
         self,
@@ -2102,9 +2148,14 @@ class Database:
         clear_limits: bool = False,
         updated_by: int | None = None,
     ) -> None:
-        """方式ごとの設定を更新する (指定した項目だけ変える)。"""
+        """方式ごとの設定を更新する (指定した項目だけ変える)。
+
+        同じ系統の方式は1行を共有する。``provider`` に受け取り方を渡しても、
+        保存先は代表キー (family) の1行になる。
+        """
         if provider not in config.ALL_PROVIDERS:
             raise DatabaseError(f"不明なチャージ方式です: {provider}")
+        provider = config.provider_family(provider)
         now = utils.now_ts()
 
         def _fn(conn: sqlite3.Connection) -> None:
@@ -2905,6 +2956,14 @@ class Database:
             return _lastrowid(cur)
 
         return await self.run(_fn, write=True)
+
+    async def list_guilds_with_panels(self, *, panel_type: str) -> list[int]:
+        """その種類のパネルを持つサーバーの一覧 (全体更新の対象を絞るため)。"""
+        rows = await self.fetchall(
+            "SELECT DISTINCT guild_id FROM panels WHERE panel_type=? AND active=1",
+            (panel_type,),
+        )
+        return [int(r["guild_id"]) for r in rows]
 
     async def list_panels(
         self,
@@ -6480,6 +6539,65 @@ def _refund_auction_bid(
         "user_id": user_id, "amount": amount, "bid_id": int(bid["id"]),
         "balance_before": before, "balance_after": after,
     }
+
+
+def _merge_provider_families(conn: sqlite3.Connection) -> None:
+    """v6: 受け取り方ごとに分かれていた方式設定を、系統ごとの1行へ統合する。
+
+    v5 までは Kyash の「送金リンク」と「請求リンク」が provider_settings の
+    別々の行を持っていた。そのため ``/provider kyash_mode`` で受け取り方を
+    切り替えた瞬間に、チャージ率と金額上下限が別の値へ化けてしまっていた。
+
+    統合するときは **そのサーバーがいま使っている受け取り方の行をそのまま残す**。
+    もう一方の値で埋めたりはしない。いま効いている条件を1文字も変えないのが、
+    管理者にとってもっとも驚きが少ないため。
+    いま使っている側に行が無ければ、その系統は既定値で動いていたということなので、
+    余った行を消すだけにする。
+    """
+    try:
+        rows = conn.execute(
+            "SELECT * FROM provider_settings WHERE provider=?",
+            (config.ChargeProvider.KYASH_CLAIM,),
+        ).fetchall()
+    except sqlite3.Error:
+        return
+    if not rows:
+        return
+    logger.info("マイグレーション: Kyash の方式別設定を %s 件統合します", len(rows))
+    for claim in rows:
+        guild_id = int(claim["guild_id"])
+        mode_row = conn.execute(
+            "SELECT kyash_mode FROM guild_settings WHERE guild_id=?", (guild_id,)
+        ).fetchone()
+        mode = str(mode_row["kyash_mode"]) if mode_row else config.KyashMode.TRANSFER
+        if mode == config.KyashMode.CLAIM:
+            # 請求リンク方式で動いていた → 請求リンク側の行を代表キーへ移す
+            now = utils.now_ts()
+            conn.execute(
+                "INSERT INTO provider_settings(guild_id, provider, created_at, updated_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(guild_id, provider) DO NOTHING",
+                (guild_id, config.ChargeProvider.KYASH, now, now),
+            )
+            conn.execute(
+                "UPDATE provider_settings SET enabled=?, charge_rate=?, "
+                "minimum_charge=?, maximum_charge=?, updated_at=? "
+                "WHERE guild_id=? AND provider=?",
+                (
+                    1 if claim["enabled"] else 0,
+                    claim["charge_rate"],
+                    claim["minimum_charge"],
+                    claim["maximum_charge"],
+                    now,
+                    guild_id,
+                    config.ChargeProvider.KYASH,
+                ),
+            )
+        # 送金リンク方式で動いていた場合は、送金リンク側の行がそのまま代表キーの行に
+        # なるので何もしない (行が無ければ既定値のままで正しい)
+        conn.execute(
+            "DELETE FROM provider_settings WHERE guild_id=? AND provider=?",
+            (guild_id, config.ChargeProvider.KYASH_CLAIM),
+        )
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:

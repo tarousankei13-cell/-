@@ -368,16 +368,26 @@ def main() -> None:
                    rate=_D(rate), destination=None)
 
     # 方式ごとに手順の言葉が変わる (共通文にしない)
+    # 段数は進行画面の「ステップ n / 総数」と揃えていること。
+    # 数が食い違うと「まだ続きがある」と誤解させてしまう。
+    expected_steps = {
+        config.ChargeProvider.KYASH: ui.CHARGE_STEPS,
+        config.ChargeProvider.KYASH_CLAIM: 2,
+        config.ChargeProvider.PAYPAY: ui.MANUAL_CHARGE_STEPS,
+        config.ChargeProvider.LTC: ui.MANUAL_CHARGE_STEPS,
+    }
     for provider in config.ALL_PROVIDERS:
         steps = ui.provider_steps(provider)
-        check(len(steps) >= 3, f"{provider} の手順がある ({len(steps)}段階)")
+        check(len(steps) == expected_steps[provider],
+              f"{provider} の手順が進行画面と同じ段数 "
+              f"({len(steps)} / 期待 {expected_steps[provider]})")
         joined = " / ".join(steps)
         check("チャージ" in joined, f"{provider} の手順が最初の操作から始まる")
     claim_steps = " ".join(ui.provider_steps(config.ChargeProvider.KYASH_CLAIM))
-    check("請求リンクを開いて" in claim_steps and "送金リンクを作る" not in claim_steps,
-          "請求リンク方式の手順に「リンクを作る」が出てこない")
+    check("請求リンクを開いて" in claim_steps and "送金リンク" not in claim_steps,
+          "請求リンク方式の手順に「送金リンク」が出てこない")
     transfer_steps = " ".join(ui.provider_steps(config.ChargeProvider.KYASH))
-    check("送金リンクを作る" in transfer_steps,
+    check("送金リンク" in transfer_steps and "請求リンク" not in transfer_steps,
           "送金リンク方式の手順にはリンク作成がある")
     paypay_steps = " ".join(ui.provider_steps(config.ChargeProvider.PAYPAY))
     check("承認" in paypay_steps, "承認制の方式は承認が要ると書く")

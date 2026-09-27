@@ -94,3 +94,8 @@ jobs:
         run: python tests/test_interaction_timeout.py
         env:
           CHARGE_BOT_TEST_DIR: ${{ runner.temp }}/charge_bot_timeout
+
+      - name: Provider mode guard (受け取り方の切り替え)
+        run: python tests/test_provider_modes.py
+        env:
+          CHARGE_BOT_TEST_DIR: ${{ runner.temp }}/charge_bot_modes

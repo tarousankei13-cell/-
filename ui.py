@@ -40,24 +40,73 @@ def bot_of(interaction: discord.Interaction) -> "ChargeBot":
 # Embed ビルダー
 # ---------------------------------------------------------------------------
 
-def provider_steps(provider: str) -> list[str]:
+def provider_method_label(provider: str, settings: "GuildSettings | None" = None) -> str:
+    """利用者に見せる方式名。受け取り方まで含めて書く。
+
+    PayPay は同じ方式のまま「ID を見て送る」「請求リンクを開く」の2通りがあるため、
+    設定が分かるときは受け取り方まで名前に出す (何をすればよいかが名前で分かる)。
+    """
+    name = config.PROVIDER_LABELS.get(provider, provider)
+    if (
+        provider == config.ChargeProvider.PAYPAY
+        and settings is not None
+        and settings.paypay_mode == config.PayPayMode.CLAIM_LINK
+    ):
+        return "PayPay (請求リンク)"
+    if provider == config.ChargeProvider.PAYPAY and settings is not None:
+        return "PayPay (ID送金)"
+    return name
+
+
+def provider_description(
+    provider: str, settings: "GuildSettings | None" = None
+) -> str:
+    """方式を選ぶときの一言説明 (受け取り方に合わせて変える)。"""
+    if (
+        provider == config.ChargeProvider.PAYPAY
+        and settings is not None
+        and settings.paypay_mode == config.PayPayMode.CLAIM_LINK
+    ):
+        return "請求リンクを開いて支払い → 申請 → 管理者の承認で反映されます"
+    return config.PROVIDER_DESCRIPTIONS.get(provider, "")
+
+
+def provider_steps(
+    provider: str, settings: "GuildSettings | None" = None
+) -> list[str]:
     """その方式でチャージするときの手順 (方式ごとに言葉を変える)。
 
     「自分が何をすればよいか」を方式ごとに具体的に書く。
     共通の文章にすると、どの方式でも当てはまらない案内になってしまう。
+
+    Args:
+        settings: 受け取り方の設定。PayPay は ID方式と請求リンク方式で
+            やることが変わるため、渡されたときはそれに合わせた手順を返す。
     """
-    if provider == config.ChargeProvider.KYASH:
-        return [
-            "`💰 チャージ` を押して**金額を入力**",
-            "Kyash アプリで**同じ金額**の送金リンクを作る",
-            "`🔗 送金リンクを送信` を押して URL を貼る",
-            "自動で受け取り → 残高が増え、DM が届きます",
-        ]
-    if provider == config.ChargeProvider.KYASH_CLAIM:
+    if (
+        provider == config.ChargeProvider.PAYPAY
+        and settings is not None
+        and settings.paypay_mode == config.PayPayMode.CLAIM_LINK
+    ):
         return [
             "`💰 チャージ` を押して**金額を入力**",
             "表示された**請求リンクを開いて支払う**",
-            "自動で確認 → 残高が増え、DM が届きます",
+            "`✅ 送金しました` を押して**取引ID**を入力",
+            "管理者が確認して承認すると反映されます",
+        ]
+    if provider == config.ChargeProvider.KYASH:
+        # 段数は進行画面の「ステップ n / 3」と揃える (数が違うと迷わせる)
+        return [
+            "`💰 チャージ` を押して**金額を入力**",
+            "Kyash アプリで**同じ金額**の送金リンクを作り、"
+            "`🔗 送金リンクを送信` から貼る",
+            "自動で受け取り → 残高が増え、DM が届きます",
+        ]
+    if provider == config.ChargeProvider.KYASH_CLAIM:
+        # 請求リンク方式は「ステップ n / 2」なので2段で書く
+        return [
+            "`💰 チャージ` を押して**金額を入力**",
+            "出てきた**請求リンクを開いて支払う** → 自動で残高に反映されます",
         ]
     if provider == config.ChargeProvider.LTC:
         return [
@@ -68,7 +117,7 @@ def provider_steps(provider: str) -> list[str]:
         ]
     return [
         "`💰 チャージ` を押して**金額を入力**",
-        "表示された**宛先へ送金**する",
+        "表示された**送金先IDへ送金**する",
         "`✅ 送金しました` を押して**取引ID**を入力",
         "管理者が確認して承認すると反映されます",
     ]
@@ -106,12 +155,24 @@ def charge_panel_embed(
     else:
         state = "🟢 **受付中**"
 
-    example_base = max(settings.minimum_charge, 1000)
-    if example_base > settings.maximum_charge:
-        example_base = settings.maximum_charge
-    example_credit = utils.calc_credited_amount(example_base, settings.charge_rate)
-
     multi = len(usable) > 1
+    # 方法が1つに決まっているときは、その方法に実際に適用される条件を出す。
+    # サーバー既定を出すと、方式別のレート・上下限 (/provider rate, /provider limits)
+    # を設定している場合に「書いてある額を送れない」ことになってしまう。
+    shown_rate = settings.charge_rate
+    shown_min = settings.minimum_charge
+    shown_max = settings.maximum_charge
+    if len(usable) == 1:
+        only_entry = usable[0]
+        shown_rate = only_entry["rate"]
+        shown_min = int(only_entry["minimum"])
+        shown_max = int(only_entry["maximum"])
+
+    example_base = max(shown_min, 1000)
+    if example_base > shown_max:
+        example_base = shown_max
+    example_credit = utils.calc_credited_amount(example_base, shown_rate)
+
     embed = discord.Embed(
         title=settings.panel_title or "💰 チャージ",
         description=(
@@ -128,14 +189,14 @@ def charge_panel_embed(
     # --- いくら増えるか (最初に知りたい情報) ---
     embed.add_field(
         name="📈 レート",
-        value=f"**{utils.fmt_rate(settings.charge_rate)}**\n"
+        value=f"**{utils.fmt_rate(shown_rate)}**\n"
               f"{utils.fmt_yen(example_base)} → **{utils.fmt_int(example_credit)}**",
         inline=True,
     )
     embed.add_field(
         name="💵 1回の金額",
-        value=f"**{utils.fmt_yen(settings.minimum_charge)}**\n"
-              f"〜 **{utils.fmt_yen(settings.maximum_charge)}**",
+        value=f"**{utils.fmt_yen(shown_min)}**\n"
+              f"〜 **{utils.fmt_yen(shown_max)}**",
         inline=True,
     )
     embed.add_field(
@@ -151,12 +212,15 @@ def charge_panel_embed(
         for entry in providers:
             provider = str(entry["provider"])
             emoji = config.PROVIDER_EMOJI.get(provider, "💠")
-            name = config.PROVIDER_LABELS.get(provider, provider)
+            # 受け取り方まで名前に出す (何をすればよいかが一覧で分かる)
+            name = provider_method_label(provider, settings)
             if entry["available"]:
+                # 方法が複数あるときだけ、既定と違うレートを行末に添える
+                # (1つのときは上の「📈 レート」がその方法の値そのもの)
                 lines.append(
                     f"{emoji} **{name}**　{_provider_speed(provider)}"
                     + (f"　{utils.fmt_rate(entry['rate'])}"
-                       if entry["rate"] != settings.charge_rate else "")
+                       if multi and entry["rate"] != settings.charge_rate else "")
                 )
             else:
                 lines.append(f"{emoji} ~~{name}~~　🚫 {entry['reason']}")
@@ -176,7 +240,7 @@ def charge_panel_embed(
         note = "　→ ⚡ の方法は自動、🕐 の方法は管理者の承認後に反映されます"
     else:
         only = str(usable[0]["provider"]) if usable else config.ChargeProvider.KYASH
-        steps = provider_steps(only)
+        steps = provider_steps(only, settings)
         note = ""
     embed.add_field(
         name="🪜 チャージの手順",
@@ -384,10 +448,20 @@ def help_embed(
     providers: Sequence[dict[str, Any]] | None = None,
 ) -> discord.Embed:
     """ヘルプ (Ephemeral)。何ができて、どう操作するかを順番に示す。"""
-    base = example_amount or max(settings.minimum_charge, 1000)
-    if base > settings.maximum_charge:
-        base = settings.maximum_charge
-    credit = utils.calc_credited_amount(base, settings.charge_rate)
+    usable = [p for p in (providers or []) if p["available"]]
+    # 方法が1つのときは、その方法に実際に適用される条件で例を出す
+    # (サーバー既定を出すと、方式別の設定をしている場合に嘘になる)
+    shown_rate = settings.charge_rate
+    shown_min = settings.minimum_charge
+    shown_max = settings.maximum_charge
+    if len(usable) == 1:
+        shown_rate = usable[0]["rate"]
+        shown_min = int(usable[0]["minimum"])
+        shown_max = int(usable[0]["maximum"])
+    base = example_amount or max(shown_min, 1000)
+    if base > shown_max:
+        base = shown_max
+    credit = utils.calc_credited_amount(base, shown_rate)
 
     embed = discord.Embed(
         title="❓ ヘルプ",
@@ -399,7 +473,6 @@ def help_embed(
         ),
         color=config.Color.INFO,
     )
-    usable = [p for p in (providers or []) if p["available"]]
     manual_usable = [
         p for p in usable if p["provider"] in config.MANUAL_PROVIDERS
     ]
@@ -408,9 +481,9 @@ def help_embed(
             name="① 使えるチャージ方法",
             value="\n".join(
                 f"{config.PROVIDER_EMOJI.get(str(p['provider']), '💠')} "
-                f"**{config.PROVIDER_LABELS.get(str(p['provider']), p['provider'])}** "
+                f"**{provider_method_label(str(p['provider']), settings)}** "
                 f"({utils.fmt_rate(p['rate'])})　{_provider_speed(str(p['provider']))}\n"
-                f"　{config.PROVIDER_DESCRIPTIONS.get(str(p['provider']), '')}"
+                f"　{provider_description(str(p['provider']), settings)}"
                 for p in usable
             ),
             inline=False,
@@ -429,10 +502,9 @@ def help_embed(
         # 方法が1つに決まっているときは、その方法の手順だけを書く。
         # 使わない方法の説明を混ぜると、かえって迷わせてしまう。
         only = str(usable[0]["provider"]) if usable else config.ChargeProvider.KYASH
-        steps = provider_steps(only)
+        steps = provider_steps(only, settings)
         embed.add_field(
-            name=f"① チャージのしかた "
-                 f"({config.PROVIDER_LABELS.get(only, only)})",
+            name=f"① チャージのしかた ({provider_method_label(only, settings)})",
             value="\n".join(
                 f"**{i}.** {text}" for i, text in enumerate(steps, start=1)
             ),
@@ -441,8 +513,9 @@ def help_embed(
     embed.add_field(
         name="いくら増えますか？",
         value=(
-            f"チャージ率は **{utils.fmt_rate(settings.charge_rate)}** です。\n"
+            f"チャージ率は **{utils.fmt_rate(shown_rate)}** です。\n"
             f"例) **{utils.fmt_yen(base)}** 送金 → **{utils.fmt_int(credit)}** 獲得\n"
+            f"1回の金額: **{utils.fmt_yen(shown_min)}** 〜 **{utils.fmt_yen(shown_max)}**\n"
             "※ 端数は四捨五入します"
         ),
         inline=True,
@@ -1030,8 +1103,15 @@ def link_wait_embed(
     credited: int,
     expires_at: int | None = None,
     resumed: bool = False,
+    mode_changed_to: str | None = None,
 ) -> discord.Embed:
-    """ステップ2: 送金リンクの送信を待っている状態。"""
+    """ステップ2: 送金リンクの送信を待っている状態。
+
+    Args:
+        mode_changed_to: 途中で管理者が受け取り方を変えた場合の、新しい方式名。
+            取引そのものは有効なので続けられるが、理由を書かないと
+            「方式を変えたのに送金リンクしか出ない」と見えてしまう。
+    """
     embed = discord.Embed(
         title=("⌛ 送金リンクの送信をお待ちしています" if resumed
                else "🔗 次に「送金リンク」を送信してください"),
@@ -1076,6 +1156,17 @@ def link_wait_embed(
         ),
         inline=False,
     )
+    if mode_changed_to:
+        embed.add_field(
+            name="ℹ️ 受け取り方が変わりました",
+            value=(
+                f"管理者が受け取り方を **{mode_changed_to}** に変更しました。\n"
+                "この取引は**送金リンク方式のまま**なので、そのまま続けられます。\n"
+                f"新しい方式で始めたい場合は `✖️ キャンセル` を押してから、"
+                "もう一度 `💰 チャージ` を押してください。"
+            ),
+            inline=False,
+        )
     embed.set_footer(text=f"取引ID: {tx_id}")
     return embed
 
@@ -2687,7 +2778,9 @@ class AuctionView(discord.ui.View):
 # チャージ方式 (PayPay / LTC の申請と審査)
 # ---------------------------------------------------------------------------
 
-def provider_select_embed(entries: Sequence[dict[str, Any]]) -> discord.Embed:
+def provider_select_embed(
+    entries: Sequence[dict[str, Any]], settings: "GuildSettings | None" = None
+) -> discord.Embed:
     """チャージ方式の選択画面。
 
     選ぶときに知りたいのは「早く反映されるか」「レートはいくらか」の2つなので、
@@ -2716,12 +2809,12 @@ def provider_select_embed(entries: Sequence[dict[str, Any]]) -> discord.Embed:
     for entry in ordered:
         provider = str(entry["provider"])
         emoji = config.PROVIDER_EMOJI.get(provider, "💠")
-        name = config.PROVIDER_LABELS.get(provider, provider)
+        name = provider_method_label(provider, settings)
         if entry["available"]:
             value = (
                 f"{_provider_speed(provider)}　"
                 f"レート **{utils.fmt_rate(entry['rate'])}**\n"
-                f"{config.PROVIDER_DESCRIPTIONS.get(provider, '')}\n"
+                f"{provider_description(provider, settings)}\n"
                 f"金額: {utils.fmt_yen(int(entry['minimum']))} 〜 "
                 f"{utils.fmt_yen(int(entry['maximum']))}"
             )
@@ -2755,13 +2848,20 @@ def deposit_embed(quote: dict[str, Any]) -> discord.Embed:
     asset_amount = quote.get("asset_amount")
     is_ltc = provider == config.ChargeProvider.LTC
 
+    claim_url = str(quote.get("claim_url") or "").strip()
+    # 請求リンク方式は「宛先へ送る」のではなく「リンクを開いて支払う」。
+    # 見出しと説明を方式に合わせないと、宛先を探して迷わせてしまう。
     embed = discord.Embed(
         title=f"{config.PROVIDER_EMOJI.get(provider, '💠')} "
-              f"{config.PROVIDER_LABELS.get(provider, provider)} で送金してください",
+              + (f"{config.PROVIDER_LABELS.get(provider, provider)} で支払ってください"
+                 if claim_url else
+                 f"{config.PROVIDER_LABELS.get(provider, provider)} で送金してください"),
         description=(
             f"{step_line(3, MANUAL_CHARGE_STEPS)}\n{SEPARATOR}\n"
-            "**下の宛先へ、表示された金額をそのまま送ってください。**\n"
-            f"{SEPARATOR}"
+            + ("**下のリンクを開いて、表示された金額をそのまま支払ってください。**\n"
+               if claim_url else
+               "**下の宛先へ、表示された金額をそのまま送ってください。**\n")
+            + f"{SEPARATOR}"
         ),
         color=config.Color.ACCENT,
     )
@@ -2771,13 +2871,18 @@ def deposit_embed(quote: dict[str, Any]) -> discord.Embed:
             value=copy_block(utils.fmt_asset(asset_amount, unit="")),
             inline=False,
         )
+    elif claim_url:
+        embed.add_field(
+            name="① 支払う金額 (リンクに入っています)",
+            value=f"**{utils.fmt_yen(amount)}**",
+            inline=False,
+        )
     else:
         embed.add_field(
             name="① 送る金額",
             value=copy_block(str(amount)),
             inline=False,
         )
-    claim_url = str(quote.get("claim_url") or "").strip()
     if claim_url:
         # 請求リンク方式: リンクを開いて支払ってもらう (宛先の入力が不要)
         embed.add_field(
@@ -2811,9 +2916,9 @@ def deposit_embed(quote: dict[str, Any]) -> discord.Embed:
         detail.append(f"レート取得元: {source}")
     embed.add_field(name="この申請の内容", value="\n".join(detail), inline=False)
     embed.add_field(
-        name="③ 送金したら",
+        name="③ 支払ったら" if claim_url else "③ 送金したら",
         value=(
-            "下の `✅ 送金しました` を押して、"
+            f"下の `✅ 送金しました` を押して、"
             f"**{config.PROVIDER_PROOF_LABELS.get(provider, '証拠')}** を入力してください。\n"
             "管理者が確認して承認すると残高に反映されます。"
         ),
@@ -2821,8 +2926,10 @@ def deposit_embed(quote: dict[str, Any]) -> discord.Embed:
     )
     warn = [
         f"・受付期限は {utils.discord_ts(quote.get('quote_expires_at'), 'R')} までです",
-        "・**金額が違うと承認されません**。表示された額をそのまま送ってください",
-        "・送金してから申請してください (申請だけでは反映されません)",
+        "・**金額が違うと承認されません**。表示された額をそのまま"
+        + ("支払ってください" if claim_url else "送ってください"),
+        ("・支払ってから申請してください (申請だけでは反映されません)" if claim_url
+         else "・送金してから申請してください (申請だけでは反映されません)"),
     ]
     if is_ltc:
         warn.append("・**LTC の返金はできません**。宛先と数量をよく確認してください")
@@ -2839,11 +2946,17 @@ def deposit_embed(quote: dict[str, Any]) -> discord.Embed:
     return embed
 
 
-def claim_link_embed(quote: dict[str, Any], *, resumed: bool = False) -> discord.Embed:
+def claim_link_embed(
+    quote: dict[str, Any], *, resumed: bool = False,
+    mode_changed_to: str | None = None,
+) -> discord.Embed:
     """請求リンクの支払い案内 (ステップ 2/2)。
 
     Bot が金額を指定して発行するため、送金リンク方式と違い
     金額の打ち間違いが起きない。
+
+    Args:
+        mode_changed_to: 途中で管理者が受け取り方を変えた場合の、新しい方式名。
     """
     embed = discord.Embed(
         title=("⌛ 支払いをお待ちしています" if resumed
@@ -2901,6 +3014,17 @@ def claim_link_embed(quote: dict[str, Any], *, resumed: bool = False) -> discord
         ),
         inline=False,
     )
+    if mode_changed_to:
+        embed.add_field(
+            name="ℹ️ 受け取り方が変わりました",
+            value=(
+                f"管理者が受け取り方を **{mode_changed_to}** に変更しました。\n"
+                "**このリンクはそのまま有効**なので、支払えば残高に反映されます。\n"
+                "新しい方式で始めたい場合は、このリンクを支払わずに期限切れを"
+                "お待ちください。"
+            ),
+            inline=False,
+        )
     embed.set_footer(text=f"取引ID: {quote['tx_id']}")
     return embed
 
@@ -3333,6 +3457,7 @@ def provider_status_embed(
         )
     for entry in entries:
         provider = str(entry["provider"])
+        family = config.provider_family(provider)
         mark = "🟢 利用可" if entry["available"] else f"🔴 {entry['reason']}"
         lines = [
             mark,
@@ -3344,9 +3469,21 @@ def provider_status_embed(
             lines.append(
                 f"入金先: `{utils.truncate(str(destination['address']), 60)}`"
             )
+        # 受け取り方が複数ある系統は、設定が両方に効くことを明記する
+        # (方式ごとに分けられると思われると、切り替えたときに驚かせてしまう)
+        if len(config.FAMILY_PROVIDERS.get(family, ())) > 1:
+            lines.append(
+                f"受け取り方: **{config.PROVIDER_LABELS.get(provider, provider)}**"
+            )
+            command = config.FAMILY_MODE_COMMANDS.get(family)
+            if command:
+                lines.append(
+                    f"　└ 上の率・金額は受け取り方を変えても同じです "
+                    f"(`{command}` で切替)"
+                )
         embed.add_field(
             name=f"{config.PROVIDER_EMOJI.get(provider, '💠')} "
-                 f"{config.PROVIDER_LABELS.get(provider, provider)}",
+                 f"{config.family_label(family)}",
             value="\n".join(lines),
             inline=False,
         )
@@ -3825,7 +3962,19 @@ async def safe_respond(
     view: discord.ui.View | None = None,
     ephemeral: bool = True,
 ) -> None:
-    """応答済みかどうかに応じて response / followup を使い分ける。"""
+    """応答済みかどうかに応じて response / followup を使い分ける。
+
+    **必ず何かを返す**ことを最優先にしている。Discord は内容に不備があると
+    400 を返してメッセージ全体を拒否する (絵文字でない文字をボタンに渡した、
+    文字数が上限を超えた、など)。そこで諦めると Interaction が未応答のまま
+    残り、利用者には「アプリケーションは応答しませんでした」と表示されて
+    **ボタンが押せなくなったように見える**。
+
+    そのため、拒否されたら内容を削って順に送り直す。
+    1) そのまま送る
+    2) View を外して送る (不備はボタン・メニュー側にあることが多い)
+    3) 文字だけで送る (最低限「失敗した」と伝える)
+    """
     kwargs: dict[str, Any] = {}
     if embed is not None:
         kwargs["embed"] = clamp_embed(embed)
@@ -3833,13 +3982,76 @@ async def safe_respond(
         kwargs["content"] = content
     if view is not None:
         kwargs["view"] = view
-    try:
+
+    async def _send(payload: dict[str, Any]) -> None:
         if interaction.response.is_done():
-            await interaction.followup.send(ephemeral=ephemeral, **kwargs)
+            await interaction.followup.send(ephemeral=ephemeral, **payload)
         else:
-            await interaction.response.send_message(ephemeral=ephemeral, **kwargs)
+            await interaction.response.send_message(ephemeral=ephemeral, **payload)
+
+    try:
+        await _send(kwargs)
+        return
     except discord.HTTPException as exc:
-        logger.warning("Interaction への応答に失敗しました: %s", utils.safe_error_text(exc))
+        logger.warning(
+            "Interaction への応答に失敗しました: %s", utils.safe_error_text(exc)
+        )
+
+    # 2) View を外して、埋め込みだけで送り直す
+    if "view" in kwargs:
+        retry = {key: value for key, value in kwargs.items() if key != "view"}
+        if retry:
+            try:
+                await _send(retry)
+                logger.info("ボタンを外して応答しました (内容の不備を回避)")
+                return
+            except discord.HTTPException as exc:
+                logger.warning(
+                    "ボタンを外しても応答できませんでした: %s",
+                    utils.safe_error_text(exc),
+                )
+
+    # 3) 最低限、文字だけで「失敗した」と伝える (無応答にはしない)
+    try:
+        await _send({
+            "content": "表示に失敗しました。もう一度お試しください。"
+                       "繰り返す場合は管理者にお知らせください。",
+        })
+        logger.info("文字だけの応答に切り替えました")
+    except discord.HTTPException as exc:
+        logger.error(
+            "Interaction へまったく応答できませんでした: %s",
+            utils.safe_error_text(exc),
+        )
+
+
+async def safe_send_modal(
+    interaction: discord.Interaction, modal: discord.ui.Modal
+) -> bool:
+    """入力欄 (Modal) を開く。開けなかったら理由を伝えて無応答を避ける。
+
+    Modal も Discord 側の検証に通らなければ 400 で拒否される。
+    そこで何も返さないと「アプリケーションは応答しませんでした」となり、
+    ボタンが押せなくなったように見えてしまう。
+
+    Returns:
+        開けたら True。
+    """
+    try:
+        await interaction.response.send_modal(modal)
+        return True
+    except discord.HTTPException as exc:
+        logger.warning("入力欄を開けませんでした: %s", utils.safe_error_text(exc))
+        await safe_respond(
+            interaction,
+            embed=info_embed(
+                "入力欄を開けませんでした",
+                "もう一度 `💰 チャージ` を押してください。\n"
+                "繰り返す場合は管理者にお知らせください。",
+                color=config.Color.DANGER,
+            ),
+        )
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -3933,13 +4145,13 @@ class AmountEntryView(discord.ui.View):
     )
     async def enter(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if self._provider == config.ChargeProvider.KYASH:
-            await interaction.response.send_modal(AmountModal(self._settings))
+            await safe_send_modal(interaction, AmountModal(self._settings))
             return
         limits = self._limits or (
             self._settings.minimum_charge, self._settings.maximum_charge
         )
-        await interaction.response.send_modal(
-            ManualAmountModal(self._provider, self._settings, limits)
+        await safe_send_modal(
+            interaction, ManualAmountModal(self._provider, self._settings, limits)
         )
 
 
@@ -3954,7 +4166,13 @@ class ManualAmountModal(discord.ui.Modal):
         self, provider: str, settings: "GuildSettings", limits: tuple[int, int]
     ) -> None:
         name = config.PROVIDER_LABELS.get(provider, provider)
-        super().__init__(title=f"ステップ2 / 4 ・ {utils.truncate(name, 20)} の金額", timeout=300)
+        # 段数は方式で違う。請求リンク方式は「金額入力 → 支払い」の2段階しかないので、
+        # 4段階と書くと「あと2つ何かある」と誤解させてしまう。
+        if provider == config.ChargeProvider.KYASH_CLAIM:
+            step = "ステップ1 / 2"
+        else:
+            step = f"ステップ2 / {MANUAL_CHARGE_STEPS}"
+        super().__init__(title=f"{step} ・ {utils.truncate(name, 20)} の金額", timeout=300)
         self.provider = provider
         low, high = limits
         self.amount: discord.ui.TextInput = discord.ui.TextInput(
@@ -3979,7 +4197,10 @@ class ManualAmountModal(discord.ui.Modal):
 class ProviderSelect(discord.ui.Select["ProviderSelectView"]):
     """チャージ方式の選択メニュー (使える方式だけを並べる)。"""
 
-    def __init__(self, entries: Sequence[dict[str, Any]]) -> None:
+    def __init__(
+        self, entries: Sequence[dict[str, Any]],
+        settings: "GuildSettings | None" = None,
+    ) -> None:
         options: list[discord.SelectOption] = []
         for entry in entries:
             if not entry["available"]:
@@ -3987,13 +4208,15 @@ class ProviderSelect(discord.ui.Select["ProviderSelectView"]):
             provider = str(entry["provider"])
             options.append(
                 discord.SelectOption(
-                    label=config.PROVIDER_LABELS.get(provider, provider),
+                    label=provider_method_label(provider, settings),
                     value=provider,
                     description=utils.truncate(
                         f"{utils.fmt_rate(entry['rate'])} / "
-                        f"{config.PROVIDER_DESCRIPTIONS.get(provider, '')}", 95,
+                        f"{provider_description(provider, settings)}", 95,
                     ),
-                    emoji=config.PROVIDER_EMOJI.get(provider),
+                    # 絵文字は必ず検証してから渡す。絵文字でない値を渡すと
+                    # Discord がメニュー全体を拒否し、ボタンが死んでしまう。
+                    emoji=utils.safe_emoji(config.PROVIDER_EMOJI.get(provider)),
                 )
             )
         # 都度生成する一時 View なので custom_id は固定しない
@@ -4021,9 +4244,12 @@ class ProviderSelect(discord.ui.Select["ProviderSelectView"]):
 class ProviderSelectView(discord.ui.View):
     """方式選択 (Ephemeral・一時 View)。"""
 
-    def __init__(self, entries: Sequence[dict[str, Any]], *, timeout: float = 180) -> None:
+    def __init__(
+        self, entries: Sequence[dict[str, Any]], *,
+        settings: "GuildSettings | None" = None, timeout: float = 180,
+    ) -> None:
         super().__init__(timeout=timeout)
-        self.add_item(ProviderSelect(entries))
+        self.add_item(ProviderSelect(entries, settings))
 
 
 class DepositView(discord.ui.View):
@@ -4048,8 +4274,8 @@ class DepositView(discord.ui.View):
     async def submitted(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        await interaction.response.send_modal(
-            RequestProofModal(self.request_id, self.provider)
+        await safe_send_modal(
+            interaction, RequestProofModal(self.request_id, self.provider)
         )
 
     @discord.ui.button(label="やめる", emoji="✖️", style=discord.ButtonStyle.secondary)
@@ -4381,7 +4607,7 @@ class LinkSubmitView(discord.ui.View):
 
     @discord.ui.button(label="送金リンクを送信", emoji="🔗", style=discord.ButtonStyle.primary)
     async def submit(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_modal(LinkModal(self._tx_id))
+        await safe_send_modal(interaction, LinkModal(self._tx_id))
 
     @discord.ui.button(label="キャンセル", emoji="✖️", style=discord.ButtonStyle.danger)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -4495,7 +4721,7 @@ class KyashLoginStartView(discord.ui.View):
 
     @discord.ui.button(label="認証コードを入力", emoji="🔑", style=discord.ButtonStyle.primary)
     async def enter_otp(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_modal(KyashOtpModal())
+        await safe_send_modal(interaction, KyashOtpModal())
 
 
 class ShopPanelView(discord.ui.View):
@@ -4602,7 +4828,9 @@ class ShopSelect(discord.ui.Select["ShopSelectView"]):
                         ("🔁 " if subscription else "") + str(item["name"]), 90),
                     value=str(int(item["id"])),
                     description=utils.truncate(" / ".join(details), 90),
-                    emoji=config.SHOP_ITEM_TYPE_EMOJI.get(item_type, "🎫"),
+                    emoji=utils.safe_emoji(
+                        config.SHOP_ITEM_TYPE_EMOJI.get(item_type, "🎫")
+                    ),
                 )
             )
         # 都度生成する一時 View なので custom_id は固定しない (永続 View ではない)
@@ -4657,7 +4885,7 @@ class ShopConfirmView(discord.ui.View):
             child.disabled = True  # type: ignore[attr-defined]
         if self._needs_input:
             # Modal を先に出す (ここで応答してしまうと Modal を出せない)
-            await interaction.response.send_modal(ItemInputModal(self._item))
+            await safe_send_modal(interaction, ItemInputModal(self._item))
             self.stop()
             return
         await interaction.response.edit_message(

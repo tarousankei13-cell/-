@@ -18,6 +18,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 import config  # noqa: E402
+import utils  # noqa: E402
 
 FAIL: list[str] = []
 OK: list[str] = []
@@ -185,7 +186,17 @@ check('NON_RETRYABLE_ERRORS' in sources['charge_service.py'],
       "再試行の判定で NON_RETRYABLE_ERRORS を使っている")
 
 print("\n=== 13. 使われていない定数が残っていない ===")
-used_src = "\n".join(v for k, v in sources.items() if k != 'config.py')
+# config.py 自身の関数 (provider_family など) から参照される定数も「使用中」とみなす。
+# 定義部だけを除きたいので、config.py は関数本体のみを対象に含める。
+_config_tree = ast.parse(sources['config.py'])
+_config_helpers = "\n".join(
+    ast.get_source_segment(sources['config.py'], node) or ''
+    for node in _config_tree.body
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+)
+used_src = "\n".join(
+    [v for k, v in sources.items() if k != 'config.py'] + [_config_helpers]
+)
 dead = [
     key for key, value in vars(config).items()
     if key.isupper() and not key.startswith('_')
@@ -212,6 +223,112 @@ print("\n=== 16. 送金リンクの完全な URL を保存しない ==="[:26] + 
 for name, src in sources.items():
     check('INSERT INTO charge_transactions' not in src or 'link_url' not in src,
           f"{name}: 取引に link_url を保存していない")
+
+print("\n=== 17. Discord へ渡す絵文字 ===")
+# ボタン・選択メニューに絵文字でない文字を渡すと Discord は 400 を返し、
+# そのメッセージ全体が送れなくなる。利用者には
+# 「アプリケーションは応答しませんでした」と見え、ボタンが押せなくなる。
+# (実際に Litecoin の "Ł" (U+0141) でこの不具合が起きた)
+for dict_name in ("STATUS_EMOJI", "PROVIDER_EMOJI", "RANK_MEDALS",
+                  "SHOP_ITEM_TYPE_EMOJI"):
+    table = getattr(config, dict_name, None)
+    check(isinstance(table, dict), f"config.{dict_name} がある")
+    for key, value in (table or {}).items():
+        points = " ".join(f"U+{ord(c):04X}" for c in str(value))
+        check(utils.is_discord_emoji(value),
+              f"config.{dict_name}[{key!r}] が絵文字 ({value!r} {points})")
+
+# ui.py の emoji= に書かれたリテラルも同じ規則で検査する
+_emoji_literals = re.findall(r'emoji\s*=\s*(["\'])(.*?)\1', sources['ui.py'])
+check(len(_emoji_literals) >= 20,
+      f"emoji= のリテラルを検査できている ({len(_emoji_literals)} 件)")
+for _quote, literal in _emoji_literals:
+    points = " ".join(f"U+{ord(c):04X}" for c in literal)
+    check(utils.is_discord_emoji(literal),
+          f"ui.py の emoji={literal!r} が絵文字 ({points})")
+
+# 実行時に組み立てる絵文字は必ず検証を通してから渡す
+for pattern in ("emoji=utils.safe_emoji(", "emoji=config."):
+    found = sources['ui.py'].count(pattern)
+    if pattern == "emoji=config.":
+        check(found == 0,
+              "設定値の絵文字を検証せずに渡していない "
+              f"(直接渡し {found} 箇所)")
+    else:
+        check(found >= 2, f"設定値の絵文字は safe_emoji を通す ({found} 箇所)")
+
+print("\n=== 18. 応答できないまま終わらせない ===")
+# 400 で拒否されても、内容を削って必ず何かを返す (無応答 = ボタンが死ぬ)
+check('async def safe_send_modal' in sources['ui.py'],
+      "入力欄を開けなかったときの受け皿がある")
+for name in ('main.py', 'commands.py'):
+    check('interaction.response.send_modal' not in sources[name],
+          f"{name}: 入力欄は safe_send_modal 経由で開く")
+check(sources['ui.py'].count('interaction.response.send_modal') == 1,
+      "ui.py で直接 send_modal するのは safe_send_modal だけ")
+
+print("\n=== 19. コンポーネントの文字数上限 ===")
+# Discord は上限を超えた内容を 400 で拒否し、メッセージごと送れなくなる。
+# 結果は絵文字のときと同じで、ボタンが押せなくなったように見える。
+_COMPONENT_LIMITS = {
+    "SelectOption": {"label": 100, "value": 100, "description": 100},
+    "TextInput": {"label": 45, "placeholder": 100},
+    "button": {"label": 80, "custom_id": 100},
+    "Select": {"placeholder": 150, "custom_id": 100},
+}
+_limit_violations: list[str] = []
+_checked_fields = 0
+_ui_tree = ast.parse(sources['ui.py'])
+for _node in ast.walk(_ui_tree):
+    if isinstance(_node, ast.ClassDef):
+        # class Foo(discord.ui.Modal, title="...") の形
+        for _kw in _node.keywords:
+            if _kw.arg == "title" and isinstance(_kw.value, ast.Constant):
+                _checked_fields += 1
+                if len(str(_kw.value.value)) > 45:
+                    _limit_violations.append(
+                        f"ui.py:{_node.lineno} {_node.name}.title "
+                        f"{len(str(_kw.value.value))}文字 (上限 45)")
+        continue
+    if not isinstance(_node, ast.Call):
+        continue
+    _name = ""
+    if isinstance(_node.func, ast.Attribute):
+        _name = _node.func.attr
+    elif isinstance(_node.func, ast.Name):
+        _name = _node.func.id
+    _limits = _COMPONENT_LIMITS.get(_name)
+    if _limits is None:
+        continue
+    for _kw in _node.keywords:
+        _cap = _limits.get(_kw.arg or "")
+        if _cap is None:
+            continue
+        _length = None
+        if isinstance(_kw.value, ast.Constant) and isinstance(_kw.value.value, str):
+            _length = len(_kw.value.value)
+        elif (isinstance(_kw.value, ast.Call)
+              and isinstance(_kw.value.func, ast.Attribute)
+              and _kw.value.func.attr == "truncate"
+              and len(_kw.value.args) >= 2
+              and isinstance(_kw.value.args[1], ast.Constant)
+              and isinstance(_kw.value.args[1].value, int)):
+            _length = _kw.value.args[1].value
+        if _length is None:
+            continue
+        _checked_fields += 1
+        if _length > _cap:
+            _limit_violations.append(
+                f"ui.py:{_node.lineno} {_name}.{_kw.arg} "
+                f"{_length}文字 (上限 {_cap})")
+check(_checked_fields >= 30,
+      f"コンポーネントの文字数を検査できている ({_checked_fields} 箇所)")
+check(not _limit_violations,
+      f"コンポーネントの文字数が上限内 ({_limit_violations})")
+for _key, _value in vars(config.CustomID).items():
+    if _key.startswith("_") or not isinstance(_value, str):
+        continue
+    check(len(_value) <= 100, f"CustomID.{_key} が100文字以内 ({len(_value)})")
 
 print("\n" + "=" * 70)
 print(f"結果: {len(OK)} 件成功 / {len(FAIL)} 件失敗")

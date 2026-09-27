@@ -234,6 +234,13 @@ class ChargeBot(commands.Bot):
             logger.info("パネル表示キャッシュを %s サーバーぶん作成しました", warmed)
         except Exception:  # noqa: BLE001
             logger.exception("パネル表示キャッシュの事前作成に失敗しました")
+        # 受付停止のままになっている方式を知らせる。
+        # 「方式を変えたのにチャージできない」の原因はほぼこれなので、
+        # 起動ログとログチャンネルの両方から気付けるようにする。
+        try:
+            await self.warn_disabled_providers()
+        except Exception:  # noqa: BLE001
+            logger.exception("受付停止中の方式の確認に失敗しました")
         charge_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_CHARGE)
         shop_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_SHOP)
         invite_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_INVITE)
@@ -643,6 +650,53 @@ class ChargeBot(commands.Bot):
             raise RuntimeError("サーバー外の操作です")
         return guild
 
+    async def warn_disabled_providers(self) -> list[tuple[int, str]]:
+        """受付停止のままの方式を探してログに出す。
+
+        v4.2 から「Kyash を止める」は送金リンク・請求リンクの両方を止める意味に
+        なった。v4.1 以前に片方だけを止めていたサーバーは、そのまま停止状態を
+        引き継ぐ。気付かないと「方式を変えてもチャージできない」ことになるため、
+        起動時に必ず知らせる。
+
+        Returns:
+            ``(guild_id, family)`` の一覧。
+        """
+        stopped: list[tuple[int, str]] = []
+        for guild in self.guilds:
+            for family in config.ADMIN_PROVIDERS:
+                row = await self.db.get_provider_settings(guild.id, family)
+                if row is not None and not row["enabled"]:
+                    stopped.append((guild.id, family))
+        for guild_id, family in stopped:
+            label = config.family_label(family)
+            logger.warning(
+                "%s は受付停止のままです guild=%s (再開するには "
+                "/provider enable provider:%s enabled:True)",
+                label, guild_id, label,
+            )
+            await self._safe_log_event(
+                guild_id,
+                f"⚠️ {label} は受付停止のままです",
+                fields=(
+                    ("再開するコマンド",
+                     f"`/provider enable provider:{label} enabled:True`", False),
+                    ("補足",
+                     "受け取り方を変えたいだけなら "
+                     f"`{config.FAMILY_MODE_COMMANDS.get(family) or '-'}` を使います。",
+                     False),
+                ),
+            )
+        return stopped
+
+    async def _safe_log_event(self, guild_id: int, title: str, **kwargs: Any) -> None:
+        """ログチャンネルへの通知 (失敗しても起動を止めない)。"""
+        try:
+            await self.charge.log_event(
+                guild_id, title, color=config.Color.WARNING, **kwargs
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("受付停止の通知を送れませんでした guild=%s", guild_id)
+
     async def on_charge_button(self, interaction: discord.Interaction) -> None:
         """💰 チャージ → 方式選択 または 金額入力 Modal。
 
@@ -706,8 +760,9 @@ class ChargeBot(commands.Bot):
             # 0件 (使えない理由を見せる) / 複数 (選んでもらう) はどちらもメッセージ
             await ui.safe_respond(
                 interaction,
-                embed=ui.provider_select_embed(snapshot["entries"]),
-                view=ui.ProviderSelectView(snapshot["entries"]) if usable else None,
+                embed=ui.provider_select_embed(snapshot["entries"], settings),
+                view=ui.ProviderSelectView(snapshot["entries"], settings=settings)
+                if usable else None,
             )
             return
         await self._start_provider(interaction, usable[0], settings, deferred=deferred)
@@ -738,8 +793,8 @@ class ChargeBot(commands.Bot):
                 ephemeral=True,
             )
             return
-        await interaction.response.send_modal(
-            ui.ManualAmountModal(provider, settings, limits)
+        await ui.safe_send_modal(
+            interaction, ui.ManualAmountModal(provider, settings, limits)
         )
 
     async def on_provider_selected(
@@ -826,9 +881,22 @@ class ChargeBot(commands.Bot):
             await ui.safe_respond(interaction, embed=ui.error_embed(exc.code))
             return
         if active is not None:
+            # 進行中の取引は、受け取り方が変わっても有効なまま続けられる
+            # (すでに送金している可能性があるので勝手に消さない)。
+            # ただし理由を書かないと「方式を変えたのに前の画面しか出ない」と
+            # 見えてしまうため、変わったことと次の一歩を必ず添える。
+            active_provider = str(active["provider"] or config.ChargeProvider.KYASH)
+            changed_to: str | None = None
+            if not self.charge.is_selected_provider(active_provider, settings):
+                current = self.charge.selected_provider(
+                    config.provider_family(active_provider), settings
+                )
+                changed_to = config.PROVIDER_LABELS.get(current, current)
             # 請求リンクの支払い待ちなら、そのリンクを出し直す
             if str(active["status"]) == config.TxStatus.WAITING_PAYMENT:
-                await self._show_claim_link(interaction, active, resumed=True)
+                await self._show_claim_link(
+                    interaction, active, resumed=True, mode_changed_to=changed_to
+                )
                 return
             if active["status"] == config.TxStatus.WAITING_LINK and (
                 not active["expires_at"] or active["expires_at"] > utils.now_ts()
@@ -845,6 +913,7 @@ class ChargeBot(commands.Bot):
                         credited=utils.calc_credited_amount(amount, rate),
                         expires_at=int(active["expires_at"] or 0) or None,
                         resumed=True,
+                        mode_changed_to=changed_to,
                     ),
                     view=ui.LinkSubmitView(
                         str(active["id"]), owner_id=interaction.user.id,
@@ -870,8 +939,8 @@ class ChargeBot(commands.Bot):
                     ephemeral=True,
                 )
                 return
-            await interaction.response.send_modal(
-                ui.ManualAmountModal(provider, settings, bounds)
+            await ui.safe_send_modal(
+                interaction, ui.ManualAmountModal(provider, settings, bounds)
             )
             return
         if deferred:
@@ -883,7 +952,7 @@ class ChargeBot(commands.Bot):
                 ephemeral=True,
             )
             return
-        await interaction.response.send_modal(ui.AmountModal(settings))
+        await ui.safe_send_modal(interaction, ui.AmountModal(settings))
 
     async def handle_amount_submit(self, interaction: discord.Interaction, raw_amount: str) -> None:
         """金額入力の確定 → Transaction 作成 → リンク送信を案内。"""
@@ -989,12 +1058,22 @@ class ChargeBot(commands.Bot):
                 interaction, embed=ui.error_embed(exc.code, admin_detail=None)
             )
             return
+        # 次の一歩は受け取り方で変わる。いま受け付けている方式で案内する。
+        settings = await self.db.get_settings(interaction.guild.id) if interaction.guild \
+            else None
+        claim_mode = (
+            settings is not None
+            and self.charge.selected_provider(config.ChargeProvider.KYASH, settings)
+            == config.ChargeProvider.KYASH_CLAIM
+        )
         await ui.safe_respond(
             interaction,
             embed=ui.info_embed(
                 "キャンセルしました",
-                "チャージをキャンセルしました。送金リンクを作成済みの場合は Kyash アプリから"
-                "キャンセルしてください。",
+                "チャージをキャンセルしました。\n"
+                + ("もう一度 `💰 チャージ` を押すと、新しい請求リンクを発行します。"
+                   if claim_mode else
+                   "送金リンクを作成済みの場合は Kyash アプリからキャンセルしてください。"),
                 color=config.Color.NEUTRAL,
             ),
         )
@@ -1088,7 +1167,8 @@ class ChargeBot(commands.Bot):
         )
 
     async def _show_claim_link(
-        self, interaction: discord.Interaction, row: Any, *, resumed: bool
+        self, interaction: discord.Interaction, row: Any, *, resumed: bool,
+        mode_changed_to: str | None = None,
     ) -> None:
         """発行済みの請求リンクを再表示する (中断からの再開)。"""
         link_id = str(row["claim_link_id"] or "")
@@ -1109,12 +1189,15 @@ class ChargeBot(commands.Bot):
             "url": utils.kyash_link_url(link_id),
             "expires_at": row["expires_at"],
         }
-        await interaction.response.send_message(
-            embed=ui.claim_link_embed(quote, resumed=resumed),
+        # すでに defer 済み (DB が混み合っていた場合) でも送れるようにする
+        await ui.safe_respond(
+            interaction,
+            embed=ui.claim_link_embed(
+                quote, resumed=resumed, mode_changed_to=mode_changed_to
+            ),
             view=ui.ClaimPaymentView(
                 str(row["id"]), owner_id=interaction.user.id, timeout=float(remaining)
             ),
-            ephemeral=True,
         )
 
     async def on_claim_check(self, interaction: discord.Interaction, tx_id: str) -> None:
@@ -1275,8 +1358,8 @@ class ChargeBot(commands.Bot):
         row = await self._review_target(interaction)
         if row is None:
             return
-        await interaction.response.send_modal(
-            ui.ApproveAmountModal(int(row["id"]), int(row["estimated_credit"]))
+        await ui.safe_send_modal(
+            interaction, ui.ApproveAmountModal(int(row["id"]), int(row["estimated_credit"]))
         )
 
     async def handle_review_edit_approve(
@@ -1332,7 +1415,7 @@ class ChargeBot(commands.Bot):
         row = await self._review_target(interaction)
         if row is None:
             return
-        await interaction.response.send_modal(ui.RejectReasonModal(int(row["id"])))
+        await ui.safe_send_modal(interaction, ui.RejectReasonModal(int(row["id"])))
 
     async def handle_review_reject(
         self, interaction: discord.Interaction, request_id: int, reason: str
@@ -1750,7 +1833,7 @@ class ChargeBot(commands.Bot):
         row = await self._refund_target(interaction)
         if row is None:
             return
-        await interaction.response.send_modal(ui.RefundRejectModal(int(row["id"])))
+        await ui.safe_send_modal(interaction, ui.RefundRejectModal(int(row["id"])))
 
     async def handle_refund_reject(
         self, interaction: discord.Interaction, request_id: int, reason: str
@@ -1828,8 +1911,8 @@ class ChargeBot(commands.Bot):
                 ),
             )
             return
-        await interaction.response.send_modal(
-            ui.FraudNoteModal(int(row["id"]), status=status)
+        await ui.safe_send_modal(
+            interaction, ui.FraudNoteModal(int(row["id"]), status=status)
         )
 
     async def handle_fraud_review(
@@ -1963,7 +2046,7 @@ class ChargeBot(commands.Bot):
                 ),
             )
             return
-        await interaction.response.send_modal(ui.AuctionBidModal(auction))
+        await ui.safe_send_modal(interaction, ui.AuctionBidModal(auction))
 
     async def handle_auction_bid(
         self, interaction: discord.Interaction, auction_id: int, raw_amount: str

@@ -35,6 +35,10 @@ SCRATCH.mkdir(parents=True, exist_ok=True)
 
 import config  # noqa: E402
 
+import discord  # noqa: E402
+
+import utils  # noqa: E402
+
 config.DATA_DIR = SCRATCH
 config.DB_PATH = SCRATCH / "test_timeout.db"
 config.SECRET_KEY_PATH = SCRATCH / "secret.key"
@@ -57,6 +61,13 @@ def check(condition: bool, label: str) -> None:
 # ---------------------------------------------------------------------------
 # Discord スタブ (応答したかどうかと、その時刻だけを見る)
 # ---------------------------------------------------------------------------
+class _FakeResponse:
+    """discord.HTTPException を組み立てるための最小の応答。"""
+
+    status = 400
+    reason = "Bad Request"
+
+
 class StubResponse:
     def __init__(self, record: "StubInteraction") -> None:
         self._record = record
@@ -70,10 +81,12 @@ class StubResponse:
         self._record.mark("defer")
 
     async def send_message(self, **kwargs: Any) -> None:
+        self._record.reject_if_needed(kwargs)
         self._done = True
         self._record.mark("send_message")
 
     async def send_modal(self, modal: Any) -> None:
+        self._record.reject_if_needed({"modal": modal})
         self._done = True
         self._record.mark("send_modal")
         self._record.modals.append(modal)
@@ -106,11 +119,24 @@ class StubInteraction:
         self.followup = StubFollowup(self)
         self.created = time.monotonic()
         self.first_response_at: float | None = None
+        #: 送信を拒否する条件 (None なら常に成功)
+        self.reject_while: Any = None
+        self.rejected: list[dict[str, Any]] = []
 
     def mark(self, kind: str) -> None:
         if self.first_response_at is None:
             self.first_response_at = time.monotonic()
         self.calls.append(kind)
+
+    def reject_if_needed(self, payload: dict[str, Any]) -> None:
+        """Discord が内容を拒否する状況を模す (400 Invalid Form Body)。
+
+        ``reject_while`` に渡した関数が True を返す間、送信を拒否する。
+        """
+        checker = getattr(self, "reject_while", None)
+        if checker is not None and checker(payload):
+            self.rejected.append(dict(payload))
+            raise discord.HTTPException(_FakeResponse(), "Invalid Form Body")
 
     @property
     def latency(self) -> float:
@@ -263,17 +289,21 @@ async def main() -> None:
         check(interaction.calls[0] == "send_message",
               f"方式が複数なら選択画面を出す "
               f"({len(snapshot['usable'])}件 → {interaction.calls[0]})")
-    # 方式を1つに絞ると、キャッシュ経由で Modal まで一気に進む
-    await bot.db.set_provider_settings(
-        G, config.ChargeProvider.KYASH_CLAIM, enabled=False, updated_by=1
-    )
+    # 受け取り方を請求リンク方式へ切り替えても、キャッシュ経由で Modal 直行できる
+    # (v4.2: Kyash の設定は系統で1つなので、片方の方式だけを停止することはできない)
+    await bot.db.update_settings(G, kyash_mode=config.KyashMode.CLAIM)
     await bot.charge.refresh_panel_view(G)
     single = bot.charge.cached_panel_view(G)
     assert single is not None
     interaction = fresh()
     await bot.on_charge_button(interaction)
-    check(len(single["usable"]) == 1 and interaction.calls[0] == "send_modal",
-          f"方式が1つに絞られていれば Modal 直行 ({interaction.calls[0]})")
+    check(
+        len(single["usable"]) == 1
+        and single["usable"][0]["provider"] == config.ChargeProvider.KYASH_CLAIM
+        and interaction.calls[0] == "send_modal",
+        f"請求リンク方式でも Modal 直行 ({interaction.calls[0]})",
+    )
+    await bot.db.update_settings(G, kyash_mode=config.KyashMode.TRANSFER)
 
     print("\n=== 3. DB が塞がっている最中の応答 (本題) ===")
 
@@ -343,7 +373,50 @@ async def main() -> None:
     print(f"  (重い処理そのものの所要: 整合性 "
           f"{(backup_started - started) * 1000:.0f} ms)")
 
-    print("\n=== 7. 応答前に DB を待つ経路が残っていないか ===")
+    print("\n=== 7. 内容を拒否されても必ず応答する ===")
+    # 実際に起きた不具合: 方式選択メニューの Litecoin に絵文字でない "Ł" を
+    # 使っていたため、Discord が 400 Invalid Form Body でメニュー全体を拒否し、
+    # 応答が返らず「アプリケーションは応答しませんでした」となっていた。
+    # ここでは「拒否されても必ず何かを返す」ことを確かめる。
+    import ui as ui_module
+
+    check(all(utils.is_discord_emoji(e) for e in config.PROVIDER_EMOJI.values()),
+          f"方式の絵文字がすべて有効 ({list(config.PROVIDER_EMOJI.values())})")
+
+    interaction = fresh()
+    # ボタン・メニューを含む送信だけを拒否する (Discord の 400 を模す)
+    interaction.reject_while = lambda payload: "view" in payload
+    await ui_module.safe_respond(
+        interaction,
+        embed=ui_module.info_embed("テスト", "本文"),
+        view=ui_module.ChargePanelView(),
+    )
+    check(interaction.first_response_at is not None,
+          f"メニューが拒否されても応答は返る ({interaction.calls})")
+    check(len(interaction.rejected) == 1 and interaction.calls[-1] == "send_message",
+          f"ボタンを外して送り直している (拒否 {len(interaction.rejected)} 回)")
+
+    # 何を送っても拒否される最悪の場合でも、例外を投げずに終わる
+    interaction = fresh()
+    interaction.reject_while = lambda payload: "content" not in payload
+    await ui_module.safe_respond(
+        interaction,
+        embed=ui_module.info_embed("テスト", "本文"),
+        view=ui_module.ChargePanelView(),
+    )
+    check(interaction.calls and interaction.calls[-1] == "send_message",
+          f"最後は文字だけでも応答する ({interaction.calls})")
+
+    # 入力欄が開けない場合も、無応答にはしない
+    interaction = fresh()
+    interaction.reject_while = lambda payload: "modal" in payload
+    opened = await ui_module.safe_send_modal(
+        interaction, ui_module.AmountModal(await bot.db.get_settings(G))
+    )
+    check(not opened and interaction.first_response_at is not None,
+          f"入力欄を開けなくても理由を返す ({interaction.calls})")
+
+    print("\n=== 8. 応答前に DB を待つ経路が残っていないか ===")
     # キャッシュがある状態では、ボタン押下から Modal までの DB 問い合わせは
     # 「進行中の取引を探す1回」だけであるべき
     await bot.charge.refresh_panel_view(G)

@@ -921,6 +921,91 @@ def channel_name_from(raw: Any, *, limit: int = 90) -> str:
 _SAFE_LINK_RE = re.compile(r"^https://[A-Za-z0-9.\-]+(?::\d+)?(?:/[^\s<>\"']*)?$")
 
 
+# ---------------------------------------------------------------------------
+# Discord の絵文字
+# ---------------------------------------------------------------------------
+# ボタンや選択メニューに渡せるのは **Unicode の絵文字** だけ。
+# ただの記号や文字を渡すと Discord は 400 Invalid Form Body を返し、
+# そのメッセージ全体が送信できなくなる。利用者からは
+# 「アプリケーションは応答しませんでした」と見え、ボタンが押せなくなる。
+#
+# 例: Litecoin の "Ł" (U+0141) は絵文字ではないため、方式選択メニューが
+#     まるごと送れず、チャージボタンが反応しなくなっていた。
+
+#: Unicode 絵文字として扱われる符号位置の範囲
+_EMOJI_RANGES: Final[tuple[tuple[int, int], ...]] = (
+    (0x00A9, 0x00A9), (0x00AE, 0x00AE),          # © ®
+    (0x203C, 0x203C), (0x2049, 0x2049),          # ‼ ⁉
+    (0x2122, 0x2122), (0x2139, 0x2139),          # ™ ℹ
+    (0x2194, 0x21AA),                            # ↔ 〜 ↪
+    (0x231A, 0x231B), (0x2328, 0x2328),          # ⌚ ⌛ ⌨
+    (0x23CF, 0x23FA),                            # ⏏ 〜 ⏺
+    (0x24C2, 0x24C2),                            # Ⓜ
+    (0x25AA, 0x25AB), (0x25B6, 0x25B6),          # ▪ ▫ ▶
+    (0x25C0, 0x25C0), (0x25FB, 0x25FE),          # ◀ ◻ 〜 ◾
+    (0x2600, 0x27BF),                            # ☀ 〜 ➿
+    (0x2934, 0x2935), (0x2B00, 0x2BFF),          # ⤴ ⤵ ⬅ 〜 ⭐
+    (0x3030, 0x3030), (0x303D, 0x303D),          # 〰 〽
+    (0x3297, 0x3297), (0x3299, 0x3299),          # ㊗ ㊙
+    (0x1F000, 0x1FAFF),                          # 🀄 〜 🫿 (大半の絵文字)
+)
+
+#: 単体では絵文字にならないが、絵文字の一部として現れる符号位置
+_EMOJI_JOINERS: Final[frozenset[int]] = frozenset({
+    0xFE0F,  # 異体字セレクタ (絵文字表示)
+    0xFE0E,  # 異体字セレクタ (文字表示)
+    0x200D,  # ゼロ幅接合子 (👨\u200d👩 のような合成)
+    0x20E3,  # 囲み記号 (1️⃣ の ⃣)
+})
+
+#: カスタム絵文字 (<:name:id> / <a:name:id>)
+_CUSTOM_EMOJI_RE = re.compile(r"^<a?:[A-Za-z0-9_]{2,32}:\d{15,25}>$")
+
+
+def is_discord_emoji(value: Any) -> bool:
+    """Discord のボタン・選択メニューに渡せる絵文字かどうか。
+
+    受け付けるのは Unicode 絵文字 (国旗・キーキャップ・合成絵文字を含む) と
+    カスタム絵文字の記法のみ。判定に迷う値は **False** を返す
+    (送信できないものを送るより、絵文字を出さない方が害が小さい)。
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    if _CUSTOM_EMOJI_RE.match(value):
+        return True
+    if len(value) > 32:
+        return False
+    codepoints = [ord(char) for char in value]
+    if all(cp in _EMOJI_JOINERS for cp in codepoints):
+        return False  # 接合子だけでは絵文字にならない
+    for cp in codepoints:
+        if cp in _EMOJI_JOINERS:
+            continue
+        if 0x1F1E6 <= cp <= 0x1F1FF:
+            continue  # 国旗 (地域指示記号)
+        if cp in (0x23, 0x2A) or 0x30 <= cp <= 0x39:
+            continue  # キーキャップの土台 (# * 0-9)
+        if not any(low <= cp <= high for low, high in _EMOJI_RANGES):
+            return False
+    return True
+
+
+def safe_emoji(value: Any) -> str | None:
+    """絵文字として使える値だけを返す (使えなければ None)。
+
+    Discord のコンポーネントへ渡す直前に通す。設定ミスや将来の書き換えで
+    絵文字でない文字が混ざっても、**絵文字が出ないだけ**で済み、
+    ボタンや選択メニューが送れなくなることはない。
+    """
+    if is_discord_emoji(value):
+        return str(value)
+    if value:
+        logger.warning(
+            "絵文字として使えない値のため表示を省略します: %r", str(value)[:32]
+        )
+    return None
+
+
 def is_safe_link(url: Any) -> bool:
     """利用者へ表示してよいリンクか判定する。
 
