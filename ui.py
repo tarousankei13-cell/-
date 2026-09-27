@@ -1579,6 +1579,228 @@ def subscription_list_embed(rows: Sequence[Any], *, guild_name: str) -> discord.
 
 
 # ---------------------------------------------------------------------------
+# サーバー全体のチャージ目標
+# ---------------------------------------------------------------------------
+
+def goal_reward_text(goal: Any) -> str:
+    """報酬の内容を1行で表す。"""
+    amount = int(goal["reward_amount"] or 0)
+    role_id = goal["reward_role_id"]
+    parts: list[str] = []
+    if amount:
+        parts.append(f"残高 **{utils.fmt_int(amount)}**")
+    if role_id:
+        parts.append(f"<@&{int(role_id)}>")
+    return " + ".join(parts) if parts else "なし"
+
+
+def goal_panel_embed(goal: Any, progress: dict[str, int] | None) -> discord.Embed:
+    """チャージ目標のパネル (進捗が動いたときに更新する)。"""
+    if goal is None:
+        return discord.Embed(
+            title="🎯 チャージ目標",
+            description=(
+                f"{SEPARATOR}\n"
+                "いま集計中の目標はありません。\n"
+                "次の目標が始まるまでお待ちください。\n"
+                f"{SEPARATOR}"
+            ),
+            color=config.Color.NEUTRAL,
+        )
+    target = int(goal["target_amount"])
+    total = int((progress or {}).get("total", 0))
+    users = int((progress or {}).get("users", 0))
+    count = int((progress or {}).get("count", 0))
+    status = str(goal["status"])
+    achieved = status == config.GoalStatus.ACHIEVED
+    if achieved:
+        total = int(goal["achieved_total"] or total)
+    remaining = max(0, target - total)
+    percent = (total / target * 100) if target > 0 else 0.0
+    embed = discord.Embed(
+        title=f"🎯 {utils.truncate(str(goal['name']), 200)}",
+        description=(
+            f"{SEPARATOR}\n"
+            f"{config.GOAL_STATUS_LABELS.get(status, status)}\n"
+            "サーバー全体のチャージ額を合わせて目標を目指します。\n"
+            f"{SEPARATOR}"
+        ),
+        color=config.Color.SUCCESS if achieved else config.Color.ACCENT,
+    )
+    embed.add_field(
+        name="進捗",
+        value=(
+            f"`{utils.progress_bar(total, target)}` **{percent:.1f}%**\n"
+            f"**{utils.fmt_yen(total)}** / {utils.fmt_yen(target)}"
+            + ("" if achieved else f"\nあと **{utils.fmt_yen(remaining)}**")
+        ),
+        inline=False,
+    )
+    embed.add_field(name="参加人数", value=f"**{users}**人", inline=True)
+    embed.add_field(name="チャージ回数", value=f"{count}回", inline=True)
+    embed.add_field(name="達成報酬", value=goal_reward_text(goal), inline=True)
+    if goal["ends_at"]:
+        embed.add_field(
+            name="締切",
+            value=(
+                f"{utils.discord_ts(int(goal['ends_at']))}\n"
+                f"({utils.discord_ts(int(goal['ends_at']), 'R')})"
+            ),
+            inline=True,
+        )
+    else:
+        embed.add_field(name="締切", value="期限なし (達成するまで)", inline=True)
+    embed.add_field(
+        name="集計の開始",
+        value=utils.discord_ts(int(goal["starts_at"])),
+        inline=True,
+    )
+    if achieved:
+        embed.add_field(
+            name="🎉 達成しました",
+            value=(
+                f"{utils.discord_ts(int(goal['achieved_at']))} に達成しました。\n"
+                "期間中にチャージした全員へ報酬を配布しました。"
+            ),
+            inline=False,
+        )
+    elif status == config.GoalStatus.OPEN:
+        embed.add_field(
+            name="▶ 参加のしかた",
+            value=(
+                "**期間中にチャージするだけ**で参加になります。\n"
+                "達成すると、期間中にチャージした**全員**が報酬を受け取れます。\n"
+                "`🔄 最新の進捗` を押すと今の数字を確認できます。"
+            ),
+            inline=False,
+        )
+    embed.set_footer(text=f"目標ID: {int(goal['id'])}")
+    return embed
+
+
+def goal_progress_embed(
+    goal: Any, progress: dict[str, int], *, contribution: int = 0
+) -> discord.Embed:
+    """個人向けの進捗表示 (🔄 ボタンの応答)。"""
+    embed = goal_panel_embed(goal, progress)
+    embed.add_field(
+        name="あなたの参加状況",
+        value=(
+            f"期間中のチャージ: **{utils.fmt_yen(contribution)}**\n"
+            + ("🟢 報酬の対象です" if contribution > 0
+               else "まだチャージがありません (チャージすると対象になります)")
+        ),
+        inline=False,
+    )
+    return embed
+
+
+def goal_reward_dm_embed(
+    *, goal_name: str, guild_name: str, reward_amount: int, role_id: int | None,
+    total: int, target: int, contribution: int,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="🎉 チャージ目標の達成報酬",
+        description=(
+            f"{SEPARATOR}\n**{guild_name}** の目標 **{goal_name}** が達成されました。\n"
+            f"期間中にチャージした方へ報酬をお渡しします。\n{SEPARATOR}"
+        ),
+        color=config.Color.SUCCESS,
+    )
+    embed.add_field(
+        name="達成額",
+        value=f"**{utils.fmt_yen(total)}** / {utils.fmt_yen(target)}",
+        inline=True,
+    )
+    embed.add_field(
+        name="あなたの参加額", value=f"**{utils.fmt_yen(contribution)}**", inline=True
+    )
+    embed.add_field(
+        name="受け取った報酬",
+        value=(f"残高 **+{utils.fmt_int(reward_amount)}**" if reward_amount else "")
+        + (f"\n<@&{role_id}> を付与" if role_id else "")
+        or "なし",
+        inline=False,
+    )
+    embed.set_footer(text="ご参加ありがとうございました")
+    return embed
+
+
+def goal_achieved_embed(goal: Any, *, granted: int, guild_name: str) -> discord.Embed:
+    """目標達成の実績 (実績チャンネルへ投稿)。"""
+    embed = discord.Embed(
+        title="🎉 チャージ目標を達成しました",
+        description=(
+            f"{SEPARATOR}\n**{guild_name}**\n"
+            f"目標 **{goal['name']}** を達成しました！\n{SEPARATOR}"
+        ),
+        color=config.Color.SUCCESS,
+    )
+    embed.add_field(
+        name="到達額",
+        value=f"**{utils.fmt_yen(int(goal['achieved_total'] or 0))}** / "
+              f"{utils.fmt_yen(int(goal['target_amount']))}",
+        inline=True,
+    )
+    embed.add_field(name="報酬を受け取った人", value=f"**{granted}**人", inline=True)
+    embed.add_field(name="報酬", value=goal_reward_text(goal), inline=True)
+    if goal["achieved_at"]:
+        embed.add_field(
+            name="達成", value=utils.discord_ts(int(goal["achieved_at"])), inline=True
+        )
+    embed.set_footer(text=f"目標ID: {int(goal['id'])}")
+    return embed
+
+
+def goal_list_embed(rows: Sequence[Any], *, guild_name: str) -> discord.Embed:
+    embed = discord.Embed(
+        title="🎯 チャージ目標の一覧",
+        description=(
+            f"{SEPARATOR}\n**{guild_name}**\n"
+            + (f"{len(rows)} 件" if rows else "目標はまだありません。")
+            + f"\n{SEPARATOR}"
+        ),
+        color=config.Color.INFO,
+    )
+    for row in list(rows)[:10]:
+        status = str(row["status"])
+        total = int(row["achieved_total"] or 0)
+        target = int(row["target_amount"])
+        lines = [
+            config.GOAL_STATUS_LABELS.get(status, status),
+            f"目標額: {utils.fmt_yen(target)}",
+            f"報酬: {goal_reward_text(row)}",
+        ]
+        if status != config.GoalStatus.OPEN:
+            lines.append(
+                f"到達: {utils.fmt_yen(total)} "
+                f"({(total / target * 100) if target else 0:.1f}%)"
+            )
+        if row["ends_at"]:
+            lines.append(f"締切: {utils.discord_ts(int(row['ends_at']))}")
+        embed.add_field(
+            name=f"`{int(row['id'])}` {utils.truncate(str(row['name']), 80)}",
+            value="\n".join(lines),
+            inline=False,
+        )
+    return embed
+
+
+class GoalPanelView(discord.ui.View):
+    """チャージ目標のパネル (Persistent View)。"""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="最新の進捗", emoji="🔄", style=discord.ButtonStyle.primary,
+        custom_id=config.CustomID.GOAL_REFRESH,
+    )
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await bot_of(interaction).on_goal_refresh_button(interaction)
+
+
+# ---------------------------------------------------------------------------
 # オークション
 # ---------------------------------------------------------------------------
 

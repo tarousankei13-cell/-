@@ -97,6 +97,7 @@ class BackgroundTasks:
             self.shop_expiry,
             self.subscription_task,
             self.auction_task,
+            self.goal_task,
             self.request_task,
             self.claim_task,
             self.tier_task,
@@ -552,6 +553,18 @@ class BackgroundTasks:
 
     @auction_task.before_loop
     async def _before_auction(self) -> None:
+        await self._wait_ready()
+
+    @tasks.loop(seconds=config.TASK_GOAL_INTERVAL)
+    async def goal_task(self) -> None:
+        """チャージ目標の進捗を確認し、達成・期限切れを処理する。"""
+        try:
+            await self.charge.check_goals()
+        except Exception:  # noqa: BLE001
+            logger.exception("チャージ目標の確認に失敗しました")
+
+    @goal_task.before_loop
+    async def _before_goal(self) -> None:
         await self._wait_ready()
 
     @tasks.loop(seconds=config.TASK_TIER_INTERVAL)

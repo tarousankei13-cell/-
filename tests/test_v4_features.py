@@ -1207,7 +1207,213 @@ async def main() -> None:
           f"最後まで残高と落札額の合計が保たれる "
           f"({final_total} + {won_total} = {injected_total})")
 
-    print("\n=== 7. 整合性 ===")
+    print("\n=== 7. サーバー全体のチャージ目標 ===")
+    goal_role = guild.add_role(StubRole(65_001, "目標達成者", position=6))
+    g1 = guild.add_member(StubMember(65_101, guild))
+    g2 = guild.add_member(StubMember(65_102, guild))
+    g3 = guild.add_member(StubMember(65_103, guild))
+
+    # 他のテストで作ったチャージと混ざらないよう、集計期間を明確に分ける。
+    # (集計開始をこの時刻にそろえ、参加分だけをこの時刻より後に作る)
+    goal_window = utils.now_ts() + 3_600
+
+    async def open_goal(**kwargs: Any) -> int:
+        """目標を作り、集計開始を goal_window にそろえる。"""
+        created = await bot.charge.create_goal(guild, **kwargs)
+        new_id = int(created["goal_id"])
+        await bot.db.execute(
+            "UPDATE charge_goals SET starts_at=? WHERE id=?", (goal_window, new_id)
+        )
+        return new_id
+
+    # 目標より前のチャージは数えない (期間の境界)
+    await give_charge(g1.id, 10_000, when=goal_window - 60)
+
+    goal_id = await open_goal(
+        name="みんなで10万円", target_amount=100_000, reward_amount=500,
+        reward_role=goal_role, days=7.0, created_by=OWNER_ID,
+    )
+    goal_row = await bot.db.get_goal(goal_id, G)
+    assert goal_row is not None
+    progress = await bot.db.goal_progress(goal_row)
+    check(progress["total"] == 0,
+          f"開始前のチャージは進捗に入らない ({progress['total']})")
+
+    # 同時に2つは作れない
+    try:
+        await bot.charge.create_goal(
+            guild, name="二重目標", target_amount=1_000, reward_amount=100,
+            reward_role=None, days=1.0, created_by=OWNER_ID,
+        )
+        check(False, "目標を同時に2つ作れてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.GOAL_ALREADY_OPEN,
+              f"集計中の目標は1つだけ ({exc.code})")
+
+    # 報酬が無い目標は作れない
+    await bot.db.close_goal(goal_id, status=config.GoalStatus.CANCELLED)
+    try:
+        await bot.charge.create_goal(
+            guild, name="報酬なし", target_amount=1_000, reward_amount=0,
+            reward_role=None, days=1.0, created_by=OWNER_ID,
+        )
+        check(False, "報酬なしの目標が作れてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.INVALID_AMOUNT,
+              f"報酬のない目標は作れない ({exc.code})")
+
+    # 本番の目標を作り直す
+    goal_id = await open_goal(
+        name="みんなで3万円", target_amount=30_000, reward_amount=500,
+        reward_role=goal_role, days=7.0, created_by=OWNER_ID,
+    )
+
+    # 進捗が積み上がる (未達のうちは報酬を配らない)
+    await give_charge(g1.id, 10_000, when=goal_window + 60)
+    await give_charge(g2.id, 5_000, when=goal_window + 120)
+    goal_row = await bot.db.get_goal(goal_id, G)
+    progress = await bot.db.goal_progress(goal_row)  # type: ignore[arg-type]
+    check(progress["total"] == 15_000 and progress["users"] == 2,
+          f"期間内のチャージが合計される ({progress['total']} / {progress['users']}人)")
+    outcome = await bot.charge.check_guild_goal(G)
+    goal_row = await bot.db.get_goal(goal_id, G)
+    check(str(goal_row["status"]) == config.GoalStatus.OPEN,  # type: ignore[index]
+          "未達のうちは集計中のまま")
+    check(not await bot.db.list_goal_grants(goal_id),
+          "未達では報酬を配らない")
+    check(outcome.get("refreshed", 0) >= 0, "進捗の確認で例外が出ない")
+
+    # 目標に到達 → 期間内にチャージした全員へ配布
+    await give_charge(g3.id, 20_000, when=goal_window + 180)
+    bal_before = {
+        m.id: await bot.db.get_balance(G, m.id) for m in (g1, g2, g3)
+    }
+    bot.dms.clear()
+    result = await bot.charge.check_goals()
+    goal_row = await bot.db.get_goal(goal_id, G)
+    assert goal_row is not None
+    check(result["achieved"] == 1
+          and str(goal_row["status"]) == config.GoalStatus.ACHIEVED,
+          f"目標額に届いたら達成になる ({goal_row['status']})")
+    check(int(goal_row["achieved_total"]) == 35_000,
+          f"達成時の到達額が記録される ({goal_row['achieved_total']})")
+    grants = await bot.db.list_goal_grants(goal_id)
+    check(len(grants) == 3, f"期間内にチャージした全員へ配布 ({len(grants)}人)")
+    for m in (g1, g2, g3):
+        got = await bot.db.get_balance(G, m.id) - bal_before[m.id]
+        check(got == 500, f"{m.id} に報酬が入る ({got})")
+        check(goal_role in m.roles, f"{m.id} に報酬ロールが付く")
+    check(len([d for d in bot.dms if "達成報酬" in d[1]]) == 3,
+          "達成を全員へ DM で知らせる")
+
+    # 二重配布しない
+    bal_after = {m.id: await bot.db.get_balance(G, m.id) for m in (g1, g2, g3)}
+    again = await bot.charge.distribute_goal_rewards(goal_id)
+    check(again["granted"] == 0, f"同じ目標で二重配布しない ({again['granted']}人)")
+    for m in (g1, g2, g3):
+        check(await bot.db.get_balance(G, m.id) == bal_after[m.id],
+              f"{m.id} の残高が二重に増えない")
+    # 達成済みの目標は再達成できない
+    check(not await bot.db.mark_goal_achieved(goal_id, total=999_999),
+          "達成済みの目標を二重に達成できない")
+    # 達成後は新しい目標を作れる
+    next_id = await open_goal(
+        name="次の目標", target_amount=1_000_000, reward_amount=100,
+        reward_role=None, days=1.0, created_by=OWNER_ID,
+    )
+    check(next_id != goal_id, "達成後は次の目標を開始できる")
+
+    # 凍結された利用者は配布対象から外れる
+    await bot.db.set_frozen(G, g2.id, True, OWNER_ID, "テスト凍結")
+    frozen_goal_row = await bot.db.get_goal(next_id, G)
+    participants = await bot.db.list_goal_participants(frozen_goal_row)  # type: ignore[arg-type]
+    check(all(int(p["user_id"]) != g2.id for p in participants),
+          "凍結された利用者は配布対象に入らない")
+    await bot.db.set_frozen(G, g2.id, False, OWNER_ID, "解除")
+
+    # 期限切れ (未達) は報酬なしで終了する
+    await bot.db.execute(
+        "UPDATE charge_goals SET ends_at=? WHERE id=?",
+        (utils.now_ts() - 5, next_id),
+    )
+    closed = await bot.charge.check_goals()
+    row = await bot.db.get_goal(next_id, G)
+    check(closed["closed"] == 1 and str(row["status"]) == config.GoalStatus.CLOSED,  # type: ignore[index]
+          f"期限切れで未達なら終了する ({row['status']})")  # type: ignore[index]
+    check(not await bot.db.list_goal_grants(next_id), "未達では報酬を配らない (期限切れ)")
+
+    # 手動で締める: 達成していれば報酬を配る
+    manual_id = await open_goal(
+        name="手動締め", target_amount=1_000, reward_amount=200,
+        reward_role=None, days=7.0, created_by=OWNER_ID,
+    )
+    await give_charge(g1.id, 2_000, when=goal_window + 240)
+    bal_before_manual = await bot.db.get_balance(G, g1.id)
+    manual_result = await bot.charge.close_goal(
+        G, manual_id, operator_id=OWNER_ID, cancel=False
+    )
+    check(manual_result["status"] == config.GoalStatus.ACHIEVED,
+          f"目標額に届いていれば手動でも達成扱い ({manual_result['status']})")
+    check(await bot.db.get_balance(G, g1.id) > bal_before_manual,
+          "手動達成でも報酬が入る")
+
+    # 中止では報酬を配らない
+    cancel_goal_id = await open_goal(
+        name="中止する目標", target_amount=1_000, reward_amount=300,
+        reward_role=None, days=7.0, created_by=OWNER_ID,
+    )
+    await give_charge(g1.id, 5_000, when=goal_window + 300)
+    bal_before_cancel_goal = await bot.db.get_balance(G, g1.id)
+    cancel_result = await bot.charge.close_goal(
+        G, cancel_goal_id, operator_id=OWNER_ID, cancel=True
+    )
+    check(cancel_result["status"] == config.GoalStatus.CANCELLED,
+          f"中止は達成にしない ({cancel_result['status']})")
+    check(await bot.db.get_balance(G, g1.id) == bal_before_cancel_goal,
+          "中止では報酬を配らない")
+    check(not await bot.db.list_goal_grants(cancel_goal_id),
+          "中止した目標に配布記録は残らない")
+    # 終了済みの目標は締められない
+    try:
+        await bot.charge.close_goal(
+            G, cancel_goal_id, operator_id=OWNER_ID, cancel=True
+        )
+        check(False, "終了済みの目標を二重に締められてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.GOAL_NOT_FOUND,
+              f"終了済みの目標は締められない ({exc.code})")
+
+    # 期限なしの目標は「いまの時点まで」を数える
+    endless_id = await bot.charge.create_goal(
+        guild, name="期限なし", target_amount=1_000_000, reward_amount=100,
+        reward_role=None, days=None, created_by=OWNER_ID,
+    )
+    endless_row = await bot.db.get_goal(int(endless_id["goal_id"]), G)
+    assert endless_row is not None
+    check(endless_row["ends_at"] is None, "期限なしの目標は締切を持たない")
+    # 既存のテストデータが入るため、増分で確かめる
+    before_endless = (await bot.db.goal_progress(endless_row))["total"]
+    await give_charge(g1.id, 3_000)
+    after_endless = (await bot.db.goal_progress(endless_row))["total"]
+    check(after_endless - before_endless == 3_000,
+          f"期限なしでも現在までのチャージを数える "
+          f"({before_endless} → {after_endless})")
+    await bot.charge.close_goal(
+        G, int(endless_row["id"]), operator_id=OWNER_ID, cancel=True  # type: ignore[index]
+    )
+
+    # 付与できないロールを報酬にはできない
+    try:
+        await bot.charge.create_goal(
+            guild, name="渡せないロール", target_amount=1_000, reward_amount=0,
+            reward_role=high_role, days=None, created_by=OWNER_ID,
+        )
+        check(False, "付与できないロールを報酬にできてしまう")
+    except ChargeError as exc:
+        check(exc.code == config.ErrorCode.ROLE_ASSIGN_FAILED,
+              f"付与できないロールは報酬にできない ({exc.code})")
+
+    print("\n=== 8. 整合性 ===")
     integrity = await bot.db.integrity_check()
     check(integrity["pragma"] == "ok", "PRAGMA quick_check OK")
     check(not integrity["balance_mismatch"], "残高と履歴合計が一致")

@@ -31,6 +31,7 @@ from database import (
     AlreadyCredited,
     AuctionError,
     Database,
+    GoalError,
     GuildSettings,
     IllegalStateTransition,
     RequestError,
@@ -99,8 +100,10 @@ class ChargeService:
             "requests_created": 0, "requests_submitted": 0,
             "requests_approved": 0, "requests_rejected": 0, "requests_expired": 0,
             "subscription_renewals": 0, "subscription_stops": 0,
-            "auctions_closed": 0, "bids": 0,
+            "auctions_closed": 0, "bids": 0, "goal_rewards": 0,
         }
+        # 目標パネルの前回の内容 (変わらないときは編集しない)
+        self._goal_signatures: dict[int, str] = {}
 
     # ==================================================================
     # 事前チェック
@@ -4242,6 +4245,284 @@ class ChargeService:
         await self.post_generic_achievement(
             int(auction["guild_id"]), ui.auction_result_embed(auction, counts=counts)
         )
+
+    # ==================================================================
+    # サーバー全体のチャージ目標
+    # ==================================================================
+    async def create_goal(
+        self,
+        guild: discord.Guild,
+        *,
+        name: str,
+        target_amount: int,
+        reward_amount: int,
+        reward_role: discord.Role | None,
+        days: float | None,
+        created_by: int,
+    ) -> dict[str, Any]:
+        """チャージ目標を作る。
+
+        報酬にロールを使う場合は、先に付与できるかを確かめる。達成してから
+        「配れませんでした」となると、参加者の期待を裏切ることになる。
+        """
+        await self.ensure_usable_guild(guild.id)
+        if reward_role is not None:
+            problem = self.role_grant_problem(guild, reward_role)
+            if problem:
+                raise ChargeError(config.ErrorCode.ROLE_ASSIGN_FAILED, problem)
+        if reward_amount <= 0 and reward_role is None:
+            raise ChargeError(
+                config.ErrorCode.INVALID_AMOUNT,
+                "報酬 (残高またはロール) を少なくとも1つ指定してください",
+            )
+        now = utils.now_ts()
+        ends_at = now + int(days * 86400) if days else None
+        try:
+            goal_id = await self.db.create_goal(
+                guild_id=guild.id, name=name, target_amount=target_amount,
+                reward_amount=reward_amount,
+                reward_role_id=reward_role.id if reward_role else None,
+                starts_at=now, ends_at=ends_at, created_by=created_by,
+            )
+        except GoalError as exc:
+            raise ChargeError(exc.code, exc.detail) from exc
+        await self.db.add_audit_log(
+            actor_id=created_by, action="GOAL_CREATE", guild_id=guild.id,
+            detail={"goal_id": goal_id, "target": target_amount,
+                    "reward_amount": reward_amount,
+                    "reward_role_id": reward_role.id if reward_role else None,
+                    "ends_at": ends_at},
+        )
+        await self._safe(self.log_event(
+            guild.id, "🎯 チャージ目標を開始しました",
+            fields=(
+                ("目標", name, True),
+                ("目標額", utils.fmt_yen(target_amount), True),
+                ("報酬", (f"{utils.fmt_int(reward_amount)}" if reward_amount else "なし")
+                 + (f" + {reward_role.mention}" if reward_role else ""), True),
+                ("締切", utils.format_jst(ends_at) if ends_at else "期限なし", True),
+            ),
+            color=config.Color.ACCENT,
+        ), context="目標開始ログ")
+        await self._safe(self.refresh_goal_panels(guild.id), context="目標パネル更新")
+        return {"goal_id": goal_id, "ends_at": ends_at}
+
+    async def refresh_goal_panels(self, guild_id: int) -> int:
+        """目標パネルへ最新の進捗を反映する。"""
+        goal = await self.db.get_open_goal(guild_id)
+        progress = await self.db.goal_progress(goal) if goal is not None else None
+        return await self._update_panels(
+            guild_id, config.PANEL_TYPE_GOAL,
+            ui.goal_panel_embed(goal, progress), ui.GoalPanelView(),
+        )
+
+    async def check_goals(self) -> dict[str, int]:
+        """すべてのサーバーの目標を見て、達成・期限切れを処理する。"""
+        result = {"achieved": 0, "closed": 0, "refreshed": 0}
+        try:
+            guild_ids = await self.db.list_goal_guilds()
+        except Exception:  # noqa: BLE001
+            logger.exception("目標のあるサーバー一覧の取得に失敗しました")
+            return result
+        for guild_id in guild_ids:
+            try:
+                outcome = await self.check_guild_goal(guild_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("目標の確認に失敗しました guild=%s", guild_id)
+                continue
+            for key in ("achieved", "closed", "refreshed"):
+                result[key] += int(outcome.get(key, 0))
+        return result
+
+    async def check_guild_goal(self, guild_id: int) -> dict[str, int]:
+        """1サーバーの目標を確認する (達成なら報酬を配る)。"""
+        goal = await self.db.get_open_goal(guild_id)
+        if goal is None:
+            return {}
+        goal_id = int(goal["id"])
+        progress = await self.db.goal_progress(goal)
+        total = int(progress["total"])
+        target = int(goal["target_amount"])
+        now = utils.now_ts()
+        if total >= target:
+            # 先に状態を進める。二重達成を防ぐため、更新できた側だけが配布する。
+            if await self.db.mark_goal_achieved(goal_id, total=total):
+                await self.distribute_goal_rewards(goal_id)
+                return {"achieved": 1}
+            return {}
+        if goal["ends_at"] and int(goal["ends_at"]) <= now:
+            if await self.db.close_goal(
+                goal_id, status=config.GoalStatus.CLOSED, total=total
+            ):
+                await self._announce_goal_failed(goal, total)
+                return {"closed": 1}
+            return {}
+        # 進捗が変わったときだけパネルを書き換える (無駄な編集を避ける)
+        signature = f"{total}:{progress['users']}"
+        if self._goal_signatures.get(guild_id) != signature:
+            self._goal_signatures[guild_id] = signature
+            await self._safe(self.refresh_goal_panels(guild_id), context="目標パネル更新")
+            return {"refreshed": 1}
+        return {}
+
+    async def distribute_goal_rewards(self, goal_id: int) -> dict[str, int]:
+        """達成した目標の報酬を期間内の参加者へ配る。
+
+        ``goal_reward_grants`` の UNIQUE(goal_id, user_id) を先に立ててから
+        残高を加算するので、途中で落ちても二重には配らない。
+        """
+        goal = await self.db.get_goal(goal_id)
+        if goal is None:
+            return {"granted": 0}
+        guild_id = int(goal["guild_id"])
+        guild = self.bot.get_guild(guild_id)
+        reward_amount = int(goal["reward_amount"] or 0)
+        role_id = goal["reward_role_id"]
+        role = guild.get_role(int(role_id)) if (guild and role_id) else None
+        participants = await self.db.list_goal_participants(goal)
+        granted = 0
+        role_failures = 0
+        for row in participants:
+            user_id = int(row["user_id"])
+            if not await self.db.record_goal_grant(
+                goal_id=goal_id, guild_id=guild_id, user_id=user_id,
+                amount=reward_amount, role_id=role.id if role else None,
+            ):
+                continue  # 既に配布済み
+            if reward_amount > 0:
+                try:
+                    await self.db.adjust_balance(
+                        guild_id=guild_id, user_id=user_id, amount=reward_amount,
+                        change_type=config.BalanceChangeType.GOAL_REWARD,
+                        operator_id=config.SYSTEM_ACTOR_ID,
+                        reason=utils.truncate(f"目標達成報酬: {goal['name']}", 500),
+                        transaction_id=f"GOAL-{goal_id}-U{user_id}",
+                    )
+                except Exception:  # noqa: BLE001 - 1人の失敗で全体を止めない
+                    logger.exception(
+                        "目標報酬の付与に失敗しました goal=%s user=%s", goal_id, user_id
+                    )
+                    continue
+            if role is not None and guild is not None:
+                member = guild.get_member(user_id)
+                if member is not None and role not in getattr(member, "roles", []):
+                    try:
+                        await member.add_roles(
+                            role, reason=utils.truncate(
+                                f"目標達成報酬 #{goal_id} ({goal['name']})", 400)
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        role_failures += 1
+                        logger.warning(
+                            "目標報酬のロール付与に失敗しました goal=%s user=%s: %s",
+                            goal_id, user_id, utils.safe_error_text(exc),
+                        )
+            granted += 1
+            await self._send_dm(
+                user_id,
+                ui.goal_reward_dm_embed(
+                    goal_name=str(goal["name"]),
+                    guild_name=self.guild_name(guild_id),
+                    reward_amount=reward_amount,
+                    role_id=role.id if role else None,
+                    total=int(goal["achieved_total"] or 0),
+                    target=int(goal["target_amount"]),
+                    contribution=int(row["amount"]),
+                ),
+                queue_on_failure=False,
+            )
+        if role_failures:
+            await self.alert_admins(
+                guild_id, "目標報酬のロールを配れませんでした",
+                f"目標 `#{goal_id}` の報酬ロール <@&{role_id}> を "
+                f"{role_failures} 人へ付与できませんでした。\n"
+                "ロールの位置と Bot の権限を確認し、手動で付与してください。",
+            )
+        self.metrics["goal_rewards"] += granted
+        await self.db.add_audit_log(
+            actor_id=config.SYSTEM_ACTOR_ID, action="GOAL_ACHIEVED", guild_id=guild_id,
+            detail={"goal_id": goal_id, "granted": granted,
+                    "reward_amount": reward_amount,
+                    "total": int(goal["achieved_total"] or 0)},
+        )
+        await self._safe(self.log_event(
+            guild_id, "🎉 チャージ目標を達成しました",
+            fields=(
+                ("目標", str(goal["name"]), True),
+                ("目標額", utils.fmt_yen(int(goal["target_amount"])), True),
+                ("到達額", utils.fmt_yen(int(goal["achieved_total"] or 0)), True),
+                ("配布人数", f"{granted}人", True),
+                ("1人あたり", utils.fmt_int(reward_amount) if reward_amount else "なし", True),
+                ("ロール", f"<@&{role_id}>" if role_id else "なし", True),
+            ),
+            color=config.Color.SUCCESS,
+        ), context="目標達成ログ")
+        await self._safe(self.post_generic_achievement(
+            guild_id,
+            ui.goal_achieved_embed(
+                goal, granted=granted, guild_name=self.guild_name(guild_id)
+            ),
+        ), context="目標達成の実績投稿")
+        await self._safe(self.refresh_goal_panels(guild_id), context="目標パネル更新")
+        self._goal_signatures.pop(guild_id, None)
+        self.request_ranking_refresh(guild_id)
+        return {"granted": granted}
+
+    async def _announce_goal_failed(self, goal: Any, total: int) -> None:
+        """期限までに達成できなかったことを知らせる。"""
+        guild_id = int(goal["guild_id"])
+        await self._safe(self.log_event(
+            guild_id, "⌛ チャージ目標は未達のまま終了しました",
+            fields=(
+                ("目標", str(goal["name"]), True),
+                ("目標額", utils.fmt_yen(int(goal["target_amount"])), True),
+                ("到達額", utils.fmt_yen(total), True),
+            ),
+            color=config.Color.NEUTRAL,
+        ), context="目標終了ログ")
+        await self._safe(self.refresh_goal_panels(guild_id), context="目標パネル更新")
+        self._goal_signatures.pop(guild_id, None)
+
+    async def close_goal(
+        self, guild_id: int, goal_id: int, *, operator_id: int, cancel: bool
+    ) -> dict[str, Any]:
+        """目標を手動で終了する (中止か、その時点で締める)。
+
+        ``cancel=False`` なら目標額に届いていれば達成として報酬を配る。
+        """
+        goal = await self.db.get_goal(goal_id, guild_id)
+        if goal is None or str(goal["status"]) != config.GoalStatus.OPEN:
+            raise ChargeError(config.ErrorCode.GOAL_NOT_FOUND)
+        progress = await self.db.goal_progress(goal)
+        total = int(progress["total"])
+        if not cancel and total >= int(goal["target_amount"]):
+            if await self.db.mark_goal_achieved(goal_id, total=total):
+                outcome = await self.distribute_goal_rewards(goal_id)
+                return {"status": config.GoalStatus.ACHIEVED, "total": total, **outcome}
+        status = config.GoalStatus.CANCELLED if cancel else config.GoalStatus.CLOSED
+        if not await self.db.close_goal(goal_id, status=status, total=total):
+            raise ChargeError(config.ErrorCode.GOAL_NOT_FOUND)
+        await self.db.add_audit_log(
+            actor_id=operator_id,
+            action="GOAL_CANCEL" if cancel else "GOAL_CLOSE",
+            guild_id=guild_id,
+            detail={"goal_id": goal_id, "total": total,
+                    "target": int(goal["target_amount"])},
+        )
+        await self._safe(self.log_event(
+            guild_id,
+            "⚫ チャージ目標を中止しました" if cancel else "🏁 チャージ目標を締めました",
+            fields=(
+                ("目標", str(goal["name"]), True),
+                ("到達額", utils.fmt_yen(total), True),
+                ("目標額", utils.fmt_yen(int(goal["target_amount"])), True),
+                ("操作者", f"<@{operator_id}>", True),
+            ),
+            color=config.Color.WARNING,
+        ), context="目標終了ログ")
+        await self._safe(self.refresh_goal_panels(guild_id), context="目標パネル更新")
+        self._goal_signatures.pop(guild_id, None)
+        return {"status": status, "total": total, "granted": 0}
 
     # ==================================================================
     # 招待キャンペーン

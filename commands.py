@@ -345,6 +345,7 @@ _PANEL_KINDS: Final[dict[str, str]] = {
     config.PANEL_TYPE_SHOP: "🛒 ショップパネル",
     config.PANEL_TYPE_INVITE: "🤝 招待パネル",
     config.PANEL_TYPE_ADMIN: "🛠 管理ダッシュボード",
+    config.PANEL_TYPE_GOAL: "🎯 チャージ目標パネル",
 }
 
 
@@ -3629,6 +3630,300 @@ class RateGroup(app_commands.Group):
 
 
 # ---------------------------------------------------------------------------
+# /goal (サーバー全体のチャージ目標)
+# ---------------------------------------------------------------------------
+class GoalGroup(app_commands.Group):
+    """サーバー全体のチャージ目標。"""
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="goal", description="チャージ目標 (progress / list は利用者も実行可)"
+        )
+
+    @app_commands.command(name="create", description="チャージ目標を開始します (管理者)")
+    @app_commands.describe(
+        name="目標の名前", target_amount="目標の合計チャージ額 (円)",
+        reward_amount="達成時に参加者へ配る残高 (0で配らない)",
+        reward_role="達成時に参加者へ付けるロール",
+        days="締切までの日数 (未指定なら期限なし)",
+        channel="進捗パネルを置くチャンネル (未指定なら設置しない)",
+    )
+    @app_commands.guild_only()
+    @require_admin()
+    async def create(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        target_amount: app_commands.Range[int, 1, 1_000_000_000],
+        reward_amount: app_commands.Range[int, 0, 1_000_000] = 0,
+        reward_role: discord.Role | None = None,
+        days: app_commands.Range[float, 0.5, 365.0] | None = None,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        """目標を開始し、必要なら進捗パネルも設置する。"""
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        name = name.strip()[:config.SHOP_NAME_MAX_LEN]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if channel is not None and (
+            guild.me is None or not _channel_writable(channel, guild.me)
+        ):
+            await interaction.followup.send(
+                embed=ui.info_embed(
+                    "このチャンネルには置けません",
+                    f"{channel.mention} へ Embed 付きメッセージを送れません。",
+                    color=config.Color.DANGER,
+                ),
+                ephemeral=True,
+            )
+            return
+        try:
+            created = await bot.charge.create_goal(
+                guild, name=name, target_amount=int(target_amount),
+                reward_amount=int(reward_amount), reward_role=reward_role,
+                days=float(days) if days else None, created_by=interaction.user.id,
+            )
+        except ChargeError as exc:
+            await interaction.followup.send(
+                embed=ui.error_embed(exc.code, admin_detail=exc.detail or None),
+                ephemeral=True,
+            )
+            return
+        goal_id = int(created["goal_id"])
+        panel_note = "なし (`/goal panel` で後から設置できます)"
+        if channel is not None:
+            goal = await bot.db.get_goal(goal_id, guild.id)
+            progress = await bot.db.goal_progress(goal)  # type: ignore[arg-type]
+            try:
+                message = await channel.send(
+                    embed=ui.goal_panel_embed(goal, progress), view=ui.GoalPanelView()
+                )
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                panel_note = f"設置に失敗しました ({utils.safe_error_text(exc)})"
+            else:
+                await bot.db.add_panel(
+                    guild.id, channel.id, message.id, config.PANEL_TYPE_GOAL
+                )
+                panel_note = f"{channel.mention} (メッセージID `{message.id}`)"
+        op_id = await _audit(
+            interaction, "GOAL_CREATE_CMD",
+            detail={"goal_id": goal_id, "target": int(target_amount),
+                    "channel_id": channel.id if channel else None},
+        )
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "🎯 チャージ目標を開始しました",
+                f"目標ID: `{goal_id}`\n名前: **{name}**\n"
+                f"目標額: **{utils.fmt_yen(int(target_amount))}**\n"
+                f"報酬: {'残高 ' + utils.fmt_int(int(reward_amount)) if reward_amount else '残高なし'}"
+                + (f" + {reward_role.mention}" if reward_role else "") + "\n"
+                f"締切: {utils.format_jst(int(created['ends_at'])) if created['ends_at'] else '期限なし'}\n"
+                f"パネル: {panel_note}\n"
+                f"操作ID: `{op_id}`",
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="panel", description="進捗パネルを設置します (管理者)"
+    )
+    @app_commands.describe(channel="設置するチャンネル (未指定なら実行したチャンネル)")
+    @app_commands.guild_only()
+    @require_admin()
+    async def panel(
+        self, interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        target = channel or interaction.channel
+        if not isinstance(target, discord.TextChannel):
+            await interaction.followup.send(
+                embed=ui.info_embed(
+                    "チャンネルを指定してください",
+                    "テキストチャンネルを `channel` で指定してください。",
+                    color=config.Color.DANGER,
+                ),
+                ephemeral=True,
+            )
+            return
+        if guild.me is None or not _channel_writable(target, guild.me):
+            await interaction.followup.send(
+                embed=ui.info_embed(
+                    "権限が不足しています",
+                    f"{target.mention} へメッセージ送信・埋め込みリンクの権限が必要です。",
+                    color=config.Color.DANGER,
+                ),
+                ephemeral=True,
+            )
+            return
+        goal = await bot.db.get_open_goal(guild.id)
+        progress = await bot.db.goal_progress(goal) if goal is not None else None
+        message = await target.send(
+            embed=ui.goal_panel_embed(goal, progress), view=ui.GoalPanelView()
+        )
+        panel_id = await bot.db.add_panel(
+            guild.id, target.id, message.id, config.PANEL_TYPE_GOAL
+        )
+        op_id = await _audit(
+            interaction, "GOAL_PANEL_CREATE",
+            detail={"panel_id": panel_id, "channel_id": target.id,
+                    "message_id": message.id},
+        )
+        await interaction.followup.send(
+            embed=ui.success_embed(
+                "✅ 進捗パネルを設置しました",
+                f"チャンネル: {target.mention}\nメッセージID: `{message.id}`\n"
+                + ("" if goal is not None else
+                   "※ いま集計中の目標はありません。`/goal create` で開始すると自動で表示されます。\n")
+                + f"操作ID: `{op_id}`",
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="progress", description="いまの進捗を表示します")
+    @app_commands.guild_only()
+    async def progress(self, interaction: discord.Interaction) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        goal = await bot.db.get_open_goal(guild.id)
+        if goal is None:
+            await interaction.followup.send(
+                embed=ui.goal_panel_embed(None, None), ephemeral=True
+            )
+            return
+        progress = await bot.db.goal_progress(goal)
+        participants = await bot.db.list_goal_participants(goal)
+        contribution = next(
+            (int(r["amount"]) for r in participants
+             if int(r["user_id"]) == interaction.user.id),
+            0,
+        )
+        await interaction.followup.send(
+            embed=ui.goal_progress_embed(goal, progress, contribution=contribution),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="list", description="目標の一覧を表示します")
+    @app_commands.guild_only()
+    async def list_goals(self, interaction: discord.Interaction) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        rows = await bot.db.list_goals(guild.id)
+        await interaction.followup.send(
+            embed=ui.goal_list_embed(rows, guild_name=guild.name), ephemeral=True
+        )
+
+    @app_commands.command(
+        name="close", description="目標を締めます (達成していれば報酬を配る・管理者)"
+    )
+    @app_commands.describe(goal_id="目標ID")
+    @app_commands.guild_only()
+    @require_admin()
+    async def close(
+        self, interaction: discord.Interaction,
+        goal_id: app_commands.Range[int, 1, 10_000_000],
+    ) -> None:
+        await _finish_goal(interaction, int(goal_id), cancel=False)
+
+    @app_commands.command(
+        name="cancel", description="目標を中止します (報酬は配らない・管理者)"
+    )
+    @app_commands.describe(goal_id="目標ID")
+    @app_commands.guild_only()
+    @require_admin()
+    async def cancel(
+        self, interaction: discord.Interaction,
+        goal_id: app_commands.Range[int, 1, 10_000_000],
+    ) -> None:
+        await _finish_goal(interaction, int(goal_id), cancel=True)
+
+    @app_commands.command(
+        name="grants", description="配布した報酬の一覧を表示します (管理者)"
+    )
+    @app_commands.describe(goal_id="目標ID")
+    @app_commands.guild_only()
+    @require_admin()
+    async def grants(
+        self, interaction: discord.Interaction,
+        goal_id: app_commands.Range[int, 1, 10_000_000],
+    ) -> None:
+        bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+        guild = interaction.guild
+        assert guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        goal = await bot.db.get_goal(int(goal_id), guild.id)
+        if goal is None:
+            await interaction.followup.send(
+                embed=ui.error_embed(config.ErrorCode.GOAL_NOT_FOUND), ephemeral=True
+            )
+            return
+        rows = await bot.db.list_goal_grants(int(goal_id))
+        people, total = await bot.db.count_goal_grants(int(goal_id))
+        lines = [
+            f"<@{int(r['user_id'])}> {utils.fmt_int(int(r['amount']))}"
+            + (f" + <@&{int(r['role_id'])}>" if r["role_id"] else "")
+            for r in rows[:25]
+        ]
+        await interaction.followup.send(
+            embed=ui.info_embed(
+                f"🎁 配布した報酬 (`{goal_id}` {goal['name']})",
+                f"{ui.SEPARATOR}\n配布 {people}人 / 合計 {utils.fmt_int(total)}\n\n"
+                + ("\n".join(lines) if lines else "まだ配布していません。"),
+            ),
+            ephemeral=True,
+        )
+
+
+async def _finish_goal(
+    interaction: discord.Interaction, goal_id: int, *, cancel: bool
+) -> None:
+    """``/goal close`` と ``/goal cancel`` の共通処理。"""
+    bot: "ChargeBot" = interaction.client  # type: ignore[assignment]
+    guild = interaction.guild
+    assert guild is not None
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        result = await bot.charge.close_goal(
+            guild.id, goal_id, operator_id=interaction.user.id, cancel=cancel
+        )
+    except ChargeError as exc:
+        await interaction.followup.send(
+            embed=ui.error_embed(exc.code, admin_detail=exc.detail or None),
+            ephemeral=True,
+        )
+        return
+    op_id = await _audit(
+        interaction, "GOAL_CANCEL_CMD" if cancel else "GOAL_CLOSE_CMD",
+        detail={"goal_id": goal_id, "status": result["status"],
+                "total": result["total"]},
+    )
+    status = str(result["status"])
+    if status == config.GoalStatus.ACHIEVED:
+        title = "🎉 目標を達成として締めました"
+        body = (
+            f"到達額: **{utils.fmt_yen(int(result['total']))}**\n"
+            f"報酬を配布した人数: **{result.get('granted', 0)}**人\n"
+        )
+    elif cancel:
+        title = "⚫ 目標を中止しました"
+        body = f"到達額: {utils.fmt_yen(int(result['total']))}\n報酬は配布していません。\n"
+    else:
+        title = "🏁 目標を未達で締めました"
+        body = f"到達額: {utils.fmt_yen(int(result['total']))}\n報酬は配布していません。\n"
+    await interaction.followup.send(
+        embed=ui.success_embed(title, f"{body}操作ID: `{op_id}`"), ephemeral=True
+    )
+
+
+# ---------------------------------------------------------------------------
 # /auction (内部残高でロールを競る)
 # ---------------------------------------------------------------------------
 class AuctionGroup(app_commands.Group):
@@ -6620,7 +6915,7 @@ async def setup_commands(bot: "ChargeBot") -> None:
         ServerGroup(), KyashGroup(), SettingsGroup(), BalanceGroup(), UserGroup(),
         MaintenanceGroup(), EmergencyStopGroup(), AchievementGroup(), TransactionGroup(),
         DataGroup(), ConfigGroup(), SystemGroup(), RateGroup(), ShopGroup(),
-        AuctionGroup(),
+        AuctionGroup(), GoalGroup(),
         CampaignGroup(), ExportGroup(), GlobalGroup(),
         ProviderGroup(), RequestGroup(), TierGroup(), RankingRewardGroup(),
     ):

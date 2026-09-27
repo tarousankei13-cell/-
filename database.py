@@ -65,6 +65,15 @@ class AuctionError(DatabaseError):
         self.detail = detail
 
 
+class GoalError(DatabaseError):
+    """チャージ目標を作成・更新できない (利用者向けエラーコードを持つ)。"""
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        super().__init__(detail or code)
+        self.code = code
+        self.detail = detail
+
+
 # ---------------------------------------------------------------------------
 # データクラス
 # ---------------------------------------------------------------------------
@@ -4543,6 +4552,184 @@ class Database:
             "ORDER BY amount DESC LIMIT 1",
             (auction_id, user_id),
         )
+
+    # ==================================================================
+    # サーバー全体のチャージ目標
+    # ==================================================================
+    async def create_goal(
+        self,
+        *,
+        guild_id: int,
+        name: str,
+        target_amount: int,
+        reward_amount: int = 0,
+        reward_role_id: int | None = None,
+        starts_at: int | None = None,
+        ends_at: int | None = None,
+        created_by: int | None = None,
+    ) -> int:
+        """目標を作る。
+
+        1サーバーで同時に集計する目標は1つだけにする。複数あると
+        「どの目標のパネルなのか」「どの期間の参加者なのか」が曖昧になる。
+
+        Raises:
+            GoalError: すでに集計中の目標がある場合。
+        """
+        now = utils.now_ts()
+        start = starts_at if starts_at is not None else now
+
+        def _fn(conn: sqlite3.Connection) -> int:
+            existing = conn.execute(
+                "SELECT id FROM charge_goals WHERE guild_id=? AND status=? LIMIT 1",
+                (guild_id, config.GoalStatus.OPEN),
+            ).fetchone()
+            if existing is not None:
+                raise GoalError(
+                    config.ErrorCode.GOAL_ALREADY_OPEN,
+                    f"集計中の目標があります (ID: {int(existing['id'])})",
+                )
+            cur = conn.execute(
+                "INSERT INTO charge_goals(guild_id, name, target_amount, reward_amount, "
+                "reward_role_id, status, starts_at, ends_at, created_by, created_at, "
+                "updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (guild_id, name, target_amount, reward_amount, reward_role_id,
+                 config.GoalStatus.OPEN, start, ends_at, created_by, now, now),
+            )
+            return _lastrowid(cur)
+
+        return await self.run(_fn, write=True)
+
+    async def get_goal(self, goal_id: int, guild_id: int | None = None) -> sqlite3.Row | None:
+        if guild_id is None:
+            return await self.fetchone("SELECT * FROM charge_goals WHERE id=?", (goal_id,))
+        return await self.fetchone(
+            "SELECT * FROM charge_goals WHERE id=? AND guild_id=?", (goal_id, guild_id)
+        )
+
+    async def get_open_goal(self, guild_id: int) -> sqlite3.Row | None:
+        return await self.fetchone(
+            "SELECT * FROM charge_goals WHERE guild_id=? AND status=? "
+            "ORDER BY id DESC LIMIT 1",
+            (guild_id, config.GoalStatus.OPEN),
+        )
+
+    async def list_goals(self, guild_id: int, *, limit: int = 15) -> list[sqlite3.Row]:
+        return await self.fetchall(
+            "SELECT * FROM charge_goals WHERE guild_id=? "
+            "ORDER BY CASE status WHEN 'OPEN' THEN 0 ELSE 1 END, id DESC LIMIT ?",
+            (guild_id, limit),
+        )
+
+    async def list_goal_guilds(self) -> list[int]:
+        """集計中の目標があるサーバーのID。"""
+        rows = await self.fetchall(
+            "SELECT DISTINCT guild_id FROM charge_goals WHERE status=?",
+            (config.GoalStatus.OPEN,),
+        )
+        return [int(r["guild_id"]) for r in rows]
+
+    async def goal_progress(self, goal: sqlite3.Row) -> dict[str, int]:
+        """目標の進捗 (期間内に完了したチャージの送金額の合計)。
+
+        付与額ではなく**送金された額**を数える。チャージ率を変えても
+        目標の意味が変わらないようにするため。返金された取引は除く。
+        """
+        end = int(goal["ends_at"]) if goal["ends_at"] else utils.now_ts() + 1
+        row = await self.fetchone(
+            "SELECT COALESCE(SUM(received_amount),0) AS total, "
+            "COUNT(*) AS count, COUNT(DISTINCT user_id) AS users "
+            "FROM charge_transactions WHERE guild_id=? AND status=? "
+            "AND refunded_at IS NULL AND created_at>=? AND created_at<?",
+            (int(goal["guild_id"]), config.TxStatus.COMPLETED,
+             int(goal["starts_at"]), end),
+        )
+        if row is None:
+            return {"total": 0, "count": 0, "users": 0}
+        return {
+            "total": int(row["total"] or 0),
+            "count": int(row["count"] or 0),
+            "users": int(row["users"] or 0),
+        }
+
+    async def list_goal_participants(
+        self, goal: sqlite3.Row, *, limit: int = 500
+    ) -> list[sqlite3.Row]:
+        """期間内にチャージした利用者 (報酬の配布対象)。
+
+        凍結された利用者は除く。返金された取引は数えない。
+        """
+        end = int(goal["ends_at"]) if goal["ends_at"] else utils.now_ts() + 1
+        return await self.fetchall(
+            "SELECT t.user_id AS user_id, SUM(t.received_amount) AS amount, "
+            "COUNT(*) AS count FROM charge_transactions t "
+            "LEFT JOIN users u ON u.guild_id=t.guild_id AND u.user_id=t.user_id "
+            "WHERE t.guild_id=? AND t.status=? AND t.refunded_at IS NULL "
+            "AND t.created_at>=? AND t.created_at<? AND COALESCE(u.frozen,0)=0 "
+            "GROUP BY t.user_id HAVING amount > 0 "
+            "ORDER BY amount DESC, t.user_id ASC LIMIT ?",
+            (int(goal["guild_id"]), config.TxStatus.COMPLETED,
+             int(goal["starts_at"]), end, limit),
+        )
+
+    async def mark_goal_achieved(self, goal_id: int, *, total: int) -> bool:
+        """目標を達成済みにする (OPEN からのみ。二重達成を防ぐ)。"""
+        now = utils.now_ts()
+        changed = await self.execute(
+            "UPDATE charge_goals SET status=?, achieved_at=?, achieved_total=?, "
+            "updated_at=? WHERE id=? AND status=?",
+            (config.GoalStatus.ACHIEVED, now, total, now, goal_id,
+             config.GoalStatus.OPEN),
+        )
+        return changed > 0
+
+    async def close_goal(
+        self, goal_id: int, *, status: str, total: int | None = None
+    ) -> bool:
+        """目標を終了する (未達で締める / 中止する)。"""
+        now = utils.now_ts()
+        changed = await self.execute(
+            "UPDATE charge_goals SET status=?, closed_at=?, achieved_total=COALESCE(?, "
+            "achieved_total), updated_at=? WHERE id=? AND status=?",
+            (status, now, total, now, goal_id, config.GoalStatus.OPEN),
+        )
+        return changed > 0
+
+    async def record_goal_grant(
+        self, *, goal_id: int, guild_id: int, user_id: int, amount: int,
+        role_id: int | None = None,
+    ) -> bool:
+        """報酬を配ったことを記録する。
+
+        UNIQUE(goal_id, user_id) があるため、同じ人へ2回配ろうとすると
+        False を返す。残高の加算より**先に**呼ぶことで二重配布を防ぐ。
+        """
+        def _fn(conn: sqlite3.Connection) -> bool:
+            try:
+                conn.execute(
+                    "INSERT INTO goal_reward_grants(goal_id, guild_id, user_id, amount, "
+                    "role_id, created_at) VALUES(?,?,?,?,?,?)",
+                    (goal_id, guild_id, user_id, amount, role_id, utils.now_ts()),
+                )
+            except sqlite3.IntegrityError:
+                return False
+            return True
+
+        return await self.run(_fn, write=True)
+
+    async def list_goal_grants(self, goal_id: int) -> list[sqlite3.Row]:
+        return await self.fetchall(
+            "SELECT * FROM goal_reward_grants WHERE goal_id=? ORDER BY id ASC", (goal_id,)
+        )
+
+    async def count_goal_grants(self, goal_id: int) -> tuple[int, int]:
+        """(配布した人数, 配布した合計額)。"""
+        row = await self.fetchone(
+            "SELECT COUNT(*) AS c, COALESCE(SUM(amount),0) AS total "
+            "FROM goal_reward_grants WHERE goal_id=?",
+            (goal_id,),
+        )
+        return (int(row["c"]), int(row["total"])) if row else (0, 0)
 
     # ==================================================================
     # 招待キャンペーン

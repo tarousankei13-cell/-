@@ -667,6 +667,8 @@ class ErrorCode:
     BID_TOO_LOW = "BID_TOO_LOW"
     ALREADY_HIGHEST = "ALREADY_HIGHEST"
     AUCTION_LIMIT_REACHED = "AUCTION_LIMIT_REACHED"
+    GOAL_ALREADY_OPEN = "GOAL_ALREADY_OPEN"
+    GOAL_NOT_FOUND = "GOAL_NOT_FOUND"
     REFUND_NOT_ELIGIBLE = "REFUND_NOT_ELIGIBLE"
     REFUND_ALREADY_REQUESTED = "REFUND_ALREADY_REQUESTED"
     ITEM_INPUT_INVALID = "ITEM_INPUT_INVALID"
@@ -735,6 +737,8 @@ USER_ERROR_MESSAGES: Final[dict[str, str]] = {
     ErrorCode.REFUND_NOT_ELIGIBLE: "この取引は返金を申請できません。",
     ErrorCode.REFUND_ALREADY_REQUESTED: "この取引はすでに返金を申請しています。",
     ErrorCode.AUCTION_LIMIT_REACHED: "同時に開催できるオークションの数を超えています。",
+    ErrorCode.GOAL_ALREADY_OPEN: "すでに集計中のチャージ目標があります。",
+    ErrorCode.GOAL_NOT_FOUND: "対象のチャージ目標が見つかりません。",
     ErrorCode.ITEM_INPUT_INVALID: "入力内容が正しくありません。",
     ErrorCode.ITEM_SETUP_FAILED: "商品の用意に失敗しました。代金は自動で返金されています。",
     ErrorCode.SUBSCRIPTION_NOT_FOUND: "継続中の対象が見つかりません。",
@@ -799,6 +803,9 @@ USER_ERROR_NEXT_ACTIONS: Final[dict[str, str]] = {
     ErrorCode.REFUND_NOT_ELIGIBLE: "完了したチャージのうち、まだ取消されていないものだけが対象です。期限を過ぎた取引は管理者へご相談ください。",
     ErrorCode.REFUND_ALREADY_REQUESTED: "`/refund list` で申請の状態を確認してください。",
     ErrorCode.AUCTION_LIMIT_REACHED: "開催中のオークションが終わってから追加してください。",
+    ErrorCode.GOAL_ALREADY_OPEN: "`/goal list` で確認し、"
+                                 "先に `/goal close` か `/goal cancel` で終了してください。",
+    ErrorCode.GOAL_NOT_FOUND: "`/goal list` で目標IDを確認してください。",
     ErrorCode.ITEM_INPUT_INVALID: "入力欄の説明にある形式で、もう一度入力してください。",
     ErrorCode.ITEM_SETUP_FAILED: "残高が戻っているか確認し、時間をおいてもう一度お試しください。"
                                  "続く場合は管理者へご連絡ください。",

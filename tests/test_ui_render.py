@@ -358,6 +358,60 @@ def main() -> None:
         for i in range(20)
     ], guild_name="サーバー" * 30))
 
+    print("\n=== 6d. チャージ目標 ===")
+    verify("goal_panel_embed (目標なし)", ui.goal_panel_embed(None, None))
+    goal_open = Row(
+        id=1, guild_id=1, name="みんなで10万円" * 20, target_amount=100_000,
+        reward_amount=500, reward_role_id=888, status=config.GoalStatus.OPEN,
+        starts_at=now - 86400, ends_at=now + 6 * 86400, achieved_at=None,
+        achieved_total=None, closed_at=None,
+    )
+    open_progress = {"total": 45_000, "count": 12, "users": 7}
+    verify("goal_panel_embed (集計中)", ui.goal_panel_embed(goal_open, open_progress))
+    panel = ui.goal_panel_embed(goal_open, open_progress)
+    text = "".join(f.name + f.value for f in panel.fields)
+    check("45.0%" in text and "あと" in text, "進捗率と残額が出る")
+    check("█" in text and "░" in text, "進捗バーが描かれる")
+    check("全員" in text, "達成すると全員が報酬を受け取れると説明する")
+    # 未達では満タンに見せない
+    almost = ui.goal_panel_embed(goal_open, {"total": 99_999, "count": 1, "users": 1})
+    almost_text = "".join(f.value for f in almost.fields)
+    check("░" in almost_text, "未達のバーは満タンにならない")
+    zero = ui.goal_panel_embed(goal_open, {"total": 0, "count": 0, "users": 0})
+    verify("goal_panel_embed (進捗ゼロ)", zero)
+    forever_goal = Row(**{**goal_open, "ends_at": None, "reward_amount": 0})
+    verify("goal_panel_embed (期限なし・ロールのみ)",
+           ui.goal_panel_embed(forever_goal, open_progress))
+    achieved_goal = Row(**{**goal_open, "status": config.GoalStatus.ACHIEVED,
+                          "achieved_at": now, "achieved_total": 101_000})
+    verify("goal_panel_embed (達成)",
+           ui.goal_panel_embed(achieved_goal, {"total": 101_000, "count": 20, "users": 9}))
+    verify("goal_progress_embed (参加あり)", ui.goal_progress_embed(
+        goal_open, open_progress, contribution=8_000))
+    no_part = ui.goal_progress_embed(goal_open, open_progress, contribution=0)
+    verify("goal_progress_embed (参加なし)", no_part)
+    check("まだチャージがありません" in "".join(f.value for f in no_part.fields),
+          "未参加の人にはその旨を伝える")
+    verify("goal_reward_dm_embed", ui.goal_reward_dm_embed(
+        goal_name="みんなで10万円", guild_name="サーバー" * 20, reward_amount=500,
+        role_id=888, total=101_000, target=100_000, contribution=8_000))
+    verify("goal_reward_dm_embed (ロールのみ)", ui.goal_reward_dm_embed(
+        goal_name="みんなで10万円", guild_name="サーバー", reward_amount=0,
+        role_id=888, total=101_000, target=100_000, contribution=8_000))
+    verify("goal_reward_dm_embed (残高のみ)", ui.goal_reward_dm_embed(
+        goal_name="みんなで10万円", guild_name="サーバー", reward_amount=500,
+        role_id=None, total=101_000, target=100_000, contribution=0))
+    verify("goal_achieved_embed", ui.goal_achieved_embed(
+        achieved_goal, granted=9, guild_name="サーバー" * 20))
+    verify("goal_list_embed (空)", ui.goal_list_embed([], guild_name="サーバー"))
+    verify("goal_list_embed", ui.goal_list_embed([
+        Row(**{**goal_open, "id": i,
+               "status": list(config.GOAL_STATUS_LABELS)[i % 4],
+               "achieved_total": 50_000 if i % 4 else None,
+               "ends_at": None if i % 3 == 0 else now + 86400})
+        for i in range(1, 13)
+    ], guild_name="サーバー" * 30))
+
     print("\n=== 6c. オークション ===")
     auction_open = Row(
         id=1, name="レア称号" * 20, description="説明" * 60, role_id=777,

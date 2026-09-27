@@ -807,6 +807,15 @@ async def main() -> None:
             ))
             print(" FAIL  検証: ショップ購入が成立していない")
 
+    # --- チャージ目標: パネルのボタンで進捗を見る ---
+    goal_panel_view = ui.GoalPanelView()
+    goal_button = next(
+        c for c in goal_panel_view.children if isinstance(c, discord.ui.Button)
+    )
+    goal_interaction = fresh(target)
+    await run_ui("目標パネル: 最新の進捗", goal_button.callback(goal_interaction),
+                 goal_interaction)
+
     # --- オークション: パネルのボタンから入札する ---
     prize_role = StubRole(620_777, "オークション景品", position=4)
     guild.roles[prize_role.id] = prize_role

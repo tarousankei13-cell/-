@@ -225,6 +225,7 @@ class ChargeBot(commands.Bot):
         self.add_view(ui.AdminPanelView())
         self.add_view(ui.ReviewCardView())
         self.add_view(ui.AuctionView())
+        self.add_view(ui.GoalPanelView())
         charge_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_CHARGE)
         shop_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_SHOP)
         invite_panels = await self.db.list_panels(panel_type=config.PANEL_TYPE_INVITE)
@@ -1519,6 +1520,39 @@ class ChargeBot(commands.Bot):
             ephemeral=True,
         )
         await self.charge.refresh_shop_panels(interaction.guild.id)
+
+    # ------------------------------------------------------------------
+    # チャージ目標の操作ハンドラ
+    # ------------------------------------------------------------------
+    async def on_goal_refresh_button(self, interaction: discord.Interaction) -> None:
+        """🔄 最新の進捗 → その時点の集計を返す (自分の参加額つき)。"""
+        if await self._guard_user_action(interaction) is None:
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = self._require_guild(interaction)
+        goal = await self.db.get_open_goal(guild.id)
+        if goal is None:
+            await interaction.followup.send(
+                embed=ui.goal_panel_embed(None, None), ephemeral=True
+            )
+            return
+        progress = await self.db.goal_progress(goal)
+        participants = await self.db.list_goal_participants(goal)
+        contribution = next(
+            (int(r["amount"]) for r in participants
+             if int(r["user_id"]) == interaction.user.id),
+            0,
+        )
+        await interaction.followup.send(
+            embed=ui.goal_progress_embed(goal, progress, contribution=contribution),
+            ephemeral=True,
+        )
+        # 押された機会に合わせてパネル自体も最新化する
+        # (失敗しても利用者への応答は済んでいるので、ログだけ残して続ける)
+        try:
+            await self.charge.refresh_goal_panels(guild.id)
+        except Exception:  # noqa: BLE001
+            logger.exception("目標パネルの更新に失敗しました guild=%s", guild.id)
 
     # ------------------------------------------------------------------
     # オークション操作ハンドラ
