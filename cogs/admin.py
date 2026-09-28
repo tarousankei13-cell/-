@@ -20,8 +20,10 @@ from models import (
 )
 from views import (
     PanelView,
+    _receipt_file,
     build_order_result_embed,
     build_panel_embed,
+    make_receipt_bytes,
     post_achievement,
     send_admin_log,
 )
@@ -416,7 +418,12 @@ class AdminCog(commands.Cog):
                     store_name=order.get("store_name", ""),
                     user_amount=order["user_amount"],
                 )
-                await user.send(embed=embed)
+                img = await make_receipt_bytes(receipt_number)
+                if img:
+                    embed.set_image(url="attachment://order.png")
+                    await user.send(embed=embed, file=_receipt_file(img))
+                else:
+                    await user.send(embed=embed)
             except Exception:
                 pass
         await send_admin_log(

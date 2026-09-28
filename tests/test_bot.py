@@ -358,6 +358,29 @@ class TestHexDecoder(unittest.TestCase):
         self.assertEqual(result.store_id, "12")
 
 
+class TestImageGen(unittest.TestCase):
+    def test_available(self):
+        import image_gen
+        self.assertTrue(image_gen.is_available())
+
+    def test_render_produces_png(self):
+        import image_gen
+        data = image_gen.render_order_complete_sync("7161")
+        self.assertTrue(data.startswith(b"\x89PNG"))
+        self.assertGreater(len(data), 1000)
+
+    def test_render_various_lengths(self):
+        import image_gen
+        for n in ["1", "842", "7161", "12345"]:
+            data = image_gen.render_order_complete_sync(n)
+            self.assertTrue(data.startswith(b"\x89PNG"))
+
+    def test_render_empty_fallback(self):
+        import image_gen
+        data = image_gen.render_order_complete_sync("")
+        self.assertTrue(data.startswith(b"\x89PNG"))
+
+
 class TestRaceConditions(AsyncTestCase):
     def setUp(self):
         super().setUp()

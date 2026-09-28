@@ -12,6 +12,7 @@ Discord上でMcDonald'sモバイルオーダーの代行注文を管理するBot
 - 実績投稿チャンネル
 - 管理者ログチャンネル
 - メンテナンスモード
+- 注文完了画像の自動生成（実際の注文番号を差し込んだ完了画面を投稿）
 
 ## セットアップ
 
@@ -106,6 +107,9 @@ python -m pytest tests/ -v
 ├── db.py             # データベース層
 ├── views.py          # Discord UIコンポーネント
 ├── mcd_adapter.py    # McDonald's API連携
+├── image_gen.py      # 注文完了画像の生成
+├── assets/
+│   └── order_complete_template.png  # 完了画面テンプレート
 ├── cogs/
 │   └── admin.py      # 管理者コマンド
 ├── tests/

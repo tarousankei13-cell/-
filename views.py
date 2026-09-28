@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import re
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import discord
 
+import image_gen
 from models import (
     DecodedOrderInfo,
     EmbedColor,
@@ -367,6 +369,21 @@ async def send_admin_log(
         logger.error("Failed to send admin log: %s", exc)
 
 
+async def make_receipt_bytes(number: str) -> bytes | None:
+    """注文番号を差し込んだ完了画像のバイト列を返す（生成不可なら None）。"""
+    if not number or not image_gen.is_available():
+        return None
+    try:
+        return await image_gen.render_order_complete(number)
+    except Exception as exc:
+        logger.error("Failed to render receipt image: %s", exc)
+        return None
+
+
+def _receipt_file(data: bytes) -> discord.File:
+    return discord.File(io.BytesIO(data), filename="order.png")
+
+
 async def post_achievement(bot: discord.Client, order: dict) -> bool:
     db: "Database" = bot.db  # type: ignore[attr-defined]
     if order.get("achievement_posted"):
@@ -379,7 +396,12 @@ async def post_achievement(bot: discord.Client, order: dict) -> bool:
         if channel is None:
             channel = await bot.fetch_channel(int(channel_id))
         embed = await build_achievement_embed(db, order)
-        await channel.send(embed=embed)  # type: ignore[union-attr]
+        img = await make_receipt_bytes(order.get("receipt_number", ""))
+        if img:
+            embed.set_image(url="attachment://order.png")
+            await channel.send(embed=embed, file=_receipt_file(img))  # type: ignore[union-attr]
+        else:
+            await channel.send(embed=embed)  # type: ignore[union-attr]
         await db.set_achievement_posted(order["id"])
         return True
     except Exception as exc:
@@ -734,7 +756,14 @@ class OrderConfirmView(discord.ui.View):
                     store_name=s_name,
                     user_amount=self.user_amount,
                 )
-                await interaction.edit_original_response(embed=embed)
+                img = await make_receipt_bytes(receipt)
+                if img:
+                    embed.set_image(url="attachment://order.png")
+                    await interaction.edit_original_response(
+                        embed=embed, attachments=[_receipt_file(img)]
+                    )
+                else:
+                    await interaction.edit_original_response(embed=embed)
 
                 order = await db.get_order(order_id)
                 if order:
