@@ -1,13 +1,15 @@
-import os
 import sys
 import logging
 from pathlib import Path
 
 import discord
 from discord.ext import commands
-from dotenv import load_dotenv
 
-load_dotenv()
+# ── ここにトークンとオーナーIDを直接記入 ──
+DISCORD_TOKEN = "ここにBotトークンを貼り付け"
+OWNER_IDS = {1324938326741876758}  # 管理者のDiscordユーザーID（複数可）
+# ── MCD連携用（任意：不要なら空文字のまま） ──
+MCD_REFRESH_TOKEN = ""
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,21 +21,15 @@ logger = logging.getLogger("bot")
 COGS_DIR = Path(__file__).parent / "cogs"
 
 
-def parse_owner_ids() -> set[int]:
-    raw = os.getenv("OWNER_IDS", "")
-    return {int(uid.strip()) for uid in raw.split(",") if uid.strip().isdigit()}
-
-
 class Bot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
 
-        owner_ids = parse_owner_ids()
         super().__init__(
             command_prefix="!",
             intents=intents,
-            owner_ids=owner_ids or None,
+            owner_ids=OWNER_IDS,
         )
         self.db = None  # type: ignore[assignment]
         self.mcd = None  # type: ignore[assignment]
@@ -47,7 +43,7 @@ class Bot(commands.Bot):
         await self.db.initialize()
 
         self.mcd = MCDAdapter()
-        await self.mcd.initialize()
+        await self.mcd.initialize(refresh_token=MCD_REFRESH_TOKEN)
 
         self.add_view(PanelView())
         self.add_dynamic_items(DepositApproveButton, DepositRejectButton)
@@ -95,13 +91,12 @@ class Bot(commands.Bot):
 
 
 def main() -> None:
-    token = os.getenv("DISCORD_TOKEN")
-    if not token:
-        logger.critical("DISCORD_TOKEN is not set. Check your .env file.")
+    if DISCORD_TOKEN == "ここにBotトークンを貼り付け" or not DISCORD_TOKEN:
+        logger.critical("DISCORD_TOKEN が設定されていません。main.py を編集してください。")
         sys.exit(1)
 
     bot = Bot()
-    bot.run(token, log_handler=None)
+    bot.run(DISCORD_TOKEN, log_handler=None)
 
 
 if __name__ == "__main__":

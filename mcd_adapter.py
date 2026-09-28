@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from typing import Optional
 
 import requests
@@ -185,8 +184,8 @@ class MCDAdapter:
         self._mcd: object | None = None
         self._lock = asyncio.Lock()
 
-    async def initialize(self) -> None:
-        refresh_token = os.getenv("MCD_REFRESH_TOKEN", "").strip()
+    async def initialize(self, refresh_token: str = "") -> None:
+        refresh_token = refresh_token.strip()
         if not refresh_token:
             logger.info("MCD adapter: no credentials configured")
             return
