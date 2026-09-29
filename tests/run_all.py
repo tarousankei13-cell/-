@@ -14,6 +14,7 @@ TESTS = [
     ("チャージ処理", "test_charge.py"),
     ("注文Saga（端から端まで）", "test_order_e2e.py"),
     ("代理実績の同一性", "test_achievement.py"),
+    ("安全性（認証情報・権限）", "test_security.py"),
 ]
 
 results = []
