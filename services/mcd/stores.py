@@ -64,20 +64,37 @@ async def resolve_store(
     if not store_id.isdigit():
         raise McdError("店舗IDは数字で指定してください")
 
-    if not force:
+    cached: StoreInfo | None = None
+    etag = None
+    async with session_scope() as s:
+        row = await s.get(StoreCache, store_id)
+        if row and row.cat_root_url:
+            row.hit_count += 1
+            etag = row.store_etag
+            cached = StoreInfo(
+                store_id=store_id, group=row.group_name, name=row.store_name or "",
+                address=row.address or "",
+                latitude=float(row.latitude or 0), longitude=float(row.longitude or 0),
+                cat_root_url=row.cat_root_url, ord_root_url=row.ord_root_url or "",
+                delivery_methods=json.loads(row.delivery_methods or "{}"),
+            )
+            age = _age_minutes(row.resolved_at)
+            # 営業時間や提供時間帯は日ごとに変わるので、一定時間で取り直す。
+            # ETag のおかげで、変更が無ければ通信量はゼロで済む。
+            from core import settings as _settings
+            ttl = int(_settings.get("store_refresh_minutes", config.STORE_REFRESH_MINUTES))
+            if not force and age is not None and age < ttl:
+                return cached
+
+    raw, group, new_etag = await client.fetch_store(store_id, etag=etag if not force else None)
+    if raw is None and cached is not None:
+        # 変更なし。確認した時刻だけ更新しておく。
         async with session_scope() as s:
             row = await s.get(StoreCache, store_id)
-            if row and row.cat_root_url:
-                row.hit_count += 1
-                return StoreInfo(
-                    store_id=store_id, group=row.group_name, name=row.store_name or "",
-                    address=row.address or "",
-                    latitude=float(row.latitude or 0), longitude=float(row.longitude or 0),
-                    cat_root_url=row.cat_root_url, ord_root_url=row.ord_root_url or "",
-                    delivery_methods=json.loads(row.delivery_methods or "{}"),
-                )
+            if row:
+                row.resolved_at = utcnow()
+        return cached
 
-    raw, group = await client.fetch_store(store_id)
     store = raw.get("store") or {}
     api = store.get("api") or {}
     info = StoreInfo(
@@ -106,6 +123,7 @@ async def resolve_store(
         row.ord_root_url = info.ord_root_url
         row.delivery_methods = json.dumps(info.delivery_methods, ensure_ascii=False)
         row.resolved_at = utcnow()
+        row.store_etag = new_etag or None
 
         # 時間帯も保存する
         await s.execute(delete(StoreDaypart).where(StoreDaypart.store_id == store_id))
@@ -127,33 +145,58 @@ async def resolve_store(
 #  メニュー
 # ============================================================
 
+def _age_minutes(when: datetime | None) -> float | None:
+    """その時刻から何分経ったか。"""
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - when).total_seconds() / 60.0
+
+
 async def menu_age_minutes(store_id: str) -> float | None:
     async with session_scope() as s:
-        row = (
+        row = await s.get(StoreCache, store_id)
+        if row is not None and row.menu_synced_at is not None:
+            return _age_minutes(row.menu_synced_at)
+        first = (
             await s.execute(
                 select(MenuProduct.synced_at).where(MenuProduct.store_id == store_id).limit(1)
             )
         ).scalar_one_or_none()
-    if row is None:
-        return None
-    if row.tzinfo is None:
-        row = row.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - row).total_seconds() / 60.0
+    return _age_minutes(first)
 
 
 async def sync_menu(
-    client: McdClient, store_id: str, *, store: StoreInfo | None = None
+    client: McdClient, store_id: str, *, store: StoreInfo | None = None,
+    force: bool = False,
 ) -> MenuDiff:
     """
     メニューを取得してDBへ保存し、前回との差分を返す。
 
-    新商品・終売・値上げはここで検出される。
+    新商品・終売・値上げ・提供時間帯の変更はここで取り込まれる。
+
+    前回のETagを送るので、内容が変わっていなければサーバーは 304 を返し、
+    約1MBのダウンロードが発生しない。そのため高頻度で呼んでも負荷が小さい。
     """
     info = store or await resolve_store(client, store_id)
     if not info.cat_root_url:
         raise McdError(f"店舗 {store_id} のカタログURLが不明です")
 
-    raw = await client.fetch_menu(store_id, info.cat_root_url)
+    async with session_scope() as s:
+        row = await s.get(StoreCache, store_id)
+        etag = None if force else (row.menu_etag if row else None)
+
+    raw, new_etag = await client.fetch_menu(store_id, info.cat_root_url, etag=etag)
+    if raw is None:
+        # 変更なし。確認した時刻だけ更新する。
+        async with session_scope() as s:
+            row = await s.get(StoreCache, store_id)
+            if row:
+                row.menu_synced_at = utcnow()
+        log.debug("メニューに変更はありませんでした: %s", store_id)
+        return MenuDiff()
+
     parsed = parse_menu(store_id, raw)
 
     async with session_scope() as s:
@@ -190,6 +233,10 @@ async def sync_menu(
                     sort_order=c.sort_order,
                 )
             )
+        row = await s.get(StoreCache, store_id)
+        if row:
+            row.menu_etag = new_etag or None
+            row.menu_synced_at = now
 
     log.info(
         "メニューを同期しました: %s 商品%d件（新規%d / 終売%d / 価格変更%d）",

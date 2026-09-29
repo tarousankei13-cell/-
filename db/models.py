@@ -199,6 +199,10 @@ class StoreCache(Base):
     delivery_methods: Mapped[str | None] = mapped_column(Text)
     resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     hit_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # ETag を覚えておき、変更が無ければ 304 で済ませる（高頻度同期のため）
+    store_etag: Mapped[str | None] = mapped_column(String(128))
+    menu_etag: Mapped[str | None] = mapped_column(String(128))
+    menu_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 # ============================================================

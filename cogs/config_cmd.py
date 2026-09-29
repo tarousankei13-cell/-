@@ -79,9 +79,10 @@ class ConfigCog(commands.Cog):
         e.add_field(
             name="その他",
             value=(
+                f"注文方式　　　{embeds.ORDER_MODE_LABEL.get(v.get('order_mode', 'both'), '?')}\n"
                 f"メンテナンス　{'ON' if v.get('maintenance') else 'OFF'}\n"
                 f"感想ゲート　　{'ON' if v.get('feedback_gate') else 'OFF'}\n"
-                f"メニュー同期　{int(v.get('menu_sync_interval_hours', 6))} 時間ごと\n"
+                f"メニュー同期　{int(v.get('menu_sync_interval_minutes', 15))} 分ごと\n"
                 f"差分通知　　　{'ON' if v.get('menu_notify_diff') else 'OFF'}"
             ),
             inline=False,
@@ -259,6 +260,37 @@ class ConfigCog(commands.Cog):
             ephemeral=True,
         )
 
+    @group.command(name="order_mode", description="注文の方式を切り替えます")
+    @app_commands.describe(mode="利用者が使える注文方法")
+    @app_commands.choices(
+        mode=[
+            app_commands.Choice(name="両方（注文コード・メニュー）", value="both"),
+            app_commands.Choice(name="注文コード(HEX)のみ", value="hex"),
+            app_commands.Choice(name="メニューから選ぶ方式のみ", value="menu"),
+        ]
+    )
+    @admin_only()
+    async def order_mode(
+        self, interaction: discord.Interaction, mode: app_commands.Choice[str]
+    ) -> None:
+        await settings.set_value("order_mode", mode.value, updated_by=interaction.user.id)
+        detail = {
+            "both": "利用者は「注文コードを貼る」と「メニューから選ぶ」を選べます。",
+            "hex": "利用者は注文コード(HEX)を貼る方法だけで注文します。",
+            "menu": (
+                "利用者はメニューから選ぶ方法だけで注文します。\n"
+                "「注文コードを作る」ボタンはパネルから消えます。"
+            ),
+        }[mode.value]
+        await interaction.response.send_message(
+            embed=embeds.ok(
+                f"注文方式を **{mode.name}** にしました。\n{detail}\n\n"
+                f"{E.WARN} 設置済みのパネルに反映するには "
+                "`/panel refresh` を実行してください。"
+            ),
+            ephemeral=True,
+        )
+
     @group.command(name="maintenance", description="メンテナンスモードを切り替えます")
     @app_commands.describe(enabled="ONにすると注文を一時停止します")
     @admin_only()
@@ -287,15 +319,34 @@ class ConfigCog(commands.Cog):
             ephemeral=True,
         )
 
-    @menu_group.command(name="interval", description="メニュー自動同期の間隔を設定します")
-    @app_commands.describe(hours="何時間ごとに同期するか（1〜24）")
+    @menu_group.command(name="interval", description="商品・時間帯・店舗の同期間隔を設定します")
+    @app_commands.describe(minutes="何分ごとに同期するか（5〜1440）")
     @admin_only()
     async def menu_interval(
-        self, interaction: discord.Interaction, hours: app_commands.Range[int, 1, 24]
+        self, interaction: discord.Interaction, minutes: app_commands.Range[int, 5, 1440]
     ) -> None:
-        await settings.set_value("menu_sync_interval_hours", int(hours), updated_by=interaction.user.id)
+        await settings.set_value(
+            "menu_sync_interval_minutes", int(minutes), updated_by=interaction.user.id
+        )
         await interaction.response.send_message(
-            embed=embeds.ok(f"メニューの自動同期を **{hours}時間ごと** に設定しました。"),
+            embed=embeds.ok(
+                f"商品・提供時間帯・店舗情報の同期を **{minutes}分ごと** に設定しました。\n"
+                f"{E.INFO} 変更が無ければ通信は発生しないため、短くしても負荷はほとんど増えません。"
+            ),
+            ephemeral=True,
+        )
+
+    @menu_group.command(name="store_refresh", description="店舗情報を取り直す間隔を設定します")
+    @app_commands.describe(minutes="何分ごとに取り直すか（5〜1440）")
+    @admin_only()
+    async def store_refresh(
+        self, interaction: discord.Interaction, minutes: app_commands.Range[int, 5, 1440]
+    ) -> None:
+        await settings.set_value(
+            "store_refresh_minutes", int(minutes), updated_by=interaction.user.id
+        )
+        await interaction.response.send_message(
+            embed=embeds.ok(f"店舗情報の再取得を **{minutes}分ごと** に設定しました。"),
             ephemeral=True,
         )
 

@@ -60,9 +60,36 @@ async def init_db(database_url: str) -> AsyncEngine:
 
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        if _is_sqlite(database_url):
+            await _add_missing_columns(conn)
 
     log.info("データベースに接続しました (%s)", "SQLite" if _is_sqlite(database_url) else "PostgreSQL")
     return _engine
+
+
+async def _add_missing_columns(conn) -> None:
+    """
+    既存のDBに、あとから増えた列を足す。
+
+    本格的なマイグレーションは使っていないので、列の追加だけ面倒を見る。
+    （列の削除や型変更は扱わない）
+    """
+    for table in Base.metadata.sorted_tables:
+        rows = (await conn.exec_driver_sql(f"PRAGMA table_info({table.name})")).fetchall()
+        if not rows:
+            continue
+        existing = {r[1] for r in rows}
+        for col in table.columns:
+            if col.name in existing:
+                continue
+            try:
+                col_type = col.type.compile(conn.dialect)
+                await conn.exec_driver_sql(
+                    f"ALTER TABLE {table.name} ADD COLUMN {col.name} {col_type}"
+                )
+                log.info("列を追加しました: %s.%s", table.name, col.name)
+            except Exception as e:
+                log.warning("列 %s.%s を追加できませんでした: %s", table.name, col.name, e)
 
 
 def get_sessionmaker() -> async_sessionmaker[AsyncSession]:

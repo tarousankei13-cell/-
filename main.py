@@ -265,6 +265,13 @@ class McdBot(commands.Bot):
 
         await settings.load_all()
 
+        # 店名で検索できるよう、同梱の店舗一覧を読み込む
+        from services.mcd.store_index import load_index
+
+        count = load_index()
+        if count:
+            log.info("店名検索が使えます（%d 店舗）", count)
+
         await self._load_cogs()
         await self._register_persistent_views()
 

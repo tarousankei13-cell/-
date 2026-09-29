@@ -22,8 +22,13 @@ log = logging.getLogger("bot.tasks")
 #  メニューの自動同期
 # ============================================================
 
-async def sync_all_menus() -> dict[str, MenuDiff]:
-    """直近で使われた店舗のメニューを更新する。新商品はここで取り込まれる。"""
+async def sync_all_menus(force: bool = False) -> dict[str, MenuDiff]:
+    """
+    使われている店舗の商品・提供時間帯・店舗情報を最新にする。
+
+    force=True のときは ETag を無視して必ず取り直す
+    （提供時間帯は日付ごとの定義なので、日付が変わったら必要）。
+    """
     store_ids = await mcd_stores.active_store_ids()
     if not store_ids:
         return {}
@@ -34,9 +39,13 @@ async def sync_all_menus() -> dict[str, MenuDiff]:
         handle = await mcd_accounts.pick_account()
         for store_id in store_ids:
             try:
-                out[store_id] = await mcd_stores.sync_menu(handle.client, store_id)
+                # 店舗情報（営業時間・対応する受取方法）も一緒に最新にする
+                info = await mcd_stores.resolve_store(handle.client, store_id, force=force)
+                out[store_id] = await mcd_stores.sync_menu(
+                    handle.client, store_id, store=info, force=force
+                )
             except Exception:
-                log.exception("店舗 %s のメニュー同期に失敗しました", store_id)
+                log.exception("店舗 %s の同期に失敗しました", store_id)
     except Exception:
         log.exception("メニュー同期を開始できませんでした")
     finally:

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 
 import discord
@@ -31,30 +32,84 @@ def yen(v: int) -> str:
 #  常設パネル
 # ============================================================
 
-def order_panel() -> discord.Embed:
+ORDER_MODE_LABEL = {
+    "both": "注文コード・メニューどちらでも",
+    "hex": "注文コード(HEX)のみ",
+    "menu": "メニューから選ぶ方式のみ",
+}
+
+
+def order_panel(mode: str | None = None) -> discord.Embed:
+    """
+    注文パネル。
+
+    はじめて使う人でも迷わないよう、手順を番号付きで書く。
+    注文方式（mode）によって説明を切り替える。
+    """
+    mode = mode or settings.get("order_mode", "both")
+    rate = float(settings.get("subsidy_rate", 40.0))
+    user_rate = 100 - rate
+
     e = discord.Embed(
         title=f"{E.BURGER} マクドナルド注文",
         description=(
-            "下のボタンから操作してください。\n"
-            "操作の内容はあなたにしか表示されません。"
+            "**下のボタンを押すだけで注文できます。**\n"
+            f"{E.INFO} 押した先の画面は、あなたにしか見えません。"
         ),
         color=GREEN,
     )
+
+    # ── 手順 ──
+    if mode == "hex":
+        steps = (
+            "**1.** 💴 チャージパネルで残高を入れる\n"
+            "**2.** 🍔 下の「注文する」を押す\n"
+            "**3.** 📋 注文コード(HEX)を貼り付ける\n"
+            "**4.** 📍 受取方法を選んで確定\n"
+            "**5.** 🧾 DMに届く**注文番号**をお店で伝える"
+        )
+    elif mode == "menu":
+        steps = (
+            "**1.** 💴 チャージパネルで残高を入れる\n"
+            "**2.** 🍔 下の「注文する」を押す\n"
+            "**3.** 🏪 お店を選ぶ（**店名の一部**でさがせます）\n"
+            "**4.** 🍔 商品を選んでカートに入れる\n"
+            "**5.** 📍 受取方法を選んで確定\n"
+            "**6.** 🧾 DMに届く**注文番号**をお店で伝える"
+        )
+    else:
+        steps = (
+            "**1.** 💴 チャージパネルで残高を入れる\n"
+            "**2.** 🍔 下の「注文する」を押す\n"
+            "**3.** どちらかを選ぶ\n"
+            "　　📋 注文コードを貼る　／　🍔 メニューから選ぶ\n"
+            "**4.** 📍 受取方法を選んで確定\n"
+            "**5.** 🧾 DMに届く**注文番号**をお店で伝える"
+        )
+    e.add_field(name="📖 はじめての方へ", value=steps, inline=False)
+
+    # ── ボタンの説明 ──
+    buttons = [f"{E.BURGER} **注文する**\n　ご注文はここから始めます。"]
+    if mode != "menu":
+        buttons.append(
+            f"{E.RECEIPT} **注文コードを作る**\n"
+            "　コードを作るだけ。**お金はかかりません。**"
+        )
+    buttons.append(f"{E.HISTORY} **履歴**\n　これまでの注文と残高を確認します。")
+    e.add_field(name="💡 ボタンの説明", value="\n".join(buttons), inline=False)
+
+    # ── 割引 ──
     e.add_field(
-        name=f"{E.BURGER} 注文する",
-        value="注文コードを貼るか、メニューから選んで注文します。",
+        name="💴 いまの割引",
+        value=(
+            f"定価の **{user_rate:g}%** のお支払いで注文できます"
+            f"（**{rate:g}% OFF**）\n"
+            f"　例）定価 ¥590 → お支払い **¥{math.ceil(590 * user_rate / 100):,}**"
+        ),
         inline=False,
     )
-    e.add_field(
-        name=f"{E.RECEIPT} 注文コードを作る",
-        value="メニューから選んで注文コードだけを作ります。決済はしません。",
-        inline=False,
-    )
-    e.add_field(
-        name=f"{E.HISTORY} 履歴",
-        value="これまでの注文と残高の動きを確認します。",
-        inline=False,
-    )
+
+    e.set_footer(text="残高が足りないときは、チャージパネルからチャージしてください")
     return e
 
 

@@ -36,6 +36,12 @@ REFUND_ENABLED = False
 ORDER_MAX_AMOUNT = None    # 1注文あたりの上限（円）。None で無制限
 ORDER_DAILY_LIMIT = None   # 1人あたりの1日の注文回数。None で無制限
 
+# 注文方式
+#   "both" … 注文コード(HEX)とメニューの両方から注文できる
+#   "hex"  … 注文コードを貼る方法だけ
+#   "menu" … メニューから選ぶ方法だけ（注文コードは使わない）
+ORDER_MODE = "both"
+
 # 一時ビュー（カート・確認画面）の有効時間（秒）
 VIEW_TIMEOUT = 120
 
@@ -45,10 +51,16 @@ PREFETCH_TTL = 90
 # ------------------------------------------------------------
 #  メニュー同期
 # ------------------------------------------------------------
-MENU_SYNC_INTERVAL_HOURS = 6    # 定期同期の間隔
-MENU_STALE_MINUTES = 30         # 注文直前に再取得する古さのしきい値
-MENU_ACTIVE_STORE_DAYS = 30     # 「直近で使われた店舗」とみなす日数
-MENU_NOTIFY_DIFF = True         # 新商品・値上げを管理者へ通知するか
+# 商品・提供時間帯・店舗情報は、マクドナルド側で随時変わる。
+# ETag により「変更が無ければ通信量ゼロ」で確認できるため、高頻度で同期する。
+MENU_SYNC_INTERVAL_MINUTES = 15   # メニューの定期同期（分）
+STORE_REFRESH_MINUTES = 30        # 店舗情報・営業時間の再取得（分）
+MENU_STALE_MINUTES = 10           # 注文直前に取り直す古さのしきい値（分）
+MENU_ACTIVE_STORE_DAYS = 30       # 「直近で使われた店舗」とみなす日数
+MENU_NOTIFY_DIFF = True           # 新商品・値上げを管理者へ通知するか
+# 提供時間帯（limitedAbility / daypart）は日付ごとに定義されるため、
+# 日付が変わったら ETag を無視して必ず取り直す。
+MENU_FORCE_REFRESH_HOUR = 0
 
 # ------------------------------------------------------------
 #  アカウント

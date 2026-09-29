@@ -178,7 +178,23 @@ class MethodView(discord.ui.View):
 
 
 async def start_order(interaction: discord.Interaction) -> None:
+    """
+    注文の入口。
+
+    注文方式が片方に絞られている場合は、選ぶ画面を挟まずに直接そちらへ進む。
+    """
     await user_repo.get_or_create(interaction.user.id)
+    mode = settings.get("order_mode", "both")
+
+    if mode == "hex":
+        await interaction.response.send_modal(HexModal())
+        return
+    if mode == "menu":
+        from ui import menu_flows
+
+        await menu_flows.start_store_select(interaction, purpose="order")
+        return
+
     async with session_scope() as s:
         balance = await L.user_balance(s, interaction.user.id)
         q = await subsidy.resolve(s, interaction.user.id, role_ids(interaction), 1000)

@@ -39,11 +39,13 @@ class FakeClient:
     async def get_paid_order(self, group, token):
         self._maybe("paid")
         return OrderResponse(order_code="OC123", display_order_number="7161")
-    async def fetch_store(self, store_id, group=None):
+    async def fetch_store(self, store_id, group=None, etag=None):
         return {"store": {"name": "テスト店", "api": {
             "catRootUrl": "https://example.invalid",
             "ordRootUrl": "https://ord.group-f.prod.mop.mcd.qorcommerce.com"},
-            "deliveryMethod": {"takeOut": {"isSupported": True}}}}, "group-f"
+            "deliveryMethod": {"takeOut": {"isSupported": True}}}}, "group-f", "etag-1"
+    async def fetch_menu(self, store_id, cat_root_url, etag=None):
+        return None, etag or ""
     async def aclose(self): pass
     def _maybe(self, step):
         if self.fail_at == step: raise self.error

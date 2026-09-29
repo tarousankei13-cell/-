@@ -26,6 +26,7 @@ from core import users as user_repo
 from db.models import Cart, StoreCache, utcnow
 from db.session import session_scope
 from services.mcd import accounts as mcd_accounts
+from services.mcd import store_index
 from services.mcd import stores as mcd_stores
 from services.mcd.client import McdError
 from services.mcd.menu import ParsedMenu, Product, minutes_of
@@ -83,7 +84,23 @@ async def clear_cart(discord_id: int) -> None:
 #  店舗の選択
 # ============================================================
 
-class StoreModal(discord.ui.Modal, title="店舗を指定"):
+class StoreSearchModal(discord.ui.Modal, title="お店をさがす"):
+    query = discord.ui.TextInput(
+        label="店名の一部（店舗IDでも可）",
+        placeholder="例: 南砂　／　所沢　／　AKIBA　／　13934",
+        required=True, max_length=40,
+    )
+
+    def __init__(self, purpose: str) -> None:
+        super().__init__()
+        self.purpose = purpose
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await show_search_results(interaction, str(self.query.value), self.purpose)
+
+
+class StoreIdModal(discord.ui.Modal, title="店舗IDを入力"):
     store_id = discord.ui.TextInput(
         label="店舗ID（5桁の数字）",
         placeholder="例: 13934",
@@ -99,25 +116,85 @@ class StoreModal(discord.ui.Modal, title="店舗を指定"):
         await open_menu(interaction, str(self.store_id.value).strip(), self.purpose)
 
 
-class StoreSelectView(discord.ui.View):
-    def __init__(self, owner_id: int, purpose: str, recent: list[tuple[str, str]]) -> None:
+async def show_search_results(
+    interaction: discord.Interaction, query: str, purpose: str
+) -> None:
+    """検索結果を選択肢として出す。"""
+    hits = store_index.search(query, limit=25)
+
+    # インデックスに無くても、過去に使った店舗からは探せるようにする
+    if not hits:
+        norm = store_index.normalize(query)
+        async with session_scope() as s:
+            rows = (await s.execute(select(StoreCache))).scalars().all()
+        hits = [
+            store_index.StoreEntry(
+                store_id=r.store_id, name=r.store_name or "", address=r.address or "",
+                group=r.group_name,
+            )
+            for r in rows
+            if norm and (
+                norm in store_index.normalize(r.store_name or "")
+                or norm in store_index.normalize(r.address or "")
+                or norm in r.store_id
+            )
+        ][:25]
+
+    if not hits:
+        hint = (
+            "店名の一部（例:「南砂」「所沢」）や、店舗IDでもお試しください。"
+            if store_index.available()
+            else "店舗IDを直接入力してください。"
+        )
+        await interaction.followup.send(
+            embed=embeds.warn(
+                f"「{query}」に一致するお店が見つかりませんでした。\n{hint}"
+            ),
+            view=StoreSelectView(interaction.user.id, purpose, []),
+            ephemeral=True,
+        )
+        return
+
+    if len(hits) == 1:
+        await open_menu(interaction, hits[0].store_id, purpose)
+        return
+
+    view = SearchResultView(interaction.user.id, purpose, hits, query)
+    await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
+
+
+class SearchResultView(discord.ui.View):
+    def __init__(self, owner_id: int, purpose: str, hits: list, query: str) -> None:
         super().__init__(timeout=config.VIEW_TIMEOUT)
         self.owner_id = owner_id
         self.purpose = purpose
+        self.query = query
 
-        if recent:
-            options = [
-                discord.SelectOption(label=(name or code)[:100], value=code, description=f"店舗ID {code}")
-                for code, name in recent[:25]
-            ]
-            sel = discord.ui.Select(placeholder="最近使った店舗から選ぶ", options=options)
-            sel.callback = self._on_recent
-            self.add_item(sel)
-            self._recent_select = sel
+        options = [
+            discord.SelectOption(
+                label=e.name[:100] or e.store_id,
+                value=e.store_id,
+                description=(e.address or f"店舗ID {e.store_id}")[:100],
+            )
+            for e in hits[:25]
+        ]
+        sel = discord.ui.Select(placeholder="お店を選んでください", options=options, row=0)
+        sel.callback = self._on_pick
+        self.add_item(sel)
+        self._sel = sel
 
-        btn = discord.ui.Button(label="店舗IDを入力", emoji=E.STORE, style=discord.ButtonStyle.primary)
-        btn.callback = self._on_input
-        self.add_item(btn)
+        again = discord.ui.Button(
+            label="もう一度さがす", emoji="🔍", style=discord.ButtonStyle.secondary, row=1
+        )
+        again.callback = self._on_again
+        self.add_item(again)
+
+    def build_embed(self) -> discord.Embed:
+        return discord.Embed(
+            title=f"{E.STORE} 「{self.query}」の検索結果",
+            description=f"{len(self._sel.options)} 件見つかりました。お店を選んでください。",
+            color=embeds.GREEN,
+        )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
@@ -127,8 +204,59 @@ class StoreSelectView(discord.ui.View):
             return False
         return True
 
+    async def _on_again(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(StoreSearchModal(self.purpose))
+
+    async def _on_pick(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await open_menu(interaction, self._sel.values[0], self.purpose)
+
+
+class StoreSelectView(discord.ui.View):
+    def __init__(self, owner_id: int, purpose: str, recent: list[tuple[str, str]]) -> None:
+        super().__init__(timeout=config.VIEW_TIMEOUT)
+        self.owner_id = owner_id
+        self.purpose = purpose
+
+        search = discord.ui.Button(
+            label="店名でさがす", emoji="🔍", style=discord.ButtonStyle.primary, row=0
+        )
+        search.callback = self._on_search
+        self.add_item(search)
+
+        by_id = discord.ui.Button(
+            label="店舗IDで指定", emoji="🔢", style=discord.ButtonStyle.secondary, row=0
+        )
+        by_id.callback = self._on_input
+        self.add_item(by_id)
+
+        if recent:
+            options = [
+                discord.SelectOption(
+                    label=(name or code)[:100], value=code, description=f"店舗ID {code}"
+                )
+                for code, name in recent[:25]
+            ]
+            sel = discord.ui.Select(
+                placeholder="最近よく使われているお店から選ぶ", options=options, row=1
+            )
+            sel.callback = self._on_recent
+            self.add_item(sel)
+            self._recent_select = sel
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                embed=embeds.error("この操作は開いた本人のみ行えます。"), ephemeral=True
+            )
+            return False
+        return True
+
+    async def _on_search(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(StoreSearchModal(self.purpose))
+
     async def _on_input(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_modal(StoreModal(self.purpose))
+        await interaction.response.send_modal(StoreIdModal(self.purpose))
 
     async def _on_recent(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -145,15 +273,21 @@ async def start_store_select(interaction: discord.Interaction, purpose: str) -> 
         ).scalars().all()
         recent = [(r.store_id, r.store_name or "") for r in rows]
 
-    title = "注文する店舗を選んでください" if purpose == "order" else "注文コードを作る店舗を選んでください"
-    e = discord.Embed(
-        title=f"{E.STORE} {title}",
-        description=(
-            "店舗IDは、マクドナルド公式アプリや店頭のレシートで確認できます。\n"
-            "5桁の数字です。"
-        ),
-        color=embeds.GREEN,
-    )
+    title = "注文するお店を選んでください" if purpose == "order" else "注文コードを作るお店を選んでください"
+    if store_index.available():
+        desc = (
+            "**店名の一部**を入れるだけで探せます。\n"
+            "例）`南砂`　`所沢`　`AKIBA`　`イオン`\n\n"
+            f"{E.INFO} 店舗IDがわかっている場合は「店舗IDで指定」からどうぞ。"
+        )
+    else:
+        desc = (
+            "**店舗IDで指定**してください（5桁の数字）。\n"
+            "マクドナルド公式アプリや店頭のレシートで確認できます。\n\n"
+            f"{E.INFO} 一度使ったお店は、次回から店名でも探せます。"
+        )
+    e = discord.Embed(title=f"{E.STORE} {title}", description=desc, color=embeds.GREEN)
+
     view = StoreSelectView(interaction.user.id, purpose, recent)
     if interaction.response.is_done():
         await interaction.followup.send(embed=e, view=view, ephemeral=True)

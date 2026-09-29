@@ -34,6 +34,7 @@ class AdminCog(commands.Cog):
     stats_group = app_commands.Group(name="stats", description="統計（管理者用）")
     menu_group = app_commands.Group(name="menu", description="メニュー（管理者用）")
     debug_group = app_commands.Group(name="debug", description="調査用（管理者用）")
+    store_group = app_commands.Group(name="store", description="店舗一覧（管理者用）")
 
     # -- 統計 ---------------------------------------------------
 
@@ -326,6 +327,103 @@ class AdminCog(commands.Cog):
                 inline=False,
             )
         await interaction.followup.send(embed=e, ephemeral=True)
+
+    # -- 店舗一覧 -----------------------------------------------
+
+    @store_group.command(name="search", description="店名の検索を試します")
+    @app_commands.describe(query="店名の一部、または店舗ID")
+    @admin_only()
+    async def store_search(self, interaction: discord.Interaction, query: str) -> None:
+        from services.mcd import store_index
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        hits = store_index.search(query, limit=20)
+        if not hits:
+            await interaction.followup.send(
+                embed=embeds.warn(
+                    f"「{query}」に一致する店舗が見つかりませんでした。\n"
+                    f"（インデックス: {store_index.get_index().count} 店舗）"
+                ),
+                ephemeral=True,
+            )
+            return
+        lines = [f"`{e.store_id}` **{e.name}**　{e.address}" for e in hits]
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title=f"{E.STORE} 「{query}」の検索結果 {len(hits)} 件",
+                description="\n".join(lines)[:4000],
+                color=embeds.BLUE,
+            ).set_footer(text=f"インデックス: {store_index.get_index().count} 店舗"),
+            ephemeral=True,
+        )
+
+    @store_group.command(name="info", description="店舗一覧の状態を表示します")
+    @admin_only()
+    async def store_info(self, interaction: discord.Interaction) -> None:
+        from services.mcd import store_index
+
+        idx = store_index.get_index()
+        e = discord.Embed(title=f"{E.STORE} 店舗一覧", color=embeds.BLUE)
+        if idx.available:
+            e.description = f"**{idx.count}** 店舗を読み込み済みです。店名で検索できます。"
+        else:
+            e.color = embeds.ORANGE
+            e.description = (
+                "店舗一覧が読み込まれていません。\n"
+                "利用者は店舗IDでの指定のみになります。\n\n"
+                "`/store reindex` で作成できます（15〜30分かかります）。"
+            )
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+    @store_group.command(name="reindex", description="店舗一覧を作り直します（時間がかかります）")
+    @owner_only()
+    async def store_reindex(self, interaction: discord.Interaction) -> None:
+        from services.mcd import store_crawl, store_index
+
+        await interaction.response.send_message(
+            embed=embeds.info(
+                f"{E.LOADING} 店舗一覧を作り直しています…\n"
+                "**15〜30分**かかります。進み具合はこのメッセージに表示します。\n"
+                f"{E.INFO} 作業中もBOTは通常どおり使えます。"
+            ),
+            ephemeral=True,
+        )
+
+        last = {"pct": -1}
+
+        async def on_progress(done: int, total: int, found: int) -> None:
+            pct = done * 100 // total
+            if pct == last["pct"]:
+                return
+            last["pct"] = pct
+            try:
+                await interaction.edit_original_response(
+                    embed=embeds.info(
+                        f"{E.LOADING} 店舗一覧を作成中… **{pct}%**\n"
+                        f"　{done:,} / {total:,} 件を確認　**{found:,}** 店舗を発見"
+                    )
+                )
+            except discord.HTTPException:
+                pass
+
+        try:
+            stores = await store_crawl.crawl(progress=on_progress)
+            size = store_crawl.save_index(stores)
+            loaded = store_index.load_index()
+        except Exception as e:
+            log.exception("店舗一覧の作成に失敗しました")
+            await interaction.edit_original_response(
+                embed=embeds.error(f"店舗一覧の作成に失敗しました。\n```{e}```")
+            )
+            return
+
+        await interaction.edit_original_response(
+            embed=embeds.ok(
+                f"店舗一覧を作り直しました。\n"
+                f"**{loaded:,}** 店舗（{size / 1024:.0f} KB）\n"
+                f"{E.INFO} 利用者は店名の一部で検索できます。"
+            )
+        )
 
     # -- 調査 ---------------------------------------------------
 

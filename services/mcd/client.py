@@ -348,31 +348,49 @@ class McdClient:
 
     # -- 店舗・メニュー（認証不要） ---------------------------
 
-    async def fetch_store(self, store_id: str, group: str | None = None) -> tuple[dict, str]:
+    async def fetch_store(
+        self, store_id: str, group: str | None = None, etag: str | None = None
+    ) -> tuple[dict | None, str, str]:
         """
-        店舗情報を取得する。(データ, group) を返す。
+        店舗情報を取得する。(データ, group, ETag) を返す。
 
-        group がわかっていれば1回で済む。わからなければ順に試す。
+        前回のETagを渡すと、内容が変わっていなければデータは None で返る
+        （サーバーが 304 を返し、通信量がゼロで済む）。
         """
+        headers = {"If-None-Match": etag} if etag else {}
         for g in ([group] if group else GROUPS):
             url = f"{DATA_CAT.format(group=g)}/{store_id}.json"
             try:
-                r = await self._client.get(url)
+                r = await self._client.get(url, headers=headers)
             except httpx.HTTPError:
                 continue
+            if r.status_code == 304:
+                return None, g, etag or ""
             if r.status_code == 200:
-                return r.json(), g
+                return r.json(), g, r.headers.get("etag", "")
         raise McdError(f"店舗 {store_id} が見つかりません")
 
-    async def fetch_menu(self, store_id: str, cat_root_url: str) -> dict:
-        """メニューカタログ（約1MB）を取得する。"""
+    async def fetch_menu(
+        self, store_id: str, cat_root_url: str, etag: str | None = None
+    ) -> tuple[dict | None, str]:
+        """
+        メニューカタログ（約1MB）を取得する。(データ, ETag) を返す。
+
+        前回のETagを渡すと、変更が無ければ 304 が返りデータは None になる。
+        高頻度で同期しても通信量がほとんど増えないのはこのため。
+        """
+        headers = {"If-None-Match": etag} if etag else {}
         try:
-            r = await self._client.get(f"{cat_root_url}/{store_id}/menu.json", timeout=60.0)
+            r = await self._client.get(
+                f"{cat_root_url}/{store_id}/menu.json", headers=headers, timeout=60.0
+            )
         except httpx.HTTPError as e:
             raise McdNetworkError(f"メニューの取得に失敗しました: {e}") from e
+        if r.status_code == 304:
+            return None, etag or ""
         if r.status_code != 200:
             raise McdError(f"メニューを取得できませんでした (HTTP {r.status_code})")
-        return r.json()
+        return r.json(), r.headers.get("etag", "")
 
     # -- カード -----------------------------------------------
 

@@ -25,6 +25,7 @@ class TasksCog(commands.Cog):
         self.bot = bot
         self._last_month: int | None = None
         self._last_daily_reset_day: int | None = None
+        self._last_menu_force_date = None
         self._last_backup_day: int | None = None
         self._started = False
 
@@ -68,15 +69,31 @@ class TasksCog(commands.Cog):
 
     # -- メニュー同期 -------------------------------------------
 
-    @tasks.loop(hours=config.MENU_SYNC_INTERVAL_HOURS)
+    @tasks.loop(minutes=config.MENU_SYNC_INTERVAL_MINUTES)
     async def menu_sync(self) -> None:
+        """
+        商品・価格・提供時間帯を取り込む。
+
+        ETag を使うので、変更が無ければ 304 が返り通信量はゼロ。
+        そのため短い間隔で回しても負荷が小さい。
+        """
         if not self._started:
             return
-        interval = int(settings.get("menu_sync_interval_hours", config.MENU_SYNC_INTERVAL_HOURS))
-        if self.menu_sync.hours != interval:
-            self.menu_sync.change_interval(hours=interval)
+        interval = int(
+            settings.get("menu_sync_interval_minutes", config.MENU_SYNC_INTERVAL_MINUTES)
+        )
+        if self.menu_sync.minutes != interval:
+            self.menu_sync.change_interval(minutes=interval)
 
-        diffs = await jobs.sync_all_menus()
+        # 提供時間帯は日付ごとに定義されているため、日付が変わったら
+        # ETag を無視して必ず取り直す。
+        today = datetime.now(timezone.utc).date()
+        force = self._last_menu_force_date != today
+        if force:
+            self._last_menu_force_date = today
+            log.info("日付が変わったため、メニューを強制的に取り直します")
+
+        diffs = await jobs.sync_all_menus(force=force)
         if not settings.get("menu_notify_diff", True):
             return
 

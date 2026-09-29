@@ -64,9 +64,8 @@ class PanelCog(commands.Cog):
     @app_commands.describe(channel="設置するチャンネル")
     @admin_only()
     async def order(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
-        await self._deploy(
-            interaction, "order", channel, embeds.order_panel(), panels.OrderPanel()
-        )
+        embed, view = panels.build_order_panel()
+        await self._deploy(interaction, "order", channel, embed, view)
 
     @group.command(name="charge", description="チャージパネルを設置します")
     @app_commands.describe(channel="設置するチャンネル")
@@ -104,7 +103,7 @@ class PanelCog(commands.Cog):
 
         stats = await admin_flows.collect_stats()
         builders = {
-            "order": (embeds.order_panel(), panels.OrderPanel()),
+            "order": panels.build_order_panel(),
             "charge": (embeds.charge_panel(), panels.ChargePanel()),
             "admin": (embeds.admin_panel(stats), panels.AdminPanel()),
         }

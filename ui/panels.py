@@ -62,8 +62,23 @@ async def guard_user(interaction: discord.Interaction) -> bool:
 # ============================================================
 
 class OrderPanel(discord.ui.View):
-    def __init__(self) -> None:
+    """
+    注文パネル。
+
+    設置するときは現在の注文方式に合わせてボタンを出し分ける。
+    一方、起動時の復元（add_view）では**すべてのボタンを登録**しておく。
+    こうしておくと、設定を変えても既に貼ってあるパネルのボタンが死なない。
+    """
+
+    def __init__(self, mode: str | None = None) -> None:
         super().__init__(timeout=None)
+        if mode is None:
+            mode = "both"          # 復元時は全ボタンを登録する
+            show_hex_builder = True
+        else:
+            show_hex_builder = mode != "menu"
+        if not show_hex_builder:
+            self.remove_item(self.make_hex)
 
     @discord.ui.button(
         label="注文する", emoji=E.BURGER,
@@ -84,6 +99,15 @@ class OrderPanel(discord.ui.View):
         from ui import flows
 
         if not await guard_user(interaction):
+            return
+        if settings.get("order_mode", "both") == "menu":
+            await interaction.response.send_message(
+                embed=embeds.info(
+                    "このサーバーでは注文コードを使わない設定になっています。\n"
+                    f"{E.BURGER}「注文する」からメニューを選んでご注文ください。"
+                ),
+                ephemeral=True,
+            )
             return
         await flows.start_hex_builder(interaction)
 
@@ -200,6 +224,12 @@ class AdminPanel(discord.ui.View):
 
 # main.py の setup_hook が、ここに並んだビューを add_view() で復元する
 PERSISTENT_VIEWS = [OrderPanel, ChargePanel, AdminPanel]
+
+def build_order_panel() -> tuple[discord.Embed, discord.ui.View]:
+    """設置・貼り直し用。現在の注文方式を反映したパネルを作る。"""
+    mode = settings.get("order_mode", "both")
+    return embeds.order_panel(mode), OrderPanel(mode)
+
 
 PANEL_BUILDERS = {
     "order": (embeds.order_panel, OrderPanel),
