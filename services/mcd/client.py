@@ -21,6 +21,7 @@ import httpx
 
 from core.http import build_async_client
 from core.telemetry import current as correlation_id
+from services.mcd import errors as mcd_errors
 from services.mcd.protocol import (
     OrderResponse, build_authorise_body, build_get_paid_body,
     parse_order_response, pb_str, proto_parse, varint_encode,
@@ -52,7 +53,17 @@ class McdAuthError(McdError):
 
 
 class McdOrderError(McdError):
-    pass
+    """
+    注文まわりの失敗。
+
+    `info` に解析したエラーの内訳が入る（種類・符号・日本語の文言）。
+    呼び出し側は info.kind を見て、別アカウントで試すべきか、
+    利用者に選び直してもらうべきかを判断する。
+    """
+
+    def __init__(self, message: str, info=None) -> None:
+        super().__init__(message)
+        self.info = info
 
 
 class McdNetworkError(McdError):
@@ -439,9 +450,10 @@ class McdClient:
         )
         if r.status_code == 200 and r.content:
             return parse_order_response(r.content)
+        info = mcd_errors.parse(r.status_code, r.content)
         raise McdOrderError(
-            f"注文の登録に失敗しました (HTTP {r.status_code}): "
-            f"{r.content.decode('utf-8', 'replace')[:200]}"
+            f"注文の登録に失敗しました (HTTP {r.status_code}): {info.summary()}",
+            info,
         )
 
     async def authorise_order(self, group: str, order_token: str) -> OrderResponse:
@@ -458,9 +470,10 @@ class McdClient:
             retry_on_401=False,   # ★リトライ禁止
         )
         if r.status_code != 200 or not r.content:
+            info = mcd_errors.parse(r.status_code, r.content)
             raise McdOrderError(
-                f"支払いの確定に失敗しました (HTTP {r.status_code}): "
-                f"{r.content.decode('utf-8', 'replace')[:200]}"
+                f"支払いの確定に失敗しました (HTTP {r.status_code}): {info.summary()}",
+                info,
             )
         return parse_order_response(r.content)
 

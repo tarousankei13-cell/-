@@ -213,9 +213,14 @@ async def report_success(account_id: int) -> None:
             log.info("アカウント %s が復帰しました", acc.label)
 
 
-async def report_failure(account_id: int, error: str) -> str:
+async def report_failure(account_id: int, error: str, *, fatal: bool = False) -> str:
     """
     失敗を記録し、必要なら隔離する。
+
+    fatal=True は「このアカウントを使い続けても直らない」場合。
+    カードの残高不足・期限切れ・認証切れなどがこれにあたる。
+    回数を待たずにすぐ隔離する。待っていると、その間の注文が
+    全部同じ理由で失敗してしまうため。
 
     返り値は新しい状態。QUARANTINED になったら管理者へ通知すること。
     """
@@ -225,7 +230,10 @@ async def report_failure(account_id: int, error: str) -> str:
             return STATUS_BANNED
         acc.consecutive_failures += 1
         acc.last_error = error[:500]
-        if acc.consecutive_failures >= config.MCD_FAILURES_TO_QUARANTINE:
+        if fatal:
+            acc.status = STATUS_QUARANTINED
+            log.error("アカウント %s を隔離しました（回復が見込めない失敗）", acc.label)
+        elif acc.consecutive_failures >= config.MCD_FAILURES_TO_QUARANTINE:
             acc.status = STATUS_QUARANTINED
             log.error("アカウント %s を隔離しました（%d回連続失敗）",
                       acc.label, acc.consecutive_failures)

@@ -571,12 +571,13 @@ async def run_order(
         return
 
     if not result.succeeded:
+        # 解析できていれば、原因に応じた説明を出す。
+        # 生の応答をそのまま見せても利用者には分からないため。
         await interaction.edit_original_response(
-            embed=embeds.error(
-                f"注文できませんでした。\n```{result.error[:500]}```\n"
-                "残高は元に戻っています。"
-            )
+            embed=embeds.error(result.user_message, title=f"{E.NG} 注文できませんでした")
         )
+        # 管理者側にだけ、原因と対処を知らせる
+        await notify_admin_failure(interaction, result)
         return
 
     # DMへ完了パネルを送る
@@ -783,6 +784,71 @@ async def post_achievement(interaction: discord.Interaction, result: saga.OrderR
         receipt_number=result.receipt_number,
         pickup_label=result.pickup_label,
     )
+
+
+async def notify_admin_failure(
+    interaction: discord.Interaction, result: saga.OrderResult
+) -> None:
+    """
+    注文の失敗を管理者チャンネルへ知らせる。
+
+    利用者に見せない詳細（どのアカウントで何が起きたか、対処方法）を
+    ここに出す。カードが使えない場合など、放置すると全員の注文が
+    失敗し続けるため、気付けるようにしておく。
+    """
+    info = result.error_info
+    # 利用者の操作ミス（時間外の商品を選んだ等）は通知しない。
+    # 管理者が何もできないうえ、件数が多いと本当の異常が埋もれる。
+    from services.mcd import errors as mcd_errors
+
+    quiet = {mcd_errors.PRODUCT_TIME, mcd_errors.PRODUCT_GONE, mcd_errors.STORE}
+    if info is not None and getattr(info, "kind", "") in quiet:
+        return
+
+    channel_id = settings.get("channel_admin")
+    if not channel_id:
+        return
+    channel = interaction.client.get_channel(int(channel_id))
+    if channel is None:
+        return
+
+    kind = getattr(info, "kind", "UNKNOWN") if info else "UNKNOWN"
+    urgent = bool(info is not None and getattr(info, "account_fault", False))
+    e = discord.Embed(
+        title=f"{E.NG if urgent else E.WARN} 注文が失敗しました",
+        description=(
+            getattr(info, "admin_text", "") if info
+            else "原因を特定できませんでした。"
+        ),
+        color=embeds.RED if urgent else embeds.ORANGE,
+        timestamp=datetime.now(timezone.utc),
+    )
+    e.add_field(name=f"{E.CHART} 種類", value=f"`{kind}`", inline=True)
+    if info is not None and getattr(info, "code", ""):
+        e.add_field(name="符号", value=f"`{info.code}`", inline=True)
+    if result.store_name or result.store_id:
+        e.add_field(
+            name=f"{E.STORE} 店舗",
+            value=f"{result.store_name or '—'}（`{result.store_id}`）",
+            inline=True,
+        )
+    if info is not None and getattr(info, "message", ""):
+        e.add_field(name=f"{E.INFO} 相手からの文言", value=info.message[:500], inline=False)
+    e.add_field(
+        name=f"{E.RECEIPT} 注文", value=f"`{result.order_id[:8]}`", inline=True
+    )
+    if info is not None and getattr(info, "raw", ""):
+        e.add_field(
+            name=f"{E.NOTE} 応答の中身",
+            value=f"```{info.raw[:500]}```",
+            inline=False,
+        )
+    if urgent:
+        e.set_footer(text="このアカウントは候補から外しました。対処するまで他のアカウントで動きます")
+    try:
+        await channel.send(embed=e)
+    except discord.HTTPException:
+        log.exception("失敗の通知を送れませんでした")
 
 
 async def notify_admin_review(client: discord.Client, result: saga.OrderResult) -> None:

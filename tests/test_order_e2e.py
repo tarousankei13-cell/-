@@ -58,7 +58,7 @@ CURRENT = {"client": None}
 async def fake_pick(exclude=None): return FakeHandle(CURRENT["client"])
 async def fake_open(account_id): return FakeHandle(CURRENT["client"])
 async def fake_success(aid): pass
-async def fake_failure(aid, err): return "ACTIVE"
+async def fake_failure(aid, err, *, fatal=False): return "QUARANTINED" if fatal else "ACTIVE"
 async def fake_fresh(client, store_id): pass
 
 def install_mocks():

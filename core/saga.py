@@ -83,6 +83,19 @@ class OrderResult:
     balance_after: int = 0
     total_orders: int = 0
     error: str = ""
+    error_info: object = None   # services.mcd.errors.McdErrorInfo（分かれば）
+
+    @property
+    def user_message(self) -> str:
+        """利用者に見せる説明。解析できていればその文言を使う。"""
+        info = self.error_info
+        if info is not None and getattr(info, "user_text", ""):
+            return info.user_text
+        return (
+            "注文を完了できませんでした。\n"
+            "管理者が確認しますので、しばらくお待ちください。\n"
+            "残高は元に戻っています。"
+        )
 
     @property
     def succeeded(self) -> bool:
@@ -385,10 +398,21 @@ async def _fetch_receipt(handle, group: str, token: str, attempts: int = 5) -> s
 
 async def _handle_failure(order_id: str, state: str, handle, error: Exception, result: OrderResult) -> OrderResult:
     message = str(error)
+    info = getattr(error, "info", None)
+    result.error_info = info
     log.warning("注文 %s が状態 %s で失敗しました: %s", order_id[:8], state, message)
 
     if handle:
-        await mcd_accounts.report_failure(handle.account_id, message)
+        # カードが使えない・認証が切れているなど、そのアカウントを
+        # 使い続けても直らない種類のときは、すぐ候補から外す。
+        # 放っておくと以降の注文が全部同じ理由で失敗し続けるため。
+        fatal = bool(info is not None and getattr(info, "account_fault", False))
+        await mcd_accounts.report_failure(handle.account_id, message, fatal=fatal)
+        if fatal:
+            log.error(
+                "アカウント %s を候補から外しました（%s）",
+                handle.account_id, getattr(info, "kind", "?"),
+            )
 
     async with session_scope() as s:
         order = await s.get(Order, order_id)

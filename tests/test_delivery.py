@@ -58,7 +58,7 @@ def install_mocks():
     async def pick(exclude=None): return FakeHandle(CURRENT["client"])
     async def open_(account_id): return FakeHandle(CURRENT["client"])
     async def noop(*a, **k): pass
-    async def failure(aid, err): return "ACTIVE"
+    async def failure(aid, err, *, fatal=False): return "ACTIVE"
     mcd_accounts.pick_account = pick
     mcd_accounts.open_account = open_
     mcd_accounts.report_success = noop
