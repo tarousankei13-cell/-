@@ -14,13 +14,13 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 import httpx
 
 from services.mcd.protocol import (
-    OrderResponse, ProtocolError, build_authorise_body, build_get_paid_body,
+    OrderResponse, build_authorise_body, build_get_paid_body,
     parse_order_response, pb_str, proto_parse, varint_encode,
 )
 

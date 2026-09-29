@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     BigInteger, Boolean, DateTime, ForeignKey, Index, Integer,
-    Numeric, String, Text, UniqueConstraint,
+    Numeric, String, Text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 

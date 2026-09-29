@@ -24,7 +24,7 @@ from sqlalchemy.exc import IntegrityError
 
 from core import ledger as L
 from core import settings
-from db.models import KyashReceipt, utcnow
+from db.models import KyashReceipt
 from db.session import session_scope, user_scope
 from services.kyash import accounts as kyash_accounts
 from services.kyash.client import KyashError, LinkAlreadyUsed

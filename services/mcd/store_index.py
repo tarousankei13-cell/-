@@ -101,7 +101,12 @@ class StoreIndex:
             log.error("店舗インデックスを読み込めませんでした: %s", e)
             return 0
 
-        self._clear()
+        # 先に新しい内容を組み立ててから一気に差し替える。
+        # 読み込み中に検索されても、古い内容のまま正しく動く。
+        entries: list[StoreEntry] = []
+        by_id: dict[str, StoreEntry] = {}
+        norm_name: dict[str, str] = {}
+        norm_addr: dict[str, str] = {}
         for store_id, d in raw.items():
             entry = StoreEntry(
                 store_id=str(store_id),
@@ -112,11 +117,13 @@ class StoreIndex:
             )
             if not entry.name:
                 continue
-            self._entries.append(entry)
-            self._by_id[entry.store_id] = entry
-            self._norm_name[entry.store_id] = normalize(entry.name)
-            self._norm_addr[entry.store_id] = normalize(entry.address)
+            entries.append(entry)
+            by_id[entry.store_id] = entry
+            norm_name[entry.store_id] = normalize(entry.name)
+            norm_addr[entry.store_id] = normalize(entry.address)
 
+        self._entries, self._by_id = entries, by_id
+        self._norm_name, self._norm_addr = norm_name, norm_addr
         log.info("店舗インデックスを読み込みました: %d 店舗", len(self._entries))
         return len(self._entries)
 

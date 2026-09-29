@@ -13,15 +13,13 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 
 import discord
 from sqlalchemy import select
 
 import config
 import emoji as E
-from core import ledger as L
-from core import subsidy
 from core import users as user_repo
 from db.models import Cart, StoreCache, utcnow
 from db.session import session_scope
@@ -30,9 +28,7 @@ from services.mcd import store_index
 from services.mcd import stores as mcd_stores
 from services.mcd.client import McdError
 from services.mcd.menu import ParsedMenu, Product, minutes_of
-from services.mcd.protocol import (
-    PICKUP_LABEL, DecodedOrder, OrderItem, build_hex,
-)
+from services.mcd.protocol import PICKUP_LABEL, OrderItem, build_hex
 from ui import embeds, flows
 
 log = logging.getLogger("bot.menu_flows")

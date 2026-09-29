@@ -9,7 +9,6 @@ from discord import app_commands
 from discord.ext import commands
 from sqlalchemy import select
 
-import config as defaults
 import emoji as E
 from core import settings
 from db.models import SubsidyRule

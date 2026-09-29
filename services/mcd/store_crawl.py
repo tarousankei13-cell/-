@@ -79,10 +79,14 @@ async def crawl(
             if progress and done % 1000 == 0:
                 await progress(done, total, len(found))
 
+    # 38,000件のタスクを一度に作るとメモリを食うため、少しずつ処理する
+    chunk = 2000
     async with httpx.AsyncClient(
         limits=httpx.Limits(max_connections=concurrency + 10)
     ) as client:
-        await asyncio.gather(*[fetch_one(client, i) for i in range(id_start, id_end)])
+        for base in range(id_start, id_end, chunk):
+            upper = min(base + chunk, id_end)
+            await asyncio.gather(*[fetch_one(client, i) for i in range(base, upper)])
 
     log.info("店舗一覧を作成しました: %d 店舗", len(found))
     return found

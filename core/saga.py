@@ -23,7 +23,6 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from sqlalchemy import select

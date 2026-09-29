@@ -6,9 +6,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-import config
 from core import ledger as L
-from core import settings
 from db.session import session_scope
 from services.kyash import accounts as kyash_accounts
 from services.mcd import accounts as mcd_accounts

@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 
 import config
 from core.crypto import get_cipher
-from db.models import KyashAccount, utcnow
+from db.models import KyashAccount
 from db.session import session_scope
 from services.kyash.client import KyashClient, KyashError, KyashSession
 

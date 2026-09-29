@@ -19,15 +19,12 @@ import logging
 import discord
 from discord import app_commands
 from discord.ext import commands
-from sqlalchemy import select
 
-import config
 import emoji as E
 from core.crypto import get_cipher
 from db.models import KyashAccount, McdAccount, McdToken, utcnow
 from db.session import session_scope
 from cogs._checks import admin_only, handle_check_failure
-from services.kyash import accounts as kyash_accounts
 from services.kyash.client import KyashClient, KyashError
 from services.mcd import accounts as mcd_accounts
 from services.mcd.client import Fingerprint, McdClient, McdError

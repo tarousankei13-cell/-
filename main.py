@@ -66,7 +66,6 @@ LOG_LEVEL = "INFO"
 #  ここから下は編集不要です
 # ============================================================
 
-import asyncio
 import base64
 import hashlib
 import json

@@ -13,8 +13,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import delete, func, select
 
 import config
 from db.models import MenuCollection, MenuProduct, StoreCache, StoreDaypart, utcnow
@@ -186,6 +185,16 @@ async def sync_menu(
     async with session_scope() as s:
         row = await s.get(StoreCache, store_id)
         etag = None if force else (row.menu_etag if row else None)
+        if etag:
+            # ETagはあるのに商品が1件も無い場合（DBを消した後など）は、
+            # 304で「変更なし」と判断してしまい、いつまでも空のままになる。
+            has_products = await s.scalar(
+                select(func.count()).select_from(MenuProduct)
+                .where(MenuProduct.store_id == store_id)
+            )
+            if not has_products:
+                log.info("商品が未登録のため、ETagを無視して取得します: %s", store_id)
+                etag = None
 
     raw, new_etag = await client.fetch_menu(store_id, info.cat_root_url, etag=etag)
     if raw is None:
