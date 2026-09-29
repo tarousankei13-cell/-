@@ -11,6 +11,7 @@ TESTS = [
     ("DBの日時の扱い", "test_db_datetime.py"),
     ("カート組み立て", "test_cart.py"),
     ("セットの選択枠・時間帯", "test_menu_choices.py"),
+    ("具材の調整（抜き・増量）", "test_customize.py"),
     ("店名検索", "test_store_search.py"),
     ("店舗の注文可否", "test_availability.py"),
     ("店舗の注文可否", "test_availability.py"),

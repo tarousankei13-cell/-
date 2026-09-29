@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime
 from typing import Any, Iterable
 
@@ -90,19 +90,35 @@ class Slot:
     """セットの構成要素（固定構成 / 選択枠 / 追加トッピング）。"""
     kind: str                 # composition / choices / canAdds
     code: str
+    # 具材名。ピクルスや氷などの符号は products に載っていないため、
+    # 解析時にここへ入れて保存する（あとから引けるように）。
+    name: str = ""
     default_product: str = ""
     reference_product: str = ""
     min_quantity: int = 0
     max_quantity: int = 1
+    default_quantity: int = 1
     extra_price: int = 0      # この枠を選んだときの加算額
     cost_inclusive: bool = True
+
+    @property
+    def removable(self) -> bool:
+        """外せる具材か（ピクルス抜き・氷抜きなど）。"""
+        return self.min_quantity < self.default_quantity
+
+    @property
+    def increasable(self) -> bool:
+        """増やせる具材か（チーズ追加など）。"""
+        return self.max_quantity > self.default_quantity
 
     def to_dict(self) -> dict:
         return self.__dict__.copy()
 
     @classmethod
     def from_dict(cls, d: dict) -> "Slot":
-        return cls(**d)
+        # 列が増える前に保存した内容も読めるようにする
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})
 
 
 @dataclass
@@ -142,6 +158,24 @@ class Product:
 
     def slots_of(self, kind: str) -> list[Slot]:
         return [s for s in self.slots if s.kind == kind]
+
+    def customizations(self) -> list[Slot]:
+        """
+        利用者がいじれる具材。
+
+        `composition` のうち、減らせる（抜ける）か増やせるものだけを返す。
+        バンズやパティのように数量が固定のものは対象外。
+
+        ⚠️ 名前が分からないもの（内部用の符号）は返さない。
+           「99901001 を抜く」と出しても利用者は判断できないため。
+           名前の解決は呼び出し側で行う（ここはコードだけを持つ）。
+        """
+        return [
+            s for s in self.slots
+            if s.kind == "composition"
+            and (s.removable or s.increasable)
+            and s.name                      # 名前が分からないものは出さない
+        ]
 
     def structure_json(self) -> str:
         return json.dumps([s.to_dict() for s in self.slots], ensure_ascii=False)
@@ -263,20 +297,27 @@ def _price_list(entry: dict) -> dict[str, int]:
     return out
 
 
-def _parse_slots(raw: dict) -> list[Slot]:
+def _parse_slots(raw: dict, names: dict[str, str] | None = None) -> list[Slot]:
+    names = names or {}
     slots: list[Slot] = []
     for kind in ("composition", "choices", "canAdds"):
         for c in raw.get(kind) or []:
             if not isinstance(c, dict):
                 continue
+            code = str(c.get("productCode") or "")
             slots.append(
                 Slot(
                     kind=kind,
-                    code=str(c.get("productCode") or ""),
+                    code=code,
+                    name=names.get(code, ""),
                     default_product=str(c.get("defaultProduct") or ""),
                     reference_product=str(c.get("referenceProduct") or ""),
                     min_quantity=int(c.get("minQuantity") or 0),
                     max_quantity=int(c.get("maxQuantity") or 1),
+                    default_quantity=int(
+                        c.get("defaultQuantity")
+                        if c.get("defaultQuantity") is not None else 1
+                    ),
                     extra_price=_price_of(c, "prePrice"),
                     cost_inclusive=bool(c.get("costInclusive", True)),
                 )
@@ -357,7 +398,7 @@ def parse_menu(store_id: str, menu: dict) -> ParsedMenu:
             price_takeout=pl.get("TAKEOUT", 0),
             price_other=pl.get("OTHER", 0),
             pre_price=_price_of(raw, "prePrice"),
-            slots=_parse_slots(raw),
+            slots=_parse_slots(raw, names),
             time_windows=_windows_of(ability, code),
             size_group=size_groups.get(code, ""),
         )
@@ -426,6 +467,35 @@ def supported_pickup_methods(store: dict) -> dict[str, bool]:
         method: bool((dm.get(key) or {}).get("isSupported"))
         for method, key in STORE_DELIVERY_KEY.items()
     }
+
+
+def customization_note(menu: "ParsedMenu", item) -> str:
+    """
+    「（ピクルス抜き）」のような補足を作る。調整が無ければ空。
+
+    具材は products に載っていないため、商品の構成（Slot）に
+    持たせておいた名前を使う。
+    """
+    product = menu.products.get(str(getattr(item, "product_code", "")))
+    if product is None:
+        return ""
+    by_code = {s.code: s for s in product.slots_of("composition")}
+    removed, increased = [], []
+    for comp in getattr(item, "components", None) or []:
+        slot = by_code.get(str(getattr(comp, "product_code", "")))
+        if slot is None or not slot.name:
+            continue
+        qty = int(getattr(comp, "quantity", slot.default_quantity))
+        if qty < slot.default_quantity:
+            removed.append(slot.name)
+        elif qty > slot.default_quantity:
+            increased.append(f"{slot.name}×{qty}")
+    parts = []
+    if removed:
+        parts.append("・".join(removed) + "抜き")
+    if increased:
+        parts.append("・".join(increased))
+    return f"（{' / '.join(parts)}）" if parts else ""
 
 
 def minutes_of(dt: datetime) -> int:

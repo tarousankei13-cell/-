@@ -28,7 +28,9 @@ from services.mcd import store_index
 from services.mcd import stores as mcd_stores
 from services.mcd.client import McdError
 from services.mcd import availability
-from services.mcd.menu import ParsedMenu, Product, minutes_of
+from services.mcd.menu import (
+    ParsedMenu, Product, customization_note, minutes_of,
+)
 from services.mcd.protocol import PICKUP_LABEL, OrderItem, build_hex
 from ui import embeds, flows
 
@@ -382,7 +384,8 @@ class CartView(discord.ui.View):
             for idx, item in enumerate(self.items, 1):
                 p = self.menu.products.get(item.product_code)
                 name = p.name if p else item.product_code
-                lines.append(f"**{idx}.** {name}　{embeds.yen(item.amount)}")
+                note = customization_note(self.menu, item)
+                lines.append(f"**{idx}.** {name}{note}　{embeds.yen(item.amount)}")
                 for comp in item.components:
                     for leaf in comp.walk():
                         if leaf is comp:
@@ -556,7 +559,10 @@ class CartView(discord.ui.View):
         lines = []
         for item in self.items:
             p = self.menu.products.get(item.product_code)
-            lines.append(f"**{p.name if p else item.product_code}**　{embeds.yen(item.amount)}")
+            note = customization_note(self.menu, item)
+            lines.append(
+                f"**{p.name if p else item.product_code}**{note}　{embeds.yen(item.amount)}"
+            )
             for comp in item.components:
                 for leaf in comp.walk():
                     if leaf is comp:
@@ -764,6 +770,13 @@ class ProductView(discord.ui.View):
     async def _add_and_close(
         self, interaction: discord.Interaction, product: Product, picks: dict[str, str]
     ) -> None:
+        # 具材を調整できる商品なら、その画面を挟む
+        if product.customizations():
+            view = CustomizeView(self.cart, product, picks)
+            await interaction.response.edit_message(
+                embed=view.build_embed(), view=view
+            )
+            return
         await _add_to_cart(self.cart, product, picks)
         self.stop()
         await self.cart.show(interaction, note=f"{E.OK} **{product.name}** を追加しました。")
@@ -890,6 +903,13 @@ class OptionView(discord.ui.View):
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
     async def _on_ok(self, interaction: discord.Interaction) -> None:
+        # 具材を調整できる商品なら、その画面を挟む
+        if self.product.customizations():
+            view = CustomizeView(self.cart, self.product, self.picks)
+            await interaction.response.edit_message(
+                embed=view.build_embed(), view=view
+            )
+            return
         await _add_to_cart(self.cart, self.product, self.picks)
         self.stop()
         await self.cart.show(
@@ -897,27 +917,207 @@ class OptionView(discord.ui.View):
         )
 
 
-async def _add_to_cart(cart: "CartView", product: Product, picks: dict[str, str]) -> None:
+class CustomizeView(discord.ui.View):
+    """
+    具材の増減を選ぶ（ピクルス抜き・氷抜きなど）。
+
+    外せる具材は最初から全部入れた状態で出し、**外したいものだけを
+    選択から外してもらう**。ふだんの注文は何もせず「この内容で追加」を
+    押すだけで済む。
+    """
+
+    def __init__(
+        self, cart: "CartView", product: Product, picks: dict[str, str]
+    ) -> None:
+        super().__init__(timeout=config.VIEW_TIMEOUT)
+        self.cart = cart
+        self.product = product
+        self.picks = picks
+        self.slots = product.customizations()
+        # 最初は全部、既定の数量のまま
+        self.amounts: dict[str, int] = {
+            slot.code: slot.default_quantity for slot in self.slots
+        }
+        self._build()
+
+    # -- 表示 --
+
+    def build_embed(self) -> discord.Embed:
+        removed = [s.name for s in self.slots if self.amounts.get(s.code, 1) == 0]
+        added = [
+            f"{s.name}×{self.amounts[s.code]}"
+            for s in self.slots
+            if self.amounts.get(s.code, 0) > s.default_quantity
+        ]
+        e = discord.Embed(
+            title=f"{E.BURGER} {self.product.name}",
+            description=(
+                "具材を調整できます。**そのままでよければ**下の"
+                "「この内容で追加」を押してください。"
+            ),
+            color=embeds.GREEN,
+        )
+        e.add_field(
+            name=f"{E.MINUS} 抜くもの",
+            value=("・" + "\n・".join(removed)) if removed else "なし",
+            inline=True,
+        )
+        if any(s.increasable for s in self.slots):
+            e.add_field(
+                name=f"{E.PLUS} 増やすもの",
+                value=("・" + "\n・".join(added)) if added else "なし",
+                inline=True,
+            )
+        e.set_footer(text="お店の都合で、ご希望に添えない場合があります")
+        return e
+
+    # -- 組み立て --
+
+    def _build(self) -> None:
+        self.clear_items()
+        row = 0
+
+        removable = [s for s in self.slots if s.removable]
+        if removable:
+            options = [
+                discord.SelectOption(
+                    label=s.name[:100], value=s.code,
+                    description="外すと「抜き」になります",
+                    default=self.amounts.get(s.code, 1) > 0,
+                )
+                for s in removable[:25]
+            ]
+            sel = discord.ui.Select(
+                placeholder="入れるものを選んでください（外すと「抜き」）",
+                options=options, row=row,
+                min_values=0, max_values=len(options),
+            )
+            sel.callback = self._on_keep
+            self.add_item(sel)
+            self._keep_select = sel
+            row += 1
+
+        increasable = [s for s in self.slots if s.increasable]
+        if increasable and row < 4:
+            options = []
+            for s in increasable[:8]:
+                for q in range(s.default_quantity + 1, s.max_quantity + 1):
+                    options.append(
+                        discord.SelectOption(
+                            label=f"{s.name} ×{q}"[:100],
+                            value=f"{s.code}:{q}",
+                            default=self.amounts.get(s.code) == q,
+                        )
+                    )
+            if options:
+                sel = discord.ui.Select(
+                    placeholder="増やすものを選んでください（任意）",
+                    options=options[:25], row=row,
+                    min_values=0, max_values=min(len(options[:25]), len(increasable)),
+                )
+                sel.callback = self._on_increase
+                self.add_item(sel)
+                self._inc_select = sel
+                row += 1
+
+        ok = discord.ui.Button(
+            label="この内容で追加", emoji=E.CART,
+            style=discord.ButtonStyle.success, row=4,
+        )
+        ok.callback = self._on_ok
+        self.add_item(ok)
+        back = discord.ui.Button(label="戻る", style=discord.ButtonStyle.secondary, row=4)
+        back.callback = self._on_back
+        self.add_item(back)
+
+    # -- 操作 --
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.cart.owner_id:
+            await interaction.response.send_message(
+                embed=embeds.error("この操作は開いた本人のみ行えます。"), ephemeral=True
+            )
+            return False
+        return True
+
+    async def _on_keep(self, interaction: discord.Interaction) -> None:
+        keep = set(self._keep_select.values)
+        for slot in self.slots:
+            if slot.removable:
+                self.amounts[slot.code] = (
+                    slot.default_quantity if slot.code in keep else slot.min_quantity
+                )
+        self._build()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _on_increase(self, interaction: discord.Interaction) -> None:
+        chosen = {}
+        for v in self._inc_select.values:
+            code, _, q = v.partition(":")
+            chosen[code] = int(q)
+        for slot in self.slots:
+            if slot.increasable:
+                # 抜いているものは増やさない（選び直しの取り消しを防ぐ）
+                if self.amounts.get(slot.code, 1) == 0:
+                    continue
+                self.amounts[slot.code] = chosen.get(slot.code, slot.default_quantity)
+        self._build()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _on_back(self, interaction: discord.Interaction) -> None:
+        view = CategoryView(self.cart)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+    async def _on_ok(self, interaction: discord.Interaction) -> None:
+        await _add_to_cart(self.cart, self.product, self.picks, self.amounts)
+        self.stop()
+        note = f"{E.OK} **{self.product.name}** を追加しました。"
+        removed = [s.name for s in self.slots if self.amounts.get(s.code, 1) == 0]
+        if removed:
+            note += f"（{'・'.join(removed)}抜き）"
+        await self.cart.show(interaction, note=note)
+
+
+async def _add_to_cart(
+    cart: "CartView",
+    product: Product,
+    picks: dict[str, str],
+    amounts: dict[str, int] | None = None,
+) -> None:
     """カートに1品足して保存する。追加の経路はここに一本化する。"""
-    cart.items.append(build_order_item(cart, product, picks))
+    cart.items.append(build_order_item(cart, product, picks, amounts))
     await save_cart(
         cart.owner_id, purpose=cart.purpose, store_id=cart.store_id,
         pickup=cart.pickup, items=cart.items,
     )
 
 
-def build_order_item(cart: CartView, product: Product, picks: dict[str, str]) -> OrderItem:
+def build_order_item(
+    cart: CartView,
+    product: Product,
+    picks: dict[str, str],
+    amounts: dict[str, int] | None = None,
+) -> OrderItem:
     """
     カタログの構造から注文の1品を組み立てる。
 
     構成品（composition）は固定、選択枠（choices）は選んだ商品を入れる。
+
+    amounts は具材の増減（{"99901032": 0} で「ピクルス抜き」）。
+    指定が無い具材は既定の数量のままにする。
     """
     pickup = cart.pickup or "takeOut"
+    amounts = amounts or {}
     components: list[OrderItem] = []
 
     for slot in product.slots_of("composition"):
-        if slot.code:
-            components.append(OrderItem(product_code=slot.code, quantity=1))
+        if not slot.code:
+            continue
+        # 抜く・増やすの指定があればそれを使う。無ければ既定のまま。
+        qty = amounts.get(slot.code, slot.default_quantity)
+        # カタログが許す範囲に収める（不正な数量を送らない）
+        qty = max(slot.min_quantity, min(qty, slot.max_quantity))
+        components.append(OrderItem(product_code=slot.code, quantity=qty))
 
     for slot in product.slots_of("choices"):
         chosen = picks.get(slot.code) or slot.default_product
