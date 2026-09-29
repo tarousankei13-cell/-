@@ -722,6 +722,126 @@ class TestErrorClassification(unittest.TestCase):
         self.assertEqual(_sanitize("Store is closed"), "Store is closed")
 
 
+# Unicode Emoji_Presentation=Yes（VS16なしで絵文字として表示される）BMP範囲
+_BMP_EMOJI_PRESENTATION = (
+    (0x231A, 0x231B), (0x23E9, 0x23EC), (0x23F0, 0x23F0), (0x23F3, 0x23F3),
+    (0x25FD, 0x25FE), (0x2614, 0x2615), (0x2648, 0x2653), (0x267F, 0x267F),
+    (0x2693, 0x2693), (0x26A1, 0x26A1), (0x26AA, 0x26AB), (0x26BD, 0x26BE),
+    (0x26C4, 0x26C5), (0x26CE, 0x26CE), (0x26D4, 0x26D4), (0x26EA, 0x26EA),
+    (0x26F2, 0x26F3), (0x26F5, 0x26F5), (0x26FA, 0x26FA), (0x26FD, 0x26FD),
+    (0x2705, 0x2705), (0x270A, 0x270B), (0x2728, 0x2728), (0x274C, 0x274C),
+    (0x274E, 0x274E), (0x2753, 0x2755), (0x2757, 0x2757), (0x2795, 0x2797),
+    (0x27B0, 0x27B0), (0x27BF, 0x27BF), (0x2B1B, 0x2B1C), (0x2B50, 0x2B50),
+    (0x2B55, 0x2B55),
+)
+
+# SMPだが Emoji_Presentation=No（VS16が必要）な主な文字
+_SMP_NEEDS_VS16 = (
+    (0x1F321, 0x1F321), (0x1F324, 0x1F32C), (0x1F336, 0x1F336),
+    (0x1F37D, 0x1F37D), (0x1F396, 0x1F397), (0x1F399, 0x1F39B),
+    (0x1F39E, 0x1F39F), (0x1F3CB, 0x1F3CE), (0x1F3D4, 0x1F3DF),
+    (0x1F3F3, 0x1F3F3), (0x1F3F5, 0x1F3F5), (0x1F3F7, 0x1F3F7),
+    (0x1F43F, 0x1F43F), (0x1F441, 0x1F441), (0x1F4FD, 0x1F4FD),
+    (0x1F549, 0x1F54A), (0x1F56F, 0x1F570), (0x1F573, 0x1F579),
+    (0x1F587, 0x1F587), (0x1F58A, 0x1F58D), (0x1F590, 0x1F590),
+    (0x1F5A5, 0x1F5A5), (0x1F5A8, 0x1F5A8), (0x1F5B1, 0x1F5B2),
+    (0x1F5BC, 0x1F5BC), (0x1F5C2, 0x1F5C4), (0x1F5D1, 0x1F5D3),
+    (0x1F5DC, 0x1F5DE), (0x1F5E1, 0x1F5E1), (0x1F5E3, 0x1F5E3),
+    (0x1F5E8, 0x1F5E8), (0x1F5EF, 0x1F5EF), (0x1F5F3, 0x1F5F3),
+    (0x1F5FA, 0x1F5FA), (0x1F6CB, 0x1F6CB), (0x1F6CD, 0x1F6CF),
+    (0x1F6E0, 0x1F6E5), (0x1F6E9, 0x1F6E9), (0x1F6F0, 0x1F6F0),
+    (0x1F6F3, 0x1F6F3),
+)
+
+
+def _in_ranges(cp: int, ranges) -> bool:
+    return any(lo <= cp <= hi for lo, hi in ranges)
+
+
+def check_button_emoji(value: str) -> str:
+    """Discordがボタン絵文字として受け付けるか判定し、問題があれば理由を返す。"""
+    if not value:
+        return "空文字"
+    if "️" in value:
+        return ""  # VS16付きは絵文字表示が明示されている
+    cp = ord(value[0])
+    if cp < 0x1F000:
+        if _in_ranges(cp, _BMP_EMOJI_PRESENTATION):
+            return ""
+        return (
+            f"U+{cp:04X} は Emoji_Presentation=No / 絵文字ではありません"
+            "（DiscordがInvalid emojiで拒否します）"
+        )
+    if _in_ranges(cp, _SMP_NEEDS_VS16):
+        return f"U+{cp:04X} は VS16(U+FE0F) が必要です"
+    return ""
+
+
+class TestButtonEmoji(unittest.TestCase):
+    """ボタン絵文字がDiscordに拒否される不具合の回帰テスト。
+
+    U+2715(✕) のような「記号だが絵文字ではない」文字を使うと
+    400 Invalid Form Body になり、そのViewを含むメッセージが一切送れなくなる。
+    """
+
+    def _all_views(self):
+        import discord
+        import views as v
+
+        return [
+            ("PanelView", v.PanelView()),
+            ("OrderConfirmView", v.OrderConfirmView(1, None, 600, 400, None)),
+            ("SaveFavoriteView", v.SaveFavoriteView(1, "aa")),
+            ("FavoritesView", v.FavoritesView(1, [
+                {"id": 1, "name": "test", "created_at": "2026-01-01"}
+            ])),
+            ("TopUpView", v.TopUpView(1, 500)),
+            ("DepositConfirmView", v.DepositConfirmView(1, 1000)),
+            ("HistoryView", v.HistoryView(1, 1, 1)),
+            ("BalanceDetailView", v.BalanceDetailView(1)),
+            ("TxHistoryView", v.TxHistoryView(1, 1, 1)),
+        ]
+
+    def test_all_button_emoji_valid(self):
+        problems = []
+        for name, view in self._all_views():
+            for child in view.children:
+                emoji = getattr(child, "emoji", None)
+                if emoji is None:
+                    continue
+                reason = check_button_emoji(str(emoji))
+                if reason:
+                    problems.append(
+                        f"{name}.{getattr(child, 'label', '?')}: "
+                        f"{str(emoji)!r} -> {reason}"
+                    )
+        self.assertEqual(problems, [], "不正なボタン絵文字:\n" + "\n".join(problems))
+
+    def test_validator_rejects_multiplication_x(self):
+        # 実際に400を引き起こした文字
+        self.assertNotEqual(check_button_emoji("✕"), "")
+
+    def test_validator_rejects_check_mark(self):
+        self.assertNotEqual(check_button_emoji("✓"), "")
+
+    def test_validator_accepts_known_good(self):
+        for good in ("❌", "✅", "⭐", "❓", "🍔", "💳", "🎁"):
+            self.assertEqual(check_button_emoji(good), "", f"{good!r} が誤判定")
+
+    def test_validator_accepts_vs16(self):
+        self.assertEqual(check_button_emoji("\U0001f5d1️"), "")
+
+    def test_validator_flags_missing_vs16(self):
+        self.assertNotEqual(check_button_emoji("\U0001f5d1"), "")
+
+    def test_panel_view_components_serialize(self):
+        for name, view in self._all_views():
+            try:
+                view.to_components()
+            except Exception as exc:
+                self.fail(f"{name}.to_components() failed: {exc}")
+
+
 class TestImageGen(unittest.TestCase):
     def test_available(self):
         import image_gen

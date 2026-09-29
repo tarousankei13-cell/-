@@ -677,14 +677,30 @@ async def start_order_flow(
         embed = discord.Embed(
             title="残高不足",
             description=(
-                f"残高が不足しています。\n\n"
-                f"必要額: **¥{user_amount:,}**\n"
-                f"現在残高: ¥{balance:,}\n"
-                f"不足額: **¥{shortage:,}**\n\n"
+                "残高が不足しているため注文できません。\n"
                 "下のボタンから不足分を入金申請できます。"
             ),
             color=EmbedColor.ERROR,
         )
+        store_display = decoded.store_name or decoded.store_id or "不明"
+        embed.add_field(name="店舗", value=store_display, inline=True)
+        embed.add_field(
+            name="受取方法", value=decoded.pickup_method or "不明", inline=True
+        )
+        product_lines = [
+            f"  {p.display_name or p.product_id}" for p in decoded.products
+        ]
+        if product_lines:
+            text = "\n".join(product_lines)
+            if len(text) > 900:
+                text = text[:890] + "\n  ..."
+            embed.add_field(
+                name="商品", value=f"```\n{text}\n```", inline=False
+            )
+        embed.add_field(name="定価", value=f"¥{decoded.total_amount:,}", inline=True)
+        embed.add_field(name="必要額", value=f"**¥{user_amount:,}**", inline=True)
+        embed.add_field(name="現在残高", value=f"¥{balance:,}", inline=True)
+        embed.add_field(name="不足額", value=f"**¥{shortage:,}**", inline=False)
         await interaction.followup.send(
             embed=embed,
             view=TopUpView(uid, shortage),
@@ -1153,7 +1169,7 @@ class OrderConfirmView(SafeView):
             )
 
     @discord.ui.button(
-        label="キャンセル", emoji="✕", style=discord.ButtonStyle.danger
+        label="キャンセル", emoji="❌", style=discord.ButtonStyle.danger
     )
     async def cancel(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -1307,7 +1323,7 @@ class FavoritesView(SafeView):
         return True
 
     @discord.ui.button(
-        label="削除", emoji="🗑", style=discord.ButtonStyle.danger, row=1
+        label="削除", emoji="🗑️", style=discord.ButtonStyle.danger, row=1
     )
     async def delete(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -1509,7 +1525,7 @@ class DepositConfirmView(SafeView):
                 logger.error("Failed to send deposit notification: %s", exc)
 
     @discord.ui.button(
-        label="キャンセル", emoji="✕", style=discord.ButtonStyle.danger
+        label="キャンセル", emoji="❌", style=discord.ButtonStyle.danger
     )
     async def cancel(
         self, interaction: discord.Interaction, button: discord.ui.Button
