@@ -39,6 +39,9 @@
 pip install -r requirements.txt
 ```
 
+必要なパッケージは8つだけです（Discord・DB・通信・暗号化・画像生成）。
+PostgreSQL を使う場合は `requirements.txt` の `asyncpg` のコメントを外してください。
+
 ### 1-3. 設定
 
 **必須なのは2つだけ**です。`main.py` 冒頭の「設定ブロック」に書きます。

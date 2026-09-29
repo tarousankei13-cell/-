@@ -1,11 +1,19 @@
+# Discord
 discord.py>=2.4.0
+
+# データベース（SQLite / PostgreSQL 両対応）
 SQLAlchemy[asyncio]>=2.0.30
-greenlet>=3.0.0
-aiosqlite>=0.20.0
-alembic>=1.13.0
-cryptography>=42.0.0
-Pillow>=10.3.0
+greenlet>=3.0.0          # SQLAlchemy の非同期処理に必要
+aiosqlite>=0.20.0        # SQLite を非同期で使うためのドライバ
+# PostgreSQL を使う場合は下の行のコメントを外してください
+# asyncpg>=0.29.0
+
+# マクドナルド / Kyash との通信
 httpx>=0.27.0
-requests>=2.32.0
-beautifulsoup4>=4.12.0
-pkce>=1.0.3
+beautifulsoup4>=4.12.0   # Kyash の送金リンクの読み取りに使用
+
+# 認証情報の暗号化
+cryptography>=42.0.0
+
+# レシート画像の生成
+Pillow>=10.3.0
