@@ -91,7 +91,8 @@ class DecodedOrder:
     amount_cents: int
     products: list[Product]
     redirect_urls: list[str]
-    pickup_method: str = ""   
+    pickup_method: str = ""
+    raw_pickup: bytes = b""   # HEX の field[7] をそのまま保持する
 
 
 @dataclass
@@ -294,6 +295,12 @@ def decode_hex(hex_str: str) -> DecodedOrder:
 
     pickup_method = _detect_pickup_method(hex_str)
 
+    raw_pickup = b""
+    for v in top.get(7, []):
+        if isinstance(v, bytes):
+            raw_pickup = v
+            break
+
     return DecodedOrder(
         store_id=store_id,
         short_order_code=short_code,
@@ -301,6 +308,7 @@ def decode_hex(hex_str: str) -> DecodedOrder:
         products=products,
         redirect_urls=redirect_urls,
         pickup_method=pickup_method,
+        raw_pickup=raw_pickup,
     )
 
 
@@ -322,6 +330,7 @@ def _build_store_order_body(
     products: list[Product],
     pos_paseto: str,
     card_id: str = "",
+    pickup_blob: bytes = b"",
 ) -> bytes:
     b = _pb_str(1, store_id)
     b += _pb_msg(2, _pb_msg(2, b""))
@@ -330,7 +339,7 @@ def _build_store_order_body(
         b += _pb_msg(3, _pb_msg(1, _pb_msg(2, card_inner)))
     else:
         b += _pb_msg(3, _pb_msg(1, b""))
-    b += _pb_msg(7, b"")
+    b += _pb_msg(7, pickup_blob)   # 空にすると受取方法がテイクアウト扱いになる
     inner = b""
     if short_order_code:
         inner += _pb_str(2, short_order_code)
@@ -705,6 +714,7 @@ class MCD:
                 products=decoded.products,
                 pos_paseto=pos_paseto,
                 card_id=card_id,
+                pickup_blob=decoded.raw_pickup,
             )
             try:
                 resp = self._sess.post(

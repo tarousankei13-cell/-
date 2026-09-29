@@ -370,3 +370,39 @@ class McdPool:
             except Exception:
                 self._persist_tokens(aid, client)
                 return None
+
+
+# ------------------------------------------------------- 公式注文ページのURL
+
+# HEX に埋まっている URL のうち、マクドナルドのものだけを通すための判定。
+# 素性の分からないリンクを利用者に見せないようにする。
+_OFFICIAL_HOST_SUFFIXES = (
+    ".mcdonalds.co.jp",
+    ".mcdonalds.com",
+    ".mcd.co.jp",
+    ".mop.mcd.qorcommerce.com",
+    ".vmobapps.com",
+)
+_OFFICIAL_HOSTS = ("mcdonalds.co.jp", "mcdonalds.com", "mcd.co.jp")
+
+
+def official_order_url(decoded: DecodedOrder) -> Optional[str]:
+    """HEX の redirect_urls から、マクドナルド公式の注文ページURLを取り出す。
+
+    HATTIMCD は ``redirect_urls`` を取り出すだけで使っていない。
+    ここに本物の注文完了ページが入っていれば、そのまま利用者に渡せる。
+    該当がなければ None。
+    """
+    from urllib.parse import urlparse
+
+    for url in getattr(decoded, "redirect_urls", None) or []:
+        try:
+            parsed = urlparse(url.strip())
+        except Exception:
+            continue
+        if parsed.scheme != "https" or not parsed.netloc:
+            continue
+        host = parsed.netloc.split("@")[-1].split(":")[0].lower()
+        if host in _OFFICIAL_HOSTS or host.endswith(_OFFICIAL_HOST_SUFFIXES):
+            return url.strip()
+    return None

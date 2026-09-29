@@ -16,7 +16,12 @@ from discord.ext import commands
 
 from mcd.cards import render_pickup_card
 from mcd.logsetup import event, new_trace
-from mcd.mcdclient import NoAccountAvailable, PaymentUncertain, hex_digest
+from mcd.mcdclient import (
+    NoAccountAvailable,
+    PaymentUncertain,
+    hex_digest,
+    official_order_url,
+)
 from mcd.rates import resolve_rate, user_pays
 from mcd.store import (
     DuplicateHex,
@@ -374,6 +379,15 @@ class Panel(commands.Cog):
                 ),
             )
             return
+
+        # HEX に埋まっている URL を記録しておく。公式の注文ページが入っていれば
+        # 決済後にそのまま利用者へ渡せる。中身が分かるようログにも残す。
+        event(
+            log, "order.decoded", user=uid,
+            store=decoded.store_id, pickup=decoded.pickup_method,
+            redirect_urls=list(decoded.redirect_urls or []),
+            official=official_order_url(decoded) or "",
+        )
 
         decision = resolve_rate(
             cfg.DEFAULT_USER_RATE, cfg.ROLE_RATES, cfg.USER_RATES, cfg.CAMPAIGNS,
@@ -824,7 +838,25 @@ class Panel(commands.Cog):
         )
         e.set_image(url="attachment://pickup.png")
 
-        sent = await dm(self.bot, uid, e=e, files=[file])
+        # HEX に公式の注文ページが入っていれば、本物のページへのリンクを付ける
+        view = None
+        official = official_order_url(decoded)
+        if official:
+            view = discord.ui.View(timeout=None)
+            view.add_item(
+                discord.ui.Button(
+                    label="注文ページを開く",
+                    style=discord.ButtonStyle.link,
+                    url=official,
+                )
+            )
+            e.add_field(
+                name="注文ページ",
+                value="下のボタンからマクドナルドの注文ページを開けます。",
+                inline=False,
+            )
+
+        sent = await dm(self.bot, uid, e=e, files=[file], view=view)
         if sent is None:
             await self.bot.send_log(
                 cfg.LOG_ERRORS_CHANNEL_ID,

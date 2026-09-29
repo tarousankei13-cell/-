@@ -7,7 +7,31 @@
 
 - 出典: https://github.com/hatti1919/HATTIMCD
 - ライセンス: MIT (`HATTIMCD/LICENSE` を参照)
-- 変更: なし（取得時のまま）
+- 変更: あり。受取方法が注文に反映されないバグを修正しています。
+
+### 受取方法 (field 7) が注文に引き継がれない問題
+
+`_detect_pickup_method()` は HEX の field[7] を読んで
+「テイクアウト / イートイン / デリバリー」を判定していましたが、
+実際に StoreOrder へ送る `_build_store_order_body()` は
+`_pb_msg(7, b"")` と**空の field[7] を固定で送っていました**。
+
+デコーダ自身の規則では「field[7] が空 = テイクアウト」なので、
+**HEX がイートインやテーブルデリバリーを指定していても、
+注文は必ずテイクアウトとして発注されます。**
+店舗側の POS にテイクアウトとして入るため、席まで運ばれません。
+
+修正内容:
+
+| 箇所 | 変更 |
+|------|------|
+| `DecodedOrder` | `raw_pickup: bytes` を追加し、HEX の field[7] を保持 |
+| `decode_hex()` | field[7] の生バイトを `raw_pickup` に格納 |
+| `_build_store_order_body()` | 引数 `pickup_blob` を追加し、`_pb_msg(7, pickup_blob)` を送る |
+| `MCD.store_order()` | `pickup_blob=decoded.raw_pickup` を渡す |
+
+HEX の field[7] をそのまま透過させる形にしているので、
+プロトコルの中身を推測せずに、指定どおりの受取方法で発注されます。
 
 ## Kyasher
 
