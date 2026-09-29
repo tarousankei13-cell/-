@@ -14,6 +14,7 @@ from core import saga, settings
 from core.telemetry import traced
 from db.session import session_scope
 from services import tasks as jobs
+from services import monitor
 from services.mcd import store_sync
 from ui import embeds
 
@@ -39,13 +40,14 @@ class TasksCog(commands.Cog):
         wait_until_ready() が例外を投げてループが静かに死ぬことがある。
         """
         for loop in (self.menu_sync, self.store_index_sync, self.health_check,
-                     self.token_warm, self.hourly_checks):
+                     self.token_warm, self.hourly_checks, self.outage_watch):
             if not loop.is_running():
                 loop.start()
 
     async def cog_unload(self) -> None:
         self.menu_sync.cancel()
         self.store_index_sync.cancel()
+        self.outage_watch.cancel()
         self.health_check.cancel()
         self.token_warm.cancel()
         self.hourly_checks.cancel()
@@ -168,6 +170,43 @@ class TasksCog(commands.Cog):
 
     @store_index_sync.before_loop
     async def before_store_index_sync(self) -> None:
+        await self._wait_ready()
+
+    # -- 外形監視 -----------------------------------------------
+
+    @tasks.loop(minutes=config.MONITOR_INTERVAL_MINUTES)
+    @traced("外形監視")
+    async def outage_watch(self) -> None:
+        """
+        マクドナルド側が落ちていないか、軽い読み取りで確かめる。
+
+        利用者からの報告で気付くのでは遅い。
+        状態が変わったときだけ通知する（毎回出すと本当の異常が埋もれる）。
+        """
+        if not self._started:
+            return
+        try:
+            report = await monitor.check()
+        except Exception:
+            log.exception("外形監視に失敗しました")
+            return
+
+        text = monitor.format_report(report)
+        if not text:
+            return
+        await self.notify_admin(
+            discord.Embed(
+                title=(
+                    f"{E.NG} マクドナルドへ接続できません"
+                    if report.became_down else f"{E.OK} 接続が復帰しました"
+                ),
+                description=text[:4000],
+                color=embeds.RED if report.became_down else embeds.GREEN,
+            )
+        )
+
+    @outage_watch.before_loop
+    async def before_outage_watch(self) -> None:
         await self._wait_ready()
 
     # -- アカウントの健全性 -------------------------------------

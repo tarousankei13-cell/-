@@ -215,6 +215,39 @@ class AdminCog(commands.Cog):
         e.set_footer(text=f"控えは {dns.TTL:.0f} 秒で作り直します")
         await interaction.response.send_message(embed=e, ephemeral=True)
 
+    @stats_group.command(name="health", description="マクドナルド側の様子を確認します")
+    @admin_only()
+    async def stats_health(self, interaction: discord.Interaction) -> None:
+        """いま接続できているかを、その場で確かめる。"""
+        from services import monitor
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        report = await monitor.check()
+
+        color = (
+            embeds.RED if report.all_down
+            else (embeds.GREEN if report.healthy == len(report.results)
+                  else embeds.ORANGE)
+        )
+        e = discord.Embed(
+            title=f"{E.STORE} マクドナルドへの接続",
+            description=f"正常 **{report.healthy}** / {len(report.results)} 件",
+            color=color,
+        )
+        for h in report.results:
+            mark = E.GREEN if h.ok else E.RED
+            body = f"{h.latency_ms:.0f}ms" if h.ok else f"`{h.last_error}`"
+            if not h.ok and h.last_ok:
+                body += f"\n最後に応答 <t:{int(h.last_ok)}:R>"
+            e.add_field(name=f"{mark} {h.name}", value=body, inline=True)
+        if report.all_down:
+            e.set_footer(
+                text="すべて応答していません。マクドナルド側の障害か、回線の問題です"
+            )
+        else:
+            e.set_footer(text=f"{config.MONITOR_INTERVAL_MINUTES}分ごとに自動で確認しています")
+        await interaction.followup.send(embed=e, ephemeral=True)
+
     @stats_group.command(name="account", description="アカウント別の使用状況")
     @admin_only()
     async def stats_account(self, interaction: discord.Interaction) -> None:
