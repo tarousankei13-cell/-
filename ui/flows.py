@@ -176,6 +176,39 @@ class MethodView(discord.ui.View):
         await menu_flows.start_store_select(interaction, purpose="order")
 
 
+async def has_usable_account() -> bool:
+    """注文に使えるマクドナルドアカウントがあるか。"""
+    from sqlalchemy import func
+
+    from db.models import McdAccount
+    from services.mcd.accounts import USABLE
+
+    async with session_scope() as s:
+        n = await s.scalar(
+            select(func.count()).select_from(McdAccount)
+            .where(McdAccount.status.in_(USABLE))
+        )
+    return bool(n)
+
+
+async def _no_account_notice(interaction: discord.Interaction) -> None:
+    """
+    アカウント未登録のときの案内。
+
+    何も設定していない状態でいきなり注文されると、
+    分かりにくいエラーになってしまうため、手前で止めて伝える。
+    """
+    embed = embeds.warn(
+        "ただいま注文を受け付けできません。\n"
+        "管理者にお問い合わせください。",
+        title=f"{E.NG} 注文を受け付けできません",
+    )
+    if interaction.response.is_done():
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 async def start_order(interaction: discord.Interaction) -> None:
     """
     注文の入口。
@@ -183,6 +216,12 @@ async def start_order(interaction: discord.Interaction) -> None:
     注文方式が片方に絞られている場合は、選ぶ画面を挟まずに直接そちらへ進む。
     """
     await user_repo.get_or_create(interaction.user.id)
+
+    if not await has_usable_account():
+        log.warning("使用できるマクドナルドアカウントがありません")
+        await _no_account_notice(interaction)
+        return
+
     mode = settings.get("order_mode", "both")
 
     if mode == "hex":
@@ -207,6 +246,9 @@ async def start_order(interaction: discord.Interaction) -> None:
 async def start_hex_builder(interaction: discord.Interaction) -> None:
     from ui import menu_flows
 
+    if not await has_usable_account():
+        await _no_account_notice(interaction)
+        return
     await menu_flows.start_store_select(interaction, purpose="hex")
 
 

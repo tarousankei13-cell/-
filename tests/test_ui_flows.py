@@ -37,6 +37,15 @@ async def main():
     client = FakeClient()
     await user_repo.get_or_create(UID)
 
+    # 注文できる状態にするため、マクドナルドアカウントを1件登録しておく
+    from db.models import McdAccount
+    async with session_scope() as s:
+        s.add(McdAccount(
+            id=1, label="test", email_enc=b"x", card_id="c1",
+            device_uid="d", wmop_device_id="w", fb_instance_id="f",
+            home_lat=35.0, home_lng=139.0,
+        ))
+
     print("\n[1] 常設パネルの表示")
     for mode in ("both", "hex", "menu"):
         await settings.set_value("order_mode", mode)
@@ -57,6 +66,17 @@ async def main():
         if await guarded(f"mode={mode} が例外なく動く", flows.start_order(itx)):
             check(f"mode={mode} → {expect}", itx.kinds[0] == expect, itx.kinds)
     await settings.set_value("order_mode", "both")
+
+    print("\n[2b] アカウント未登録のときの案内")
+    from sqlalchemy import update
+    from db.models import McdAccount as _MA
+    async with session_scope() as s:
+        await s.execute(update(_MA).values(status="BANNED"))
+    itx = FakeInteraction(user, client)
+    await flows.start_order(itx)
+    check("分かりやすい案内が出る", "受け付けできません" in itx.text(), itx.text()[:60])
+    async with session_scope() as s:
+        await s.execute(update(_MA).values(status="ACTIVE"))
 
     print("\n[3] 残高の表示")
     async with user_scope(UID) as s:
