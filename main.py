@@ -157,10 +157,16 @@ class McdBot(commands.Bot):
            この時点では self.guilds が空で、残留したギルドコマンドを
            掃除できないため（二重表示の原因）。同期は on_ready で行う。
         """
+        from core.crypto import init_cipher
         from db.session import init_db
 
+        init_cipher(self.encryption_key)
         await init_db(self.database_url)
         log.info("データベースを初期化しました")
+
+        from core import settings
+
+        await settings.load_all()
 
         await self._load_cogs()
         await self._register_persistent_views()

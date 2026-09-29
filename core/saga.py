@@ -44,7 +44,8 @@ CREATED = "CREATED"
 QUOTED = "QUOTED"
 BALANCE_HELD = "BALANCE_HELD"
 MCD_STORED = "MCD_STORED"
-MCD_AUTHORISED = "MCD_AUTHORISED"      # ★ここから自動返金禁止
+MCD_AUTHORISING = "MCD_AUTHORISING"    # ★決済を呼んでいる最中。課金の成否が不明
+MCD_AUTHORISED = "MCD_AUTHORISED"
 RECEIPT_FETCHED = "RECEIPT_FETCHED"
 CAPTURED = "CAPTURED"
 NOTIFIED = "NOTIFIED"
@@ -54,8 +55,12 @@ REFUNDED = "REFUNDED"
 MANUAL_REVIEW = "MANUAL_REVIEW"        # ⚠️ 人の確認が必要
 
 TERMINAL = {COMPLETED, REFUNDED, MANUAL_REVIEW}
-# この状態以降は、失敗しても自動で返金してはいけない
-PAID_OR_LATER = {MCD_AUTHORISED, RECEIPT_FETCHED, CAPTURED, NOTIFIED, COMPLETED}
+# この状態以降は、失敗しても自動で返金してはいけない。
+# ⚠️ MCD_AUTHORISING を含めるのが要。決済リクエストの途中で通信が切れた場合、
+#    課金されたかどうか分からないため、勝手に返金すると二重の損失になりうる。
+PAID_OR_LATER = {
+    MCD_AUTHORISING, MCD_AUTHORISED, RECEIPT_FETCHED, CAPTURED, NOTIFIED, COMPLETED,
+}
 
 ProgressCallback = Callable[[str, str], Awaitable[None]]  # (段階, 表示文言)
 
@@ -245,22 +250,42 @@ async def execute(order_id: str, progress: ProgressCallback | None = None) -> Or
             state = MCD_STORED
 
         # ---- ④ 支払いの確定（ここから自動返金禁止） ----
-        if state == MCD_STORED:
+        receipt = ""
+        if state in (MCD_STORED, MCD_AUTHORISING):
             if handle is None:
                 handle = await _reopen_account(order_id)
             async with session_scope() as s:
                 order = await s.get(Order, order_id)
                 token, group = order.order_token or "", order.group_name or "group-f"
 
-            auth = await handle.client.authorise_order(group, token)
-            await _record(
-                order_id, state, MCD_AUTHORISED,
-                {"status": auth.status, "order_code": auth.order_code},
-            )
+            if state == MCD_STORED:
+                # ★呼び出す前に状態を確定させる。
+                #   ここで落ちても「決済を試みた」ことが記録に残る。
+                await _record(order_id, state, MCD_AUTHORISING)
+                state = MCD_AUTHORISING
+                try:
+                    auth = await handle.client.authorise_order(group, token)
+                    receipt = auth.display_order_number
+                except (McdError, McdNetworkError, McdOrderError) as exc:
+                    # ⚠️ 課金されたかどうか分からない。リトライは絶対にしない。
+                    #    読み取り専用の GetPaidOrder で実際の状態を確かめる。
+                    paid = await _probe_paid(handle, group, token)
+                    if paid is None:
+                        log.error(
+                            "決済の成否を確認できませんでした。手動確認へ回します: %s", exc
+                        )
+                        raise
+                    log.warning("決済は成立していました（応答だけが届きませんでした）")
+                    receipt = paid.display_order_number
+            else:
+                # 復旧時: 決済を試みた直後に落ちていた
+                paid = await _probe_paid(handle, group, token)
+                if paid is None:
+                    raise SagaError("決済の成否を確認できませんでした")
+                receipt = paid.display_order_number
+
+            await _record(order_id, state, MCD_AUTHORISED, {"receipt_number": receipt})
             state = MCD_AUTHORISED
-            receipt = auth.display_order_number
-        else:
-            receipt = ""
 
         # ---- ⑤ 注文番号の取得 ----
         if state == MCD_AUTHORISED:
@@ -308,6 +333,24 @@ async def _reopen_account(order_id: str):
     if not account_id:
         raise SagaError("この注文に紐づくアカウントが分かりません")
     return await mcd_accounts.open_account(account_id)
+
+
+async def _probe_paid(handle, group: str, token: str, attempts: int = 3):
+    """
+    決済が実際に成立したかを確認する。
+
+    GetPaidOrder は読み取り専用なので何度呼んでも安全。
+    注文が返ってくれば成立、確認できなければ None を返す（→ 手動確認へ）。
+    """
+    for i in range(attempts):
+        try:
+            paid = await handle.client.get_paid_order(group, token)
+            if paid.order_code or paid.display_order_number:
+                return paid
+        except McdError as e:
+            log.info("決済状況の確認を再試行します (%d/%d): %s", i + 1, attempts, e)
+        await asyncio.sleep(1.5)
+    return None
 
 
 async def _fetch_receipt(handle, group: str, token: str, attempts: int = 5) -> str:

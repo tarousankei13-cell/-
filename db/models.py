@@ -238,7 +238,9 @@ class KyashReceipt(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     link_uuid: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
-    kyash_account_id: Mapped[int | None] = mapped_column(ForeignKey("kyash_accounts.id"))
+    kyash_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("kyash_accounts.id", ondelete="SET NULL")
+    )
     discord_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
     sender_name: Mapped[str | None] = mapped_column(String(64))
@@ -280,7 +282,10 @@ class Order(Base):
     user_amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
     subsidy_amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
-    mcd_account_id: Mapped[int | None] = mapped_column(ForeignKey("mcd_accounts.id"))
+    # アカウントを削除しても履歴は残す（参照はNULLになる）
+    mcd_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("mcd_accounts.id", ondelete="SET NULL")
+    )
     order_token: Mapped[str | None] = mapped_column(Text)
     order_code: Mapped[str | None] = mapped_column(String(64))
     receipt_number: Mapped[str | None] = mapped_column(String(16))  # 注文番号（例 7161）
