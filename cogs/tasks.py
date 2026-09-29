@@ -11,6 +11,7 @@ from discord.ext import commands, tasks
 import config
 import emoji as E
 from core import saga, settings
+from core.telemetry import traced
 from db.session import session_scope
 from services import tasks as jobs
 from services.mcd import store_sync
@@ -73,6 +74,7 @@ class TasksCog(commands.Cog):
     # -- メニュー同期 -------------------------------------------
 
     @tasks.loop(minutes=config.MENU_SYNC_INTERVAL_MINUTES)
+    @traced("メニュー同期")
     async def menu_sync(self) -> None:
         """
         商品・価格・提供時間帯を取り込む。
@@ -127,6 +129,7 @@ class TasksCog(commands.Cog):
     # -- 店舗一覧の同期 -----------------------------------------
 
     @tasks.loop(minutes=config.STORE_INDEX_SYNC_MINUTES)
+    @traced("店舗同期")
     async def store_index_sync(self) -> None:
         """
         店舗一覧を最新に保つ。

@@ -9,6 +9,7 @@ TESTS = [
     ("メニュー解析（実データ247商品）", "test_menu.py"),
     ("暗号化・複式元帳・排他制御", "test_phase0.py"),
     ("DBの日時の扱い", "test_db_datetime.py"),
+    ("相関IDと通信計測", "test_telemetry.py"),
     ("カート組み立て", "test_cart.py"),
     ("セットの選択枠・時間帯", "test_menu_choices.py"),
     ("具材の調整（抜き・増量）", "test_customize.py"),

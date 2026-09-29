@@ -19,6 +19,7 @@ import emoji as E
 from core import ledger as L
 from core import saga, settings, subsidy
 from core import users as user_repo
+from core.telemetry import traced
 from db.models import as_utc, Order, User
 from db.session import session_scope
 from services.mcd import accounts as mcd_accounts
@@ -116,6 +117,7 @@ class ChargeModal(discord.ui.Modal, title="残高チャージ"):
         max_length=255,
     )
 
+    @traced("チャージ")
     async def on_submit(self, interaction: discord.Interaction) -> None:
         from services.kyash.charge import ChargeError, charge_from_link
 
@@ -511,6 +513,7 @@ class ConfirmView(discord.ui.View):
 #  注文の実行と通知
 # ============================================================
 
+@traced("注文")
 async def run_order(
     interaction: discord.Interaction,
     decoded: DecodedOrder,

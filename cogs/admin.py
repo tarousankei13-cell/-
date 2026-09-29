@@ -91,6 +91,60 @@ class AdminCog(commands.Cog):
             )
         await interaction.followup.send(embed=e, ephemeral=True)
 
+    @stats_group.command(name="network", description="通信の速さと失敗率を表示します")
+    @admin_only()
+    async def stats_network(self, interaction: discord.Interaction) -> None:
+        """
+        相手先ごとの応答時間と失敗率。
+
+        「最近遅い」を感覚ではなく数字で判断できるようにするためのもの。
+        p50 は半数がこれ以内、p95 は95%がこれ以内という意味。
+        """
+        from datetime import datetime, timezone
+
+        from core.telemetry import metrics
+
+        snap = metrics.snapshot()
+        if not snap:
+            await interaction.response.send_message(
+                embed=embeds.info(
+                    "まだ通信の記録がありません。\n"
+                    "注文や同期が動くと貯まります。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        e = discord.Embed(
+            title=f"{E.CHART} 通信の状況",
+            description=(
+                f"起動してから **{metrics.total_requests:,}** 件\n"
+                f"うち失敗 **{metrics.total_failures:,}** 件"
+            ),
+            color=embeds.BLUE,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        def ms(v):
+            if v is None:
+                return "—"
+            return f"{v/1000:.1f}秒" if v >= 1000 else f"{v:.0f}ms"
+
+        for st in snap[:12]:
+            rate = st.failure_rate * 100
+            mark = E.GREEN if rate < 1 else (E.YELLOW if rate < 10 else E.RED)
+            body = (
+                f"件数 **{st.total:,}**　失敗 **{rate:.1f}%**\n"
+                f"中央値 {ms(st.p50)}　95% {ms(st.p95)}"
+            )
+            if st.last_error:
+                body += f"\n{E.WARN} 直近の失敗: `{st.last_error[:40]}`"
+            e.add_field(name=f"{mark} {st.host}", value=body, inline=True)
+
+        elapsed = (datetime.now(timezone.utc).timestamp() - metrics.started_at) / 60
+        e.set_footer(text=f"起動から {elapsed:.0f} 分 / 直近300件から算出")
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
     @stats_group.command(name="account", description="アカウント別の使用状況")
     @admin_only()
     async def stats_account(self, interaction: discord.Interaction) -> None:
