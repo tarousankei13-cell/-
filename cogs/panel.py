@@ -279,9 +279,14 @@ class Panel(commands.Cog):
         await interaction.response.send_message(
             embed=self.panel_embed(), view=PanelView(self)
         )
+        sent = await interaction.original_response()
+        # 混雑状況を定期更新できるよう、パネルの位置を覚えておく
+        await asyncio.to_thread(
+            self.bot.store.set_kv, "panel_message", [interaction.channel_id, sent.id]
+        )
         await asyncio.to_thread(
             self.bot.store.audit, "panel.posted", interaction.user.id,
-            {"channel": interaction.channel_id},
+            {"channel": interaction.channel_id, "message": sent.id},
         )
 
     # ------------------------------------------------------------ 事前チェック

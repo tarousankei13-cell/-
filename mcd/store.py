@@ -535,9 +535,24 @@ class Store:
             )
 
     def release_hex(self, order_id: int) -> None:
-        """事前チェックで落ちた注文の hex を解放する（決済は試みていない場合のみ）。"""
+        """注文コードを再利用できる状態に戻す。
+
+        まだ決済を試みていない (pending) 行はそのまま消す。
+        既に失敗として記録済みの行は、履歴を残したいので消さず、
+        hex_sha256 だけ一意な番兵に差し替えて UNIQUE 制約から外す。
+        paid / unknown は二重決済になるので絶対に解放しない。
+        """
         with self.tx() as c:
-            c.execute("DELETE FROM orders WHERE id=? AND status='pending'", (order_id,))
+            row = c.execute("SELECT status FROM orders WHERE id=?", (order_id,)).fetchone()
+            if row is None:
+                return
+            if row["status"] == "pending":
+                c.execute("DELETE FROM orders WHERE id=?", (order_id,))
+            elif row["status"] == "failed":
+                c.execute(
+                    "UPDATE orders SET hex_sha256=?, raw_hex=NULL WHERE id=?",
+                    (f"released:{order_id}", order_id),
+                )
 
     def stale_pending_orders(self, older_than: datetime) -> list[sqlite3.Row]:
         return self._q(
