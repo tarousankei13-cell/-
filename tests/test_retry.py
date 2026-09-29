@@ -108,7 +108,7 @@ async def main():
     import inspect
     from services.mcd import client as C
     src = inspect.getsource(C.McdClient)
-    def region(name, size=900):
+    def region(name, size=1400):
         i = src.index(f"async def {name}")
         return src[i:i + size]
     check("注文の登録は ONCE ★", "Idempotency.ONCE" in region("store_order"))

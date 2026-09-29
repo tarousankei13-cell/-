@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import config
 from core.crypto import get_cipher
+from core import breaker
 from db.models import as_utc, McdAccount, McdToken, utcnow
 from db.session import session_scope
 from services.mcd.client import Fingerprint, McdClient, McdError, TokenSet
@@ -173,6 +174,16 @@ async def pick_account(exclude: set[int] | None = None) -> AccountHandle:
             await s.execute(select(McdAccount).where(McdAccount.status.in_(USABLE)))
         ).scalars().all()
         candidates = [a for a in rows if a.id not in exclude and a.card_id]
+        # 続けて失敗しているアカウントは、しばらく使わない。
+        # 壊れた相手に送り続けると全員がタイムアウトを待たされるため。
+        usable = [a for a in candidates if breaker.accounts.allows(f"mcd:{a.id}")]
+        if usable:
+            candidates = usable
+        elif candidates:
+            # 全部止まっている場合は、一番早く復帰するものを試す
+            log.warning("使えるアカウントが一時的にありません。最も回復が近いものを試します")
+            candidates.sort(key=lambda a: breaker.accounts.get(f"mcd:{a.id}").retry_after)
+            candidates = candidates[:1]
         if not candidates:
             no_card = [a.label for a in rows if a.id not in exclude and not a.card_id]
             if no_card:
@@ -201,6 +212,7 @@ async def pick_account(exclude: set[int] | None = None) -> AccountHandle:
 # ============================================================
 
 async def report_success(account_id: int) -> None:
+    breaker.accounts.record_success(f"mcd:{account_id}")
     async with session_scope() as s:
         acc = await s.get(McdAccount, account_id)
         if acc is None:
@@ -224,6 +236,7 @@ async def report_failure(account_id: int, error: str, *, fatal: bool = False) ->
 
     返り値は新しい状態。QUARANTINED になったら管理者へ通知すること。
     """
+    breaker.accounts.record_failure(f"mcd:{account_id}", error)
     async with session_scope() as s:
         acc = await s.get(McdAccount, account_id)
         if acc is None:

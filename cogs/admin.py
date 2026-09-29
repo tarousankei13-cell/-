@@ -146,6 +146,46 @@ class AdminCog(commands.Cog):
         e.set_footer(text=f"起動から {elapsed:.0f} 分 / 直近300件から算出")
         await interaction.response.send_message(embed=e, ephemeral=True)
 
+    @stats_group.command(name="breaker", description="一時的に使っていない経路を表示します")
+    @admin_only()
+    async def stats_breaker(self, interaction: discord.Interaction) -> None:
+        """
+        続けて失敗した相手は、しばらく使わないようにしている。
+        その状態を確認する。
+        """
+        from core import breaker
+
+        rows = breaker.groups.snapshot() + breaker.accounts.snapshot()
+        if not rows:
+            await interaction.response.send_message(
+                embed=embeds.ok("すべて正常です。止めている経路はありません。"),
+                ephemeral=True,
+            )
+            return
+
+        blocked = [b for b in rows if b.state != breaker.CLOSED]
+        e = discord.Embed(
+            title=f"{E.SYNC} 経路の状態",
+            description=(
+                f"{E.OK} 正常 {len(rows) - len(blocked)} 件"
+                + (f"　/　{E.WARN} 停止中 {len(blocked)} 件" if blocked else "")
+            ),
+            color=embeds.ORANGE if blocked else embeds.GREEN,
+        )
+        for b in (blocked or rows)[:15]:
+            mark = {
+                breaker.CLOSED: E.GREEN, breaker.HALF: E.YELLOW, breaker.OPEN: E.RED
+            }.get(b.state, E.GREEN)
+            body = b.describe()
+            if b.last_error:
+                body += f"\n`{b.last_error[:60]}`"
+            if b.total_blocked:
+                body += f"\n送らずに済ませた回数 {b.total_blocked}"
+            e.add_field(name=f"{mark} {b.name}", value=body, inline=True)
+        if not blocked:
+            e.set_footer(text="すべて正常です")
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
     @stats_group.command(name="account", description="アカウント別の使用状況")
     @admin_only()
     async def stats_account(self, interaction: discord.Interaction) -> None:

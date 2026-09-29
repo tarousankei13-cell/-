@@ -19,7 +19,7 @@ from typing import Awaitable, Callable
 
 import httpx
 
-from core import retry
+from core import breaker, retry
 from core.http import build_async_client
 from core.telemetry import current as correlation_id
 from services.mcd import errors as mcd_errors
@@ -399,7 +399,13 @@ class McdClient:
         （サーバーが 304 を返し、通信量がゼロで済む）。
         """
         headers = {"If-None-Match": etag} if etag else {}
+        tried_any = False
         for g in ([group] if group else GROUPS):
+            # 応答しなくなっている配信元は飛ばす。
+            # 総当たりのたびに待たされると、店舗の解決だけで数十秒かかる。
+            if not breaker.groups.allows(g):
+                continue
+            tried_any = True
             url = f"{DATA_CAT.format(group=g)}/{store_id}.json"
             try:
                 # 読み取りなので何度送っても構わない。
@@ -412,12 +418,18 @@ class McdClient:
                     label=f"店舗情報の取得({g})",
                     attempts=2,
                 )
-            except httpx.HTTPError:
+            except httpx.HTTPError as e:
+                breaker.groups.record_failure(g, str(e))
                 continue
+            breaker.groups.record_success(g)
             if r.status_code == 304:
                 return None, g, etag or ""
             if r.status_code == 200:
                 return r.json(), g, r.headers.get("etag", "")
+        if not tried_any:
+            raise McdNetworkError(
+                "マクドナルドの配信元に接続できません。しばらくしてからお試しください"
+            )
         raise McdError(f"店舗 {store_id} が見つかりません")
 
     async def fetch_menu(
