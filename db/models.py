@@ -377,6 +377,34 @@ class Cart(Base):
 #  メニューカタログ
 # ============================================================
 
+class AuditLog(Base):
+    """
+    管理操作の記録。
+
+    お金を扱うため、誰がいつ何を変えたかを残す。
+    「誰が負担率を60%にしたのか」「この残高付与は誰の判断か」に
+    答えられないと、複数人で運用できない。
+
+    ⚠️ この表は**消さない**。バックアップにも必ず含める。
+    """
+    __tablename__ = "audit_log"
+
+    id: Mapped[int] = mapped_column(AutoBigInt, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    actor_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    actor_name: Mapped[str | None] = mapped_column(String(64))
+    # 何をしたか（subsidy.global / balance.grant / account.remove など）
+    action: Mapped[str] = mapped_column(String(48), nullable=False, index=True)
+    # 対象（利用者ID・アカウントID・設定キーなど）
+    target: Mapped[str | None] = mapped_column(String(64), index=True)
+    before: Mapped[str | None] = mapped_column(Text)
+    after: Mapped[str | None] = mapped_column(Text)
+    reason: Mapped[str | None] = mapped_column(String(255))
+    detail: Mapped[str | None] = mapped_column(Text)
+
+
 class MenuProduct(Base):
     __tablename__ = "menu_products"
 

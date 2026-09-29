@@ -67,8 +67,23 @@ def get(key: str, default: Any = None) -> Any:
     return DEFAULTS.get(key, default)
 
 
-async def set_value(key: str, value: Any, *, updated_by: int | None = None) -> None:
-    """設定を保存する。次回起動時も維持される。"""
+async def set_value(
+    key: str,
+    value: Any,
+    *,
+    updated_by: int | None = None,
+    actor_name: str | None = None,
+    reason: str | None = None,
+    audit: bool = True,
+) -> None:
+    """
+    設定を保存する。次回起動時も維持される。
+
+    ⚠️ 変更は自動的に監査ログへ残る。
+       設定コマンドを増やすたびに記録を書き足す必要は無い。
+       記録したくない内部的な更新だけ audit=False にする。
+    """
+    previous = _cache.get(key)
     payload = json.dumps(value, ensure_ascii=False)
     async with session_scope() as s:
         row = await s.get(BotConfig, key)
@@ -79,6 +94,15 @@ async def set_value(key: str, value: Any, *, updated_by: int | None = None) -> N
             row.updated_by = updated_by
     _cache[key] = value
     log.info("設定を更新しました: %s = %s", key, value)
+
+    if audit and updated_by:
+        # 循環参照を避けるため、ここで取り込む
+        from core import audit as audit_log
+
+        await audit_log.record(
+            actor_id=updated_by, actor_name=actor_name, action="config.set",
+            target=key, before=previous, after=value, reason=reason,
+        )
 
 
 async def set_in_session(s: AsyncSession, key: str, value: Any, *, updated_by: int | None = None) -> None:

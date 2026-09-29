@@ -13,6 +13,7 @@ from discord.ext import commands
 
 import config
 import emoji as E
+from core import audit
 from core import ledger as L
 from core import settings
 from core import users as user_repo
@@ -167,6 +168,12 @@ class AdminCog(commands.Cog):
         except L.LedgerError as e:
             await interaction.followup.send(embed=embeds.error(str(e)), ephemeral=True)
             return
+        await audit.record(
+            actor_id=interaction.user.id, actor_name=str(interaction.user),
+            action="balance.grant", target=str(user.id),
+            after=f"{amount:+,}円", reason=reason,
+            detail={"balance_after": balance, "user": str(user)},
+        )
         await interaction.followup.send(
             embed=embeds.ok(
                 f"{user.mention} の残高を **{amount:+,}円** しました。\n"
@@ -182,6 +189,11 @@ class AdminCog(commands.Cog):
             u = await user_repo.ensure_user(s, user.id)
             u.is_banned = True
             u.note = reason or u.note
+        await audit.record(
+            actor_id=interaction.user.id, actor_name=str(interaction.user),
+            action="user.ban", target=str(user.id), reason=reason or None,
+            before="利用可", after="停止中", detail={"user": str(user)},
+        )
         await interaction.response.send_message(
             embed=embeds.ok(f"{user.mention} の利用を停止しました。"), ephemeral=True
         )
@@ -192,9 +204,64 @@ class AdminCog(commands.Cog):
         async with session_scope() as s:
             u = await user_repo.ensure_user(s, user.id)
             u.is_banned = False
+        await audit.record(
+            actor_id=interaction.user.id, actor_name=str(interaction.user),
+            action="user.unban", target=str(user.id),
+            before="停止中", after="利用可", detail={"user": str(user)},
+        )
         await interaction.response.send_message(
             embed=embeds.ok(f"{user.mention} の利用停止を解除しました。"), ephemeral=True
         )
+
+    @admin.command(name="audit", description="管理操作の記録を表示します")
+    @app_commands.describe(
+        user="この人の操作だけ表示（任意）",
+        action="種類で絞り込み（例: balance / subsidy / account）",
+        limit="表示件数（既定20・最大50）",
+    )
+    @admin_only()
+    async def admin_audit(
+        self,
+        interaction: discord.Interaction,
+        user: discord.User | None = None,
+        action: str | None = None,
+        limit: app_commands.Range[int, 1, 50] = 20,
+    ) -> None:
+        """
+        誰がいつ何を変えたかの記録。
+
+        お金を扱うので、設定の変更・残高の付与・利用停止・
+        アカウントの削除はすべてここに残る。
+        """
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        entries = await audit.search(
+            actor_id=user.id if user else None, action=action, limit=int(limit)
+        )
+        total = await audit.count()
+
+        if not entries:
+            await interaction.followup.send(
+                embed=embeds.info(
+                    "条件に合う記録がありませんでした。\n"
+                    f"記録は全部で **{total:,}** 件あります。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        body = "\n\n".join(e.line() for e in entries)
+        cond = []
+        if user:
+            cond.append(f"操作者 {user.mention}")
+        if action:
+            cond.append(f"種類 `{action}`")
+        e = discord.Embed(
+            title=f"{E.NOTE} 管理操作の記録",
+            description=(("　/　".join(cond) + "\n\n") if cond else "") + body[:3800],
+            color=embeds.BLUE,
+        )
+        e.set_footer(text=f"{len(entries)} 件を表示 / 記録は全部で {total:,} 件")
+        await interaction.followup.send(embed=e, ephemeral=True)
 
     @admin.command(name="review", description="要確認の注文を処理します")
     @admin_only()

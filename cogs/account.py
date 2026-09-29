@@ -21,6 +21,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import emoji as E
+from core import audit
 from core.crypto import get_cipher
 from db.models import KyashAccount, McdAccount, McdToken, utcnow
 from db.session import session_scope
@@ -441,6 +442,10 @@ class AccountCog(commands.Cog):
             if token:
                 await s.delete(token)
             await s.delete(acc)
+        await audit.record(
+            actor_id=interaction.user.id, actor_name=str(interaction.user),
+            action="account.remove", target=f"mcd:{account_id}", before=label,
+        )
         await interaction.response.send_message(
             embed=embeds.ok(f"`#{account_id}` **{label}** を削除しました。"), ephemeral=True
         )
@@ -555,6 +560,10 @@ class AccountCog(commands.Cog):
                 return
             label = acc.label
             await s.delete(acc)
+        await audit.record(
+            actor_id=interaction.user.id, actor_name=str(interaction.user),
+            action="account.remove", target=f"kyash:{account_id}", before=label,
+        )
         await interaction.response.send_message(
             embed=embeds.ok(f"`#{account_id}` **{label}** を削除しました。"), ephemeral=True
         )
