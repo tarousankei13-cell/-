@@ -8,6 +8,7 @@ TESTS = [
     ("protobuf層（実HEXで検証）", "test_protocol.py"),
     ("メニュー解析（実データ247商品）", "test_menu.py"),
     ("暗号化・複式元帳・排他制御", "test_phase0.py"),
+    ("DBの日時の扱い", "test_db_datetime.py"),
     ("カート組み立て", "test_cart.py"),
     ("店名検索", "test_store_search.py"),
     ("店舗一覧の定期同期", "test_store_sync.py"),

@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import config
 from core.crypto import get_cipher
-from db.models import McdAccount, McdToken, utcnow
+from db.models import as_utc, McdAccount, McdToken, utcnow
 from db.session import session_scope
 from services.mcd.client import Fingerprint, McdClient, McdError, TokenSet
 
@@ -144,14 +144,18 @@ def _score(acc: McdAccount, now: datetime) -> float:
     elif acc.status == STATUS_DEGRADED:
         score += 0.5
 
-    if acc.last_used_at:
-        elapsed = (now - acc.last_used_at).total_seconds() / 60.0
+    last_used = as_utc(acc.last_used_at)
+    if last_used:
+        elapsed = (now - last_used).total_seconds() / 60.0
         score += 1.5 * min(elapsed / 30.0, 1.0)
     else:
         score += 1.5
 
-    score += 1.0 * max(0.0, 1.0 - acc.orders_today / 20.0)
-    score -= 5.0 * acc.consecutive_failures
+    # DBに保存する前のオブジェクトでは、列の既定値(0)がまだ入っておらず
+    # None になる。ここで落ちるとアカウントを1つも選べなくなるため、
+    # 数え上げ系は必ず 0 を補ってから計算する。
+    score += 1.0 * max(0.0, 1.0 - (acc.orders_today or 0) / 20.0)
+    score -= 5.0 * (acc.consecutive_failures or 0)
     return score
 
 

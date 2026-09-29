@@ -37,7 +37,13 @@ PAGE_SIZE = 25
 
 
 def now_minutes() -> int:
-    return minutes_of(datetime.now())
+    """
+    いまが0時から何分か（日本時間）。
+
+    提供時間帯は日本時間で定義されているため、サーバーのタイムゾーン
+    設定に頼らず、必ず日本時間で数える（config.now_jst）。
+    """
+    return minutes_of(config.now_jst())
 
 
 # ============================================================

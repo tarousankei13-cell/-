@@ -19,7 +19,7 @@ import emoji as E
 from core import ledger as L
 from core import saga, settings, subsidy
 from core import users as user_repo
-from db.models import Order, User
+from db.models import as_utc, Order, User
 from db.session import session_scope
 from services.mcd import accounts as mcd_accounts
 from services.mcd import stores as mcd_stores
@@ -89,7 +89,8 @@ async def show_history(interaction: discord.Interaction) -> None:
             saga.COMPLETED: E.OK, saga.NOTIFIED: E.OK, saga.CAPTURED: E.OK,
             saga.REFUNDED: E.NG, saga.MANUAL_REVIEW: E.WARN,
         }.get(o.state, E.LOADING)
-        when = o.created_at.strftime("%m/%d %H:%M") if o.created_at else "—"
+        created = as_utc(o.created_at)
+        when = created.astimezone(config.JST).strftime("%m/%d %H:%M") if created else "—"
         e.add_field(
             name=f"{mark} {when}　{o.store_name or o.store_id or '—'}",
             value=(
@@ -684,7 +685,8 @@ async def daily_order_count() -> int:
     """本日成立した注文の件数。実績パネルの「本日◯件目」に使う。"""
     from sqlalchemy import func
 
-    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    # 日本時間の0時から数える（UTCの0時だと日本の朝9時で切り替わってしまう）
+    today = config.jst_midnight()
     async with session_scope() as s:
         count = await s.scalar(
             select(func.count()).select_from(Order).where(

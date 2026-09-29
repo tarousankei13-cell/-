@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 import config
 from core.crypto import get_cipher
-from db.models import KyashAccount
+from db.models import as_utc, KyashAccount
 from db.session import session_scope
 from services.kyash.client import KyashClient, KyashError, KyashSession
 
@@ -47,9 +47,7 @@ def token_days_left(acc: KyashAccount) -> float | None:
     """アクセストークンの残り日数。1ヶ月で失効する。"""
     if not acc.token_obtained_at:
         return None
-    obtained = acc.token_obtained_at
-    if obtained.tzinfo is None:
-        obtained = obtained.replace(tzinfo=timezone.utc)
+    obtained = as_utc(acc.token_obtained_at)
     elapsed = (datetime.now(timezone.utc) - obtained).days
     return config.KYASH_TOKEN_LIFETIME_DAYS - elapsed
 
@@ -63,8 +61,11 @@ def _score(acc: KyashAccount) -> float:
       ・トークンの期限が近い口座は避ける
     """
     score = 3.0 if acc.is_kyc else 0.0
+    # 保存前のオブジェクトでは列の既定値がまだ入っていないので 0 を補う
     if acc.monthly_cap:
-        score += 2.0 * max(0.0, 1.0 - acc.received_this_month / acc.monthly_cap)
+        score += 2.0 * max(
+            0.0, 1.0 - (acc.received_this_month or 0) / acc.monthly_cap
+        )
     else:
         score += 2.0
     left = token_days_left(acc)

@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 """
 既定値と定数
 
@@ -133,3 +135,30 @@ PICKUP_METHODS = {
     "driveThru":      {"field": 5, "label": "ドライブスルー",         "enabled": False},
     "addressDelivery":{"field": 6, "label": "デリバリー",             "enabled": False},
 }
+
+# ============================================================
+#  時刻
+# ============================================================
+# マクドナルドの提供時間帯（朝マック・夜マック）は**日本時間**で定義されている。
+#   ・mopDaypartAbilityLists の日付キーは日本の日付
+#   ・start/end の値は日本時間の「0時からの経過分」（朝マック 350〜620 = 5:50〜10:20）
+#
+# サーバーのタイムゾーン設定に頼ると、UTCの環境では9時間ずれて
+# 朝マックが一切選べなくなる。日付・時刻の判定は必ずこれを使うこと。
+JST = timezone(timedelta(hours=9))
+
+
+def now_jst() -> datetime:
+    """いまの日本時間。"""
+    return datetime.now(JST)
+
+
+def today_jst() -> str:
+    """日本時間の今日（YYYY-MM-DD）。提供時間帯の日付キーに使う。"""
+    return now_jst().strftime("%Y-%m-%d")
+
+
+def jst_midnight() -> datetime:
+    """日本時間の今日の0時。「本日の件数」の集計に使う。"""
+    return now_jst().replace(hour=0, minute=0, second=0, microsecond=0)
+

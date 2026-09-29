@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+
+import config
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -194,7 +196,8 @@ async def make_backup() -> tuple[str, bytes]:
             return dest.read_bytes()
 
     data = await asyncio.to_thread(_read)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+    # ファイル名は日本時間（管理者が見て分かる時刻にする）
+    stamp = config.now_jst().strftime("%Y%m%d-%H%M")
     return f"backup-{stamp}.db", data
 
 

@@ -29,6 +29,27 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def as_utc(value: datetime | None) -> datetime | None:
+    """
+    DBから読んだ日時を、必ずタイムゾーン付き(UTC)にして返す。
+
+    ⚠️ SQLite は `DateTime(timezone=True)` を指定してもタイムゾーンを
+       保存しない。書き込むときは付いていても、読み戻すと naive になる。
+       そのまま `datetime.now(timezone.utc)` と引き算・比較すると
+       `can't subtract offset-naive and offset-aware datetimes` で落ちる。
+
+       保存している値は常にUTCなので、tzinfo が無ければUTCとして扱う。
+       PostgreSQL では最初から付いているため、その場合はそのまま返す。
+
+    DBから読んだ日時をPython側で計算に使うときは、**必ずこれを通すこと**。
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
 def new_uuid() -> str:
     return str(uuid.uuid4())
 

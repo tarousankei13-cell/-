@@ -90,7 +90,9 @@ class TasksCog(commands.Cog):
 
         # 提供時間帯は日付ごとに定義されているため、日付が変わったら
         # ETag を無視して必ず取り直す。
-        today = datetime.now(timezone.utc).date()
+        # 提供時間帯は日付ごとに定義されているので、**日本の**日付が
+        # 変わったら取り直す（UTCの日付だと切り替わりが朝9時になる）
+        today = config.now_jst().date()
         force = self._last_menu_force_date != today
         if force:
             self._last_menu_force_date = today
@@ -205,7 +207,9 @@ class TasksCog(commands.Cog):
     async def hourly_checks(self) -> None:
         if not self._started:
             return
-        now = datetime.now(timezone.utc)
+        # 日次リセット・バックアップ・通知の時刻はすべて日本時間で判断する
+        # （UTCだと「0時にリセット」が日本の朝9時になってしまう）
+        now = config.now_jst()
 
         # 元帳の整合性
         ok, message = await jobs.check_ledger()
@@ -220,7 +224,7 @@ class TasksCog(commands.Cog):
 
         # Kyash トークンの期限
         warnings = await jobs.kyash_token_warnings()
-        if warnings and now.hour == 9:
+        if warnings and now.hour == 9:   # 日本時間の朝9時
             await self.notify_admin(
                 discord.Embed(
                     title=f"{E.KEY} Kyashトークンの期限が近づいています",

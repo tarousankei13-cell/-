@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import delete, func, select
 
 import config
-from db.models import MenuCollection, MenuProduct, StoreCache, StoreDaypart, utcnow
+from db.models import as_utc, MenuCollection, MenuProduct, StoreCache, StoreDaypart, utcnow
 from db.session import session_scope
 from services.mcd.client import McdClient, McdError
 from services.mcd.menu import (
@@ -126,7 +126,9 @@ async def resolve_store(
 
         # 時間帯も保存する
         await s.execute(delete(StoreDaypart).where(StoreDaypart.store_id == store_id))
-        date_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # ⚠️ 日付キーは**日本の日付**。UTCで作ると日本時間の0〜9時に
+        #    前日のキーを見てしまい、時間帯が一件も取れなくなる。
+        date_key = config.today_jst()
         for dp in parse_dayparts(raw, date_key):
             s.add(
                 StoreDaypart(
@@ -146,10 +148,9 @@ async def resolve_store(
 
 def _age_minutes(when: datetime | None) -> float | None:
     """その時刻から何分経ったか。"""
+    when = as_utc(when)
     if when is None:
         return None
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - when).total_seconds() / 60.0
 
 
