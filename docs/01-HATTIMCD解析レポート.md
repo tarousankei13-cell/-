@@ -317,18 +317,25 @@ def _build_store_order_body(..., pickup_payload: bytes = b"") -> bytes:
     b += _pb_msg(7, pickup_payload)   # 呼び出し側から受取方法を注入
 ```
 
-### 必要なペイロード（要採取 → V-1 が最優先課題に昇格）
+### ✅ 必要なペイロード（**解決済み** — `docs/07` §4.2 で protobuf 定義を入手）
+
+`field 7` は `CreateDeliveryMethod`（oneof）である。
 
 | 受取方法 | `field 7` の中身 | 状態 |
 |---|---|---|
-| テイクアウト | `b""`（空） | ✅ 判明済み |
-| イートイン（カウンター受取） | `field 1` を含むサブメッセージ | ❓ **中身の詳細が未確定** |
-| イートイン（テーブルデリバリー） | `field 1` + テーブル番号？ | ❓ 未確定 |
-| デリバリー | `field 2` を含むサブメッセージ | ❓ 未確定 |
+| 店内（カウンター受取） | `field 1`（eatIn・ほぼ空） | ✅ 確定 |
+| テイクアウト | `field 2`（takeOut・ほぼ空） | ✅ 確定 |
+| 店内（席まで） | `field 3`（tableDelivery + tableNumber） | ✅ 確定 |
+| 駐車場で受け取る | `field 4`（curbsidePickUp + curbsideNumber） | ✅ 確定 |
+| ドライブスルー | `field 5`（driveThru） | ✅ 確定 |
+| デリバリー | `field 6`（addressDelivery + 住所） | ✅ 確定 |
 
-**採取方法**: 公式アプリ／mcdon.asia で各受取方法の hex を1つずつ生成し、
-`_proto_parse(bytes.fromhex(hex))[7]` を出力して差分を比較する。
-採取用のデバッグコマンド `/debug hex <hex>` を管理者向けに実装すること（`docs/05`）。
+> ⚠️ **本レポート初版の推測は誤っていた。** `field 2` はデリバリーではなく **takeOut** である。
+> HATTIMCD 自身も同じ誤りを持っている（`docs/07` §5.1 に修正コードあり）。
 
-> **Phase 2 までの暫定対応**: 受取方法セレクトは「テイクアウト」のみ選択可とし、
-> 他は「準備中」でグレーアウト。V-1 が確定次第ロック解除する。
+**残る確認**: `tableDelivery.tableNumber` と `curbsidePickUp.curbsideNumber` の
+フィールド番号のみ実測で確認する。テイクアウトと店内カウンター受取は**空メッセージ**なので
+すぐ実装できる。
+
+> **暫定対応は不要になった**: テイクアウトと店内（カウンター受取）は Phase 1 から選択可能にしてよい。
+> 席まで／駐車場は番号入力の実装とあわせて Phase 5 で解禁する。
