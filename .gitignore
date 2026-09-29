@@ -1,0 +1,14 @@
+# ⚠️ main.py にはトークンと暗号化キーを直接書くため、公開リポジトリでは除外する
+# （このリポジトリを公開する場合は下の行のコメントを外してください）
+# main.py
+
+data/
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.log
