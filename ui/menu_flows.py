@@ -12,6 +12,7 @@ purpose:
 from __future__ import annotations
 
 import json
+import asyncio
 import logging
 from datetime import datetime
 
@@ -328,6 +329,11 @@ async def open_menu(interaction: discord.Interaction, store_id: str, purpose: st
             embed=embeds.error("この店舗のメニューを取得できませんでした。"), ephemeral=True
         )
         return
+
+    # 利用者が商品を選んでいる間に、裏で注文の下ごしらえをしておく。
+    # 確定ボタンを押したときの待ちが短くなる。失敗しても影響しない。
+    if purpose == "order":
+        asyncio.create_task(mcd_accounts.warm_up(store_id, info.group))
 
     await save_cart(interaction.user.id, purpose=purpose, store_id=store_id, pickup=None, items=[])
     # いまの時間に使える受取方法だけを選択肢に出す

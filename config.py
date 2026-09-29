@@ -85,6 +85,7 @@ KYASH_TOKEN_WARN_DAYS = 7        # 残りこの日数で管理者へ通知
 TOKEN_REFRESH_MARGIN_SECONDS = 60   # 期限の何秒前に先回りして更新するか
 ROOT_PASETO_TTL_SECONDS = 3600      # root PASETO の想定寿命
 TOKEN_WARM_INTERVAL_MINUTES = 45    # バックグラウンドでの事前更新間隔
+POS_PASETO_TTL_SECONDS = 600        # POSトークンを使い回す時間（注文のたびに取らない）
 
 # ------------------------------------------------------------
 #  実績パネル（プライバシー重視）

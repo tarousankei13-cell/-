@@ -211,6 +211,62 @@ async def pick_account(exclude: set[int] | None = None) -> AccountHandle:
 #  健全性
 # ============================================================
 
+# ------------------------------------------------------------
+#  POSトークンの使い回し
+# ------------------------------------------------------------
+# 注文のたびに取り直していたが、短時間なら使い回せる。
+# 1注文あたりの往復が1回減る。
+#   キー: (アカウントID, グループ) → (トークン, 期限)
+_pos_cache: dict[tuple[int, str], tuple[str, float]] = {}
+
+
+async def pos_paseto(handle: "AccountHandle", group: str) -> str:
+    """POSトークンを取る。まだ新しければ前のものを使う。"""
+    import time
+
+    key = (handle.account_id, group)
+    hit = _pos_cache.get(key)
+    now = time.time()
+    if hit and hit[1] > now:
+        return hit[0]
+
+    token = await handle.client.get_pos_paseto(group)
+    _pos_cache[key] = (token, now + float(config.POS_PASETO_TTL_SECONDS))
+    return token
+
+
+def forget_pos(account_id: int | None = None) -> None:
+    """使えなくなったトークンを捨てる。"""
+    if account_id is None:
+        _pos_cache.clear()
+        return
+    for key in [k for k in _pos_cache if k[0] == account_id]:
+        _pos_cache.pop(key, None)
+
+
+async def warm_up(store_id: str, group: str = "") -> None:
+    """
+    注文の下ごしらえを先に済ませておく。
+
+    利用者が商品を選んでいる間に、裏でトークンと接続を温めておくと、
+    確定ボタンを押したときの待ちが短くなる。
+
+    ⚠️ 失敗しても何もしない。あくまで前倒しなので、
+       本番の注文はいつもどおり自分で取り直す。
+    """
+    handle = None
+    try:
+        handle = await pick_account()
+        await handle.client.ensure_auth()
+        if group:
+            await pos_paseto(handle, group)
+    except Exception as e:
+        log.debug("下ごしらえに失敗しました（注文には影響しません）: %s", e)
+    finally:
+        if handle:
+            await handle.aclose()
+
+
 async def report_success(account_id: int) -> None:
     breaker.accounts.record_success(f"mcd:{account_id}")
     async with session_scope() as s:
@@ -237,6 +293,7 @@ async def report_failure(account_id: int, error: str, *, fatal: bool = False) ->
     返り値は新しい状態。QUARANTINED になったら管理者へ通知すること。
     """
     breaker.accounts.record_failure(f"mcd:{account_id}", error)
+    forget_pos(account_id)   # 使えなくなっているかもしれないので捨てる
     async with session_scope() as s:
         acc = await s.get(McdAccount, account_id)
         if acc is None:

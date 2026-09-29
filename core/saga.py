@@ -234,8 +234,12 @@ async def execute(order_id: str, progress: ProgressCallback | None = None) -> Or
                 # 作り直して問題ない（未払いの注文が店側に残ることはある）。
                 log.warning("注文の登録中に中断していたため、やり直します: %s", order_id[:8])
             handle = await mcd_accounts.pick_account()
-            await handle.client.ensure_auth()
-            info = await mcd_stores.resolve_store(handle.client, store_id)
+            # 認証の更新と店舗の確認は互いに関係が無いので同時に行う。
+            # 店舗情報は認証がいらない配信元から取るため、待つ必要が無い。
+            _auth, info = await asyncio.gather(
+                handle.client.ensure_auth(),
+                mcd_stores.resolve_store(handle.client, store_id),
+            )
             await notify("store", f"店舗を確認しました（{info.name}）")
 
             async with session_scope() as s:
@@ -253,7 +257,8 @@ async def execute(order_id: str, progress: ProgressCallback | None = None) -> Or
             if state != MCD_STORING:
                 await _record(order_id, state, MCD_STORING)
                 state = MCD_STORING
-            pos_paseto = await handle.client.get_pos_paseto(info.group)
+            # 短時間なら前のトークンを使い回す（1注文あたり1往復減る）
+            pos_paseto = await mcd_accounts.pos_paseto(handle, info.group)
             body = build_store_order_body(
                 decoded, pos_paseto=pos_paseto, card_id=handle.card_id,
                 pickup_method=pickup,

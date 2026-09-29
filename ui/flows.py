@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -341,11 +342,13 @@ async def open_preview(interaction: discord.Interaction, hex_text: str) -> None:
 
     # 店舗を解決し、ついでにメニューを新しくしておく（先読み）
     store_name, supported = "", {}
+    store_group = ""
     handle = None
     try:
         handle = await mcd_accounts.pick_account()
         info = await mcd_stores.resolve_store(handle.client, decoded.store_id)
         store_name, supported = info.name, info.delivery_methods
+        store_group = info.group
         try:
             await mcd_stores.ensure_menu_fresh(handle.client, decoded.store_id)
         except Exception:
@@ -355,6 +358,10 @@ async def open_preview(interaction: discord.Interaction, hex_text: str) -> None:
     finally:
         if handle:
             await handle.aclose()
+
+    # 受取方法を選んでいる間に、裏で注文の下ごしらえをしておく
+    if store_group:
+        asyncio.create_task(mcd_accounts.warm_up(decoded.store_id, store_group))
 
     # 注文コードの店舗が、いま注文を受け付けているか確かめる。
     # 残高を確保する前にここで止める。
