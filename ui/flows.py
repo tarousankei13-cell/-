@@ -303,10 +303,8 @@ async def open_preview(interaction: discord.Interaction, hex_text: str) -> None:
         owner_id=interaction.user.id, decoded=decoded, quote=quote,
         balance=balance, store_name=store_name, supported=supported,
     )
-    await interaction.followup.send(
-        embed=view.build_embed(lines), view=view, ephemeral=True
-    )
-    view.lines = lines
+    view.lines = lines   # 送信前に入れる（受取方法を選び直したときに消えないように）
+    await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
 
 
 class ConfirmView(discord.ui.View):
@@ -340,12 +338,20 @@ class ConfirmView(discord.ui.View):
                     default=(method == self.pickup),
                 )
             )
+        # 注文コードに書かれていた受取方法が候補に無い場合、そのままだと
+        # 選び直せないまま確定できてしまう。候補に足しておく。
+        if self.pickup and not any(o.value == self.pickup for o in options):
+            label = config.PICKUP_METHODS.get(self.pickup, {}).get("label", self.pickup)
+            options.insert(
+                0, discord.SelectOption(label=label, value=self.pickup, default=True)
+            )
         if not options:
             options = [discord.SelectOption(label="テイクアウト", value="takeOut", default=True)]
             self.pickup = self.pickup or "takeOut"
 
         self.select = discord.ui.Select(
-            placeholder="受取方法を選んでください", options=options, min_values=1, max_values=1,
+            placeholder="受取方法を選んでください", options=options[:25],
+            min_values=1, max_values=1,
         )
         self.select.callback = self._on_select
         self.add_item(self.select)

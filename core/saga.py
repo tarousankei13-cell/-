@@ -30,7 +30,7 @@ from sqlalchemy import select
 
 from core import ledger as L
 from core.subsidy import Quote
-from db.models import Order, OrderEvent, utcnow
+from db.models import Order, OrderEvent, User, utcnow
 from db.session import session_scope, user_scope
 from services.mcd import accounts as mcd_accounts
 from services.mcd import stores as mcd_stores
@@ -43,6 +43,7 @@ log = logging.getLogger("bot.saga")
 CREATED = "CREATED"
 QUOTED = "QUOTED"
 BALANCE_HELD = "BALANCE_HELD"
+MCD_STORING = "MCD_STORING"            # 注文を登録している最中（まだ課金はされない）
 MCD_STORED = "MCD_STORED"
 MCD_AUTHORISING = "MCD_AUTHORISING"    # ★決済を呼んでいる最中。課金の成否が不明
 MCD_AUTHORISED = "MCD_AUTHORISED"
@@ -215,7 +216,11 @@ async def execute(order_id: str, progress: ProgressCallback | None = None) -> Or
     handle = None
     try:
         # ---- ② アカウントの確保と下準備 ----
-        if state == BALANCE_HELD:
+        if state in (BALANCE_HELD, MCD_STORING):
+            if state == MCD_STORING:
+                # 登録の最中に落ちていた。StoreOrder は課金を伴わないので
+                # 作り直して問題ない（未払いの注文が店側に残ることはある）。
+                log.warning("注文の登録中に中断していたため、やり直します: %s", order_id[:8])
             handle = await mcd_accounts.pick_account()
             await handle.client.ensure_auth()
             info = await mcd_stores.resolve_store(handle.client, store_id)
@@ -233,6 +238,9 @@ async def execute(order_id: str, progress: ProgressCallback | None = None) -> Or
 
             # ---- ③ 注文の登録 ----
             await notify("send", "マクドナルドへ送信しています…")
+            if state != MCD_STORING:
+                await _record(order_id, state, MCD_STORING)
+                state = MCD_STORING
             pos_paseto = await handle.client.get_pos_paseto(info.group)
             body = build_store_order_body(
                 decoded, pos_paseto=pos_paseto, card_id=handle.card_id,
@@ -310,6 +318,12 @@ async def execute(order_id: str, progress: ProgressCallback | None = None) -> Or
                 await L.capture(s, discord_id, user_amount, subsidy_amount, order_id=order_id)
             await _record(order_id, state, CAPTURED)
             state = CAPTURED
+            # 利用回数はここで1回だけ増やす。
+            # _finalize でやると、復旧のたびに二重に数えてしまう。
+            async with session_scope() as s:
+                user = await s.get(User, discord_id)
+                if user:
+                    user.total_orders += 1
 
         if handle:
             await mcd_accounts.report_success(handle.account_id)
@@ -393,7 +407,7 @@ async def _handle_failure(order_id: str, state: str, handle, error: Exception, r
 
     # ここまでなら課金は成立していないので、ホールドを解放して返金する
     await _record(order_id, state, COMPENSATING, {"error": message})
-    if state in (BALANCE_HELD, MCD_STORED):
+    if state in (BALANCE_HELD, MCD_STORING, MCD_STORED):
         try:
             async with user_scope(discord_id) as s:
                 await L.release(s, discord_id, user_amount, order_id=order_id, memo=message[:200])
@@ -427,12 +441,8 @@ async def _finalize(order_id: str, result: OrderResult) -> OrderResult:
 
     async with session_scope() as s:
         result.balance_after = await L.user_balance(s, discord_id)
-        from db.models import User
-
         user = await s.get(User, discord_id)
-        if user:
-            user.total_orders += 1
-            result.total_orders = user.total_orders
+        result.total_orders = user.total_orders if user else 0
     return result
 
 
@@ -469,7 +479,13 @@ async def recover_pending() -> list[OrderResult]:
     for order_id, state in pending:
         try:
             log.info("復旧中: %s (状態 %s)", order_id[:8], state)
-            results.append(await execute(order_id))
+            r = await execute(order_id)
+            # 復旧した注文はDMを送れないまま残るので、ここで完了にしておく。
+            # そのままだと起動のたびに拾われ続けてしまう。
+            if r.state == CAPTURED:
+                await mark_notified(order_id)
+                r.state = COMPLETED
+            results.append(r)
         except Exception:
             log.exception("注文 %s の復旧に失敗しました", order_id[:8])
             await _record(order_id, state, MANUAL_REVIEW, {"error": "復旧に失敗"})

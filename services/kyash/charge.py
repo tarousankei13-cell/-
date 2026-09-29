@@ -56,12 +56,14 @@ async def charge_from_link(discord_id: int, url: str) -> ChargeResult:
     charge_max = int(settings.get("charge_max", 50_000))
 
     handle = None
+    checker = None
     receipt_id = str(uuid.uuid4())
     try:
-        # ① リンクの確認（金額が分からないと口座を選べないので、まず1つ開く）
-        handle = await kyash_accounts.pick_account(charge_min)
+        # ① リンクの確認。金額が分かるまで口座を決められないので、
+        #    まず任意の口座で読み取りだけ行う（link_check は読み取り専用）。
+        checker = await kyash_accounts.pick_account(charge_min)
         try:
-            info = await handle.client.link_check(url)
+            info = await checker.client.link_check(url)
         except LinkAlreadyUsed as e:
             raise ChargeError(f"このリンクは使用できません。{e}") from e
 
@@ -73,6 +75,11 @@ async def charge_from_link(discord_id: int, url: str) -> ChargeResult:
             raise ChargeError(f"チャージは ¥{charge_min:,} 以上から受け付けています")
         if info.amount > charge_max:
             raise ChargeError(f"1回のチャージは ¥{charge_max:,} までです")
+
+        # ★金額が確定したので、その額を受けられる口座を選び直す。
+        #   月間の受取上限を超えないようにするため。
+        await checker.aclose()
+        handle, checker = await kyash_accounts.pick_account(info.amount), None
 
         # ② 予約（同じリンクを2回使わせない）
         async with session_scope() as s:
@@ -142,8 +149,9 @@ async def charge_from_link(discord_id: int, url: str) -> ChargeResult:
     except ChargeError:
         raise
     except KyashError as e:
-        if handle:
-            await kyash_accounts.report_failure(handle.account_id, str(e))
+        failed = handle or checker
+        if failed:
+            await kyash_accounts.report_failure(failed.account_id, str(e))
         async with session_scope() as s:
             row = await s.get(KyashReceipt, receipt_id)
             if row and row.status in (RESERVED,):
@@ -152,6 +160,8 @@ async def charge_from_link(discord_id: int, url: str) -> ChargeResult:
         log.warning("チャージに失敗しました: %s", e)
         raise ChargeError(f"チャージに失敗しました: {e}") from e
     finally:
+        if checker:
+            await checker.aclose()
         if handle:
             await handle.aclose()
 

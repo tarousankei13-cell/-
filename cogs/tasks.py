@@ -24,6 +24,7 @@ class TasksCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self._last_month: int | None = None
+        self._last_daily_reset_day: int | None = None
         self._last_backup_day: int | None = None
         self._started = False
 
@@ -165,8 +166,9 @@ class TasksCog(commands.Cog):
                 )
             )
 
-        # 日次リセット
-        if now.hour == 0 and self._last_backup_day != now.day:
+        # 日次リセット（バックアップとは別のフラグで管理する）
+        if now.hour == 0 and self._last_daily_reset_day != now.day:
+            self._last_daily_reset_day = now.day
             await jobs.daily_reset()
 
         # 月次リセット

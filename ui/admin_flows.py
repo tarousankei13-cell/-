@@ -169,7 +169,7 @@ async def show_accounts(interaction: discord.Interaction) -> None:
     if mcd_rows:
         lines = []
         for aid, label, status, fails, today, has_card in mcd_rows:
-            mark = E.HEALTH.get(status, E.GREY if hasattr(E, "GREY") else E.YELLOW)
+            mark = E.HEALTH.get(status, E.YELLOW)
             card = "" if has_card else f"　{E.WARN} カード未設定"
             fail = f"　失敗{fails}回" if fails else ""
             lines.append(f"{mark} `#{aid}` **{label}**　本日{today}件{fail}{card}")

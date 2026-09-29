@@ -320,14 +320,19 @@ class CartView(discord.ui.View):
 
     # -- 操作 ---------------------------------------------------
 
+    async def show(self, interaction: discord.Interaction, note: str | None = None) -> None:
+        """カート画面に戻る。商品を足したあとは必ずここを通す。"""
+        self._build()
+        embed = await self.build_embed()
+        if note:
+            embed.description = note
+        await interaction.response.edit_message(embed=embed, view=self)
+
     async def _on_add(self, interaction: discord.Interaction) -> None:
+        # 同じメッセージを書き換えて進む。
+        # 別メッセージを出すと、商品を足してもカートの表示が古いまま残ってしまう。
         view = CategoryView(self)
-        await interaction.response.send_message(
-            embed=discord.Embed(
-                title=f"{E.BURGER} カテゴリを選んでください", color=embeds.GREEN
-            ),
-            view=view, ephemeral=True,
-        )
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
     async def _on_remove(self, interaction: discord.Interaction) -> None:
         if self.items:
@@ -457,20 +462,34 @@ class CategoryView(discord.ui.View):
             )
         if not options:
             options = [discord.SelectOption(label="（今は選べる商品がありません）", value="_none")]
-        sel = discord.ui.Select(placeholder="カテゴリ", options=options)
+        sel = discord.ui.Select(placeholder="カテゴリ", options=options, row=0)
         sel.callback = self._on_pick
         self.add_item(sel)
         self._sel = sel
 
+        back = discord.ui.Button(label="カートに戻る", emoji=E.CART,
+                                 style=discord.ButtonStyle.secondary, row=1)
+        back.callback = self._on_back
+        self.add_item(back)
+
+    def build_embed(self) -> discord.Embed:
+        return discord.Embed(
+            title=f"{E.BURGER} カテゴリを選んでください",
+            description=f"{E.STORE} {self.cart.store_name or self.cart.store_id}",
+            color=embeds.GREEN,
+        )
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.cart.owner_id
+
+    async def _on_back(self, interaction: discord.Interaction) -> None:
+        self.stop()
+        await self.cart.show(interaction)
 
     async def _on_pick(self, interaction: discord.Interaction) -> None:
         cid = self._sel.values[0]
         if cid == "_none":
-            await interaction.response.edit_message(
-                embed=embeds.info("いま注文できる商品がありません。"), view=None
-            )
+            await self.cart.show(interaction, note="いま注文できる商品がありません。")
             return
         view = ProductView(self.cart, cid, page=0)
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
@@ -558,10 +577,7 @@ class ProductView(discord.ui.View):
 
     async def _on_back(self, interaction: discord.Interaction) -> None:
         view = CategoryView(self.cart)
-        await interaction.response.edit_message(
-            embed=discord.Embed(title=f"{E.BURGER} カテゴリを選んでください", color=embeds.GREEN),
-            view=view,
-        )
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
     async def _on_pick(self, interaction: discord.Interaction) -> None:
         code = self._sel.values[0]
@@ -584,18 +600,9 @@ class ProductView(discord.ui.View):
     async def _add_and_close(
         self, interaction: discord.Interaction, product: Product, picks: dict[str, str]
     ) -> None:
-        item = build_order_item(self.cart, product, picks)
-        self.cart.items.append(item)
-        self.cart._build()
-        await save_cart(
-            self.cart.owner_id, purpose=self.cart.purpose, store_id=self.cart.store_id,
-            pickup=self.cart.pickup, items=self.cart.items,
-        )
+        await _add_to_cart(self.cart, product, picks)
         self.stop()
-        await interaction.response.edit_message(
-            embed=embeds.ok(f"**{product.name}** をカートに追加しました。\n元のカート画面に戻って続けてください。"),
-            view=None,
-        )
+        await self.cart.show(interaction, note=f"{E.OK} **{product.name}** を追加しました。")
 
 
 class OptionView(discord.ui.View):
@@ -691,27 +698,23 @@ class OptionView(discord.ui.View):
 
     async def _on_back(self, interaction: discord.Interaction) -> None:
         view = CategoryView(self.cart)
-        await interaction.response.edit_message(
-            embed=discord.Embed(title=f"{E.BURGER} カテゴリを選んでください", color=embeds.GREEN),
-            view=view,
-        )
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
     async def _on_ok(self, interaction: discord.Interaction) -> None:
-        item = build_order_item(self.cart, self.product, self.picks)
-        self.cart.items.append(item)
-        self.cart._build()
-        await save_cart(
-            self.cart.owner_id, purpose=self.cart.purpose, store_id=self.cart.store_id,
-            pickup=self.cart.pickup, items=self.cart.items,
-        )
+        await _add_to_cart(self.cart, self.product, self.picks)
         self.stop()
-        await interaction.response.edit_message(
-            embed=embeds.ok(
-                f"**{self.product.name}** をカートに追加しました。\n"
-                "元のカート画面に戻って続けてください。"
-            ),
-            view=None,
+        await self.cart.show(
+            interaction, note=f"{E.OK} **{self.product.name}** を追加しました。"
         )
+
+
+async def _add_to_cart(cart: "CartView", product: Product, picks: dict[str, str]) -> None:
+    """カートに1品足して保存する。追加の経路はここに一本化する。"""
+    cart.items.append(build_order_item(cart, product, picks))
+    await save_cart(
+        cart.owner_id, purpose=cart.purpose, store_id=cart.store_id,
+        pickup=cart.pickup, items=cart.items,
+    )
 
 
 def build_order_item(cart: CartView, product: Product, picks: dict[str, str]) -> OrderItem:

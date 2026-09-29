@@ -235,6 +235,24 @@ async def main():
         check("注文番号を取り戻した", o.receipt_number == "7161", o.receipt_number)
         check("残高が正しく確定", await L.user_balance(s, uid8) == 1520, await L.user_balance(s, uid8))
 
+    print("\n[9b] ★復旧を繰り返しても壊れないか")
+    async with session_scope() as s:
+        u8 = await s.get(User, uid8)
+        orders_before = u8.total_orders
+        bal_before = await L.user_balance(s, uid8)
+    again = await saga.recover_pending()
+    check(f"2回目の復旧では何も拾わない（{len(again)}件）", len(again) == 0, [r.state for r in again])
+    async with session_scope() as s:
+        u8 = await s.get(User, uid8)
+        check(f"利用回数が二重に増えない（{orders_before}回のまま）",
+              u8.total_orders == orders_before, u8.total_orders)
+        check("残高も変わらない", await L.user_balance(s, uid8) == bal_before)
+
+    print("\n[9c] 利用回数のカウント")
+    async with session_scope() as s:
+        u1 = await s.get(User, 1001)
+        check(f"正常注文1件で利用回数1（実際{u1.total_orders}）", u1.total_orders == 1, u1.total_orders)
+
     print("\n[10] 元帳の最終整合性")
     async with session_scope() as s:
         rep = await L.verify_integrity(s)
