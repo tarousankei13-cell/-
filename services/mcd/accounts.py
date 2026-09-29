@@ -156,15 +156,27 @@ def _score(acc: McdAccount, now: datetime) -> float:
 
 
 async def pick_account(exclude: set[int] | None = None) -> AccountHandle:
-    """使えるアカウントを1つ選んで開く。"""
+    """
+    使えるアカウントを1つ選んで開く。
+
+    決済カードが設定されていないアカウントは注文を完了できないため、
+    候補から外す（/mcd card で設定できる）。
+    """
     exclude = exclude or set()
     now = datetime.now(timezone.utc)
     async with session_scope() as s:
         rows = (
             await s.execute(select(McdAccount).where(McdAccount.status.in_(USABLE)))
         ).scalars().all()
-        candidates = [a for a in rows if a.id not in exclude]
+        candidates = [a for a in rows if a.id not in exclude and a.card_id]
         if not candidates:
+            no_card = [a.label for a in rows if a.id not in exclude and not a.card_id]
+            if no_card:
+                raise McdError(
+                    "決済カードが設定されていないため注文できません。"
+                    f"（{', '.join(no_card[:3])}）"
+                    " /mcd card <ID> で設定してください"
+                )
             raise McdError(
                 "使用できるマクドナルドアカウントがありません。"
                 "/mcd list で状態を確認してください"

@@ -185,8 +185,11 @@ async def has_usable_account() -> bool:
 
     async with session_scope() as s:
         n = await s.scalar(
-            select(func.count()).select_from(McdAccount)
-            .where(McdAccount.status.in_(USABLE))
+            select(func.count()).select_from(McdAccount).where(
+                McdAccount.status.in_(USABLE),
+                McdAccount.card_id.isnot(None),
+                McdAccount.card_id != "",
+            )
         )
     return bool(n)
 

@@ -78,6 +78,19 @@ async def main():
     async with session_scope() as s:
         await s.execute(update(_MA).values(status="ACTIVE"))
 
+    print("\n[2c] 決済カード未設定のときの案内")
+    from sqlalchemy import update as _upd
+    async with session_scope() as s:
+        await s.execute(_upd(_MA).values(card_id=None))
+    itx = FakeInteraction(user, client)
+    await flows.start_order(itx)
+    check("カード未設定でも案内が出る", "受け付けできません" in itx.text(), itx.text()[:60])
+    async with session_scope() as s:
+        await s.execute(_upd(_MA).values(card_id="c1"))
+    itx = FakeInteraction(user, client)
+    await flows.start_order(itx)
+    check("カードを設定すれば注文できる", "受け付けできません" not in itx.text(), itx.text()[:60])
+
     print("\n[3] 残高の表示")
     async with user_scope(UID) as s:
         await L.charge(s, UID, 3000, receipt_id="ui-1")
