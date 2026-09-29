@@ -186,6 +186,35 @@ class AdminCog(commands.Cog):
             e.set_footer(text="すべて正常です")
         await interaction.response.send_message(embed=e, ephemeral=True)
 
+    @stats_group.command(name="dns", description="名前解決の控えの状況を表示します")
+    @admin_only()
+    async def stats_dns(self, interaction: discord.Interaction) -> None:
+        from core import dns
+
+        st = dns.stats()
+        total = st["hit"] + st["miss"]
+        rate = (st["hit"] / total * 100) if total else 0
+        e = discord.Embed(
+            title=f"{E.SYNC} 名前解決の控え",
+            description=(
+                f"控えている相手 **{st['entries']}** 件\n"
+                f"控えで済んだ割合 **{rate:.0f}%**（{st['hit']:,} / {total:,}）"
+            ),
+            color=embeds.BLUE,
+        )
+        if st["stale"]:
+            e.add_field(
+                name=f"{E.WARN} 期限切れの結果を使った回数",
+                value=f"{st['stale']:,} 回\n"
+                      "DNSが引けない状態が起きています",
+                inline=False,
+            )
+        if st["fail"]:
+            e.add_field(name=f"{E.NG} 引けなかった回数",
+                        value=f"{st['fail']:,} 回", inline=True)
+        e.set_footer(text=f"控えは {dns.TTL:.0f} 秒で作り直します")
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
     @stats_group.command(name="account", description="アカウント別の使用状況")
     @admin_only()
     async def stats_account(self, interaction: discord.Interaction) -> None:

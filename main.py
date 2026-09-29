@@ -276,6 +276,12 @@ class McdBot(commands.Bot):
 
         await settings.load_all()
 
+        # 相手の名前を先に引いておく。最初の注文で待たずに済むほか、
+        # DNSが引けなくなっても前回の結果で動き続けられる。
+        from core import dns
+
+        await dns.prewarm()
+
         # 店名で検索できるよう、同梱の店舗一覧を読み込む
         from services.mcd.store_index import load_index
 

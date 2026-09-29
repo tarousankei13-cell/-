@@ -24,6 +24,7 @@ TESTS = [
     ("管理操作の記録", "test_audit.py"),
     ("再送の方針（冪等性）", "test_retry.py"),
     ("サーキットブレーカー", "test_breaker.py"),
+    ("名前解決の控え", "test_dns.py"),
     ("注文Saga（端から端まで）", "test_order_e2e.py"),
     ("エラーの判別と対処", "test_errors.py"),
     ("代理実績の同一性", "test_achievement.py"),
