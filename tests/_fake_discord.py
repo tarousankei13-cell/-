@@ -47,7 +47,8 @@ class FakeFollowup:
         if not self.parent.response.is_done():
             raise RuntimeError("defer していないのに followup.send を呼びました")
         self.parent.actions.append(
-            ("followup", {"content": content, "embed": embed, "view": view, "file": file})
+            ("followup", {"content": content, "embed": embed, "view": view,
+                          "file": file, "ephemeral": ephemeral})
         )
 
 

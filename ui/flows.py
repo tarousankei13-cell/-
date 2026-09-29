@@ -569,15 +569,16 @@ async def run_order(
             embed=embeds.ok("注文が完了しました。\n詳細と控えを DM にお送りしました。")
         )
     else:
+        # DMが閉じていても控えは必要なので、この場に画像ごと出す
         await interaction.edit_original_response(
             embed=embeds.warn(
-                f"注文は完了しましたが、DMを送信できませんでした。\n\n"
-                f"{E.RECEIPT} **注文番号　`{result.receipt_number or '—'}`**\n"
-                f"{E.STORE} {result.store_name}（`{result.store_id}`）\n\n"
-                "DMの受信を許可すると、次回から控えをお送りできます。",
+                f"注文は完了しましたが、DMを送信できませんでした。\n"
+                "控えはこの下に表示します（あなたにだけ見えています）。\n\n"
+                "DMの受信を許可すると、次回からDMにお送りできます。",
                 title=f"{E.WARN} DMを送信できませんでした",
             )
         )
+        await send_completion_here(interaction, result)
 
     await saga.mark_notified(result.order_id)
     await post_achievement(interaction, result)
@@ -630,6 +631,52 @@ async def send_completion_dm(interaction: discord.Interaction, result: saga.Orde
         return False
     except discord.HTTPException:
         log.exception("DMの送信に失敗しました")
+        return False
+
+
+async def send_completion_here(
+    interaction: discord.Interaction, result: saga.OrderResult
+) -> bool:
+    """
+    DMが閉じているときの代わりの届け先。
+
+    控え画像と注文番号を、本人にだけ見える形でその場に出す。
+    注文番号が分からないと店頭で受け取れないので、ここは落とせない。
+    """
+    from services import receipt as receipt_svc
+
+    image = None
+    try:
+        image = await receipt_svc.render(result.receipt_number)
+    except Exception:
+        log.exception("レシート画像の生成に失敗しました")
+
+    embed = embeds.receipt_fallback(
+        receipt_number=result.receipt_number,
+        store_name=result.store_name,
+        store_id=result.store_id,
+        pickup_label=result.pickup_label,
+        with_image=image is not None,
+    )
+
+    kwargs: dict = {"embed": embed, "ephemeral": True}
+    if image is not None:
+        kwargs["file"] = discord.File(image, filename="receipt.png")
+    if result.receipt_number and result.store_id:
+        view = discord.ui.View()
+        view.add_item(
+            discord.ui.Button(
+                label="受け取り画面を開く", emoji=E.RECEIPT, style=discord.ButtonStyle.link,
+                url=receipt_svc.receipt_view_url(result.store_id, result.receipt_number),
+            )
+        )
+        kwargs["view"] = view
+
+    try:
+        await interaction.followup.send(**kwargs)
+        return True
+    except discord.HTTPException:
+        log.exception("控えの表示に失敗しました")
         return False
 
 

@@ -339,6 +339,43 @@ def dm_complete(
     return e
 
 
+def receipt_fallback(
+    *,
+    receipt_number: str,
+    store_name: str,
+    store_id: str,
+    pickup_label: str,
+    with_image: bool = True,
+) -> discord.Embed:
+    """
+    DMが送れなかったときに、その場で出す控え。
+
+    店頭で必要なのは注文番号なので、まずそれを大きく出す。
+    """
+    e = discord.Embed(
+        title=f"{E.RECEIPT} ご注文の控え",
+        description=(
+            "この画面をお店で提示してください。\n"
+            "**閉じると再表示できません。** 画像の保存か、番号の書き留めをお願いします。"
+        ),
+        color=GREEN,
+        timestamp=datetime.now(timezone.utc),
+    )
+    e.add_field(
+        name=f"{E.RECEIPT} 注文番号",
+        value=f"```\n{receipt_number or '----'}\n```",
+        inline=True,
+    )
+    e.add_field(
+        name=f"{E.STORE} 店舗", value=f"{store_name or '—'}\n`{store_id}`", inline=True
+    )
+    e.add_field(name=f"{E.PIN} 受取方法", value=pickup_label or "—", inline=True)
+    e.set_footer(text="ご利用ありがとうございます")
+    if with_image:
+        e.set_image(url="attachment://receipt.png")
+    return e
+
+
 # ============================================================
 #  実績パネル（プライバシー重視 / docs/05 §5）
 # ============================================================
