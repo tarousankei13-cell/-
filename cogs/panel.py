@@ -22,7 +22,7 @@ from mcd.mcdclient import (
     hex_digest,
     official_order_url,
 )
-from mcd.rates import resolve_rate, user_pays
+from mcd.rates import active_campaigns, resolve_rate, user_pays
 from mcd.store import (
     DuplicateHex,
     InsufficientBalance,
@@ -136,6 +136,18 @@ class PanelView(discord.ui.View):
             await deny(interaction, "紹介機能が読み込まれていません")
             return
         await referral_cog.show_referral(interaction)
+
+    @discord.ui.button(
+        label="自分の負担率", style=discord.ButtonStyle.secondary, custom_id="panel:rate", row=2
+    )
+    async def rate(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.show_rate(interaction)
+
+    @discord.ui.button(
+        label="ランキング", style=discord.ButtonStyle.secondary, custom_id="panel:ranking", row=2
+    )
+    async def ranking(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.show_ranking(interaction)
 
 
 # ============================================================== hex 入力モーダル
@@ -262,8 +274,20 @@ class Panel(commands.Cog):
                 "1. 「チャージ」で残高を入れる\n"
                 "2. 「注文する」で注文コードを貼る\n"
                 "3. 内容を確認して決済\n"
-                f"4. 注文番号が DM に届く\n"
+                "4. 注文番号が DM に届く\n"
                 f"5. {cfg.E_MEMO} 感想を DM で送る（次回注文の条件）"
+            ),
+            inline=False,
+        )
+        e.add_field(
+            name="ボタンの説明",
+            value=(
+                "**注文する** … 注文コードを貼って決済\n"
+                "**チャージ** … Kyash の送金リンクで残高を入れる\n"
+                "**残高・履歴** … 残高、入出金、注文の履歴\n"
+                "**紹介コード** … 自分のコードの確認と、他人のコードの入力\n"
+                "**自分の負担率** … いま適用されている割引率\n"
+                "**ランキング** … 今月の利用ランキング"
             ),
             inline=False,
         )
@@ -973,6 +997,62 @@ class Panel(commands.Cog):
             e.add_field(name="注文履歴", value="\n".join(lines)[:1000], inline=False)
 
         await reply(interaction, e)
+
+    # ------------------------------------------------------------ 負担率
+
+    async def show_rate(self, interaction: discord.Interaction) -> None:
+        cfg = self.bot.cfg
+        decision = resolve_rate(
+            cfg.DEFAULT_USER_RATE, cfg.role_rates(), cfg.user_rates(), cfg.campaigns(),
+            interaction.user.id, role_ids(interaction.user),
+        )
+        e = embed(f"{cfg.E_MONEY} あなたの負担率", None, MONEY, footer=cfg.BRAND_NAME)
+        e.add_field(name="負担率", value=f"定価の **{decision.rate}%**", inline=True)
+        e.add_field(name="適用元", value=decision.source, inline=True)
+        e.add_field(
+            name="支払額の例",
+            value=(
+                f"定価 500 円 → **{user_pays(500, decision.rate):,} 円**\n"
+                f"定価 590 円 → **{user_pays(590, decision.rate):,} 円**\n"
+                f"定価 1,000 円 → **{user_pays(1000, decision.rate):,} 円**"
+            ),
+            inline=False,
+        )
+        running = active_campaigns(cfg.campaigns())
+        if running:
+            e.add_field(
+                name="適用中のキャンペーン",
+                value="\n".join(f"{c.name}: 負担 {c.rate}%" for c in running),
+                inline=False,
+            )
+        await reply(interaction, e)
+
+    # ---------------------------------------------------------- ランキング
+
+    async def show_ranking(self, interaction: discord.Interaction) -> None:
+        cfg = self.bot.cfg
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        now = now_jst()
+        rows = await asyncio.to_thread(self.bot.store.leaderboard, now.year, now.month, 10)
+        if not rows:
+            await reply(
+                interaction,
+                embed("今月の注文はまだありません", "最初の注文をお待ちしています。", INFO),
+            )
+            return
+        lines = [
+            f"**{i}.** <@{r['user_id']}> ・ {r['n']} 回 ・ 支払 {yen(r['paid'])}"
+            for i, r in enumerate(rows, start=1)
+        ]
+        await reply(
+            interaction,
+            embed(
+                f"{cfg.E_CHART} {now.year}年{now.month}月 の利用ランキング",
+                "\n".join(lines),
+                MONEY,
+                footer=cfg.BRAND_NAME,
+            ),
+        )
 
 
 async def setup(bot: commands.Bot) -> None:

@@ -83,10 +83,6 @@ class Charge(commands.Cog):
 
         await interaction.response.send_modal(ChargeModal(self))
 
-    @app_commands.command(name="charge", description="Kyash の送金リンクで残高をチャージします")
-    async def charge_cmd(self, interaction: discord.Interaction) -> None:
-        await self.start_charge(interaction)
-
     # ------------------------------------------------------------ 本処理
 
     async def process_charge(self, interaction: discord.Interaction, raw: str) -> None:

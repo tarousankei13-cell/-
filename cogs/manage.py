@@ -13,10 +13,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from mcd.rates import active_campaigns, resolve_rate, user_pays
-from mcd.store import now_jst
+from mcd.rates import active_campaigns
 
-from ._shared import BAD, INFO, MONEY, OK, WARN, deny, embed, reply, role_ids, yen
+from ._shared import BAD, INFO, MONEY, OK, WARN, deny, embed, reply, yen
 
 log = logging.getLogger("bot.manage")
 
@@ -690,48 +689,8 @@ class Manage(commands.Cog):
         )
         await reply(interaction, e)
 
-    @app_commands.command(name="ranking", description="今月の利用ランキング")
-    async def ranking(self, interaction: discord.Interaction) -> None:
-        cfg = self.bot.cfg
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        now = now_jst()
-        rows = await asyncio.to_thread(self.bot.store.leaderboard, now.year, now.month, 10)
-        if not rows:
-            await reply(interaction, embed("今月の注文はまだありません", "", INFO))
-            return
-        lines = [
-            f"**{i}.** <@{r['user_id']}> ・ {r['n']} 回 ・ 支払 {yen(r['paid'])}"
-            for i, r in enumerate(rows, start=1)
-        ]
-        await reply(
-            interaction,
-            embed(
-                f"{cfg.E_CHART} {now.year}年{now.month}月 の利用ランキング",
-                "\n".join(lines),
-                MONEY,
-                footer=cfg.BRAND_NAME,
-            ),
-        )
-
-    @app_commands.command(name="myrate", description="自分に適用される負担率を確認します")
-    async def myrate(self, interaction: discord.Interaction) -> None:
-        cfg = self.bot.cfg
-        decision = resolve_rate(
-            cfg.DEFAULT_USER_RATE, cfg.role_rates(), cfg.user_rates(), cfg.campaigns(),
-            interaction.user.id, role_ids(interaction.user),
-        )
-        e = embed(f"{cfg.E_MONEY} あなたの負担率", None, MONEY, footer=cfg.BRAND_NAME)
-        e.add_field(name="負担率", value=f"定価の **{decision.rate}%**", inline=True)
-        e.add_field(name="適用元", value=decision.source, inline=True)
-        e.add_field(
-            name="例",
-            value=(
-                f"定価 590 円 → **{user_pays(590, decision.rate):,} 円**\n"
-                f"定価 1,000 円 → **{user_pays(1000, decision.rate):,} 円**"
-            ),
-            inline=False,
-        )
-        await reply(interaction, e)
+    # 「自分の負担率」と「ランキング」は利用者向けなので、
+    # スラッシュコマンドではなく panel.py のボタンから開く。
 
 
 async def setup(bot: commands.Bot) -> None:

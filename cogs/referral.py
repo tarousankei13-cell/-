@@ -135,10 +135,6 @@ class Referral(commands.Cog):
 
         await reply(interaction, e, view=ReferralView(self, uid, can_claim))
 
-    @app_commands.command(name="referral", description="紹介コードの確認と入力")
-    async def referral_cmd(self, interaction: discord.Interaction) -> None:
-        await self.show_referral(interaction)
-
     # ------------------------------------------------------------ コード適用
 
     async def claim_code(self, interaction: discord.Interaction, raw: str) -> None:
