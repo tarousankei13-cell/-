@@ -84,6 +84,10 @@ class PaidOrder:
     store_name: str
 
 
+class DailyLimitReached(MCDError):
+    """その日の上限に達したアカウントしか残っていない。"""
+
+
 class McdPool:
     def __init__(self, store: Store, timeout: int = 25, fail_threshold: int = 3):
         self.store = store
@@ -95,6 +99,32 @@ class McdPool:
         # 同時に走っている注文の数。パネルの待ち行列表示に使う。
         self.inflight = 0
         self.waiting = 0
+        # サーキットブレーカー用。連続失敗を数える。
+        self.consecutive_failures = 0
+        # アカウント別の1日の上限。0 なら無制限。
+        self.daily_order_limit = 0
+        self.daily_amount_limit = 0
+
+    # ----------------------------------------------------- アカウント別の上限
+
+    def _within_daily_limit(self, account_id: int, face_amount: int) -> bool:
+        if not (self.daily_order_limit or self.daily_amount_limit):
+            return True
+        from .store import now_jst
+
+        usage = self.store.account_usage(account_id, now_jst().strftime("%Y-%m-%d"))
+        if self.daily_order_limit and usage["count"] >= self.daily_order_limit:
+            return False
+        if self.daily_amount_limit and usage["amount"] + face_amount > self.daily_amount_limit:
+            return False
+        return True
+
+    def usable_for(self, face_amount: int) -> list:
+        """その金額を通せるアカウントだけを返す。"""
+        return [
+            r for r in self._candidates()
+            if self._within_daily_limit(int(r["id"]), face_amount)
+        ]
 
     # ------------------------------------------------------------ 内部
 
@@ -138,10 +168,11 @@ class McdPool:
         return len(self._candidates())
 
     @asynccontextmanager
-    async def account(self, prefer: Optional[int] = None):
+    async def account(self, prefer: Optional[int] = None, face_amount: int = 0):
         """使えるアカウントを1つ確保し、そのロックを握ったまま渡す。
 
-        選び方は least-recently-used。連続失敗が閾値に達したものは外す。
+        選び方は least-recently-used。連続失敗が閾値に達したものと、
+        その日の上限に達したものは外す。
         """
         self.waiting += 1
         try:
@@ -150,8 +181,18 @@ class McdPool:
                 if not rows:
                     raise NoAccountAvailable(
                         "使用できるマクドナルドアカウントがありません。"
-                        "/mcd account list で状態を確認してください。"
+                        "管理パネルの「アカウント状態」で確認してください。"
                     )
+                if face_amount:
+                    within = [
+                        r for r in rows
+                        if self._within_daily_limit(int(r["id"]), face_amount)
+                    ]
+                    if not within:
+                        raise DailyLimitReached(
+                            "本日の利用上限に達しました。時間をおいてお試しください。"
+                        )
+                    rows = within
                 if prefer is not None:
                     rows.sort(key=lambda r: (int(r["id"]) != prefer, r["last_used_at"] or ""))
                 else:
@@ -179,6 +220,7 @@ class McdPool:
     def _note_success(self, account_id: int) -> None:
         from .store import ts
 
+        self.consecutive_failures = 0
         self.store.update_mcd_account(
             account_id, fail_count=0, last_used_at=ts(), last_error=None
         )
@@ -186,6 +228,7 @@ class McdPool:
     def _note_failure(self, account_id: int, err: str) -> int:
         from .store import ts
 
+        self.consecutive_failures += 1
         rows = [r for r in self.store.list_mcd_accounts() if int(r["id"]) == account_id]
         count = (int(rows[0]["fail_count"]) if rows else 0) + 1
         self.store.update_mcd_account(
@@ -246,9 +289,12 @@ class McdPool:
         """
         last_error: Optional[Exception] = None
         tried: set[int] = set()
+        face_amount = int(decoded.amount_cents or 0)
 
         for _attempt in range(max(1, self.available_count())):
-            async with self.account() as (account_id, label, client, row):
+            async with self.account(face_amount=face_amount) as (
+                account_id, label, client, row,
+            ):
                 if account_id in tried:
                     continue
                 tried.add(account_id)
@@ -357,6 +403,41 @@ class McdPool:
         raise _mark(
             NoAccountAvailable(f"どのアカウントでも認証できませんでした: {last_error}"), True
         )
+
+    async def check_paid(
+        self, order_token: str, group: str, account_id: int
+    ) -> tuple[Optional[bool], str]:
+        """課金されたか後から照会する。
+
+        戻り値は (課金されたか, 説明)。判断できないときは (None, 理由)。
+        決済の応答が途中で切れた注文を、手作業なしで片付けるために使う。
+        """
+        if not order_token:
+            return None, "order_token がありません"
+        try:
+            async with self.account(prefer=account_id) as (aid, _label, client, _row):
+                try:
+                    await asyncio.to_thread(client._ensure_auth)
+                    result = await asyncio.to_thread(
+                        client.get_paid_order, order_token, group
+                    )
+                    self._persist_tokens(aid, client)
+                except MCDOrderError as exc:
+                    self._persist_tokens(aid, client)
+                    text = str(exc)
+                    # 見つからない = 決済が成立していない
+                    if "404" in text or "not found" in text.lower():
+                        return False, "決済済み注文として登録されていません"
+                    return None, text[:200]
+                except Exception as exc:
+                    self._persist_tokens(aid, client)
+                    return None, str(exc)[:200]
+        except (NoAccountAvailable, DailyLimitReached) as exc:
+            return None, str(exc)[:200]
+
+        if result.receipt_number or result.order_code:
+            return True, f"受け取り番号 {result.receipt_number or result.order_code}"
+        return None, "応答は返ったが受け取り番号が取れませんでした"
 
     async def buzzer(self, order_token: str, group: str, account_id: int) -> Optional[int]:
         async with self.account(prefer=account_id) as (aid, _label, client, _row):

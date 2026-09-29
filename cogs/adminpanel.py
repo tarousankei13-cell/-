@@ -160,6 +160,29 @@ class AdminPanelView(discord.ui.View):
     async def whois(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.send_modal(UserIdModal(self.cog, "whois", "利用者の状況を見る"))
 
+    # ---- 4段目: 運用 ----
+
+    @discord.ui.button(
+        label="注文の受付を切り替え", style=discord.ButtonStyle.secondary,
+        custom_id="admin:maintenance", row=3,
+    )
+    async def maintenance(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.toggle_maintenance(interaction)
+
+    @discord.ui.button(
+        label="バックアップを取る", style=discord.ButtonStyle.secondary,
+        custom_id="admin:backup", row=3,
+    )
+    async def backup(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.make_backup(interaction)
+
+    @discord.ui.button(
+        label="起動時の点検をやり直す", style=discord.ButtonStyle.secondary,
+        custom_id="admin:diagnose", row=3,
+    )
+    async def diagnose(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.run_diagnose(interaction)
+
 
 # ======================================================================= cog
 
@@ -196,10 +219,21 @@ class AdminPanel(commands.Cog):
             inline=False,
         )
         e.add_field(
+            name="運用",
+            value="注文の受付を切り替え / バックアップを取る / 起動時の点検をやり直す",
+            inline=False,
+        )
+        if int(cfg.MAINTENANCE):
+            e.add_field(
+                name=f"{cfg.E_LOCK} いまは注文を停止中です",
+                value=str(cfg.MAINTENANCE_NOTE or "「注文の受付を切り替え」で再開できます。"),
+                inline=False,
+            )
+        e.add_field(
             name="ここに無い操作",
             value=(
                 "アカウント登録は `/mcd login` `/kyash login`、\n"
-                "設定の変更は `/config` 系を使ってください。"
+                "設定の変更は `/config` 系、代理での実績投稿は `/proxyreport`。"
             ),
             inline=False,
         )
@@ -550,6 +584,96 @@ class AdminPanel(commands.Cog):
                 f"{cfg.E_LOCK} 利用停止" if banned else f"{cfg.E_OK} 停止解除",
                 f"<@{uid}>\n実行: {interaction.user.mention}",
                 BAD if banned else OK,
+            ),
+        )
+
+    # ------------------------------------------------------------ 運用
+
+    async def toggle_maintenance(self, interaction: discord.Interaction) -> None:
+        cfg = self.bot.cfg
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        now_on = bool(int(cfg.MAINTENANCE))
+        cfg.set("MAINTENANCE", 0 if now_on else 1)
+        cfg.set(
+            "MAINTENANCE_NOTE",
+            "" if now_on else f"{interaction.user} により手動で停止されました。",
+        )
+        # 手動操作のあとは自動復帰の対象から外す
+        await asyncio.to_thread(self.bot.store.set_kv, "maintenance_since", None)
+        if now_on:
+            self.bot.mcd.consecutive_failures = 0
+        await asyncio.to_thread(
+            self.bot.store.audit,
+            "maintenance.off" if now_on else "maintenance.on",
+            interaction.user.id, {"via": "adminpanel"},
+        )
+
+        panel = self.bot.get_cog("Panel")
+        if panel is not None:
+            await panel.refresh_panel()
+
+        await reply(
+            interaction,
+            embed(
+                f"{cfg.E_OK} 注文の受付を再開しました" if now_on else f"{cfg.E_LOCK} 注文を停止しました",
+                (
+                    "利用者はパネルから注文できるようになりました。"
+                    if now_on
+                    else "利用者が注文しようとすると停止中と表示されます。\n"
+                         "もう一度押すと再開します。"
+                ),
+                OK if now_on else WARN,
+            ),
+        )
+        await self.bot.send_log(
+            cfg.LOG_ADMIN_CHANNEL_ID,
+            embed(
+                f"{cfg.E_OK} 受付再開" if now_on else f"{cfg.E_LOCK} 受付停止",
+                f"実行: {interaction.user.mention}",
+                OK if now_on else WARN,
+            ),
+        )
+
+    async def make_backup(self, interaction: discord.Interaction) -> None:
+        cfg = self.bot.cfg
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            path = await asyncio.to_thread(self.bot.store.backup, int(cfg.BACKUP_KEEP))
+        except Exception as exc:
+            await reply(
+                interaction, embed(f"{cfg.E_NG} バックアップに失敗しました", str(exc)[:300], BAD)
+            )
+            return
+        files = await asyncio.to_thread(self.bot.store.list_backups)
+        await asyncio.to_thread(
+            self.bot.store.audit, "db.backup", interaction.user.id,
+            {"file": path.name, "via": "adminpanel"},
+        )
+        await reply(
+            interaction,
+            embed(
+                f"{cfg.E_OK} バックアップを作成しました",
+                f"`{path.name}`\n保存されているバックアップ: {len(files)} 件\n"
+                "復元は `/config restore` から行えます。",
+                OK,
+            ),
+        )
+
+    async def run_diagnose(self, interaction: discord.Interaction) -> None:
+        cfg = self.bot.cfg
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        tasks_cog = self.bot.get_cog("Tasks")
+        if tasks_cog is None:
+            await reply(interaction, embed(f"{cfg.E_NG} 点検機能が読み込まれていません", "", BAD))
+            return
+        await tasks_cog.self_diagnose()
+        await reply(
+            interaction,
+            embed(
+                f"{cfg.E_OK} 点検しました",
+                "結果をオーナーの DM に送りました。",
+                OK,
             ),
         )
 

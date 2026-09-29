@@ -639,6 +639,280 @@ class Reports(commands.Cog):
 
     # ------------------------------------------------------------ コマンド
 
+    # --------------------------------------------------------- 代理での投稿
+
+    @app_commands.command(
+        name="proxyreport", description="利用者の感想を代理で実績に投稿します（オーナー限定）"
+    )
+    @app_commands.describe(
+        user="感想を送ってきた利用者",
+        content="感想の本文",
+        order_id="対象の注文ID（省略すると未完了の注文に紐づけます）",
+        image1="添付する画像",
+        image2="添付する画像",
+        image3="添付する画像",
+    )
+    async def proxy_report(
+        self,
+        interaction: discord.Interaction,
+        user: discord.User,
+        content: str,
+        order_id: Optional[int] = None,
+        image1: Optional[discord.Attachment] = None,
+        image2: Optional[discord.Attachment] = None,
+        image3: Optional[discord.Attachment] = None,
+    ) -> None:
+        cfg = self.bot.cfg
+        if not await self.bot.is_owner(interaction.user):
+            await deny(interaction, "オーナー限定のコマンドです")
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        # --- 対象の注文を決める ---
+        if order_id is not None:
+            order = await asyncio.to_thread(self.bot.store.get_order, int(order_id))
+            if order is None or int(order["user_id"]) != user.id:
+                await reply(
+                    interaction,
+                    embed(
+                        f"{cfg.E_NG} 注文が見つかりません",
+                        f"注文 #{order_id} は {user.mention} のものではありません。",
+                        BAD,
+                    ),
+                )
+                return
+        else:
+            order = await asyncio.to_thread(self.bot.store.blocking_order, user.id)
+            if order is None:
+                await reply(
+                    interaction,
+                    embed(
+                        f"{cfg.E_NG} 対象の注文がありません",
+                        f"{user.mention} に感想待ちの注文はありません。\n"
+                        "過去の注文に紐づける場合は order_id を指定してください。",
+                        BAD,
+                    ),
+                )
+                return
+
+        if str(order["report_status"]) == "approved":
+            await reply(
+                interaction,
+                embed(f"{cfg.E_NG} この注文は既に完了しています", f"注文 #{order['id']}", BAD),
+            )
+            return
+
+        text = content.strip()
+        if len(text) < 5:
+            await reply(
+                interaction, embed(f"{cfg.E_NG} 感想が短すぎます", "5 文字以上でお願いします。", BAD)
+            )
+            return
+
+        # --- 画像を取り込む。使い回しは通常の投稿と同じ基準で弾く ---
+        hashes: list[str] = []
+        blobs: list[tuple[str, bytes]] = []
+        for attachment in (image1, image2, image3):
+            if attachment is None:
+                continue
+            if not (attachment.content_type or "").startswith("image/"):
+                await reply(
+                    interaction,
+                    embed(f"{cfg.E_NG} 画像ではないファイルが含まれています", attachment.filename, BAD),
+                )
+                return
+            if attachment.size > MAX_IMAGE_BYTES:
+                await reply(
+                    interaction,
+                    embed(f"{cfg.E_NG} 画像が大きすぎます", attachment.filename, BAD),
+                )
+                return
+            data = await attachment.read()
+            try:
+                phash = await asyncio.to_thread(dhash, data)
+            except Exception:
+                await reply(
+                    interaction,
+                    embed(f"{cfg.E_NG} 画像を読み取れませんでした", attachment.filename, BAD),
+                )
+                return
+            verdict = await asyncio.to_thread(self.bot.fraud.check_image, user.id, phash)
+            if verdict.blocked:
+                await reply(
+                    interaction,
+                    embed(
+                        f"{cfg.E_NG} 使い回しの画像が含まれています",
+                        verdict.reasons(),
+                        BAD,
+                    ),
+                )
+                return
+            hashes.append(phash)
+            blobs.append((attachment.filename, data))
+
+        # --- 通常の投稿と同じ経路で登録する ---
+        report_id = await asyncio.to_thread(
+            self.bot.store.create_report,
+            int(order["id"]), user.id, text[:1800], len(blobs), hashes,
+            interaction.channel_id or 0, 0,
+        )
+        self.bot._report_blobs = getattr(self.bot, "_report_blobs", {})
+        self.bot._report_blobs[report_id] = blobs
+
+        await asyncio.to_thread(
+            self.bot.store.audit, "report.proxy_submitted", interaction.user.id,
+            {
+                "report": report_id, "order": int(order["id"]), "user": user.id,
+                "images": len(blobs),
+            },
+        )
+        # 代理であることは管理ログにだけ残す。実績チャンネルには出さない。
+        await self.bot.send_log(
+            cfg.LOG_ADMIN_CHANNEL_ID,
+            embed(
+                f"{cfg.E_MEMO} 代理で感想を登録しました",
+                f"対象: {user.mention} ・ 注文 #{order['id']} ・ report #{report_id}\n"
+                f"実行: {interaction.user.mention}\n画像 {len(blobs)} 枚\n\n{text[:600]}",
+                WARN,
+            ),
+        )
+
+        await self.finalize_proxy(interaction, report_id, user.id, int(order["id"]))
+
+    async def finalize_proxy(
+        self, interaction: discord.Interaction, report_id: int, uid: int, order_id: int
+    ) -> None:
+        """代理投稿をそのまま承認済みとして実績チャンネルへ出す。
+
+        見た目は通常の実績と同じ。代理かどうかは監査ログと管理ログにだけ残る。
+        """
+        cfg = self.bot.cfg
+        await asyncio.to_thread(
+            self.bot.store.decide_report, report_id, True, interaction.user.id, ""
+        )
+        report = await asyncio.to_thread(self.bot.store.get_report, report_id)
+
+        message_id = await self._publish(report_id, uid, report, order_id)
+        if message_id:
+            await asyncio.to_thread(self.bot.store.set_report_message, report_id, message_id)
+
+        import json
+
+        for phash in json.loads(report["image_hashes"] or "[]"):
+            await asyncio.to_thread(self.bot.store.remember_image_hash, phash, uid, report_id)
+
+        bonus_paid = 0
+        if int(report["image_count"]) > 0 and not int(report["photo_bonus_paid"]):
+            balance = await asyncio.to_thread(
+                self.bot.store.credit, uid, K_PHOTO, cfg.PHOTO_BONUS,
+                f"report:{report_id}", "商品レポートへの画像添付",
+            )
+            await asyncio.to_thread(self.bot.store.mark_photo_bonus_paid, report_id)
+            bonus_paid = cfg.PHOTO_BONUS
+            await self.bot.send_log(
+                cfg.LOG_MONEY_CHANNEL_ID,
+                embed(
+                    f"{cfg.E_CAMERA} 画像ボーナス",
+                    f"<@{uid}> +{yen(cfg.PHOTO_BONUS)}（残高 {yen(balance)}）",
+                    MONEY,
+                ),
+            )
+
+        await self._ack(
+            interaction,
+            embed(
+                f"{cfg.E_OK} 代理で投稿しました",
+                f"<@{uid}> ・ 注文 #{order_id} ・ report #{report_id}\n"
+                "実績チャンネルには通常の投稿と同じ形で出ています。\n"
+                "代理であることは管理ログにのみ記録しました。"
+                + (f"\n画像ボーナス +{yen(bonus_paid)} を付与" if bonus_paid else ""),
+                OK,
+            ),
+        )
+        await dm(
+            self.bot, uid,
+            e=embed(
+                f"{cfg.E_OK} 感想が承認されました",
+                "実績チャンネルに投稿しました。次の注文ができるようになりました。"
+                + (f"\n{cfg.E_CAMERA} 画像ボーナス **+{yen(bonus_paid)}**" if bonus_paid else ""),
+                OK,
+            ),
+        )
+
+        referral = self.bot.get_cog("Referral")
+        if referral is not None:
+            try:
+                await referral.maybe_payout(uid)
+            except Exception:
+                log.exception("紹介報酬の判定に失敗しました (user=%s)", uid)
+
+    # --------------------------------------------------------- アーカイブ検索
+
+    @app_commands.command(name="archive", description="過去の商品レポートを検索します")
+    @app_commands.describe(
+        user="投稿者で絞る", store_id="店舗IDで絞る", keyword="本文に含まれる語で絞る",
+        count="表示件数",
+    )
+    async def archive(
+        self,
+        interaction: discord.Interaction,
+        user: Optional[discord.User] = None,
+        store_id: Optional[str] = None,
+        keyword: Optional[str] = None,
+        count: int = 10,
+    ) -> None:
+        cfg = self.bot.cfg
+        if not await self.bot.is_owner(interaction.user):
+            await deny(interaction, "オーナー限定のコマンドです")
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        rows = await asyncio.to_thread(
+            self.bot.store.search_reports,
+            user.id if user else None,
+            (store_id or "").strip(),
+            (keyword or "").strip(),
+            max(1, min(count, 25)),
+        )
+        if not rows:
+            await reply(
+                interaction,
+                embed("該当する商品レポートはありません", "条件を変えてお試しください。", INFO),
+            )
+            return
+
+        e = embed(
+            f"{cfg.E_CAMERA} 商品レポート {len(rows)} 件",
+            None,
+            REPORT_COLOR,
+            footer=cfg.BRAND_NAME,
+        )
+        conditions = []
+        if user:
+            conditions.append(f"投稿者 {user.mention}")
+        if store_id:
+            conditions.append(f"店舗 `{store_id}`")
+        if keyword:
+            conditions.append(f"語句「{keyword}」")
+        if conditions:
+            e.description = "条件: " + " / ".join(conditions)
+
+        for row in rows[:10]:
+            body = str(row["content"]).replace("\n", " ")
+            e.add_field(
+                name=(
+                    f"#{row['id']} ・ {str(row['created_at'])[5:16]} ・ "
+                    f"{row['o_store_name'] or row['o_store_id'] or '-'}"
+                    + (f" ・ 画像{row['image_count']}枚" if row["image_count"] else "")
+                )[:250],
+                value=(f"<@{row['user_id']}>\n{body[:200]}" + ("…" if len(body) > 200 else ""))[:1020],
+                inline=False,
+            )
+        if len(rows) > 10:
+            e.set_footer(text=f"{cfg.BRAND_NAME} ・ 他 {len(rows) - 10} 件（count で増やせます）")
+        await reply(interaction, e)
+
     @app_commands.command(name="reports", description="承認待ちの商品レポートを一覧表示します")
     async def reports_cmd(self, interaction: discord.Interaction) -> None:
         cfg = self.bot.cfg

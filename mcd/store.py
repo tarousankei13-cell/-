@@ -23,6 +23,7 @@ K_ORDER = "order"              # 注文の支払い (マイナス)
 K_REFUND = "refund"            # 決済失敗の払い戻し
 K_REFERRAL = "referral"        # 紹介報酬
 K_PHOTO = "photo_bonus"        # 実績に画像を添えた報酬
+K_BONUS = "charge_bonus"       # まとめてチャージした際のボーナス
 K_ADJUST = "adjust"            # オーナーによる手動調整
 
 SCHEMA = """
@@ -175,6 +176,15 @@ CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS store_presets (
+    user_id    INTEGER NOT NULL,
+    store_id   TEXT    NOT NULL,
+    store_name TEXT,
+    uses       INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT    NOT NULL,
+    PRIMARY KEY (user_id, store_id)
+);
 """
 
 
@@ -241,6 +251,96 @@ class Store:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    # ------------------------------------------------------------ バックアップ
+
+    def backup_dir(self) -> Path:
+        directory = self.path.parent / "backups"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def _new_backup_path(self, prefix: str = "bot") -> Path:
+        """まだ存在しないファイル名を作る。
+
+        秒までの時刻だけだと同じ秒に2回取ったときに衝突し、
+        復元元にしようとしたファイルを上書きしてしまう。
+        """
+        base = self.backup_dir()
+        stamp = now_jst().strftime("%Y%m%d-%H%M%S")
+        candidate = base / f"{prefix}-{stamp}.sqlite3"
+        counter = 1
+        while candidate.exists():
+            candidate = base / f"{prefix}-{stamp}-{counter}.sqlite3"
+            counter += 1
+        return candidate
+
+    def backup(self, keep: int = 14, prefix: str = "bot") -> Path:
+        """SQLite の backup API で安全にコピーを取る。
+
+        ファイルを直接コピーすると書き込み途中の状態を掴む恐れがあるため、
+        接続経由でバックアップする。
+        """
+        target = self._new_backup_path(prefix)
+        with self._lock:
+            dest = sqlite3.connect(str(target))
+            try:
+                self._conn.backup(dest)
+            finally:
+                dest.close()
+        if prefix == "bot":
+            self.prune_backups(keep)
+        return target
+
+    def list_backups(self) -> list[Path]:
+        """新しい順。定期バックアップと復元直前の保存の両方を含む。"""
+        files = list(self.backup_dir().glob("bot-*.sqlite3"))
+        files += list(self.backup_dir().glob("pre-restore-*.sqlite3"))
+        return sorted(files, key=lambda p: p.name, reverse=True)
+
+    def prune_backups(self, keep: int) -> int:
+        """定期バックアップだけを間引く。復元直前の保存は残す。"""
+        files = sorted(
+            self.backup_dir().glob("bot-*.sqlite3"), key=lambda p: p.name, reverse=True
+        )
+        removed = 0
+        for old in files[max(0, keep):]:
+            try:
+                old.unlink()
+                removed += 1
+            except OSError:
+                pass
+        return removed
+
+    def restore(self, backup_path: str | Path) -> None:
+        """バックアップの内容を現在の DB に書き戻す。
+
+        接続は張ったまま中身だけ差し替えるので、呼び出し後は
+        キャッシュしている設定などを読み直すこと。
+        """
+        import shutil
+        import uuid as _uuid
+
+        source_path = Path(backup_path)
+        if not source_path.exists():
+            raise FileNotFoundError(str(source_path))
+
+        # 復元元を先に退避する。この後に取る「復元前の保存」が
+        # 万一同名になっても、元データを失わないようにするため。
+        staged = self.backup_dir() / f".restoring-{_uuid.uuid4().hex[:8]}.sqlite3"
+        shutil.copy2(source_path, staged)
+
+        try:
+            # 戻す前に今の状態も保存しておく（誤復元からの復帰用）
+            self.backup(prefix="pre-restore")
+            with self._lock:
+                source = sqlite3.connect(str(staged))
+                try:
+                    source.backup(self._conn)
+                finally:
+                    source.close()
+                self._conn.commit()
+        finally:
+            staged.unlink(missing_ok=True)
 
     @contextmanager
     def tx(self):
@@ -880,3 +980,149 @@ class Store:
 
     def active_user_ids(self) -> list[int]:
         return [int(r["user_id"]) for r in self._q("SELECT user_id FROM users WHERE banned=0")]
+
+    def daily_summary(self, day: str) -> dict:
+        """指定日(YYYY-MM-DD)の注文を集計する。"""
+        row = self._q1(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(face_amount),0) AS face, "
+            "COALESCE(SUM(paid_amount),0) AS paid FROM orders "
+            "WHERE status='paid' AND paid_at LIKE ?",
+            (day + "%",),
+        )
+        failed = self._q1(
+            "SELECT COUNT(*) AS n FROM orders WHERE status IN ('failed','unknown') "
+            "AND created_at LIKE ?",
+            (day + "%",),
+        )
+        charged = self._q1(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(amount),0) AS total FROM charges "
+            "WHERE user_id<>0 AND created_at LIKE ?",
+            (day + "%",),
+        )
+        face, paid = int(row["face"]), int(row["paid"])
+        return {
+            "day": day,
+            "orders": int(row["n"]),
+            "face": face,
+            "paid": paid,
+            "burden": face - paid,
+            "failed": int(failed["n"]),
+            "charges": int(charged["n"]),
+            "charged_total": int(charged["total"]),
+        }
+
+    # -------------------------------------------- アカウント別の利用状況
+
+    def account_usage(self, account_id: int, day: str) -> dict:
+        """その日にそのアカウントで通した注文の件数と金額。"""
+        row = self._q1(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(face_amount),0) AS face FROM orders "
+            "WHERE status='paid' AND mcd_account_id=? AND paid_at LIKE ?",
+            (account_id, day + "%"),
+        )
+        return {"count": int(row["n"]), "amount": int(row["face"])}
+
+    # ------------------------------------------------------- 決済成否不明
+
+    def unknown_orders(self) -> list[sqlite3.Row]:
+        """課金されたか確認できていない注文。"""
+        return self._q("SELECT * FROM orders WHERE status='unknown' ORDER BY id")
+
+    def resolve_unknown(self, order_id: int, paid: bool, note: str = "") -> None:
+        """照合の結果を反映する。paid=False なら失敗として扱う。"""
+        with self.tx() as c:
+            row = c.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+            if row is None or row["status"] != "unknown":
+                return
+            if paid:
+                c.execute(
+                    "UPDATE orders SET status='paid', report_status='awaiting', "
+                    "error=? WHERE id=?",
+                    (note[:500], order_id),
+                )
+                c.execute(
+                    "UPDATE users SET total_orders=total_orders+1, total_face=total_face+?,"
+                    " total_paid=total_paid+? WHERE user_id=?",
+                    (int(row["face_amount"]), int(row["paid_amount"]), int(row["user_id"])),
+                )
+            else:
+                c.execute(
+                    "UPDATE orders SET status='failed', error=? WHERE id=?",
+                    (note[:500], order_id),
+                )
+
+    # -------------------------------------------------------- 店舗プリセット
+
+    def remember_store(self, user_id: int, store_id: str, store_name: str) -> None:
+        if not store_id:
+            return
+        with self.tx() as c:
+            c.execute(
+                "INSERT INTO store_presets(user_id,store_id,store_name,uses,created_at) "
+                "VALUES(?,?,?,1,?) "
+                "ON CONFLICT(user_id,store_id) DO UPDATE SET uses=uses+1, "
+                "store_name=COALESCE(NULLIF(excluded.store_name,''), store_name)",
+                (user_id, store_id, store_name, ts()),
+            )
+
+    def known_stores(self, user_id: int) -> list[sqlite3.Row]:
+        return self._q(
+            "SELECT * FROM store_presets WHERE user_id=? ORDER BY uses DESC, store_id",
+            (user_id,),
+        )
+
+    def is_known_store(self, user_id: int, store_id: str) -> bool:
+        return self._q1(
+            "SELECT 1 FROM store_presets WHERE user_id=? AND store_id=?", (user_id, store_id)
+        ) is not None
+
+    # ----------------------------------------------------- 実績アーカイブ
+
+    def search_reports(
+        self,
+        user_id: Optional[int] = None,
+        store_id: str = "",
+        keyword: str = "",
+        limit: int = 20,
+    ) -> list[sqlite3.Row]:
+        sql = (
+            "SELECT r.*, o.store_id AS o_store_id, o.store_name AS o_store_name, "
+            "o.pickup AS o_pickup, o.paid_at AS o_paid_at "
+            "FROM reports r LEFT JOIN orders o ON o.id = r.order_id "
+            "WHERE r.status='approved'"
+        )
+        args: list[Any] = []
+        if user_id:
+            sql += " AND r.user_id=?"
+            args.append(user_id)
+        if store_id:
+            sql += " AND o.store_id=?"
+            args.append(store_id)
+        if keyword:
+            sql += " AND r.content LIKE ?"
+            args.append(f"%{keyword}%")
+        sql += " ORDER BY r.id DESC LIMIT ?"
+        args.append(limit)
+        return self._q(sql, args)
+
+    # ------------------------------------------------- 長期未使用の残高
+
+    def dormant_users(self, cutoff: datetime, min_balance: int) -> list[dict]:
+        """最後の動きが cutoff より古く、残高が残っている利用者。"""
+        rows = self._q(
+            "SELECT u.user_id, u.balance, MAX(l.created_at) AS last_move "
+            "FROM users u LEFT JOIN ledger l ON l.user_id = u.user_id "
+            "WHERE u.balance >= ? AND u.banned = 0 "
+            "GROUP BY u.user_id",
+            (min_balance,),
+        )
+        limit = cutoff.isoformat(timespec="seconds")
+        return [
+            {
+                "user_id": int(r["user_id"]),
+                "balance": int(r["balance"]),
+                "last_move": r["last_move"],
+            }
+            for r in rows
+            if r["last_move"] and str(r["last_move"]) < limit
+        ]

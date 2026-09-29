@@ -17,7 +17,7 @@ from discord.ext import commands
 
 from mcd.kyashclient import ClaimLinkRejected, NoKyashAccount
 from mcd.logsetup import event, new_trace
-from mcd.store import DuplicateLink
+from mcd.store import K_BONUS, DuplicateLink
 
 from ._shared import BAD, MONEY, OK, WARN, deny, dm, embed, has_order_role, post, reply, yen
 
@@ -190,6 +190,22 @@ class Charge(commands.Cog):
             amount=received.amount, charge=charge_id,
         )
 
+        # --- チャージボーナス（まとめて入れてもらうと受け取り回数が減る）---
+        bonus, percent = cfg.charge_bonus_for(received.amount)
+        if bonus > 0:
+            balance = await asyncio.to_thread(
+                self.bot.store.credit, uid, K_BONUS, bonus,
+                f"charge:{charge_id}", f"チャージボーナス {percent}%",
+            )
+            await self.bot.send_log(
+                cfg.LOG_MONEY_CHANNEL_ID,
+                embed(
+                    f"{cfg.E_GIFT} チャージボーナス",
+                    f"<@{uid}> +{yen(bonus)}（{percent}% ・ 残高 {yen(balance)}）",
+                    MONEY,
+                ),
+            )
+
         # --- 5) 多重アカウント検知（機能17）---
         verdict = await asyncio.to_thread(
             self.bot.fraud.check_charge, uid, received.sender_public_id, received.sender_name
@@ -215,6 +231,10 @@ class Charge(commands.Cog):
             footer=f"{cfg.BRAND_NAME} ・ 返金はできません",
         )
         e.add_field(name="チャージ額", value=f"**{yen(received.amount)}**", inline=True)
+        if bonus > 0:
+            e.add_field(
+                name=f"{cfg.E_GIFT} ボーナス", value=f"**+{yen(bonus)}**（{percent}%）", inline=True
+            )
         e.add_field(name="残高", value=f"**{yen(balance)}**", inline=True)
         if received.sender_name:
             e.add_field(name="送金元", value=received.sender_name, inline=True)

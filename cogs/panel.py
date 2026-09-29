@@ -173,6 +173,28 @@ class HexModal(discord.ui.Modal, title="注文コードの入力"):
 # ============================================================ 決済の確認ビュー
 
 
+class GraceView(discord.ui.View):
+    """決済直前の取り消し猶予。StoreOrder に入る前なので安全に止められる。"""
+
+    def __init__(self, user_id: int, seconds: int):
+        super().__init__(timeout=seconds + 5)
+        self.user_id = user_id
+        self.cancelled = False
+        self.done = asyncio.Event()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.user_id
+
+    @discord.ui.button(label="やっぱりやめる", style=discord.ButtonStyle.danger)
+    async def stop_now(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.cancelled = True
+        for child in self.children:
+            child.disabled = True
+        self.done.set()
+        self.stop()
+        await interaction.response.defer()
+
+
 class ConfirmOrderView(discord.ui.View):
     def __init__(self, cog: "Panel", user_id: int, payload: dict, timeout: float):
         super().__init__(timeout=timeout)
@@ -192,14 +214,49 @@ class ConfirmOrderView(discord.ui.View):
             child.disabled = True
         self.stop()
         cfg = self.cog.bot.cfg
-        await interaction.response.edit_message(
-            embed=embed(
-                f"{cfg.E_CLOCK} 決済しています",
-                f"完了までお待ちください。\n{queue_line(self.cog.bot.mcd)}",
-                INFO,
-            ),
-            view=self,
-        )
+        grace = int(cfg.CANCEL_GRACE_SECONDS)
+
+        if grace > 0:
+            grace_view = GraceView(self.user_id, grace)
+            await interaction.response.edit_message(
+                embed=embed(
+                    f"{cfg.E_CLOCK} {grace} 秒後に決済します",
+                    f"間違いがあれば下のボタンで取り消せます。\n"
+                    f"取り消すなら今のうちです。",
+                    WARN,
+                ),
+                view=grace_view,
+            )
+            try:
+                await asyncio.wait_for(grace_view.done.wait(), timeout=grace)
+            except asyncio.TimeoutError:
+                pass
+            if grace_view.cancelled:
+                await interaction.edit_original_response(
+                    embed=embed(
+                        "取り消しました", "決済は行われていません。残高も減っていません。", INFO
+                    ),
+                    view=None,
+                )
+                return
+            await interaction.edit_original_response(
+                embed=embed(
+                    f"{cfg.E_CLOCK} 決済しています",
+                    f"完了までお待ちください。\n{queue_line(self.cog.bot.mcd)}",
+                    INFO,
+                ),
+                view=None,
+            )
+        else:
+            await interaction.response.edit_message(
+                embed=embed(
+                    f"{cfg.E_CLOCK} 決済しています",
+                    f"完了までお待ちください。\n{queue_line(self.cog.bot.mcd)}",
+                    INFO,
+                ),
+                view=self,
+            )
+
         await self.cog.execute_order(interaction, self.payload)
 
     @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
@@ -213,6 +270,38 @@ class ConfirmOrderView(discord.ui.View):
 
 
 # ========================================================== 上限超過の承認ボタン
+
+
+class ReceiptButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"rcpt:(?P<oid>\d+)",
+):
+    """DM が届かなかった人が、自分の受け取り番号を本人だけに表示するボタン。
+
+    番号をチャンネルに直接書くと他の人に見えてしまうので、
+    ボタン経由で本人にだけ返す。
+    """
+
+    def __init__(self, order_id: int):
+        self.order_id = order_id
+        super().__init__(
+            discord.ui.Button(
+                label="受け取り番号を表示",
+                style=discord.ButtonStyle.success,
+                custom_id=f"rcpt:{order_id}",
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match: re.Match[str]):
+        return cls(int(match["oid"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        cog: Optional[Panel] = interaction.client.get_cog("Panel")
+        if cog is None:
+            await interaction.response.send_message("読み込み中です。", ephemeral=True)
+            return
+        await cog.show_receipt(interaction, self.order_id)
 
 
 class OrderApproveButton(
@@ -255,17 +344,24 @@ class Panel(commands.Cog):
 
     async def cog_load(self) -> None:
         self.bot.add_view(PanelView(self))
-        self.bot.add_dynamic_items(OrderApproveButton)
+        self.bot.add_dynamic_items(OrderApproveButton, ReceiptButton)
 
     # ------------------------------------------------------------ パネル設置
 
     def panel_embed(self) -> discord.Embed:
         cfg = self.bot.cfg
+        stopped = bool(int(cfg.MAINTENANCE))
         e = embed(
-            f"{cfg.E_FOOD} モバイルオーダー",
-            "注文コードを貼り付けて注文できます。\n"
-            "残高は Kyash の送金リンクでチャージしてください。",
-            OK,
+            f"{cfg.E_LOCK} ただいま注文を停止しています" if stopped
+            else f"{cfg.E_FOOD} モバイルオーダー",
+            (
+                str(cfg.MAINTENANCE_NOTE or "しばらくしてからお試しください。")
+                + "\n復旧したら自動で再開します。"
+                if stopped
+                else "注文コードを貼り付けて注文できます。\n"
+                     "残高は Kyash の送金リンクでチャージしてください。"
+            ),
+            BAD if stopped else OK,
             footer=cfg.BRAND_NAME,
         )
         e.add_field(
@@ -324,6 +420,16 @@ class Panel(commands.Cog):
         """注文に進んでよいかの入口チェック。通らなければ False。"""
         cfg = self.bot.cfg
         uid = interaction.user.id
+
+        if int(cfg.MAINTENANCE):
+            note = str(cfg.MAINTENANCE_NOTE or "")
+            await deny(
+                interaction,
+                f"{cfg.E_WARN} ただいま注文を停止しています",
+                (note or "しばらくしてからお試しください。")
+                + "\n復旧したら自動で再開します。",
+            )
+            return False
 
         if not has_order_role(interaction.user, cfg.ORDER_ROLE_ID):
             await deny(
@@ -457,7 +563,24 @@ class Panel(commands.Cog):
         )
         e.add_field(name="混雑状況", value=queue_line(self.bot.mcd), inline=True)
 
-        # --- 残高不足（機能1: 不足分の請求リンクを出す）---
+        # --- いつもと違う店舗の警告（別店舗に注文してしまう事故を防ぐ）---
+        if int(cfg.STORE_MISMATCH_WARN):
+            known = await asyncio.to_thread(self.bot.store.known_stores, uid)
+            if known and not any(k["store_id"] == decoded.store_id for k in known):
+                usual = "、".join(
+                    f"{k['store_name'] or k['store_id']}" for k in known[:3]
+                )
+                e.add_field(
+                    name=f"{cfg.E_WARN} いつもと違う店舗です",
+                    value=(
+                        f"これまでのご利用: {usual}\n"
+                        f"今回: **{store_name or decoded.store_id}**\n"
+                        "店舗が合っているか確認してください。"
+                    ),
+                    inline=False,
+                )
+
+        # --- 残高不足（不足分の請求リンクを出す）---
         if balance < pay:
             await self._offer_shortfall(interaction, uid, pay - balance, e)
             return
@@ -656,7 +779,7 @@ class Panel(commands.Cog):
     async def execute_order(self, interaction: discord.Interaction, payload: dict) -> None:
         cfg = self.bot.cfg
         uid = interaction.user.id
-        ok = await self._pay_and_notify(uid, payload)
+        ok = await self._pay_and_notify(uid, payload, interaction=interaction)
         try:
             await interaction.edit_original_response(
                 embed=embed(
@@ -670,7 +793,11 @@ class Panel(commands.Cog):
             pass
 
     async def _pay_and_notify(
-        self, uid: int, payload: dict, order_id: Optional[int] = None
+        self,
+        uid: int,
+        payload: dict,
+        order_id: Optional[int] = None,
+        interaction: Optional[discord.Interaction] = None,
     ) -> bool:
         """残高を引いて決済し、結果を通知する。戻り値は成功したかどうか。"""
         cfg = self.bot.cfg
@@ -716,6 +843,20 @@ class Panel(commands.Cog):
             return False
 
         # 4) 決済
+        # 共有アカウントを直列化しているため、混雑時は順番待ちになる。
+        # ephemeral を閉じてしまった人にも状況が伝わるよう DM で知らせる。
+        if int(cfg.QUEUE_NOTIFY) and self.bot.mcd.inflight >= self.bot.mcd.available_count():
+            await dm(
+                self.bot, uid,
+                e=embed(
+                    f"{cfg.E_CLOCK} 順番をお待ちください",
+                    f"ただいま混み合っています（{queue_line(self.bot.mcd)}）。\n"
+                    "順番が来たら自動で決済し、注文番号をお送りします。\n"
+                    "このまま閉じていただいて構いません。",
+                    INFO,
+                ),
+            )
+
         try:
             paid = await self.bot.mcd.pay(payload["hex"], decoded, trace)
         except PaymentUncertain as exc:
@@ -765,6 +906,7 @@ class Panel(commands.Cog):
                     BAD,
                 ),
             )
+            await self.check_circuit()
             return False
 
         # 5) 成功
@@ -775,8 +917,14 @@ class Panel(commands.Cog):
         user_row = await asyncio.to_thread(store.get_user, uid)
         total_orders = int(user_row["total_orders"]) if user_row else 1
 
+        # よく使う店舗として覚える（次回以降の店舗違い警告に使う）
+        await asyncio.to_thread(
+            store.remember_store, uid, decoded.store_id,
+            paid.store_name or payload["store_name"] or "",
+        )
+
         await self._send_receipt(
-            uid, order_id, paid, payload, balance_after, total_orders
+            uid, order_id, paid, payload, balance_after, total_orders, interaction
         )
         await self._post_stage1(uid, decoded.pickup_method)
         await self.bot.send_log(
@@ -801,7 +949,14 @@ class Panel(commands.Cog):
     # ------------------------------------------------------------ 通知まわり
 
     async def _send_receipt(
-        self, uid: int, order_id: int, paid, payload: dict, balance_after: int, total_orders: int
+        self,
+        uid: int,
+        order_id: int,
+        paid,
+        payload: dict,
+        balance_after: int,
+        total_orders: int,
+        interaction: Optional[discord.Interaction] = None,
     ) -> None:
         cfg = self.bot.cfg
         decoded = payload["decoded"]
@@ -881,16 +1036,95 @@ class Panel(commands.Cog):
             )
 
         sent = await dm(self.bot, uid, e=e, files=[file], view=view)
-        if sent is None:
-            await self.bot.send_log(
-                cfg.LOG_ERRORS_CHANNEL_ID,
-                embed(
-                    f"{cfg.E_WARN} DM を送れませんでした",
-                    f"<@{uid}> ・ 注文 #{order_id} ・ 注文番号 **{paid.receipt_number}**\n"
-                    "DM が拒否されています。番号を直接お伝えください。",
-                    WARN,
-                ),
+        if sent is not None:
+            return
+
+        # --- DM が届かなかったときの代替導線 ---
+        # 決済は成功しているので、番号を必ず本人に届ける。
+        await self.bot.send_log(
+            cfg.LOG_ERRORS_CHANNEL_ID,
+            embed(
+                f"{cfg.E_WARN} DM を送れませんでした",
+                f"<@{uid}> ・ 注文 #{order_id} ・ 注文番号 **{paid.receipt_number}**\n"
+                "本人には別の方法で番号を出しています。",
+                WARN,
+            ),
+        )
+
+        # 1) 操作中なら、その場で本人にだけ返す
+        if interaction is not None:
+            try:
+                retry = discord.File(io.BytesIO(png), filename="pickup.png")
+                await interaction.followup.send(
+                    content=f"{cfg.E_WARN} DM を送れなかったため、ここに表示します。",
+                    embed=e, files=[retry], view=view, ephemeral=True,
+                )
+                return
+            except Exception:
+                log.warning("ephemeral での受け取り番号の表示に失敗しました (order=%s)", order_id)
+
+        # 2) 操作が終わっている場合は、パネルに本人だけ押せるボタンを出す
+        view = discord.ui.View(timeout=None)
+        view.add_item(ReceiptButton(order_id))
+        await post(
+            self.bot,
+            cfg.PANEL_CHANNEL_ID,
+            content=f"<@{uid}>",
+            embed=embed(
+                f"{cfg.E_BELL} 受け取り番号をお届けできませんでした",
+                "DM が受け取れない設定になっています。\n"
+                "下のボタンを押すと、あなたにだけ番号が表示されます。",
+                WARN,
+            ),
+            view=view,
+        )
+
+    async def show_receipt(self, interaction: discord.Interaction, order_id: int) -> None:
+        """ReceiptButton から呼ばれる。本人にだけ番号とカードを返す。"""
+        cfg = self.bot.cfg
+        order = await asyncio.to_thread(self.bot.store.get_order, order_id)
+        if order is None:
+            await interaction.response.send_message("注文が見つかりません。", ephemeral=True)
+            return
+        if int(order["user_id"]) != interaction.user.id:
+            await interaction.response.send_message(
+                "この注文はあなたのものではありません。", ephemeral=True
             )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        when = str(order["paid_at"] or order["created_at"])[:16].replace("T", " ")
+        png = await asyncio.to_thread(
+            render_pickup_card,
+            order["receipt_number"] or "----",
+            order["store_name"] or "",
+            order["store_id"] or "",
+            order["pickup"] or "",
+            when,
+            order["short_code"] or "",
+            cfg.BRAND_NAME,
+        )
+        e = embed(
+            "受け取り番号",
+            "この画像をスクリーンショットで保存してください。",
+            OK,
+            footer=cfg.BRAND_NAME,
+        )
+        e.add_field(
+            name="注文番号", value=f"```\n{order['receipt_number'] or '----'}\n```", inline=False
+        )
+        e.add_field(
+            name="店舗",
+            value=f"{order['store_name'] or '-'}\n`{order['store_id']}`",
+            inline=True,
+        )
+        e.add_field(name="受取方法", value=order["pickup"] or "-", inline=True)
+        if order["short_code"]:
+            e.add_field(name="照合コード", value=f"`{order['short_code']}`", inline=True)
+        e.set_image(url="attachment://pickup.png")
+        await interaction.followup.send(
+            embed=e, files=[discord.File(io.BytesIO(png), filename="pickup.png")], ephemeral=True
+        )
 
     async def _post_stage1(self, uid: int, pickup: str) -> None:
         """1段階目の実績。番号・店舗・金額は出さない。"""
@@ -921,6 +1155,62 @@ class Panel(commands.Cog):
         e.add_field(name="オーナー負担", value=yen(payload["face"] - payload["pay"]), inline=True)
         e.add_field(name="使用アカウント", value=f"{paid.account_label} / {paid.group}", inline=True)
         return e
+
+    async def check_circuit(self) -> None:
+        """連続失敗が続いたら注文を止める（サーキットブレーカー）。
+
+        1件ずつ失敗させ続けるより、まとめて止めてオーナーに知らせるほうが
+        被害が小さい。復帰は tasks.py が定期的に試みる。
+        """
+        cfg = self.bot.cfg
+        if int(cfg.MAINTENANCE):
+            return
+        threshold = int(cfg.CIRCUIT_FAIL_THRESHOLD)
+        if self.bot.mcd.consecutive_failures < threshold:
+            return
+
+        cfg.set("MAINTENANCE", 1)
+        cfg.set(
+            "MAINTENANCE_NOTE",
+            f"決済が {self.bot.mcd.consecutive_failures} 回続けて失敗したため自動停止しました。",
+        )
+        await asyncio.to_thread(
+            self.bot.store.set_kv, "maintenance_since", now_jst().isoformat(timespec="seconds")
+        )
+        await asyncio.to_thread(
+            self.bot.store.audit, "maintenance.auto_on", 0,
+            {"failures": self.bot.mcd.consecutive_failures},
+        )
+
+        owners = " ".join(f"<@{oid}>" for oid in (self.bot.owner_ids or []))
+        await post(
+            self.bot,
+            cfg.LOG_ERRORS_CHANNEL_ID,
+            content=owners or None,
+            embed=embed(
+                f"{cfg.E_WARN} 自動でメンテナンスモードに入りました",
+                f"決済が {self.bot.mcd.consecutive_failures} 回連続で失敗しました。\n"
+                f"{cfg.CIRCUIT_COOLDOWN_MINUTES} 分後に自動で復帰を試みます。\n"
+                "すぐ戻す場合は `/config set MAINTENANCE 0` を実行してください。",
+                BAD,
+            ),
+        )
+        await self.refresh_panel()
+
+    async def refresh_panel(self) -> None:
+        """パネルの表示を今の状態に合わせて更新する。"""
+        stored = await asyncio.to_thread(self.bot.store.get_kv, "panel_message", None)
+        if not stored:
+            return
+        channel_id, message_id = stored
+        try:
+            channel = self.bot.get_channel(int(channel_id)) or await self.bot.fetch_channel(
+                int(channel_id)
+            )
+            message = await channel.fetch_message(int(message_id))
+            await message.edit(embed=self.panel_embed())
+        except Exception:
+            log.debug("パネルを更新できませんでした", exc_info=True)
 
     async def _alert_fraud(self, uid: int, verdict, context: str) -> None:
         cfg = self.bot.cfg
@@ -977,7 +1267,8 @@ class Panel(commands.Cog):
                 sign = "+" if int(entry["amount"]) > 0 else ""
                 label = {
                     "charge": "チャージ", "order": "注文", "refund": "返金",
-                    "referral": "紹介報酬", "photo_bonus": "画像ボーナス", "adjust": "調整",
+                    "referral": "紹介報酬", "photo_bonus": "画像ボーナス",
+                    "charge_bonus": "チャージボーナス", "adjust": "調整",
                 }.get(entry["kind"], entry["kind"])
                 lines.append(
                     f"`{entry['created_at'][5:16]}` {label} {sign}{int(entry['amount']):,} → {int(entry['balance_after']):,}"

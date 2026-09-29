@@ -19,7 +19,7 @@ from discord.ext import commands
 from mcd.rates import user_pays
 from mcd.settings import GROUPS, SPECS, SettingError
 
-from ._shared import BAD, INFO, MONEY, OK, WARN, deny, embed, reply
+from ._shared import BAD, INFO, MONEY, OK, WARN, ConfirmView, deny, embed, reply
 
 log = logging.getLogger("bot.config")
 
@@ -562,6 +562,208 @@ class Config(commands.Cog):
             return
         await self._log_change(interaction, "CAMPAIGNS", f"-{name}")
         await reply(interaction, embed(f"{cfg.E_OK} 削除しました", f"「{name}」", OK))
+
+    # ------------------------------------------------------ チャージボーナス
+
+    @group.command(name="bonus-add", description="チャージボーナスの段を追加します")
+    @app_commands.describe(minimum="この額以上のチャージが対象(円)", percent="ボーナス率(%)")
+    async def bonus_add(
+        self, interaction: discord.Interaction, minimum: int, percent: int
+    ) -> None:
+        if not await owner_gate(interaction):
+            return
+        cfg = self.bot.cfg
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            cfg.add_charge_bonus(minimum, percent)
+        except SettingError as exc:
+            await reply(interaction, embed(f"{cfg.E_NG} 追加できません", str(exc), BAD))
+            return
+        await self._log_change(interaction, "CHARGE_BONUS", f"+{minimum}円={percent}%")
+        await reply(
+            interaction,
+            embed(
+                f"{cfg.E_OK} チャージボーナスを設定しました",
+                f"**{minimum:,} 円**以上のチャージで **+{percent}%**\n"
+                f"例: {minimum:,} 円 → +{minimum * percent // 100:,} 円",
+                MONEY,
+            ),
+        )
+
+    @group.command(name="bonus-list", description="チャージボーナスの一覧")
+    async def bonus_list(self, interaction: discord.Interaction) -> None:
+        if not await owner_gate(interaction):
+            return
+        cfg = self.bot.cfg
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        tiers = cfg.charge_bonus_tiers()
+        if not tiers:
+            await reply(
+                interaction,
+                embed(
+                    "チャージボーナスは設定されていません",
+                    "`/config bonus-add` で追加できます。",
+                    INFO,
+                ),
+            )
+            return
+        lines = [
+            f"**{minimum:,} 円**以上 → +{percent}%（+{minimum * percent // 100:,} 円〜）"
+            for minimum, percent in tiers
+        ]
+        await reply(
+            interaction,
+            embed(
+                f"{cfg.E_MONEY} チャージボーナス {len(tiers)} 段",
+                "\n".join(lines) + "\n\n該当する中で最も高い段が適用されます。",
+                MONEY,
+            ),
+        )
+
+    @group.command(name="bonus-remove", description="チャージボーナスの段を削除します")
+    @app_commands.describe(minimum="削除する段の下限(円)")
+    async def bonus_remove(self, interaction: discord.Interaction, minimum: int) -> None:
+        if not await owner_gate(interaction):
+            return
+        cfg = self.bot.cfg
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not cfg.remove_charge_bonus(minimum):
+            await reply(
+                interaction,
+                embed(f"{cfg.E_NG} 見つかりません", f"{minimum:,} 円の段はありません。", BAD),
+            )
+            return
+        await self._log_change(interaction, "CHARGE_BONUS", f"-{minimum}円")
+        await reply(interaction, embed(f"{cfg.E_OK} 削除しました", f"{minimum:,} 円の段", OK))
+
+    # ------------------------------------------------------------ バックアップ
+
+    @group.command(name="backup", description="いますぐバックアップを取ります")
+    async def backup(self, interaction: discord.Interaction) -> None:
+        if not await owner_gate(interaction):
+            return
+        cfg = self.bot.cfg
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            path = await asyncio.to_thread(self.bot.store.backup, int(cfg.BACKUP_KEEP))
+        except Exception as exc:
+            await reply(interaction, embed(f"{cfg.E_NG} 失敗しました", str(exc)[:300], BAD))
+            return
+        await self._log_change(interaction, "backup", path.name)
+        await reply(
+            interaction,
+            embed(
+                f"{cfg.E_OK} バックアップを作成しました",
+                f"`{path.name}`\n保持世代: {cfg.BACKUP_KEEP}",
+                OK,
+            ),
+        )
+
+    @group.command(name="backup-list", description="バックアップの一覧")
+    async def backup_list(self, interaction: discord.Interaction) -> None:
+        if not await owner_gate(interaction):
+            return
+        cfg = self.bot.cfg
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        files = await asyncio.to_thread(self.bot.store.list_backups)
+        if not files:
+            await reply(
+                interaction,
+                embed("バックアップがありません", "`/config backup` で作成できます。", INFO),
+            )
+            return
+        lines = [
+            f"`{p.name}` ・ {p.stat().st_size // 1024:,} KB"
+            for p in files[:20]
+        ]
+        await reply(
+            interaction,
+            embed(
+                f"{cfg.E_CHART} バックアップ {len(files)} 件",
+                "\n".join(lines) + "\n\n復元は `/config restore`",
+                INFO,
+            ),
+        )
+
+    @group.command(name="restore", description="バックアップから復元します（危険）")
+    @app_commands.describe(name="復元するバックアップのファイル名")
+    async def restore(self, interaction: discord.Interaction, name: str) -> None:
+        if not await owner_gate(interaction):
+            return
+        cfg = self.bot.cfg
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        target = next(
+            (p for p in await asyncio.to_thread(self.bot.store.list_backups) if p.name == name),
+            None,
+        )
+        if target is None:
+            await reply(
+                interaction,
+                embed(f"{cfg.E_NG} 見つかりません", f"`{name}` は存在しません。", BAD),
+            )
+            return
+
+        confirm = ConfirmView(interaction.user.id, yes_label="復元する",
+                              yes_style=discord.ButtonStyle.danger)
+        await reply(
+            interaction,
+            embed(
+                f"{cfg.E_WARN} 本当に復元しますか？",
+                f"`{name}` の内容で現在のデータを上書きします。\n"
+                "**このバックアップ以降の残高・注文・実績はすべて消えます。**\n"
+                "念のため、復元の直前に現状のバックアップを自動で取ります。",
+                BAD,
+            ),
+            view=confirm,
+        )
+        await confirm.wait()
+        if not confirm.value:
+            await interaction.edit_original_response(
+                embed=embed("復元をやめました", "データは変更していません。", INFO), view=None
+            )
+            return
+
+        try:
+            await asyncio.to_thread(self.bot.store.restore, target)
+            cfg.reload()
+        except Exception as exc:
+            await interaction.edit_original_response(
+                embed=embed(f"{cfg.E_NG} 復元に失敗しました", str(exc)[:300], BAD), view=None
+            )
+            return
+
+        await asyncio.to_thread(
+            self.bot.store.audit, "db.restored", interaction.user.id, {"file": name}
+        )
+        await interaction.edit_original_response(
+            embed=embed(
+                f"{cfg.E_OK} 復元しました",
+                f"`{name}` から復元し、設定を読み直しました。\n"
+                "パネルを設置し直す必要がある場合があります。",
+                OK,
+            ),
+            view=None,
+        )
+        await self.bot.send_log(
+            cfg.LOG_ADMIN_CHANNEL_ID,
+            embed(
+                f"{cfg.E_WARN} データベースを復元しました",
+                f"`{name}`\n実行: {interaction.user.mention}",
+                BAD,
+            ),
+        )
+
+    @restore.autocomplete("name")
+    async def _backup_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        text = (current or "").lower()
+        return [
+            app_commands.Choice(name=p.name, value=p.name)
+            for p in self.bot.store.list_backups()
+            if text in p.name.lower()
+        ][:25]
 
     @campaign_remove.autocomplete("name")
     async def _campaign_autocomplete(

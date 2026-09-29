@@ -107,13 +107,40 @@ SPECS: dict[str, Spec] = {
         _spec("MONTHLY_REPORT_HOUR", "int", 10, "月次レポートを送る時刻(JST)", "動作", 0, 23),
         _spec("HEALTH_CHECK_HOURS", "int", 6, "ヘルスチェックの間隔(時間)", "動作", 1, 168),
         _spec("KYASH_TOKEN_WARN_DAYS", "int", 7, "Kyashトークンの警告日数", "動作", 1, 30),
+        _spec("CANCEL_GRACE_SECONDS", "int", 5, "決済を押した後の取り消し猶予(秒)", "動作", 0, 60,
+              "0 で猶予なし。StoreOrder の前なので安全に取り消せる"),
+        _spec("QUEUE_NOTIFY", "int", 1, "順番が近づいたらDMで知らせる(1で有効)", "動作", 0, 1),
+        _spec("STORE_MISMATCH_WARN", "int", 1, "いつもと違う店舗を警告する(1で有効)", "動作", 0, 1),
+        _spec("MAINTENANCE", "int", 0, "メンテナンスモード(1で注文停止)", "動作", 0, 1,
+              "API障害時は自動で1になり、復旧すると自動で0に戻る"),
+        _spec("MAINTENANCE_NOTE", "str", "", "メンテナンス中に表示する理由", "動作"),
+
+        # ---- 保護・上限 ----
+        _spec("ACCOUNT_DAILY_ORDERS", "int", 0,
+              "1アカウントあたりの1日の注文件数上限", "保護", 0, 1000,
+              "0 で無制限。超えたら次のアカウントへ回す"),
+        _spec("ACCOUNT_DAILY_AMOUNT", "int", 0,
+              "1アカウントあたりの1日の決済額上限(円)", "保護", 0, 10000000,
+              "0 で無制限。カードの与信枠を超えないようにする"),
+        _spec("CIRCUIT_FAIL_THRESHOLD", "int", 5,
+              "連続失敗が何回でメンテナンスに入るか", "保護", 2, 50),
+        _spec("CIRCUIT_COOLDOWN_MINUTES", "int", 15,
+              "自動メンテナンスから復帰を試すまでの時間(分)", "保護", 1, 1440),
+        _spec("BACKUP_KEEP", "int", 14, "残すバックアップの数", "保護", 1, 365),
+        _spec("BACKUP_HOUR", "int", 4, "バックアップを取る時刻(JST)", "保護", 0, 23),
+        _spec("DAILY_SUMMARY_HOUR", "int", 9, "日次サマリーを送る時刻(JST)", "保護", 0, 23),
+        _spec("DORMANT_DAYS", "int", 90,
+              "残高が動かない日数がこれを超えたら通知", "保護", 0, 3650, "0 で無効"),
+        _spec("DORMANT_MIN_BALANCE", "int", 100, "通知の対象にする最低残高(円)", "保護", 1, 1000000),
+        _spec("UNKNOWN_RECHECK_MINUTES", "int", 10,
+              "決済成否不明の注文を照合しにいく間隔(分)", "保護", 1, 1440),
     ]
 }
 
-GROUPS = ["チャンネル", "料率", "金額", "規約", "不正検知", "動作"]
+GROUPS = ["チャンネル", "料率", "金額", "規約", "不正検知", "動作", "保護"]
 
 # 単独の値ではなく表で持つもの
-TABLE_KEYS = ("ROLE_RATES", "USER_RATES", "CAMPAIGNS")
+TABLE_KEYS = ("ROLE_RATES", "USER_RATES", "CAMPAIGNS", "CHARGE_BONUS")
 
 REQUIRED_KEYS = (
     "ORDER_ROLE_ID",
@@ -152,9 +179,12 @@ class Settings:
             for key, spec in SPECS.items():
                 stored = self._store.get_kv(KV_PREFIX + key, None)
                 cache[key] = spec.default if stored is None else stored
+            list_tables = ("CAMPAIGNS", "CHARGE_BONUS")
             for key in TABLE_KEYS:
                 stored = self._store.get_kv(KV_PREFIX + key, None)
-                cache[key] = stored if stored is not None else ([] if key == "CAMPAIGNS" else {})
+                if stored is None:
+                    stored = [] if key in list_tables else {}
+                cache[key] = stored
             self._cache = cache
 
     def __getattr__(self, name: str) -> Any:
@@ -331,6 +361,45 @@ class Settings:
         if len(remaining) == len(items):
             return False
         self._set_table("CAMPAIGNS", remaining)
+        return True
+
+    # ---- チャージボーナス ----
+
+    def charge_bonus_tiers(self) -> list[tuple[int, int]]:
+        """(チャージ額の下限, ボーナス率%) を額の大きい順で返す。"""
+        rows = []
+        for item in self.CHARGE_BONUS or []:
+            try:
+                rows.append((int(item["min"]), int(item["percent"])))
+            except Exception:
+                log.warning("壊れたチャージボーナス設定を読み飛ばしました: %r", item)
+        return sorted(rows, key=lambda x: x[0], reverse=True)
+
+    def charge_bonus_for(self, amount: int) -> tuple[int, int]:
+        """(ボーナス額, 適用率%) を返す。該当なしなら (0, 0)。"""
+        for minimum, percent in self.charge_bonus_tiers():
+            if amount >= minimum:
+                return (amount * percent) // 100, percent
+        return 0, 0
+
+    def add_charge_bonus(self, minimum: int, percent: int) -> list[tuple[int, int]]:
+        if minimum < 1:
+            raise SettingError("下限は 1 円以上にしてください")
+        if not 1 <= percent <= 100:
+            raise SettingError("ボーナス率は 1〜100% で指定してください")
+        items = [
+            i for i in (self.CHARGE_BONUS or []) if int(i.get("min", 0)) != minimum
+        ]
+        items.append({"min": int(minimum), "percent": int(percent)})
+        self._set_table("CHARGE_BONUS", items)
+        return self.charge_bonus_tiers()
+
+    def remove_charge_bonus(self, minimum: int) -> bool:
+        items = list(self.CHARGE_BONUS or [])
+        remaining = [i for i in items if int(i.get("min", 0)) != minimum]
+        if len(remaining) == len(items):
+            return False
+        self._set_table("CHARGE_BONUS", remaining)
         return True
 
     # ------------------------------------------------------------ 不正検知
