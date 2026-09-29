@@ -81,16 +81,75 @@ async def render(receipt_number: str) -> io.BytesIO:
     return io.BytesIO(data)
 
 
+# リンク先が使えるかどうか。使えないと分かったらボタンを出さない。
+_link_alive: bool = True
+_link_checked_at: float = 0.0
+
+
 def receipt_view_url(store_id: str, receipt_number: str) -> str:
     """
     受け取り画面のURL。
 
-    DMのボタンから開けるようにしておくと、利用者が本物の画面を
-    自分で表示できる（docs/07 §3）。
+    ⚠️ これは外部サイトへの飾りのリンク。BOTの動作には関わらない。
+       店頭で必要な注文番号は、BOTが作るレシート画像に入っている。
+
+    設定が空のとき、または直近の確認でリンク先が落ちていたときは
+    空文字を返す。呼び出し側はその場合ボタンを出さないこと。
     """
-    return config.RECEIPT_VIEW_URL.format(
-        store_id=store_id, receipt_number=receipt_number
-    )
+    from core import settings
+
+    template = settings.get("receipt_view_url", config.RECEIPT_VIEW_URL)
+    if not template or not _link_alive:
+        return ""
+    try:
+        return template.format(store_id=store_id, receipt_number=receipt_number)
+    except (KeyError, IndexError, ValueError):
+        log.warning("受け取り画面のURLの書式が正しくありません: %s", template)
+        return ""
+
+
+async def check_link_alive(force: bool = False) -> bool:
+    """
+    リンク先が生きているか確かめる。
+
+    落ちているサイトへのボタンを利用者に見せないための確認。
+    確認できなかった場合は「生きている」ものとして扱う
+    （こちらの回線の問題でボタンを消してしまわないように）。
+    """
+    global _link_alive, _link_checked_at
+    import time
+
+    from core import settings
+    from core.http import build_async_client
+
+    template = settings.get("receipt_view_url", config.RECEIPT_VIEW_URL)
+    if not template:
+        _link_alive = False
+        return False
+
+    interval = int(config.RECEIPT_URL_CHECK_MINUTES) * 60
+    if not force and time.time() - _link_checked_at < interval:
+        return _link_alive
+
+    url = template.format(store_id="13934", receipt_number="0000")
+    try:
+        async with build_async_client(timeout=10.0) as client:
+            r = await client.head(url)
+            if r.status_code >= 400:
+                r = await client.get(url)
+        alive = r.status_code < 500
+    except Exception as e:
+        log.info("受け取り画面のURLを確認できませんでした（ボタンは出します）: %s", e)
+        _link_checked_at = time.time()
+        return _link_alive
+
+    if alive != _link_alive:
+        log.info(
+            "受け取り画面のリンクを%sにしました（%s）",
+            "表示" if alive else "非表示", url,
+        )
+    _link_alive, _link_checked_at = alive, time.time()
+    return alive
 
 
 def self_check() -> str:

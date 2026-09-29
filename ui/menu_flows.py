@@ -27,6 +27,7 @@ from services.mcd import accounts as mcd_accounts
 from services.mcd import store_index
 from services.mcd import stores as mcd_stores
 from services.mcd.client import McdError
+from services.mcd import availability
 from services.mcd.menu import ParsedMenu, Product, minutes_of
 from services.mcd.protocol import PICKUP_LABEL, OrderItem, build_hex
 from ui import embeds, flows
@@ -158,7 +159,7 @@ async def show_search_results(
             embed=embeds.warn(
                 f"「{query}」に一致するお店が見つかりませんでした。\n{hint}"
             ),
-            view=StoreSelectView(interaction.user.id, purpose, []),
+            view=StoreSelectView(interaction.user.id, purpose),
             ephemeral=True,
         )
         return
@@ -221,7 +222,14 @@ class SearchResultView(discord.ui.View):
 
 
 class StoreSelectView(discord.ui.View):
-    def __init__(self, owner_id: int, purpose: str, recent: list[tuple[str, str]]) -> None:
+    def __init__(self, owner_id: int, purpose: str) -> None:
+        """
+        お店の選び方を出す。
+
+        以前は「最近よく使われているお店」のプルダウンも出していたが、
+        他の利用者がどこで注文したかが伝わってしまうため取りやめた。
+        （プライバシー重視の方針・docs/05 §0）
+        """
         super().__init__(timeout=config.VIEW_TIMEOUT)
         self.owner_id = owner_id
         self.purpose = purpose
@@ -238,20 +246,6 @@ class StoreSelectView(discord.ui.View):
         by_id.callback = self._on_input
         self.add_item(by_id)
 
-        if recent:
-            options = [
-                discord.SelectOption(
-                    label=(name or code)[:100], value=code, description=f"店舗ID {code}"
-                )
-                for code, name in recent[:25]
-            ]
-            sel = discord.ui.Select(
-                placeholder="最近よく使われているお店から選ぶ", options=options, row=1
-            )
-            sel.callback = self._on_recent
-            self.add_item(sel)
-            self._recent_select = sel
-
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
@@ -266,21 +260,8 @@ class StoreSelectView(discord.ui.View):
     async def _on_input(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(StoreIdModal(self.purpose))
 
-    async def _on_recent(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        await open_menu(interaction, self._recent_select.values[0], self.purpose)
-
-
 async def start_store_select(interaction: discord.Interaction, purpose: str) -> None:
     await user_repo.get_or_create(interaction.user.id)
-    async with session_scope() as s:
-        rows = (
-            await s.execute(
-                select(StoreCache).order_by(StoreCache.hit_count.desc()).limit(25)
-            )
-        ).scalars().all()
-        recent = [(r.store_id, r.store_name or "") for r in rows]
-
     title = "注文するお店を選んでください" if purpose == "order" else "注文コードを作るお店を選んでください"
     if store_index.available():
         desc = (
@@ -296,7 +277,7 @@ async def start_store_select(interaction: discord.Interaction, purpose: str) -> 
         )
     e = discord.Embed(title=f"{E.STORE} {title}", description=desc, color=embeds.GREEN)
 
-    view = StoreSelectView(interaction.user.id, purpose, recent)
+    view = StoreSelectView(interaction.user.id, purpose)
     if interaction.response.is_done():
         await interaction.followup.send(embed=e, view=view, ephemeral=True)
     else:
@@ -328,6 +309,17 @@ async def open_menu(interaction: discord.Interaction, store_id: str, purpose: st
         if handle:
             await handle.aclose()
 
+    # 注文できない店舗は、商品を選ばせる前にここで止める。
+    # 選び終えてから断られるのが一番つらいので、理由まで説明する。
+    av = await availability.check_store(store_id)
+    if not av.orderable:
+        await interaction.followup.send(
+            embed=embeds.store_unavailable(info.name, store_id, av),
+            view=StoreSelectView(interaction.user.id, purpose),
+            ephemeral=True,
+        )
+        return
+
     menu = await mcd_stores.load_menu(store_id)
     if not menu.products:
         await interaction.followup.send(
@@ -336,7 +328,12 @@ async def open_menu(interaction: discord.Interaction, store_id: str, purpose: st
         return
 
     await save_cart(interaction.user.id, purpose=purpose, store_id=store_id, pickup=None, items=[])
-    view = CartView(interaction.user.id, purpose, store_id, info.name, info.delivery_methods, menu)
+    # いまの時間に使える受取方法だけを選択肢に出す
+    usable = {m: (m in av.methods) for m in info.delivery_methods}
+    view = CartView(
+        interaction.user.id, purpose, store_id, info.name,
+        usable or info.delivery_methods, menu,
+    )
     await interaction.followup.send(embed=await view.build_embed(), view=view, ephemeral=True)
 
 
@@ -492,16 +489,41 @@ class CartView(discord.ui.View):
             embed=embeds.info("やめました。"), view=None
         )
 
+    def _unavailable_items(self, minutes: int) -> list[Product]:
+        """
+        いま取り扱いの無い商品を、セットの中身まで辿って集める。
+
+        同じ商品が複数の枠に入っていても一度だけ返す。
+        """
+        seen: set[str] = set()
+        out: list[Product] = []
+
+        def walk(item) -> None:
+            code = str(getattr(item, "product_code", "") or "")
+            if code and code not in seen:
+                seen.add(code)
+                p = self.menu.products.get(code)
+                if p is not None and not p.is_orderable_at(minutes):
+                    out.append(p)
+            for child in getattr(item, "components", None) or []:
+                walk(child)
+
+        for item in self.items:
+            walk(item)
+        return out
+
     async def _on_go(self, interaction: discord.Interaction) -> None:
         pickup = self.pickup or "takeOut"
         # 販売時間を確定直前に再確認する（カート投入後に時間帯を跨ぐことがある）
+        #
+        # ⚠️ セットの中身まで見ること。セット自体は売っていても、
+        #    中のサイドやドリンクが時間外ということがある。
+        #    （朝の時間にマックフライポテトを入れた場合など）
+        #    見落とすとマクドナルド側から
+        #    「ただいまのお時間は選択した商品のお取り扱いがありません」
+        #    で弾かれ、利用者には原因が分からない。
         minutes = now_minutes()
-        unavailable = [
-            self.menu.products[i.product_code].name
-            for i in self.items
-            if i.product_code in self.menu.products
-            and not self.menu.products[i.product_code].is_orderable_at(minutes)
-        ]
+        unavailable = [p.name for p in self._unavailable_items(minutes)]
         if unavailable:
             await interaction.response.edit_message(
                 embed=embeds.warn(
@@ -781,12 +803,20 @@ class OptionView(discord.ui.View):
         )
         return e
 
+    def _slot_label(self, slot, candidates: list[Product]) -> str:
+        """選択枠の見出し。中身から「ドリンク」「サイド」を言い当てる。"""
+        base = slot.default_product or slot.reference_product
+        col = self.cart.menu.collection_of(base) if base else None
+        return col.name if col else "お選びください"
+
     def _build(self) -> None:
         self.clear_items()
-        for idx, c in enumerate(self.choices[:3]):
+        row = 0
+        for c in self.choices[:2]:
             candidates = self._candidates(c)
             if not candidates:
                 continue
+            label = self._slot_label(c, candidates)
             options = [
                 discord.SelectOption(
                     label=p.name[:100], value=p.code,
@@ -794,9 +824,27 @@ class OptionView(discord.ui.View):
                 )
                 for p in candidates[:25]
             ]
-            sel = discord.ui.Select(placeholder=f"選択枠 {idx + 1}", options=options, row=idx)
+            sel = discord.ui.Select(placeholder=label, options=options, row=row)
             sel.callback = self._make_cb(c.code, sel)
             self.add_item(sel)
+            row += 1
+
+            # サイズを選べる商品なら、その下にサイズも出す
+            sizes = self._sizes(c)
+            if len(sizes) > 1 and row < 3:
+                size_options = [
+                    discord.SelectOption(
+                        label=p.name[:100], value=p.code,
+                        default=(self.picks.get(c.code) == p.code),
+                    )
+                    for p in sizes[:25]
+                ]
+                ssel = discord.ui.Select(
+                    placeholder=f"{label}のサイズ", options=size_options, row=row
+                )
+                ssel.callback = self._make_cb(c.code, ssel)
+                self.add_item(ssel)
+                row += 1
 
         ok = discord.ui.Button(label="カートに追加", emoji=E.PLUS, style=discord.ButtonStyle.success, row=3)
         ok.callback = self._on_ok
@@ -809,24 +857,23 @@ class OptionView(discord.ui.View):
         """
         選択枠に入れられる商品。
 
-        カタログは枠の中身を直接持っていないため、既定商品のサイズ違いを候補にする。
+        以前は「既定商品のサイズ違い」だけを候補にしていたため、
+        ドリンクがコカ・コーラしか選べなかった。
+        いまは参照商品の属するカテゴリ全体から、
+        **その時刻に取り扱いのあるものだけ**を出す。
         """
-        base = slot.default_product or slot.reference_product
-        if not base:
+        return self.cart.menu.choice_candidates(slot, now_minutes())
+
+    def _sizes(self, slot) -> list[Product]:
+        """いま選んでいる商品のサイズ違い。無ければ空。"""
+        chosen = self.picks.get(slot.code)
+        if not chosen:
             return []
-        menu = self.cart.menu
-        out = []
-        # サイズ違いは「名前の末尾がサイズ表記」という規則で探す
-        base_p = menu.products.get(base)
-        if base_p is None:
-            return []
-        stem = base_p.name.rsplit(" ", 1)[0]
-        for p in menu.products.values():
-            if p.name == base_p.name or p.name.rsplit(" ", 1)[0] == stem:
-                out.append(p)
-        if base_p not in out:
-            out.insert(0, base_p)
-        return out or [base_p]
+        minutes = now_minutes()
+        return [
+            p for p in self.cart.menu.size_variants(chosen)
+            if p.is_orderable_at(minutes)
+        ]
 
     def _make_cb(self, slot_code: str, sel: discord.ui.Select):
         async def cb(interaction: discord.Interaction) -> None:

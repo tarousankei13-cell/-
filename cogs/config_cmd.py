@@ -398,6 +398,69 @@ class ConfigCog(commands.Cog):
             ephemeral=True,
         )
 
+    @group.command(name="receipt_url", description="完了DMの「受け取り画面」リンクを設定します")
+    @app_commands.describe(
+        url="リンク先のURL。off と入れるとボタンを出しません（既定に戻すなら default）"
+    )
+    @admin_only()
+    async def receipt_url(self, interaction: discord.Interaction, url: str) -> None:
+        """
+        完了DMに出る「受け取り画面を開く」ボタンのリンク先。
+
+        これは外部サイトへの飾りのリンクで、BOTの動作には関わらない。
+        注文・メニュー同期・店舗同期はマクドナルド公式のAPIだけで完結する。
+        店頭で必要な注文番号はBOTが作るレシート画像に入っている。
+        """
+        from services import receipt as receipt_svc
+
+        value = url.strip()
+        if value.lower() in ("off", "なし", "無効", "disable"):
+            await settings.set_value("receipt_view_url", "", updated_by=interaction.user.id)
+            await interaction.response.send_message(
+                embed=embeds.ok(
+                    "「受け取り画面を開く」ボタンを**表示しない**ようにしました。\n"
+                    f"{E.INFO} 注文番号はレシート画像に入っているので、受け取りには影響しません。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if value.lower() in ("default", "既定", "デフォルト"):
+            value = config.RECEIPT_VIEW_URL
+
+        if not value.startswith("https://"):
+            await interaction.response.send_message(
+                embed=embeds.error("URLは https:// で始めてください。"), ephemeral=True
+            )
+            return
+        try:
+            value.format(store_id="13934", receipt_number="0000")
+        except (KeyError, IndexError, ValueError):
+            await interaction.response.send_message(
+                embed=embeds.error(
+                    "URLの書式が正しくありません。\n"
+                    "`{store_id}` と `{receipt_number}` を差し込み位置に入れてください。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await settings.set_value("receipt_view_url", value, updated_by=interaction.user.id)
+        alive = await receipt_svc.check_link_alive(force=True)
+        await interaction.followup.send(
+            embed=embeds.ok(
+                f"受け取り画面のリンクを設定しました。\n```{value}```\n"
+                + (
+                    f"{E.OK} リンク先に接続できました。"
+                    if alive
+                    else f"{E.WARN} リンク先に接続できなかったため、"
+                         "ボタンは自動的に非表示になります。"
+                )
+            ),
+            ephemeral=True,
+        )
+
     @group.command(name="achievement_fields", description="実績パネルの表示項目を設定します")
     @app_commands.describe(
         anon_code="匿名コード", list_price="定価", subsidy_rate="負担率",

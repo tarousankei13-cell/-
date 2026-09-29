@@ -19,6 +19,8 @@ from typing import Awaitable, Callable
 
 import httpx
 
+from core.http import build_async_client
+from core.telemetry import current as correlation_id
 from services.mcd.protocol import (
     OrderResponse, build_authorise_body, build_get_paid_body,
     parse_order_response, pb_str, proto_parse, varint_encode,
@@ -177,11 +179,9 @@ class McdClient:
         self.fp = fingerprint
         self.tokens = tokens or TokenSet()
         self._on_tokens_updated = on_tokens_updated
-        self._client = httpx.AsyncClient(
-            timeout=timeout,
-            proxy=proxy,
-            follow_redirects=True,
-            limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+        self._client = build_async_client(
+            timeout=timeout, proxy=proxy,
+            max_connections=8, max_keepalive=4,
         )
 
     async def aclose(self) -> None:

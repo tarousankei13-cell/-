@@ -219,11 +219,22 @@ class StoreCache(Base):
     # 対応する受取方法 {"takeOut": true, ...} をJSONで
     delivery_methods: Mapped[str | None] = mapped_column(Text)
     resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # 解決した回数。管理者の統計用で、利用者には見せない。
+    # （以前は「最近よく使われているお店」として出していたが、
+    #   他の利用者の行動が伝わるため取りやめた）
     hit_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     # ETag を覚えておき、変更が無ければ 304 で済ませる（高頻度同期のため）
     store_etag: Mapped[str | None] = mapped_column(String(128))
     menu_etag: Mapped[str | None] = mapped_column(String(128))
     menu_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # 注文できるかの判定に使う（店舗を選んだ時点で理由を出すため）
+    #   mop_enabled : モバイルオーダーに対応しているか
+    #   foe_status  : 店舗の稼働状態。NORMAL 以外は一時休業など
+    #   method_hours: 受取方法ごとの営業時間 {"eatIn": {"2026-09-30": {...}}} をJSONで
+    mop_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    foe_status: Mapped[str | None] = mapped_column(String(32))
+    method_hours: Mapped[str | None] = mapped_column(Text)
 
 
 # ============================================================
@@ -380,6 +391,8 @@ class MenuProduct(Base):
     pre_price: Mapped[int | None] = mapped_column(Integer)  # セットの表示価格
     structure: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     time_windows: Mapped[str | None] = mapped_column(Text)  # limitedAbility の checkoutable
+    # サイズ違いをまとめる代表コード。コカ・コーラ S/M/L は同じ値を持つ。
+    size_group: Mapped[str | None] = mapped_column(String(16))
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

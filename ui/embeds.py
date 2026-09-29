@@ -339,6 +339,45 @@ def dm_complete(
     return e
 
 
+def store_unavailable(store_name: str, store_id: str, av) -> discord.Embed:
+    """
+    その店舗がいま注文を受け付けていないことを伝える。
+
+    商品を選び終えてから断られるのが一番つらいので、
+    店舗を選んだ時点でここまで説明する。
+    """
+    e = discord.Embed(
+        title=f"{E.WARN} {av.title or 'ただいま注文できません'}",
+        description=av.reason or "この店舗はただいま注文を受け付けていません。",
+        color=ORANGE,
+    )
+    e.add_field(
+        name=f"{E.STORE} 店舗",
+        value=f"{store_name or '—'}\n`{store_id}`",
+        inline=True,
+    )
+    if av.windows:
+        e.add_field(
+            name=f"{E.SYNC} 注文できる時間",
+            value=av.window_text(),
+            inline=True,
+        )
+    if av.hint:
+        e.add_field(name=f"{E.INFO} ご案内", value=av.hint, inline=False)
+    if av.methods:
+        from services.mcd.protocol import PICKUP_LABEL
+
+        e.add_field(
+            name=f"{E.PIN} この店舗の受け取り方法",
+            value="・" + "\n・".join(
+                PICKUP_LABEL.get(m, m) for m in av.methods
+            ),
+            inline=False,
+        )
+    e.set_footer(text="別の店舗を選ぶか、時間をおいてお試しください")
+    return e
+
+
 def receipt_fallback(
     *,
     receipt_number: str,

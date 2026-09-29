@@ -19,6 +19,7 @@ import config
 from db.models import as_utc, MenuCollection, MenuProduct, StoreCache, StoreDaypart, utcnow
 from db.session import session_scope
 from services.mcd.client import McdClient, McdError
+from services.mcd import availability
 from services.mcd.menu import (
     Collection, MenuDiff, ParsedMenu, Product, Slot,
     diff_menus, parse_dayparts, parse_menu, supported_pickup_methods,
@@ -123,6 +124,13 @@ async def resolve_store(
         row.delivery_methods = json.dumps(info.delivery_methods, ensure_ascii=False)
         row.resolved_at = utcnow()
         row.store_etag = new_etag or None
+
+        # 注文できるかの判定に使う情報（店舗を選んだ時点で理由を出すため）
+        row.mop_enabled = bool(store.get("mopEnabled", True))
+        row.foe_status = str(store.get("foeStatus") or "NORMAL")
+        row.method_hours = json.dumps(
+            availability.method_hours(raw), ensure_ascii=False
+        )
 
         # 時間帯も保存する
         await s.execute(delete(StoreDaypart).where(StoreDaypart.store_id == store_id))
@@ -232,6 +240,7 @@ async def sync_menu(
                     price_other=p.price_other, pre_price=p.pre_price,
                     structure=p.structure_json(),
                     time_windows=json.dumps(p.time_windows),
+                    size_group=p.size_group or None,
                     synced_at=now,
                 )
             )
@@ -290,6 +299,7 @@ async def load_menu(store_id: str) -> ParsedMenu:
             price_other=r.price_other or 0, pre_price=r.pre_price or 0,
             slots=[Slot.from_dict(d) for d in json.loads(r.structure or "[]")],
             time_windows=json.loads(r.time_windows or "[]"),
+            size_group=r.size_group or "",
         )
     collections = [
         Collection(
@@ -298,7 +308,12 @@ async def load_menu(store_id: str) -> ParsedMenu:
         )
         for r in crows
     ]
-    return ParsedMenu(store_id=store_id, products=products, collections=collections)
+    # サイズ違いの対応表は、保存してある代表コードから組み直す
+    size_groups = {c: p.size_group for c, p in products.items() if p.size_group}
+    return ParsedMenu(
+        store_id=store_id, products=products, collections=collections,
+        size_groups=size_groups,
+    )
 
 
 async def active_store_ids(days: int | None = None) -> list[str]:

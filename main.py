@@ -125,9 +125,16 @@ KEY_FILE = DATA_DIR / "encryption_key.txt"
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    # %(corr)s は相関ID。1回の注文に紐づくログを絞り込めるようにする。
+    format="%(asctime)s [%(levelname)s] %(name)s: %(corr)s%(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+
+# 相関IDを全てのログ行に載せる（付いていない行は空欄になる）
+from core.telemetry import CorrelationFilter  # noqa: E402
+
+for _handler in logging.root.handlers:
+    _handler.addFilter(CorrelationFilter())
 # 通信ライブラリは1リクエストごとに INFO を出すため、店舗同期を回すと
 # 15分ごとに数百行が流れてログが読めなくなる。警告だけにしておく。
 for _noisy in ("httpx", "httpcore"):

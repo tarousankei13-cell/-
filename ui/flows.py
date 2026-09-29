@@ -22,6 +22,7 @@ from core import users as user_repo
 from db.models import as_utc, Order, User
 from db.session import session_scope
 from services.mcd import accounts as mcd_accounts
+from services.mcd import availability
 from services.mcd import stores as mcd_stores
 from services.mcd.client import McdError
 from services.mcd.protocol import (
@@ -353,6 +354,21 @@ async def open_preview(interaction: discord.Interaction, hex_text: str) -> None:
         if handle:
             await handle.aclose()
 
+    # 注文コードの店舗が、いま注文を受け付けているか確かめる。
+    # 残高を確保する前にここで止める。
+    av = await availability.check_store(decoded.store_id)
+    if not av.orderable:
+        await interaction.followup.send(
+            embed=embeds.store_unavailable(store_name, decoded.store_id, av),
+            ephemeral=True,
+        )
+        return
+    # いまの時間に使える受取方法だけを選ばせる
+    if av.methods:
+        supported = {m: (m in av.methods) for m in (supported or {})} or {
+            m: True for m in av.methods
+        }
+
     async with session_scope() as s:
         quote = await subsidy.resolve(
             s, interaction.user.id, role_ids(interaction), decoded.total_amount
@@ -609,11 +625,14 @@ async def send_completion_dm(interaction: discord.Interaction, result: saga.Orde
     )
 
     view = discord.ui.View()
-    if result.receipt_number and result.store_id:
+    # 外部サイトへの飾りのリンク。設定で無効にされていたり、
+    # リンク先が落ちていたりするときは空文字が返るのでボタンを出さない。
+    link = receipt_svc.receipt_view_url(result.store_id, result.receipt_number)
+    if link:
         view.add_item(
             discord.ui.Button(
-                label="受け取り画面を開く", emoji=E.RECEIPT, style=discord.ButtonStyle.link,
-                url=receipt_svc.receipt_view_url(result.store_id, result.receipt_number),
+                label="受け取り画面を開く", emoji=E.RECEIPT,
+                style=discord.ButtonStyle.link, url=link,
             )
         )
 
@@ -663,12 +682,13 @@ async def send_completion_here(
     kwargs: dict = {"embed": embed, "ephemeral": True}
     if image is not None:
         kwargs["file"] = discord.File(image, filename="receipt.png")
-    if result.receipt_number and result.store_id:
+    link = receipt_svc.receipt_view_url(result.store_id, result.receipt_number)
+    if link:
         view = discord.ui.View()
         view.add_item(
             discord.ui.Button(
-                label="受け取り画面を開く", emoji=E.RECEIPT, style=discord.ButtonStyle.link,
-                url=receipt_svc.receipt_view_url(result.store_id, result.receipt_number),
+                label="受け取り画面を開く", emoji=E.RECEIPT,
+                style=discord.ButtonStyle.link, url=link,
             )
         )
         kwargs["view"] = view

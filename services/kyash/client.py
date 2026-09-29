@@ -22,6 +22,8 @@ import uuid
 from dataclasses import dataclass
 
 import httpx
+
+from core.http import build_async_client
 from bs4 import BeautifulSoup
 
 log = logging.getLogger("bot.kyash")
@@ -99,7 +101,7 @@ class KyashClient:
             installation_uuid=s.installation_uuid or str(uuid.uuid4()).upper(),
         )
         self._email = ""
-        self._client = httpx.AsyncClient(timeout=timeout, proxy=proxy, follow_redirects=True)
+        self._client = build_async_client(timeout=timeout, proxy=proxy)
 
     async def aclose(self) -> None:
         await self._client.aclose()

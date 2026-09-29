@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 import config
+from core.http import build_async_client
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -209,8 +210,8 @@ async def sync(
     )
     sem = asyncio.Semaphore(CONCURRENCY)
 
-    async with httpx.AsyncClient(
-        limits=httpx.Limits(max_connections=CONCURRENCY * 4 + 20)
+    async with build_async_client(
+        max_connections=CONCURRENCY * 4 + 20, max_keepalive=CONCURRENCY * 2
     ) as client:
         # ---- ① サイトマップの照合 ----------------------------
         interval = int(config.STORE_SITEMAP_CHECK_MINUTES) * 60

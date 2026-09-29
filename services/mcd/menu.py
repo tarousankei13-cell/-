@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterable
 
+import config
+
 log = logging.getLogger("bot.menu")
 
 # 受取方法 → menu.json の priceCode
@@ -115,6 +117,7 @@ class Product:
     pre_price: int = 0                 # セットの表示価格
     slots: list[Slot] = field(default_factory=list)
     time_windows: list[dict] = field(default_factory=list)  # [{start,end}] 分単位
+    size_group: str = ""      # サイズ違いをまとめる代表コード
 
     def price_for(self, pickup_method: str) -> int:
         """
@@ -157,6 +160,76 @@ class ParsedMenu:
     store_id: str
     products: dict[str, Product]
     collections: list[Collection]
+
+    size_groups: dict[str, str] = field(default_factory=dict)   # code → 代表コード
+
+    def collection_of(self, code: str) -> "Collection | None":
+        """
+        その商品が属するカテゴリ。
+
+        複数に属することがある（ハッシュポテトは「サイドメニュー」と
+        「朝マック」の両方）。選択枠の候補に使うので、**一番小さい**
+        ＝一番具体的なカテゴリを返す。
+        """
+        hits = [c for c in self.collections if str(code) in c.product_codes]
+        return min(hits, key=lambda c: len(c.product_codes)) if hits else None
+
+    def size_variants(self, code: str) -> list[Product]:
+        """同じ商品のサイズ違い（S/M/L）。"""
+        group = self.size_groups.get(str(code))
+        if not group:
+            return []
+        out = [
+            p for c, p in self.products.items()
+            if self.size_groups.get(c) == group
+        ]
+        return sorted(out, key=lambda p: p.code)
+
+    def choice_candidates(
+        self, slot: Slot, minutes: int | None = None
+    ) -> list[Product]:
+        """
+        セットの選択枠（ドリンク・サイド）に入れられる商品。
+
+        ⚠️ カタログには枠の中身が直接書かれていない。
+           枠は `9997925` のような符号を持つが、これはどこにも定義が無い。
+           代わりに `referenceProduct`（例: コカ・コーラ(M)）が
+           示されているので、**その商品が属するカテゴリ全体**を候補にする。
+           これで「ドリンクはコーラしか選べない」状態を解消できる。
+
+        さらに、その時刻に取り扱いのない商品は候補から外す。
+        朝の時間にマックフライポテトを選ばせると、注文時に
+        マクドナルド側から「ただいまのお時間は取り扱いがありません」と
+        弾かれてしまうため。
+        """
+        base = slot.default_product or slot.reference_product
+        if not base:
+            return []
+
+        col = self.collection_of(base)
+        codes = list(col.product_codes) if col else []
+        if not codes:
+            # カテゴリが分からないときは、せめてサイズ違いを出す
+            codes = [p.code for p in self.size_variants(base)] or [base]
+
+        out = []
+        for code in codes:
+            p = self.products.get(str(code))
+            if p is None:
+                continue
+            if minutes is not None and not p.is_orderable_at(minutes):
+                continue
+            out.append(p)
+
+        # 既定の商品は、時間帯の判定に関わらず必ず残す
+        # （マクドナルド側が既定として指定しているものなので）
+        if base not in [p.code for p in out]:
+            base_p = self.products.get(str(base))
+            if base_p is not None and (
+                minutes is None or base_p.is_orderable_at(minutes)
+            ):
+                out.insert(0, base_p)
+        return out
 
     def visible_products(self, collection_id: str, minutes: int | None = None) -> list[Product]:
         col = next((c for c in self.collections if c.id == collection_id), None)
@@ -211,24 +284,63 @@ def _parse_slots(raw: dict) -> list[Slot]:
     return slots
 
 
-def _time_windows(menu: dict, code: str) -> list[dict]:
-    """limitedAbility から、その商品の注文可能な時間帯を取り出す。"""
+def _limited_ability(menu: dict, date_key: str | None = None) -> dict:
+    """
+    limitedAbility から、その日の ability を取り出す。
+
+    ⚠️ このデータには `0008-09-30` のような**壊れた日付キー**が
+       混ざっており、しかもJSONの先頭に来る。
+       素直に最初の要素を使うと、その日の本当の時間帯を取り逃す。
+       実在する日付（2000年以降）だけを見て、今日のものを選ぶ。
+    """
     limited = menu.get("limitedAbility") or {}
-    for day in limited.values():
-        ability = (day or {}).get("ability") or {}
-        entry = ability.get(code)
-        if entry:
-            return [
-                {"start": int(w["start"]), "end": int(w["end"])}
-                for w in (entry.get("checkoutable") or [])
-                if "start" in w and "end" in w
-            ]
-    return []
+    valid = {k: v for k, v in limited.items() if k[:4].isdigit() and int(k[:4]) >= 2000}
+    if not valid:
+        return {}
+    key = date_key or config.today_jst()
+    day = valid.get(key)
+    if day is None:
+        day = valid[sorted(valid)[0]]
+    return (day or {}).get("ability") or {}
+
+
+def _windows_of(ability: dict, code: str) -> list[dict]:
+    entry = ability.get(code)
+    if not entry:
+        return []
+    return [
+        {"start": int(w["start"]), "end": int(w["end"])}
+        for w in (entry.get("checkoutable") or [])
+        if "start" in w and "end" in w
+    ]
+
+
+def parse_size_groups(menu: dict) -> dict[str, str]:
+    """
+    サイズ違いの対応表を作る。
+
+    sizeVariants は「コカ・コーラ → S:3110 / M:3120 / L:3150」のような形。
+    どのサイズからも同じ代表コードに辿れるようにしておく。
+    """
+    out: dict[str, str] = {}
+    for key, v in (menu.get("sizeVariants") or {}).items():
+        if not isinstance(v, dict):
+            continue
+        group = str(v.get("productCode") or key)
+        for size in v.get("sizes") or []:
+            code = str((size or {}).get("productCode") or "")
+            if code:
+                out[code] = group
+        out.setdefault(str(key), group)
+    return out
 
 
 def parse_menu(store_id: str, menu: dict) -> ParsedMenu:
     names = harvest_names(menu)
     names.update(build_size_names(menu))   # サイズ違いは親名＋サイズで上書き
+
+    ability = _limited_ability(menu)
+    size_groups = parse_size_groups(menu)
 
     products: dict[str, Product] = {}
     for code, raw in (menu.get("products") or {}).items():
@@ -246,7 +358,8 @@ def parse_menu(store_id: str, menu: dict) -> ParsedMenu:
             price_other=pl.get("OTHER", 0),
             pre_price=_price_of(raw, "prePrice"),
             slots=_parse_slots(raw),
-            time_windows=_time_windows(menu, code),
+            time_windows=_windows_of(ability, code),
+            size_group=size_groups.get(code, ""),
         )
 
     collections: list[Collection] = []
@@ -264,7 +377,10 @@ def parse_menu(store_id: str, menu: dict) -> ParsedMenu:
 
     log.info("メニューを解析しました: 店舗%s 商品%d件 カテゴリ%d件",
              store_id, len(products), len(collections))
-    return ParsedMenu(store_id=store_id, products=products, collections=collections)
+    return ParsedMenu(
+        store_id=store_id, products=products, collections=collections,
+        size_groups=size_groups,
+    )
 
 
 # ============================================================
