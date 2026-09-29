@@ -148,17 +148,32 @@ class AdminCog(commands.Cog):
     @app_commands.command(name="sync", description="スラッシュコマンドを同期します")
     @app_commands.describe(scope="同期範囲")
     @app_commands.choices(scope=[
-        app_commands.Choice(name="このサーバー（即時反映）", value="guild"),
-        app_commands.Choice(name="グローバル（反映に最大1時間）", value="global"),
-        app_commands.Choice(name="このサーバーのコマンドを削除", value="clear"),
+        app_commands.Choice(name="グローバル（推奨・重複しません）", value="global"),
+        app_commands.Choice(name="重複を修復（コマンドが2つずつある場合）", value="repair"),
+        app_commands.Choice(name="このサーバーのみ即時反映（テスト用）", value="guild"),
     ])
     @_is_owner_check()
     async def sync_cmd(
-        self, interaction: discord.Interaction, scope: str = "guild"
+        self, interaction: discord.Interaction, scope: str = "global"
     ) -> None:
         await interaction.response.defer(ephemeral=True)
         try:
-            if scope == "guild":
+            if scope == "repair":
+                if interaction.guild is None:
+                    await interaction.followup.send(
+                        "サーバー内で実行してください。", ephemeral=True
+                    )
+                    return
+                # ギルド専用コマンドを消してグローバルのみに統一する
+                self.bot.tree.clear_commands(guild=interaction.guild)
+                await self.bot.tree.sync(guild=interaction.guild)
+                synced = await self.bot.tree.sync()
+                desc = (
+                    f"このサーバーの重複コマンドを削除し、"
+                    f"グローバルに {len(synced)} 件を再同期しました。\n"
+                    "反映まで数十秒かかる場合があります。"
+                )
+            elif scope == "guild":
                 if interaction.guild is None:
                     await interaction.followup.send(
                         "サーバー内で実行してください。", ephemeral=True
@@ -166,16 +181,12 @@ class AdminCog(commands.Cog):
                     return
                 self.bot.tree.copy_global_to(guild=interaction.guild)
                 synced = await self.bot.tree.sync(guild=interaction.guild)
-                desc = f"このサーバーに {len(synced)} 件のコマンドを同期しました。"
-            elif scope == "clear":
-                if interaction.guild is None:
-                    await interaction.followup.send(
-                        "サーバー内で実行してください。", ephemeral=True
-                    )
-                    return
-                self.bot.tree.clear_commands(guild=interaction.guild)
-                await self.bot.tree.sync(guild=interaction.guild)
-                desc = "このサーバーのコマンドを削除しました。"
+                desc = (
+                    f"このサーバーに {len(synced)} 件を同期しました。\n"
+                    "⚠ グローバル側にも同じコマンドが残っている場合、"
+                    "一覧に2つずつ表示されます。その場合は "
+                    "`/sync repair` を実行してください。"
+                )
             else:
                 synced = await self.bot.tree.sync()
                 desc = f"グローバルに {len(synced)} 件のコマンドを同期しました。"
@@ -197,13 +208,28 @@ class AdminCog(commands.Cog):
 
     @commands.command(name="sync")
     @commands.is_owner()
-    async def sync_text(self, ctx: commands.Context, scope: str = "guild") -> None:
-        """スラッシュコマンドが壊れた時用のテキスト版同期コマンド。"""
+    async def sync_text(self, ctx: commands.Context, scope: str = "global") -> None:
+        """スラッシュコマンドが壊れた時用のテキスト版同期コマンド。
+
+        !sync          グローバル同期（重複しません）
+        !sync repair   コマンドが2つずつ表示される場合の修復
+        !sync guild    このサーバーのみ即時反映（テスト用）
+        """
         try:
-            if scope == "guild" and ctx.guild is not None:
+            if scope == "repair" and ctx.guild is not None:
+                self.bot.tree.clear_commands(guild=ctx.guild)
+                await self.bot.tree.sync(guild=ctx.guild)
+                synced = await self.bot.tree.sync()
+                await ctx.send(
+                    f"重複を修復しました。グローバル {len(synced)} 件に統一。"
+                )
+            elif scope == "guild" and ctx.guild is not None:
                 self.bot.tree.copy_global_to(guild=ctx.guild)
                 synced = await self.bot.tree.sync(guild=ctx.guild)
-                await ctx.send(f"このサーバーに {len(synced)} 件同期しました。")
+                await ctx.send(
+                    f"このサーバーに {len(synced)} 件同期しました。"
+                    "（重複表示された場合は `!sync repair`）"
+                )
             else:
                 synced = await self.bot.tree.sync()
                 await ctx.send(f"グローバルに {len(synced)} 件同期しました。")
@@ -1732,6 +1758,121 @@ class AdminCog(commands.Cog):
             )
         embed.set_thumbnail(url=user.display_avatar.url)
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @admin_group.command(
+        name="diagnose", description="設定の問題を自動診断します"
+    )
+    async def admin_diagnose(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        s = await self.db.get_all_settings()
+        mcd = self.bot.mcd  # type: ignore[attr-defined]
+        ok: list[str] = []
+        warn: list[str] = []
+
+        # 外部API
+        if mcd.is_enabled:
+            ok.append("外部API: 有効（自動決済が動作します）")
+        else:
+            warn.append(
+                "外部API: **未設定**\n"
+                "→ 全注文が「要確認」になり自動決済されません。\n"
+                "　 main.py の `MCD_REFRESH_TOKEN` を設定してください。"
+            )
+
+        # チャンネル
+        for key, label in (
+            ("achievement_channel_id", "実績チャンネル"),
+            ("admin_log_channel_id", "管理者ログ"),
+        ):
+            cid = s.get(key, "")
+            if not cid:
+                warn.append(
+                    f"{label}: 未設定\n"
+                    f"→ `/admin channel "
+                    f"{'achievement' if 'achieve' in key else 'admin_log'}` で設定"
+                )
+                continue
+            try:
+                ch = self.bot.get_channel(int(cid)) or await self.bot.fetch_channel(
+                    int(cid)
+                )
+                perms = ch.permissions_for(ch.guild.me)  # type: ignore[union-attr]
+                if not (perms.send_messages and perms.embed_links):
+                    warn.append(f"{label}: 送信権限が不足しています（{ch.mention}）")
+                elif not perms.attach_files:
+                    warn.append(
+                        f"{label}: ファイル添付権限がなく完了画像を送れません"
+                    )
+                else:
+                    ok.append(f"{label}: OK（{ch.mention}）")
+            except Exception:
+                warn.append(f"{label}: チャンネルID {cid} にアクセスできません")
+
+        # コマンド重複
+        try:
+            global_cmds = await self.bot.tree.fetch_commands()
+            guild_cmds = (
+                await self.bot.tree.fetch_commands(guild=interaction.guild)
+                if interaction.guild
+                else []
+            )
+            if global_cmds and guild_cmds:
+                warn.append(
+                    f"コマンド重複: グローバル {len(global_cmds)}件 + "
+                    f"サーバー {len(guild_cmds)}件 が両方登録されています。\n"
+                    "→ 一覧に2つずつ表示されます。`/sync repair` で解消できます。"
+                )
+            else:
+                ok.append(
+                    f"コマンド登録: グローバル {len(global_cmds)}件 / "
+                    f"サーバー {len(guild_cmds)}件（重複なし）"
+                )
+        except Exception:
+            warn.append("コマンド登録状況を取得できませんでした。")
+
+        # 制限設定
+        if int(s.get("order_cooldown", "0") or 0) > 60:
+            warn.append("注文クールダウンが60秒超です。長すぎないか確認してください。")
+        if s.get("maintenance") == "1":
+            warn.append("メンテナンスモードが**有効**です（注文できません）。")
+        if s.get("accepting_orders") != "1":
+            warn.append("注文受付が**停止中**です。")
+
+        # パネル
+        panels = await self.db.get_all_panels()
+        if panels:
+            ok.append(f"パネル: {len(panels)}件 設置済み")
+        else:
+            warn.append("パネル未設置 → `/setup_panel` を実行してください。")
+
+        # 画像生成
+        import image_gen
+        if image_gen.is_available():
+            ok.append("完了画像生成: 利用可能")
+        else:
+            warn.append(
+                "完了画像生成: 利用不可（Pillow未導入 または assets/ が欠落）"
+            )
+
+        embed = discord.Embed(
+            title="診断結果",
+            color=EmbedColor.WARNING if warn else EmbedColor.SUCCESS,
+        )
+        if warn:
+            embed.add_field(
+                name=f"⚠ 要対応（{len(warn)}件）",
+                value="\n\n".join(warn)[:1024],
+                inline=False,
+            )
+        if ok:
+            embed.add_field(
+                name=f"✅ 正常（{len(ok)}件）",
+                value="\n".join(ok)[:1024],
+                inline=False,
+            )
+        if not warn:
+            embed.description = "問題は見つかりませんでした。"
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @admin_group.command(name="settings", description="現在の設定を表示します")
     async def admin_settings(self, interaction: discord.Interaction) -> None:

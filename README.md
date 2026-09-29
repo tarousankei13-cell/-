@@ -91,6 +91,8 @@ docker compose up -d
 
 コマンドが表示されない場合は `/sync` または `!sync` を実行してください。
 
+設定に問題がないかは **`/admin diagnose`** で自動診断できます。
+
 ## コマンド一覧
 
 ### ユーザー
@@ -108,8 +110,9 @@ docker compose up -d
 | コマンド | 説明 |
 |---------|------|
 | `/setup_panel` | パネルを設置 |
-| `/sync [scope]` | スラッシュコマンドを同期（guild/global/clear） |
-| `!sync` | テキスト版の同期（スラッシュが壊れた時用） |
+| `/sync [scope]` | コマンド同期（global＝既定 / repair＝重複修復 / guild＝即時） |
+| `!sync [scope]` | テキスト版の同期（スラッシュが壊れた時用） |
+| `/admin diagnose` | 設定の問題を自動診断 |
 | `/restart` | Bot再起動 |
 | `/admin balance add/remove/set/view/history/top` | 残高管理 |
 | `/admin order view/search/complete/refund/review/retry` | 注文管理 |
@@ -211,6 +214,41 @@ python -m unittest tests.test_bot -v
 ├── docker-compose.yml
 └── requirements.txt
 ```
+
+## トラブルシューティング
+
+まず **`/admin diagnose`** を実行してください。外部APIの設定漏れ、チャンネル権限、コマンド重複、メンテナンスモードの状態などを自動で検出します。
+
+### コマンドが2つずつ表示される
+
+グローバルコマンドとサーバー個別コマンドが**両方**登録されている状態です。
+
+```
+/sync repair
+```
+
+サーバー個別のコマンドを削除し、グローバルのみに統一します（`!sync repair` でも可）。
+
+以後は `/sync`（既定＝グローバル）を使ってください。`/sync guild` は即時反映される代わりに、グローバル側が残っていると重複の原因になります。
+
+### 正しいHexなのに注文できない
+
+| 表示 | 原因と対処 |
+|------|-----------|
+| 入力エラー（長さが不正） | Hexが途中で切れています。4000文字を超える場合は2つ目の入力欄に続きを貼ってください |
+| 重複した注文 | そのHexは既に注文済みです。新しくHexを取得してください |
+| 残高不足 | 入金が必要です。表示されるボタンから申請できます |
+| 解析エラー（金額を取得できません） | Hexの形式が想定と異なります |
+| 操作が早すぎます | クールダウン中です。`/admin limit cooldown` で調整できます |
+| 🔍 確認待ちになる | `MCD_REFRESH_TOKEN` が未設定です。設定しない限り自動決済されません |
+
+改行・空白・全角文字が混ざったHexは自動で正規化されるため、そのまま貼り付けて問題ありません。
+
+### 入金できない
+
+- `最低入金額は ¥XXX です` → `/admin limit deposit` で下限を調整
+- `操作が早すぎます` → `/admin limit cooldown` でクールダウンを調整
+- 承認ボタンが出ない → `/admin channel admin_log` が未設定です。設定しない場合は `/admin deposits approve <ID>` で承認してください
 
 ## 注意事項
 

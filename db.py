@@ -807,14 +807,23 @@ class Database:
 
     # ── Orders ────────────────────────────────────────────────
 
-    async def find_reused_hex(self, hex_data: str) -> dict | None:
-        """同一Hexで有効な注文が既にあるか確認。"""
+    DEFAULT_REUSE_STATUSES = ("pending", "processing", "completed")
+
+    async def find_reused_hex(
+        self, hex_data: str, statuses: tuple[str, ...] | None = None
+    ) -> dict | None:
+        """同一Hexで有効な注文が既にあるか確認。
+
+        失敗・キャンセル・返金済みの注文は再注文を妨げない。
+        """
         digest = hex_digest(hex_data)
+        statuses = statuses or self.DEFAULT_REUSE_STATUSES
+        placeholders = ",".join("?" * len(statuses))
         cursor = await self._db.execute(
             "SELECT id, user_id, status, created_at FROM orders "
-            "WHERE hex_hash = ? AND status NOT IN ('failed', 'cancelled') "
+            f"WHERE hex_hash = ? AND status IN ({placeholders}) "
             "ORDER BY id DESC LIMIT 1",
-            (digest,),
+            (digest, *statuses),
         )
         row = await cursor.fetchone()
         return dict(row) if row else None

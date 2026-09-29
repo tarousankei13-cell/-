@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -128,8 +129,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "min_deposit_amount": "100",
     "max_deposit_amount": "0",    # 0 = 無制限
     "daily_order_limit": "0",     # 0 = 無制限
-    "order_cooldown": "30",       # 秒
-    "deposit_cooldown": "60",     # 秒
+    "order_cooldown": "10",       # 秒
+    "deposit_cooldown": "15",     # 秒
     "hex_reuse_check": "1",
     # ランク・ポイント
     "rank_enabled": "1",
@@ -238,14 +239,43 @@ def clamp_rate(rate: int) -> int:
 # ── ユーティリティ ─────────────────────────────────────────
 
 
+_WHITESPACE_RE = re.compile(r"\s+", re.UNICODE)
+_ZENKAKU = str.maketrans(
+    "０１２３４５６７８９ＡＢＣＤＥＦａｂｃｄｅｆ　",
+    "0123456789ABCDEFabcdef ",
+)
+
+
+def normalize_hex(hex_str: str) -> str:
+    """貼り付け時に混入する改行・空白・全角文字を除去する。"""
+    if not hex_str:
+        return ""
+    s = hex_str.translate(_ZENKAKU)
+    s = s.replace("​", "").replace("﻿", "")
+    return _WHITESPACE_RE.sub("", s)
+
+
+def normalize_number(text: str) -> str:
+    """全角数字・カンマ・通貨記号を除去して数値文字列にする。"""
+    if not text:
+        return ""
+    s = text.translate(_ZENKAKU)
+    for ch in (",", "¥", "￥", "円", " "):
+        s = s.replace(ch, "")
+    return s.strip()
+
+
 def validate_hex(hex_str: str) -> tuple[bool, str]:
-    s = hex_str.strip()
+    s = normalize_hex(hex_str)
     if not s:
         return False, "Hexデータが空です。"
     if len(s) > MAX_HEX_LENGTH:
         return False, f"Hexデータが長すぎます（上限: {MAX_HEX_LENGTH:,}文字）"
     if len(s) % 2 != 0:
-        return False, "Hexデータの長さが奇数です。"
+        return False, (
+            f"Hexデータの長さが不正です（{len(s)}文字）。\n"
+            "途中で切れていないか確認してください。"
+        )
     try:
         bytes.fromhex(s)
     except ValueError:
@@ -258,7 +288,9 @@ def calculate_user_amount(total: int, rate_percent: int) -> int:
 
 
 def hex_digest(hex_str: str) -> str:
-    return hashlib.sha256(hex_str.strip().lower().encode("utf-8")).hexdigest()
+    return hashlib.sha256(
+        normalize_hex(hex_str).lower().encode("utf-8")
+    ).hexdigest()
 
 
 def utc_now() -> datetime:

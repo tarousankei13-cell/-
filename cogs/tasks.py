@@ -27,6 +27,8 @@ class TasksCog(commands.Cog):
 
     @tasks.loop(hours=1)
     async def hourly_loop(self) -> None:
+        if self.bot.is_closed() or self.db is None:
+            return
         try:
             await self._maybe_backup()
         except Exception as exc:

@@ -21,6 +21,8 @@ from models import (
     day_start_utc,
     hex_digest,
     next_rank,
+    normalize_hex,
+    normalize_number,
     resolve_rank,
     utc_now,
     validate_hex,
@@ -86,6 +88,53 @@ class TestModels(unittest.TestCase):
     def test_day_start_format(self):
         s = day_start_utc(9)
         self.assertRegex(s, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+
+class TestInputNormalization(unittest.TestCase):
+    """貼り付け時に混入する文字でHexが弾かれる不具合の回帰テスト。"""
+
+    CLEAN = "0a0531323334"
+
+    def test_newline_in_hex_accepted(self):
+        ok, msg = validate_hex("0a053132\n3334")
+        self.assertTrue(ok, msg)
+
+    def test_crlf_in_hex_accepted(self):
+        self.assertTrue(validate_hex("0a05\r\n3132\r\n3334")[0])
+
+    def test_spaces_in_hex_accepted(self):
+        self.assertTrue(validate_hex("0a 05 31 32 33 34")[0])
+
+    def test_tab_in_hex_accepted(self):
+        self.assertTrue(validate_hex("0a05\t31323334")[0])
+
+    def test_fullwidth_space_accepted(self):
+        self.assertTrue(validate_hex("0a05　3132 3334")[0])
+
+    def test_fullwidth_digits_accepted(self):
+        self.assertTrue(validate_hex("０ａ０５31323334")[0])
+
+    def test_zero_width_chars_stripped(self):
+        self.assertTrue(validate_hex("0a05​3132﻿3334")[0])
+
+    def test_normalize_hex_equivalence(self):
+        for dirty in ("0a05\n3132 3334", "0a05\t31323334", " 0a0531323334 "):
+            self.assertEqual(normalize_hex(dirty), self.CLEAN)
+
+    def test_digest_stable_across_whitespace(self):
+        self.assertEqual(hex_digest(self.CLEAN), hex_digest("0a05\n3132 3334"))
+
+    def test_truly_odd_hex_still_rejected(self):
+        ok, msg = validate_hex("0a053132333")
+        self.assertFalse(ok)
+        self.assertIn("不正", msg)
+
+    def test_non_hex_still_rejected(self):
+        self.assertFalse(validate_hex("zzzz")[0])
+
+    def test_normalize_number_variants(self):
+        for raw in ("1000", "1,000", "¥1000", "￥1000", "１０００", "1000円", " 1000 "):
+            self.assertEqual(normalize_number(raw), "1000")
 
 
 class AsyncTestCase(unittest.TestCase):
@@ -321,6 +370,44 @@ class TestHexReuse(DBTestCase):
         self.run_async(self.db.update_order_status(oid, OrderStatus.PROCESSING))
         self.run_async(self.db.update_order_status(oid, OrderStatus.FAILED))
         self.assertIsNone(self.run_async(self.db.find_reused_hex("cafe")))
+
+    def test_hex_reuse_ignores_refunded(self):
+        """返金済みの注文は再注文を妨げない。"""
+        self.run_async(self.db.add_balance(1, 5000, TransactionType.ADMIN_ADD))
+        oid = self.make_order(hex_data="beef")
+        self.complete(oid)
+        self.run_async(self.db.refund_order(oid))
+        self.assertIsNone(self.run_async(self.db.find_reused_hex("beef")))
+
+    def test_hex_reuse_manual_review_optional(self):
+        """外部API未設定時（manual_review）は既定で再注文を妨げない。"""
+        self.run_async(self.db.add_balance(1, 5000, TransactionType.ADMIN_ADD))
+        oid = self.make_order(hex_data="f00d")
+        self.run_async(self.db.update_order_status(oid, OrderStatus.PROCESSING))
+        self.run_async(self.db.update_order_status(oid, OrderStatus.MANUAL_REVIEW))
+        self.assertIsNone(self.run_async(self.db.find_reused_hex("f00d")))
+        # API有効時は要確認も重複扱いにできる
+        blocked = self.run_async(
+            self.db.find_reused_hex(
+                "f00d", ("pending", "processing", "completed", "manual_review")
+            )
+        )
+        self.assertIsNotNone(blocked)
+
+    def test_hex_reuse_blocks_completed(self):
+        self.run_async(self.db.add_balance(1, 5000, TransactionType.ADMIN_ADD))
+        oid = self.make_order(hex_data="abcd")
+        self.complete(oid)
+        found = self.run_async(self.db.find_reused_hex("abcd"))
+        self.assertIsNotNone(found)
+        self.assertEqual(found["id"], oid)
+
+    def test_hex_reuse_matches_whitespace_variant(self):
+        self.run_async(self.db.add_balance(1, 5000, TransactionType.ADMIN_ADD))
+        self.make_order(hex_data="0a0531323334")
+        self.assertIsNotNone(
+            self.run_async(self.db.find_reused_hex("0a05\n3132 3334"))
+        )
 
     def test_unrelated_hex_not_flagged(self):
         self.run_async(self.db.add_balance(1, 5000, TransactionType.ADMIN_ADD))

@@ -20,6 +20,8 @@ from models import (
     TransactionType,
     calculate_user_amount,
     next_rank,
+    normalize_hex,
+    normalize_number,
     parse_iso,
     resolve_rank,
     utc_now,
@@ -65,6 +67,53 @@ class RateLimiter:
 
 
 rate_limiter = RateLimiter()
+
+
+# ── 共通エラーハンドリング ──────────────────────────────────
+
+
+async def report_error(interaction: discord.Interaction) -> None:
+    embed = discord.Embed(
+        title="エラー",
+        description=(
+            "処理中にエラーが発生しました。\n"
+            "時間をおいて再度お試しください。"
+        ),
+        color=EmbedColor.ERROR,
+    )
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        else:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception:
+        pass
+
+
+class SafeView(discord.ui.View):
+    """例外時にユーザーへ必ずフィードバックを返すView。"""
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,  # type: ignore[type-arg]
+    ) -> None:
+        logger.error(
+            "%s error on %s: %s",
+            type(self).__name__, type(item).__name__, error, exc_info=True,
+        )
+        await report_error(interaction)
+
+
+class SafeModal(discord.ui.Modal):
+    """例外時にユーザーへ必ずフィードバックを返すModal。"""
+
+    async def on_error(
+        self, interaction: discord.Interaction, error: Exception
+    ) -> None:
+        logger.error("%s error: %s", type(self).__name__, error, exc_info=True)
+        await report_error(interaction)
 
 
 # ── 処理中カウンタ（Graceful Shutdown 用） ────────────────────
@@ -275,7 +324,7 @@ async def build_achievement_embed(db: "Database", order: dict) -> discord.Embed:
     )
     embed.add_field(
         name="店舗",
-        value=order.get("store_name") or order.get("store_id", "不明"),
+        value=order.get("store_name") or order.get("store_id") or "不明",
         inline=True,
     )
     embed.add_field(name="ご利用額", value=f"¥{order['user_amount']:,}", inline=True)
@@ -556,6 +605,7 @@ async def start_order_flow(
             ephemeral=True,
         )
 
+    hex_str = normalize_hex(hex_str)
     ok, err_msg = validate_hex(hex_str)
     if not ok:
         await fail("入力エラー", err_msg)
@@ -563,13 +613,18 @@ async def start_order_flow(
 
     settings = await db.get_all_settings()
 
-    # Hex重複チェック
+    # Hex重複チェック（失敗・返金済みの注文は再注文を妨げない）
     if settings.get("hex_reuse_check", "1") == "1":
-        dup = await db.find_reused_hex(hex_str)
+        statuses = ["pending", "processing", "completed"]
+        if mcd.is_enabled:
+            # 決済が通った可能性がある場合のみ要確認も対象にする
+            statuses.append("manual_review")
+        dup = await db.find_reused_hex(hex_str, tuple(statuses))
         if dup:
             await fail(
                 "重複した注文",
-                f"このHexデータは既に注文 #{dup['id']:04d} で使用されています。",
+                f"このHexデータは既に注文 #{dup['id']:04d} で使用されています。\n"
+                "新しく取得したHexデータをご利用ください。",
             )
             return
 
@@ -716,29 +771,9 @@ async def guard_user(
 # ── Persistent panel view ──────────────────────────────────
 
 
-class PanelView(discord.ui.View):
+class PanelView(SafeView):
     def __init__(self) -> None:
         super().__init__(timeout=None)
-
-    async def on_error(
-        self,
-        interaction: discord.Interaction,
-        error: Exception,
-        item: discord.ui.Item,  # type: ignore[type-arg]
-    ) -> None:
-        logger.error("PanelView error: %s", error, exc_info=True)
-        embed = discord.Embed(
-            title="エラー",
-            description="処理中にエラーが発生しました。",
-            color=EmbedColor.ERROR,
-        )
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(embed=embed, ephemeral=True)
-            else:
-                await interaction.followup.send(embed=embed, ephemeral=True)
-        except Exception:
-            pass
 
     @discord.ui.button(
         label="注文する",
@@ -859,42 +894,34 @@ class PanelView(discord.ui.View):
 # ── Hex input modal ────────────────────────────────────────
 
 
-class HexInputModal(discord.ui.Modal, title="注文データ入力"):
+class HexInputModal(SafeModal, title="注文データ入力"):
     hex_input = discord.ui.TextInput(
         label="Hex Stream",
         style=discord.TextStyle.paragraph,
-        placeholder="Hexデータを貼り付けてください",
+        placeholder="Hexデータを貼り付けてください（改行が入っても問題ありません）",
         required=True,
+        max_length=4000,
+    )
+    hex_input2 = discord.ui.TextInput(
+        label="Hex（続き・4000文字を超える場合のみ）",
+        style=discord.TextStyle.paragraph,
+        placeholder="1つ目に収まらなかった残りを貼り付けてください",
+        required=False,
         max_length=4000,
     )
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
-        rate_limiter.mark(interaction.user.id, "order")
-        await start_order_flow(interaction, self.hex_input.value.strip())
-
-    async def on_error(
-        self, interaction: discord.Interaction, error: Exception
-    ) -> None:
-        logger.error("HexInputModal error: %s", error, exc_info=True)
-        embed = discord.Embed(
-            title="エラー",
-            description="処理中にエラーが発生しました。",
-            color=EmbedColor.ERROR,
+        combined = normalize_hex(self.hex_input.value) + normalize_hex(
+            self.hex_input2.value or ""
         )
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(embed=embed, ephemeral=True)
-            else:
-                await interaction.followup.send(embed=embed, ephemeral=True)
-        except Exception:
-            pass
+        await start_order_flow(interaction, combined)
 
 
 # ── Order confirm view ─────────────────────────────────────
 
 
-class OrderConfirmView(discord.ui.View):
+class OrderConfirmView(SafeView):
     def __init__(
         self,
         user_id: int,
@@ -974,6 +1001,8 @@ class OrderConfirmView(discord.ui.View):
                 view=None,
             )
             return
+
+        rate_limiter.mark(self.user_id, "order")
 
         if coupon_code:
             try:
@@ -1064,6 +1093,8 @@ class OrderConfirmView(discord.ui.View):
             else:
                 await interaction.edit_original_response(embed=embed, view=view)
 
+            await notify_user(client, self.user_id, embed, img)
+
             order = await db.get_order(order_id)
             if order:
                 await post_achievement(client, order)
@@ -1141,7 +1172,7 @@ class OrderConfirmView(discord.ui.View):
 # ── お気に入り ──────────────────────────────────────────────
 
 
-class SaveFavoriteView(discord.ui.View):
+class SaveFavoriteView(SafeView):
     def __init__(self, user_id: int, hex_data: str) -> None:
         super().__init__(timeout=600)
         self.user_id = user_id
@@ -1167,7 +1198,7 @@ class SaveFavoriteView(discord.ui.View):
         self.stop()
 
 
-class SaveFavoriteModal(discord.ui.Modal, title="お気に入りに保存"):
+class SaveFavoriteModal(SafeModal, title="お気に入りに保存"):
     name_input = discord.ui.TextInput(
         label="名前",
         placeholder="例: いつものセット",
@@ -1257,11 +1288,10 @@ class FavoriteSelect(discord.ui.Select):
             return
 
         await interaction.response.defer(ephemeral=True)
-        rate_limiter.mark(interaction.user.id, "order")
         await start_order_flow(interaction, fav["hex_data"])
 
 
-class FavoritesView(discord.ui.View):
+class FavoritesView(SafeView):
     def __init__(self, user_id: int, favorites: list[dict]) -> None:
         super().__init__(timeout=300)
         self.user_id = user_id
@@ -1296,7 +1326,7 @@ class FavoritesView(discord.ui.View):
         self.stop()
 
 
-class DeleteFavoriteModal(discord.ui.Modal, title="お気に入り削除"):
+class DeleteFavoriteModal(SafeModal, title="お気に入り削除"):
     name_input = discord.ui.TextInput(
         label="削除するお気に入りの名前",
         placeholder="完全一致で入力してください",
@@ -1328,7 +1358,7 @@ class DeleteFavoriteModal(discord.ui.Modal, title="お気に入り削除"):
 # ── 入金 ────────────────────────────────────────────────────
 
 
-class TopUpView(discord.ui.View):
+class TopUpView(SafeView):
     """残高不足時の入金案内。"""
 
     def __init__(self, user_id: int, shortage: int) -> None:
@@ -1356,7 +1386,7 @@ class TopUpView(discord.ui.View):
         self.stop()
 
 
-class DepositAmountModal(discord.ui.Modal, title="入金申請"):
+class DepositAmountModal(SafeModal, title="入金申請"):
     amount_input = discord.ui.TextInput(
         label="入金額（円）",
         placeholder="例: 1000",
@@ -1370,7 +1400,7 @@ class DepositAmountModal(discord.ui.Modal, title="入金申請"):
             self.amount_input.default = str(default_amount)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        raw = self.amount_input.value.strip().replace(",", "").replace("¥", "")
+        raw = normalize_number(self.amount_input.value)
         try:
             amount = int(raw)
         except ValueError:
@@ -1414,24 +1444,8 @@ class DepositAmountModal(discord.ui.Modal, title="入金申請"):
             embed=embed, view=view, ephemeral=True
         )
 
-    async def on_error(
-        self, interaction: discord.Interaction, error: Exception
-    ) -> None:
-        logger.error("DepositAmountModal error: %s", error, exc_info=True)
-        try:
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    title="エラー",
-                    description="処理中にエラーが発生しました。",
-                    color=EmbedColor.ERROR,
-                ),
-                ephemeral=True,
-            )
-        except Exception:
-            pass
 
-
-class DepositConfirmView(discord.ui.View):
+class DepositConfirmView(SafeView):
     def __init__(self, user_id: int, amount: int) -> None:
         super().__init__(timeout=300)
         self.user_id = user_id
@@ -1622,7 +1636,7 @@ class DepositRejectButton(
         )
 
 
-class DepositRejectReasonModal(discord.ui.Modal, title="入金却下"):
+class DepositRejectReasonModal(SafeModal, title="入金却下"):
     reason_input = discord.ui.TextInput(
         label="却下理由",
         placeholder="理由を入力してください（任意）",
@@ -1700,7 +1714,7 @@ class DepositRejectReasonModal(discord.ui.Modal, title="入金却下"):
 # ── History view (paginated) ──────────────────────────────
 
 
-class HistoryView(discord.ui.View):
+class HistoryView(SafeView):
     def __init__(self, user_id: int, page: int, total_pages: int) -> None:
         super().__init__(timeout=300)
         self.user_id = user_id
@@ -1754,7 +1768,7 @@ class HistoryView(discord.ui.View):
 # ── Balance detail view ────────────────────────────────────
 
 
-class BalanceDetailView(discord.ui.View):
+class BalanceDetailView(SafeView):
     def __init__(self, user_id: int) -> None:
         super().__init__(timeout=300)
         self.user_id = user_id
@@ -1797,7 +1811,7 @@ class BalanceDetailView(discord.ui.View):
         await interaction.response.send_modal(PointRedeemModal(points))
 
 
-class PointRedeemModal(discord.ui.Modal, title="ポイント交換"):
+class PointRedeemModal(SafeModal, title="ポイント交換"):
     amount_input = discord.ui.TextInput(
         label="交換するポイント数（1pt = ¥1）",
         placeholder="例: 500",
@@ -1842,7 +1856,7 @@ class PointRedeemModal(discord.ui.Modal, title="ポイント交換"):
 # ── Transaction history view (paginated) ───────────────────
 
 
-class TxHistoryView(discord.ui.View):
+class TxHistoryView(SafeView):
     def __init__(self, user_id: int, page: int, total_pages: int) -> None:
         super().__init__(timeout=300)
         self.user_id = user_id
