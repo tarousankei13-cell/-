@@ -12,3 +12,6 @@ __pycache__/
 venv/
 .env
 *.log
+
+# 配布用ZIP（リポジトリには含めない）
+*.zip
