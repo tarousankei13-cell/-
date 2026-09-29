@@ -19,6 +19,7 @@ from typing import Awaitable, Callable
 
 import httpx
 
+from core import retry
 from core.http import build_async_client
 from core.telemetry import current as correlation_id
 from services.mcd import errors as mcd_errors
@@ -346,15 +347,44 @@ class McdClient:
     def _auth_headers(self) -> dict[str, str]:
         return {**qor_headers(self.fp), "Authorization": f"Bearer {self.tokens.root_paseto}"}
 
-    async def _qor_post(self, url: str, body: bytes, *, retry_on_401: bool = True) -> httpx.Response:
-        try:
-            r = await self._client.post(url, headers=self._auth_headers(), content=body)
-        except httpx.HTTPError as e:
-            raise McdNetworkError(f"通信に失敗しました: {e}") from e
+    async def _qor_post(
+        self,
+        url: str,
+        body: bytes,
+        *,
+        retry_on_401: bool = True,
+        idempotency: retry.Idempotency = retry.Idempotency.ONCE,
+        label: str = "",
+    ) -> httpx.Response:
+        """
+        認証付きの POST。
+
+        ⚠️ idempotency の既定は ONCE（送り直さない）。
+           注文の登録や支払いの確定がここを通るため、
+           うっかり再送しないよう**安全側を既定にしてある**。
+           読み取りの呼び出しだけが SAFE を明示する。
+        """
+        async def once() -> httpx.Response:
+            try:
+                return await self._client.post(
+                    url, headers=self._auth_headers(), content=body
+                )
+            except httpx.HTTPError as e:
+                raise McdNetworkError(f"通信に失敗しました: {e}") from e
+
+        r = await retry.call(
+            once,
+            idempotency=idempotency,
+            retry_on=(McdNetworkError,),
+            label=label or "通信",
+            attempts=3 if idempotency.retryable else 1,
+        )
         if r.status_code in (401, 403) and retry_on_401:
             log.info("認証切れを検出したため再取得します")
             await self.ensure_auth(force=True)
-            return await self._qor_post(url, body, retry_on_401=False)
+            return await self._qor_post(
+                url, body, retry_on_401=False, idempotency=idempotency, label=label
+            )
         return r
 
     # -- 店舗・メニュー（認証不要） ---------------------------
@@ -372,7 +402,16 @@ class McdClient:
         for g in ([group] if group else GROUPS):
             url = f"{DATA_CAT.format(group=g)}/{store_id}.json"
             try:
-                r = await self._client.get(url, headers=headers)
+                # 読み取りなので何度送っても構わない。
+                # 一時的な通信の乱れで店舗が「見つからない」ことにならないよう、
+                # 少し待って送り直す。
+                r = await retry.call(
+                    lambda u=url: self._client.get(u, headers=headers),
+                    idempotency=retry.Idempotency.SAFE,
+                    retry_on=(httpx.HTTPError,),
+                    label=f"店舗情報の取得({g})",
+                    attempts=2,
+                )
             except httpx.HTTPError:
                 continue
             if r.status_code == 304:
@@ -445,8 +484,12 @@ class McdClient:
 
         ⚠️ 冪等ではない可能性があるため、同じ group への再試行はしない。
         """
+        # ⚠️ StoreOrder は冪等ではない。応答が届かなくても送り直さない
+        #    （相手には届いていて、未払いの注文が二重にできる恐れがある）
+        retry.guard_once("StoreOrder")
         r = await self._qor_post(
-            f"{ORD.format(group=group)}/app/mcdord.UserOrderService/StoreOrder", body
+            f"{ORD.format(group=group)}/app/mcdord.UserOrderService/StoreOrder", body,
+            idempotency=retry.Idempotency.ONCE, label="注文の登録",
         )
         if r.status_code == 200 and r.content:
             return parse_order_response(r.content)
@@ -463,11 +506,14 @@ class McdClient:
         ⚠️ この呼び出しは絶対にリトライしないこと（二重課金になる）。
            失敗したら get_paid_order で実際の状態を確認する。
         """
+        # ⚠️ ここは絶対に送り直さない。二重課金になる
+        retry.guard_once("AuthoriseOrder")
         await self.ensure_auth(force=True)  # 確定直前に必ず新しいPASETOで
         r = await self._qor_post(
             f"{ORD.format(group=group)}/app/mcdord.UserOrderService/AuthoriseOrder",
             build_authorise_body(order_token),
             retry_on_401=False,   # ★リトライ禁止
+            idempotency=retry.Idempotency.ONCE, label="支払いの確定",
         )
         if r.status_code != 200 or not r.content:
             info = mcd_errors.parse(r.status_code, r.content)
@@ -479,9 +525,12 @@ class McdClient:
 
     async def get_paid_order(self, group: str, order_token: str) -> OrderResponse:
         """決済済みの注文を確認する。読み取り専用なので何度でも呼べる。"""
+        # 読み取りなので何度でも送ってよい。決済の成否を確かめる大事な
+        # 経路なので、一時的な失敗で諦めないようにする。
         r = await self._qor_post(
             f"{ORD.format(group=group)}/app/mcdord.UserOrderService/GetPaidOrder",
             build_get_paid_body(order_token),
+            idempotency=retry.Idempotency.SAFE, label="注文状態の確認",
         )
         if r.status_code != 200 or not r.content:
             raise McdOrderError(f"注文を確認できませんでした (HTTP {r.status_code})")

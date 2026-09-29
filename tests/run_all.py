@@ -22,6 +22,7 @@ TESTS = [
     ("アカウント登録（OTP）", "test_account_setup.py"),
     ("管理者コマンド", "test_admin_cmds.py"),
     ("管理操作の記録", "test_audit.py"),
+    ("再送の方針（冪等性）", "test_retry.py"),
     ("注文Saga（端から端まで）", "test_order_e2e.py"),
     ("エラーの判別と対処", "test_errors.py"),
     ("代理実績の同一性", "test_achievement.py"),
