@@ -386,6 +386,33 @@ class ConfigCog(commands.Cog):
             ephemeral=True,
         )
 
+    @store_group.command(name="sitemap", description="店舗IDを照合する間隔を設定します")
+    @app_commands.describe(minutes="何分ごとに照合するか（30〜1440）")
+    @admin_only()
+    async def store_sitemap(
+        self, interaction: discord.Interaction, minutes: app_commands.Range[int, 30, 1440]
+    ) -> None:
+        """
+        新しい店舗の開店・閉店を調べる間隔。
+
+        この照合だけは相手が ETag を返さないため、毎回0.5MBほど
+        受け取ることになる。開店・閉店はそう頻繁では無いので、
+        通信量が気になる場合は長めにしてよい。
+        """
+        await settings.set_value(
+            "store_sitemap_check_minutes", int(minutes),
+            updated_by=interaction.user.id, actor_name=str(interaction.user),
+        )
+        per_day = 24 * 60 / int(minutes) * 0.5
+        await interaction.response.send_message(
+            embed=embeds.ok(
+                f"店舗IDの照合を **{minutes}分ごと** に設定しました。\n"
+                f"{E.INFO} 1日あたりおよそ **{per_day:.0f}MB** を受け取ります。\n"
+                "（商品や営業時間の同期はETagが効くので、これとは別です）"
+            ),
+            ephemeral=True,
+        )
+
     @store_group.command(name="notify", description="店舗一覧の変化の通知を切り替えます")
     @app_commands.describe(enabled="開店・閉店・店名変更を管理者チャンネルへ通知するか")
     @admin_only()

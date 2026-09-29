@@ -213,7 +213,13 @@ async def sync(
     # 共用の接続を借りる。毎回作り直すとそのたびにTLSの handshake が起きる。
     async with catalog_session() as client:
         # ---- ① サイトマップの照合 ----------------------------
-        interval = int(config.STORE_SITEMAP_CHECK_MINUTES) * 60
+        from core import settings
+
+        interval = int(
+            settings.get(
+                "store_sitemap_check_minutes", config.STORE_SITEMAP_CHECK_MINUTES
+            )
+        ) * 60
         due = full or (_now() - int(meta.get("sitemap_at") or 0) >= interval)
         sitemap_ids: set[str] = set()
         if due:

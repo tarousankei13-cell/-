@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import config
@@ -37,20 +38,36 @@ async def sync_all_menus(force: bool = False) -> dict[str, MenuDiff]:
     out: dict[str, MenuDiff] = {}
     try:
         handle = await mcd_accounts.pick_account()
-        for store_id in store_ids:
-            try:
-                # 店舗情報（営業時間・対応する受取方法）も一緒に最新にする
-                info = await mcd_stores.resolve_store(handle.client, store_id, force=force)
-                out[store_id] = await mcd_stores.sync_menu(
-                    handle.client, store_id, store=info, force=force
-                )
-            except Exception:
-                log.exception("店舗 %s の同期に失敗しました", store_id)
+
+        # 店舗ごとの同期は互いに関係が無いので同時に行う。
+        # 順番に待つと、店舗が20件あるだけで十数秒かかっていた。
+        # ETag が効くので大半は 304（0バイト）で終わる。
+        sem = asyncio.Semaphore(config.MENU_SYNC_CONCURRENCY)
+
+        async def one(store_id: str) -> None:
+            async with sem:
+                try:
+                    # 店舗情報（営業時間・対応する受取方法）も一緒に最新にする
+                    info = await mcd_stores.resolve_store(
+                        handle.client, store_id, force=force
+                    )
+                    out[store_id] = await mcd_stores.sync_menu(
+                        handle.client, store_id, store=info, force=force
+                    )
+                except Exception:
+                    log.exception("店舗 %s の同期に失敗しました", store_id)
+
+        await asyncio.gather(*[one(sid) for sid in store_ids])
     except Exception:
         log.exception("メニュー同期を開始できませんでした")
     finally:
         if handle:
             await handle.aclose()
+
+    changed = sum(1 for d in out.values() if d.has_changes)
+    log.info(
+        "メニューを同期しました: %d店舗（変更あり %d店舗）", len(out), changed
+    )
     return out
 
 

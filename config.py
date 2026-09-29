@@ -63,6 +63,7 @@ STORE_INDEX_SYNC_MINUTES = 15     # 巡回更新の間隔（分）
 STORE_INDEX_REFRESH_BATCH = 400   # 1回に取り直す店舗数（全3,036店舗を約2時間で一周）
 STORE_SITEMAP_CHECK_MINUTES = 60  # 店舗IDの一覧を照合する間隔（分）
 MENU_STALE_MINUTES = 10           # 注文直前に取り直す古さのしきい値（分）
+MENU_SYNC_CONCURRENCY = 6         # メニュー同期を何店舗まで同時に行うか
 MENU_ACTIVE_STORE_DAYS = 30       # 「直近で使われた店舗」とみなす日数
 MENU_NOTIFY_DIFF = True           # 新商品・値上げを管理者へ通知するか
 # 提供時間帯（limitedAbility / daypart）は日付ごとに定義されるため、
