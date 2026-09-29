@@ -4,15 +4,38 @@ Discord上でMcDonald'sモバイルオーダーの代行注文を管理するBot
 
 ## 機能
 
+**注文**
 - パネルベースのUI（ボタン操作、再起動後も持続）
 - Hex入力による注文解析・実行
+- お気に入り登録＆ワンタップ再注文
+- 注文完了画像の自動生成（実際の注文番号を差し込んだ完了画面）
+- 注文ステータスのDM通知
+- 一時的な通信障害の自動リトライ（指数バックオフ）
+
+**残高・特典**
 - 残高管理（入金申請 → 管理者承認フロー）
-- 注文履歴・取引履歴（ページネーション付き）
-- 管理者コマンド一式（残高操作・注文管理・統計・エクスポート）
-- 実績投稿チャンネル
+- 残高不足時の自動入金案内
+- ランク制度（利用回数で割引率アップ）
+- ポイント還元＆残高への交換
+- クーポン／キャンペーン
+- VIP個別負担率
+
+**管理**
+- 管理者コマンド一式（残高・注文・入金・統計・エクスポート）
+- 実績投稿チャンネル＋代理投稿・再投稿
 - 管理者ログチャンネル
-- メンテナンスモード
-- 注文完了画像の自動生成（実際の注文番号を差し込んだ完了画面を投稿）
+- 日次レポート自動送信（ASCIIグラフ付き）
+- ブラックリスト
+- 商品名辞書（CSV一括登録・未登録ID検出）
+- 各種上限／クールダウン設定
+- Hex重複利用の防止
+
+**運用**
+- SQLite自動バックアップ（世代管理）
+- スキーマ自動マイグレーション
+- Graceful Shutdown（処理中の注文を待って終了）
+- 設定・残高のメモリキャッシュ
+- Docker対応
 
 ## セットアップ
 
@@ -34,20 +57,15 @@ Discord Developer Portalで以下を設定:
 pip install -r requirements.txt
 ```
 
-### 4. 環境変数
+### 4. トークン設定
 
-`.env.example` をコピーして `.env` を作成:
+`main.py` の先頭を編集します。
 
-```bash
-cp .env.example .env
+```python
+DISCORD_TOKEN = "ここにBotトークンを貼り付け"
+OWNER_IDS = {123456789012345678}   # 管理者のDiscordユーザーID（複数可）
+MCD_REFRESH_TOKEN = ""             # 任意。未設定なら手動処理モード
 ```
-
-必須項目:
-- `DISCORD_TOKEN` - Discord Bot Token
-- `OWNER_IDS` - 管理者のDiscordユーザーID（カンマ区切り）
-
-任意項目:
-- `MCD_REFRESH_TOKEN` - McDonald's API refresh token（未設定時は手動処理モード）
 
 ### 5. 起動
 
@@ -55,72 +73,149 @@ cp .env.example .env
 python main.py
 ```
 
+Dockerの場合:
+
+```bash
+docker compose up -d
+```
+
 ### 6. 初期設定（Discord上）
 
-1. `/setup_panel` でパネルを設置
-2. `/admin channel achievement #channel` で実績チャンネルを設定
-3. `/admin channel admin_log #channel` で管理者ログチャンネルを設定
-4. `/admin rate 60` でユーザー負担率を設定（60 = 40%OFF）
-5. `/admin minimum 400` で最低注文額を設定
+```
+/setup_panel                          パネルを設置
+/admin channel achievement #実績       実績チャンネルを設定
+/admin channel admin_log #ログ         管理者ログチャンネルを設定
+/admin rate 60                        負担率60%（40% OFF）
+/admin minimum 400                    最低注文額
+```
 
-## 管理者コマンド
+コマンドが表示されない場合は `/sync` または `!sync` を実行してください。
+
+## コマンド一覧
+
+### ユーザー
+
+| コマンド | 説明 |
+|---------|------|
+| `/profile` | ランク・残高・ポイント・節約総額を表示 |
+| `/coupon <code>` | クーポンを適用（次回注文で自動使用） |
+| `/points` | ポイント確認・残高への交換 |
+| `/favorites` | お気に入りから再注文 |
+| `/notify <bool>` | DM通知のON/OFF |
+
+### 管理者
 
 | コマンド | 説明 |
 |---------|------|
 | `/setup_panel` | パネルを設置 |
+| `/sync [scope]` | スラッシュコマンドを同期（guild/global/clear） |
+| `!sync` | テキスト版の同期（スラッシュが壊れた時用） |
 | `/restart` | Bot再起動 |
 | `/admin balance add/remove/set/view/history/top` | 残高管理 |
 | `/admin order view/search/complete/refund/review/retry` | 注文管理 |
+| `/admin achievement repost/post/preview` | 実績の再投稿・代理投稿・画像プレビュー |
 | `/admin deposits list/approve/reject` | 入金管理 |
-| `/admin channel achievement/admin_log` | チャンネル設定 |
-| `/admin rate` | 負担率設定 |
-| `/admin minimum` | 最低注文額設定 |
-| `/admin maintenance` | メンテナンスモード |
-| `/admin accepting` | 注文受付ON/OFF |
-| `/admin stats` | 統計情報 |
-| `/admin user` | ユーザー情報 |
-| `/admin export` | データエクスポート（CSV） |
+| `/admin blacklist add/remove/list` | 利用制限 |
+| `/admin vip set/clear/list` | 個別負担率 |
+| `/admin coupon create/list/delete` | クーポン |
+| `/admin campaign start/stop` | キャンペーン |
+| `/admin points add/rate` | ポイント付与・還元率 |
+| `/admin product add/list/delete/unknown/import` | 商品名辞書 |
+| `/admin channel achievement/admin_log/report` | チャンネル設定 |
+| `/admin limit order_max/deposit/daily/cooldown/hex_check` | 上限・制限 |
+| `/admin backup now/list/config` | バックアップ |
+| `/admin report now/config` | レポート |
 | `/admin panel refresh/delete` | パネル管理 |
+| `/admin rate` / `minimum` / `maintenance` / `accepting` | 基本設定 |
+| `/admin stats` / `user` / `settings` / `export` | 情報・出力 |
+
+## 割引率の決まり方
+
+適用順に上書き・加算されます。
+
+1. **基本負担率** — `/admin rate` の設定値
+2. **VIP個別率** — 設定されていれば基本値を置き換え
+3. **キャンペーン** — より有利なら適用
+4. **ランク割引** — 完了注文数に応じて減算
+5. **クーポン** — 適用中なら減算
+
+最終的に 1〜100% にクランプされます。
+
+### ランク
+
+| ランク | 必要完了数 | 追加割引 |
+|-------|----------|---------|
+| 🥉 ブロンズ | 0 | +0% |
+| 🥈 シルバー | 10 | +2% |
+| 🥇 ゴールド | 30 | +4% |
+| 💎 プラチナ | 60 | +6% |
+| 👑 ダイヤモンド | 100 | +8% |
+
+## 実績の代理投稿
+
+実績の送信に失敗した場合に使えます。**通常の実績と見た目は完全に同一**です。
+
+```
+/admin achievement repost <order_id>
+```
+既存注文のデータをそのまま再投稿します（完了画像付き）。
+
+```
+/admin achievement post <total_amount> <user_amount> [store] [receipt_number] [order_id]
+```
+DBに存在しない実績を手動で投稿します。`order_id` 省略時は最新注文IDの次が使われます。
 
 ## データベース
 
-SQLite（`concierge.db`）を使用。テーブル:
+SQLite（`concierge.db`、スキーマ v2）。テーブル:
 
-- `users` - ユーザー情報・残高
-- `transactions` - 全取引履歴
-- `orders` - 注文情報
-- `deposits` - 入金申請
-- `panels` - パネル位置情報
-- `settings` - 設定値
+| テーブル | 内容 |
+|---------|------|
+| `users` | 残高・ポイント・ランク関連・VIP率・制限状態 |
+| `transactions` | 全取引履歴（残高の増減を完全記録） |
+| `orders` | 注文情報（Hexハッシュ・適用率・リトライ回数含む） |
+| `deposits` | 入金申請 |
+| `favorites` | お気に入り |
+| `coupons` / `coupon_uses` | クーポンと使用履歴 |
+| `product_names` / `unknown_products` | 商品名辞書と未登録ID |
+| `panels` | パネル位置情報 |
+| `settings` | 設定値 |
+
+起動時に既存DBのスキーマを自動でマイグレーションします（既存データは保持）。
 
 ## テスト
 
 ```bash
-python -m pytest tests/ -v
+python -m unittest tests.test_bot -v
 ```
+
+87件のテストが含まれます（残高整合性・二重処理防止・レース条件・マイグレーション・割引率解決・画像生成など）。
 
 ## ファイル構成
 
 ```
-├── main.py           # エントリポイント
-├── models.py         # データモデル・定数
-├── db.py             # データベース層
-├── views.py          # Discord UIコンポーネント
-├── mcd_adapter.py    # McDonald's API連携
-├── image_gen.py      # 注文完了画像の生成
+├── main.py              # エントリポイント（トークン設定もここ）
+├── models.py            # データモデル・定数・ランク定義
+├── db.py                # データベース層（キャッシュ・マイグレーション）
+├── views.py             # Discord UIコンポーネント
+├── mcd_adapter.py       # McDonald's API連携（aiohttp・リトライ）
+├── image_gen.py         # 注文完了画像の生成
 ├── assets/
-│   └── order_complete_template.png  # 完了画面テンプレート
+│   └── order_complete_template.png
 ├── cogs/
-│   └── admin.py      # 管理者コマンド
-├── tests/
-│   └── test_bot.py   # テスト
-├── requirements.txt
-├── .env.example
-└── README.md
+│   ├── admin.py         # 管理者コマンド
+│   ├── user.py          # ユーザーコマンド
+│   └── tasks.py         # 自動バックアップ・日次レポート
+├── tests/test_bot.py
+├── Dockerfile
+├── docker-compose.yml
+└── requirements.txt
 ```
 
 ## 注意事項
 
-- 本番運用時はsystemdなどでプロセス管理を推奨
-- SQLiteのバックアップを定期的に行うこと
-- `MCD_REFRESH_TOKEN` 未設定時は全注文が手動確認（manual_review）になります
+- 商品名辞書は初期状態では空です。`/admin product unknown` で実際に出現した商品IDを確認し、`/admin product add` または `/admin product import`（CSV）で登録してください。
+- `MCD_REFRESH_TOKEN` 未設定時は全注文が手動確認（manual_review）になります。
+- 決済の二重実行を防ぐため、**タイムアウトは自動リトライしません**（要確認扱い）。自動リトライは接続拒否など「リクエストが届いていないことが明らかな障害」のみ対象です。
+- 本番運用ではsystemdまたはDockerでのプロセス管理を推奨します。`stop_grace_period` は Graceful Shutdown 用に40秒を確保しています。
+- バックアップは `backups/` に保存されます。定期的に外部へ退避してください。

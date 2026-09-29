@@ -1,0 +1,11 @@
+services:
+  bot:
+    build: .
+    container_name: mcdonalds-concierge
+    restart: unless-stopped
+    stop_grace_period: 40s
+    volumes:
+      - ./concierge.db:/app/concierge.db
+      - ./backups:/app/backups
+    environment:
+      TZ: Asia/Tokyo

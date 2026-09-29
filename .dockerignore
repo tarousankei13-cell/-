@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+*.zip
+.git/
+.gitignore
+backups/
+tests/
+.env

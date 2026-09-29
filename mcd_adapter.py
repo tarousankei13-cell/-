@@ -2,7 +2,7 @@
 
 Hex decoding is always available (pure protobuf parsing).
 External ordering requires MCD_REFRESH_TOKEN and the HATTIMCD module.
-Store name lookup works without authentication.
+Store name lookup works without authentication (aiohttp).
 """
 
 from __future__ import annotations
@@ -11,9 +11,9 @@ import asyncio
 import logging
 from typing import Optional
 
-import requests
+import aiohttp
 
-from models import DecodedOrderInfo, ProductInfo, resolve_product_name
+from models import DecodedOrderInfo, ProductInfo
 
 logger = logging.getLogger("bot.mcd")
 
@@ -98,8 +98,7 @@ def _parse_product_proto(raw: bytes) -> ProductInfo:
     addons = [
         _parse_product_proto(r) for r in f.get(5, []) if isinstance(r, bytes)
     ]
-    display = resolve_product_name(product_id) if product_id else ""
-    return ProductInfo(product_id=product_id, display_name=display, addons=addons)
+    return ProductInfo(product_id=product_id, display_name="", addons=addons)
 
 
 # ── Hex decoder (no network needed) ────────────────────────
@@ -157,22 +156,36 @@ _STORE_HEADERS = {
     "Accept": "application/json",
 }
 
+_SENSITIVE_WORDS = (
+    "bearer", "token", "paseto", "authorization",
+    "password", "secret", "key", "cookie",
+)
 
-def _fetch_store_name_sync(store_id: str, timeout: int = 10) -> str:
-    for group in _DATA_GROUPS:
-        url = (
-            f"https://data.cat.{group}.prod.mop.mcd.qorcommerce.com"
-            f"/{store_id}.json"
-        )
-        try:
-            resp = requests.get(url, headers=_STORE_HEADERS, timeout=timeout)
-            if resp.status_code == 200:
-                name = resp.json().get("store", {}).get("name", "")
-                if name:
-                    return name
-        except Exception:
-            continue
-    return ""
+_RETRYABLE_HINTS = (
+    "connection refused", "connection reset", "connection aborted",
+    "name or service not known", "temporary failure in name resolution",
+    "cannot connect", "server disconnected", "bad gateway",
+    "service unavailable", "502", "503", "504",
+)
+
+_TIMEOUT_HINTS = ("timeout", "timed out")
+
+
+def _sanitize(message: str) -> str:
+    low = message.lower()
+    if any(w in low for w in _SENSITIVE_WORDS):
+        return "外部API処理エラー"
+    return message
+
+
+def _classify(message: str) -> str:
+    """'timeout' | 'retryable' | 'fatal' を返す。"""
+    low = message.lower()
+    if any(w in low for w in _TIMEOUT_HINTS):
+        return "timeout"
+    if any(w in low for w in _RETRYABLE_HINTS):
+        return "retryable"
+    return "fatal"
 
 
 # ── Async adapter ──────────────────────────────────────────
@@ -183,6 +196,9 @@ class MCDAdapter:
         self._enabled = False
         self._mcd: object | None = None
         self._lock = asyncio.Lock()
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._store_cache: dict[str, str] = {}
+        self.max_attempts = 3
 
     async def initialize(self, refresh_token: str = "") -> None:
         refresh_token = refresh_token.strip()
@@ -206,46 +222,109 @@ class MCDAdapter:
     def is_enabled(self) -> bool:
         return self._enabled
 
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10),
+                headers=_STORE_HEADERS,
+            )
+        return self._session
+
+    async def close(self) -> None:
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    async def fetch_store_name(self, store_id: str) -> str:
+        if not store_id:
+            return ""
+        if store_id in self._store_cache:
+            return self._store_cache[store_id]
+        session = await self._get_session()
+        for group in _DATA_GROUPS:
+            url = (
+                f"https://data.cat.{group}.prod.mop.mcd.qorcommerce.com"
+                f"/{store_id}.json"
+            )
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        payload = await resp.json(content_type=None)
+                        name = (payload or {}).get("store", {}).get("name", "")
+                        if name:
+                            self._store_cache[store_id] = name
+                            return name
+            except Exception:
+                continue
+        return ""
+
     async def decode_hex(self, hex_str: str) -> DecodedOrderInfo:
         info = await asyncio.to_thread(decode_hex_sync, hex_str)
         if info.store_id:
             try:
-                name = await asyncio.to_thread(
-                    _fetch_store_name_sync, info.store_id
-                )
-                info.store_name = name
+                info.store_name = await self.fetch_store_name(info.store_id)
             except Exception:
                 pass
         return info
 
-    async def execute_order(self, hex_str: str) -> dict:
+    async def execute_order(
+        self, hex_str: str, max_attempts: int | None = None
+    ) -> dict:
+        """注文を実行する。
+
+        一時的なネットワーク障害のみ指数バックオフで自動リトライする。
+        タイムアウトは二重決済を避けるためリトライせず要確認扱いにする。
+        """
         if not self._enabled or self._mcd is None:
             raise RuntimeError("外部注文APIが設定されていません。")
+
+        attempts = max_attempts if max_attempts is not None else self.max_attempts
+        attempts = max(1, min(5, attempts))
+
         async with self._lock:
-            try:
-                result = await asyncio.to_thread(
-                    self._mcd.pay_from_hex, hex_str  # type: ignore[union-attr]
-                )
-                return {
-                    "success": True,
-                    "receipt_number": getattr(result, "receipt_number", "") or "",
-                    "order_token": getattr(result, "order_token", "") or "",
-                    "order_group": getattr(result, "group", "") or "",
-                    "store_name": getattr(result, "store_name", "") or "",
-                }
-            except Exception as exc:
-                err = str(exc)
-                sensitive_words = (
-                    "bearer", "token", "paseto", "authorization",
-                    "password", "secret", "key",
-                )
-                if any(w in err.lower() for w in sensitive_words):
-                    err = "外部API処理エラー"
-                is_timeout = any(
-                    w in err.lower() for w in ("timeout", "timed out", "connect")
-                )
-                return {
-                    "success": False,
-                    "error": err[:300],
-                    "unknown_state": is_timeout,
-                }
+            last_error = "不明なエラー"
+            for attempt in range(1, attempts + 1):
+                try:
+                    result = await asyncio.to_thread(
+                        self._mcd.pay_from_hex, hex_str  # type: ignore[union-attr]
+                    )
+                    return {
+                        "success": True,
+                        "receipt_number": getattr(result, "receipt_number", "") or "",
+                        "order_token": getattr(result, "order_token", "") or "",
+                        "order_group": getattr(result, "group", "") or "",
+                        "store_name": getattr(result, "store_name", "") or "",
+                        "attempts": attempt,
+                    }
+                except Exception as exc:
+                    raw = str(exc)
+                    kind = _classify(raw)
+                    last_error = _sanitize(raw)[:300]
+
+                    if kind == "timeout":
+                        return {
+                            "success": False,
+                            "error": last_error,
+                            "unknown_state": True,
+                            "attempts": attempt,
+                        }
+                    if kind == "retryable" and attempt < attempts:
+                        delay = 2 ** (attempt - 1)
+                        logger.warning(
+                            "Order attempt %d/%d failed (retrying in %ds)",
+                            attempt, attempts, delay,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    return {
+                        "success": False,
+                        "error": last_error,
+                        "unknown_state": False,
+                        "attempts": attempt,
+                    }
+
+            return {
+                "success": False,
+                "error": last_error,
+                "unknown_state": False,
+                "attempts": attempts,
+            }
