@@ -1,44 +1,62 @@
 """
 マクドナルド Discord 注文BOT — エントリポイント
 
-起動前に下の「設定ブロック」を書き換えてください。
+設定の入れ方は2通りあります。どちらでも構いません。
 
-⚠️ 重要 ⚠️
-このファイルには BOT トークンと暗号化キーを直接書きます。
+  A) 下の「設定ブロック」に直接書く（かんたん）
+  B) ホスティング側の環境変数に入れる（安全・おすすめ）
+
+直接書いた値が優先され、空欄なら環境変数を読みます。
+
+⚠️ A) を選ぶ場合の注意 ⚠️
+このファイルにトークンと暗号化キーが平文で入ります。
 **絶対に公開リポジトリへ push しないでください。**
-GitHub に上げる場合は .gitignore に main.py を追加してください。
+GitHub に上げる場合は .gitignore の `# main.py` のコメントを外してください。
 """
 
 # ============================================================
 #  設定ブロック — ここだけ書き換えてください
+#
+#  ★ 貼り付けるときは、前後のダブルクォート " を消さないこと ★
+#
+#      DISCORD_TOKEN = "ここに貼る"
+#                      ↑        ↑  この2つは残す
+#
+#  片方でも消すと SyntaxError: unterminated string literal になります。
 # ============================================================
 
 # Discord BOT トークン
 #   Developer Portal → あなたのアプリ → Bot → Reset Token
+#   環境変数でも可: DISCORD_TOKEN / DISCORD_BOT_TOKEN / TOKEN / BOT_TOKEN
 DISCORD_TOKEN = ""
 
 # BOTオーナーの Discord ユーザーID（複数可）
 #   すべての管理者コマンドが使えます
+#   環境変数でも可: OWNER_IDS（カンマ区切り 例 123,456）
 OWNER_IDS = [1324938326741876758]
 
 # 管理者ロールID（任意 / 複数可）
 #   ここに入れたロールを持つ人も管理者パネルを操作できます
+#   環境変数でも可: ADMIN_ROLE_IDS（カンマ区切り）
 ADMIN_ROLE_IDS = []
 
 # コマンドを反映させるサーバーID
-#   指定あり → そのサーバーだけに即座に反映（開発・単一サーバー運用ならこちら）
+#   指定あり → そのサーバーだけに即座に反映（単一サーバー運用ならこちら）
 #   None     → 全サーバーに反映（反映まで最大1時間かかります）
+#   環境変数でも可: GUILD_ID
 GUILD_ID = None
 
-# 暗号化キー（認証情報の保護に使用）
-#   下のコマンドで生成して貼り付けてください:
-#     python -c "import os,base64;print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
-#   ⚠️ 一度設定したら変更しないでください。変更すると保存済みの認証情報が読めなくなります。
+# 暗号化キー ★空のままで大丈夫です★
+#   登録したアカウント情報をDBの中で暗号化するための鍵です。
+#   空にしておくと初回起動時に自動生成し、data/encryption_key.txt に保存します。
+#   次回以降はそのファイルを読むので、設定する必要はありません。
+#   （自分で決めたい場合や、環境変数 ENCRYPTION_KEY で渡したい場合だけ使ってください）
 ENCRYPTION_KEY = ""
 
 # データベース接続先
 #   SQLite（既定・そのままでOK） : "sqlite+aiosqlite:///./data/bot.db"
 #   PostgreSQL                  : "postgresql+asyncpg://user:pass@host/dbname"
+#   環境変数でも可: DATABASE_URL
 DATABASE_URL = "sqlite+aiosqlite:///./data/bot.db"
 
 # ログの詳しさ  "INFO"（通常） / "DEBUG"（不具合調査時）
@@ -49,6 +67,7 @@ LOG_LEVEL = "INFO"
 # ============================================================
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -59,11 +78,51 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 
+
+# ------------------------------------------------------------
+#  設定の解決（直接書いた値 → 環境変数 の順に探す）
+# ------------------------------------------------------------
+
+def _from_env(*names: str) -> str:
+    """環境変数を順に探す。前後の空白と、誤って含めた引用符は取り除く。"""
+    for name in names:
+        value = os.getenv(name)
+        if value and value.strip():
+            return value.strip().strip('"').strip("'")
+    return ""
+
+
+def _resolve_text(written: str, *env_names: str) -> str:
+    text = (written or "").strip()
+    return text if text else _from_env(*env_names)
+
+
+def _resolve_ids(written, *env_names: str) -> list[int]:
+    if written:
+        return [int(v) for v in written]
+    raw = _from_env(*env_names).replace(" ", "")
+    return [int(p) for p in raw.split(",") if p.isdigit()]
+
+
+DISCORD_TOKEN = _resolve_text(
+    DISCORD_TOKEN, "DISCORD_TOKEN", "DISCORD_BOT_TOKEN", "TOKEN", "BOT_TOKEN"
+)
+ENCRYPTION_KEY = _resolve_text(ENCRYPTION_KEY, "ENCRYPTION_KEY")
+OWNER_IDS = _resolve_ids(OWNER_IDS, "OWNER_IDS")
+ADMIN_ROLE_IDS = _resolve_ids(ADMIN_ROLE_IDS, "ADMIN_ROLE_IDS")
+DATABASE_URL = (
+    _resolve_text(DATABASE_URL, "DATABASE_URL") or "sqlite+aiosqlite:///./data/bot.db"
+)
+if GUILD_ID is None:
+    _guild = _from_env("GUILD_ID")
+    GUILD_ID = int(_guild) if _guild.isdigit() else None
+
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 COGS_DIR = BASE_DIR / "cogs"
 SYNC_STATE_FILE = DATA_DIR / "sync_state.json"
 PID_FILE = DATA_DIR / "bot.pid"
+KEY_FILE = DATA_DIR / "encryption_key.txt"
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
@@ -77,17 +136,53 @@ log = logging.getLogger("bot")
 #  起動前チェック
 # ------------------------------------------------------------
 
+def load_or_create_encryption_key() -> str:
+    """
+    暗号化キーを用意する。
+
+    設定されていなければ自動生成し、data/encryption_key.txt に保存する。
+    次回以降はそのファイルから読むので、利用者が意識する必要はない。
+
+    この鍵はDBの中のアカウント情報（マクドナルド・Kyashの認証情報）だけを
+    守るためのもの。残高や注文履歴は暗号化していないため、万一この鍵を
+    失っても、アカウントを登録し直せば元どおり使える。
+    """
+    if ENCRYPTION_KEY:
+        return ENCRYPTION_KEY
+
+    if KEY_FILE.exists():
+        saved = KEY_FILE.read_text().strip()
+        if saved:
+            return saved
+
+    key = base64.urlsafe_b64encode(os.urandom(32)).decode()
+    KEY_FILE.write_text(key)
+    try:
+        KEY_FILE.chmod(0o600)   # 本人だけが読めるようにする
+    except OSError:
+        pass
+    log.info("暗号化キーを自動生成しました: %s", KEY_FILE)
+    log.info("  このファイルは登録済みアカウントの復号に必要です。消さないでください。")
+    return key
+
+
 def validate_config() -> None:
-    """設定の書き忘れを、起動前にわかりやすく知らせる。"""
+    """設定の書き忘れや貼り間違いを、起動前にわかりやすく知らせる。"""
     errors = []
     if not DISCORD_TOKEN:
-        errors.append("DISCORD_TOKEN が空です。Developer Portal から取得して設定してください。")
-    if not ENCRYPTION_KEY:
         errors.append(
-            "ENCRYPTION_KEY が空です。次のコマンドで生成して設定してください:\n"
-            '      python -c "import os,base64;'
-            'print(base64.urlsafe_b64encode(os.urandom(32)).decode())"'
+            "DISCORD_TOKEN が空です。\n"
+            "      main.py に直接書くか、環境変数 DISCORD_TOKEN に設定してください。"
         )
+    elif DISCORD_TOKEN.count(".") != 2 or len(DISCORD_TOKEN) < 50:
+        # BOTトークンは「.」で3つに区切られた形。貼り付けミスを早めに知らせる。
+        errors.append(
+            "DISCORD_TOKEN の形式が正しくないようです。\n"
+            "      トークンの一部が欠けていないか確認してください。\n"
+            "      （読み込めた文字数: %d文字）" % len(DISCORD_TOKEN)
+        )
+
+    # ENCRYPTION_KEY は空でよい（初回起動時に自動生成する）
     if not OWNER_IDS:
         errors.append("OWNER_IDS が空です。あなたの Discord ユーザーIDを設定してください。")
 
@@ -95,6 +190,8 @@ def validate_config() -> None:
         log.critical("設定に不備があります:")
         for e in errors:
             log.critical("  ✗ %s", e)
+        log.critical("")
+        log.critical("  設定の入れ方は main.py の冒頭か README.md をご覧ください。")
         sys.exit(1)
 
 
@@ -144,7 +241,7 @@ class McdBot(commands.Bot):
         )
         self._synced = False
         self.admin_role_ids = set(ADMIN_ROLE_IDS)
-        self.encryption_key = ENCRYPTION_KEY
+        self.encryption_key = load_or_create_encryption_key()
         self.database_url = DATABASE_URL
 
     # -- 起動シーケンス ---------------------------------------

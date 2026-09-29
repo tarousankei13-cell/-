@@ -276,7 +276,12 @@ class AdminCog(commands.Cog):
             await interaction.followup.send(embed=embeds.error(str(e)), ephemeral=True)
             return
         await interaction.followup.send(
-            content=f"{E.OK} バックアップ（{len(data) / 1024:.0f} KB）",
+            content=(
+                f"{E.OK} バックアップ（{len(data) / 1024:.0f} KB）\n"
+                f"{E.INFO} 残高・注文履歴はこのファイルだけで復元できます。\n"
+                f"　　登録済みアカウントも戻すには、サーバーの "
+                f"`data/encryption_key.txt` も必要です"
+            ),
             file=discord.File(io.BytesIO(data), filename=name),
             ephemeral=True,
         )

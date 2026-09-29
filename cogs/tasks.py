@@ -204,7 +204,12 @@ class TasksCog(commands.Cog):
             return
         try:
             await channel.send(
-                content=f"{E.OK} 定期バックアップ（{len(data) / 1024:.0f} KB）",
+                content=(
+                    f"{E.OK} 定期バックアップ（{len(data) / 1024:.0f} KB）\n"
+                    f"{E.INFO} 残高・注文履歴はこのファイルだけで復元できます。\n"
+                    f"　　登録済みアカウントも戻すには、サーバーの "
+                    f"`data/encryption_key.txt` も必要です"
+                ),
                 file=discord.File(io.BytesIO(data), filename=name),
             )
             log.info("バックアップを送信しました: %s", name)
