@@ -141,6 +141,26 @@ async def main():
     if await guarded("該当なしでも落ちない", menu_flows.show_search_results(itx, "存在しない店XYZ", "order")):
         check("見つからない旨を伝える", "見つかりません" in itx.text(), itx.text()[:80])
 
+    print("\n[7b] インデックスが無いとき（過去に使った店舗から探す）")
+    from pathlib import Path as _P
+    from db.models import StoreCache
+    store_index.load_index(_P("/nonexistent/none.json"))
+    async with session_scope() as s:
+        s.add(StoreCache(store_id="13934", group_name="group-f", store_name="南砂町店",
+                         address="東京都江東区新砂", cat_root_url="x", hit_count=5))
+    itx = FakeInteraction(user, client)
+    await menu_flows.start_store_select(itx, "order")
+    check("店舗IDでの指定を案内する", "店舗IDで指定" in itx.text(), itx.text()[:80])
+    itx = FakeInteraction(user, client)
+    await itx.response.defer(ephemeral=True, thinking=True)
+    await menu_flows.show_search_results(itx, "南砂", "order")
+    check("過去に使った店舗からは探せる", "見つかりません" not in itx.text(), itx.text()[:80])
+    itx = FakeInteraction(user, client)
+    await itx.response.defer(ephemeral=True, thinking=True)
+    await menu_flows.show_search_results(itx, "ありえない店XYZ", "order")
+    check("該当なしを伝える", "見つかりません" in itx.text(), itx.text()[:80])
+    store_index.load_index(_P(idx))
+
     print("\n[8] チャージ画面")
     itx = FakeInteraction(user, client)
     if await guarded("チャージのモーダルが開く", flows.open_charge_modal(itx)):
