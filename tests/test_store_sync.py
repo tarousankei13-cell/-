@@ -73,8 +73,17 @@ class FakeClient:
 def install(world, tmp: Path):
     store_index.SYNCED_PATH = tmp / "stores.json"
     store_index.BUNDLED_PATH = tmp / "bundled.json"
-    # 通信は core.http.build_async_client で作るので、そこを差し替える
-    store_sync.build_async_client = lambda **kw: FakeClient(world)
+    # 通信は core.http.catalog_session から借りるので、そこを差し替える
+    from contextlib import asynccontextmanager
+
+    def fake_session(client):
+        @asynccontextmanager
+        async def _s():
+            yield client
+        return _s
+
+    store_sync._fake = fake_session
+    store_sync.catalog_session = fake_session(FakeClient(world))
     store_sync.SITEMAP_URLS = ["https://map.mcdonalds.co.jp/sitemap.xml"]
 
 
@@ -155,13 +164,13 @@ async def main():
         async def get(self, url, headers=None, timeout=None):
             if "sitemap" in url: raise RuntimeError("接続できません")
             return await super().get(url, headers, timeout)
-    store_sync.build_async_client = lambda **kw: Broken(w)
+    store_sync.catalog_session = store_sync._fake(Broken(w))
     _force_sitemap_check()
     r = await store_sync.sync()
     check("エラーを記録する", bool(r.error), r.error)
     check("店舗は消えない", r.total == 3, r.total)
     check("検索は続けられる", len(store_index.search("梅田")) == 1)
-    store_sync.build_async_client = lambda **kw: FakeClient(w)
+    store_sync.catalog_session = store_sync._fake(FakeClient(w))
 
     print("\n[9] 一覧が壊れていたら同梱の一覧から作り直す")
     store_index.SYNCED_PATH.write_text("これはJSONではない", encoding="utf-8")

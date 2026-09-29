@@ -413,8 +413,10 @@ class McdBot(commands.Bot):
     # -- 後片付け ---------------------------------------------
 
     async def close(self) -> None:
+        from core.http import close_shared
         from db.session import close_db
 
+        await close_shared()
         await close_db()
         await super().close()
 

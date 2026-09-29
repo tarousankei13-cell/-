@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 import config
-from core.http import build_async_client
+from core.http import catalog_session
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -210,9 +210,8 @@ async def sync(
     )
     sem = asyncio.Semaphore(CONCURRENCY)
 
-    async with build_async_client(
-        max_connections=CONCURRENCY * 4 + 20, max_keepalive=CONCURRENCY * 2
-    ) as client:
+    # 共用の接続を借りる。毎回作り直すとそのたびにTLSの handshake が起きる。
+    async with catalog_session() as client:
         # ---- ① サイトマップの照合 ----------------------------
         interval = int(config.STORE_SITEMAP_CHECK_MINUTES) * 60
         due = full or (_now() - int(meta.get("sitemap_at") or 0) >= interval)
