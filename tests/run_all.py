@@ -10,6 +10,7 @@ TESTS = [
     ("暗号化・複式元帳・排他制御", "test_phase0.py"),
     ("カート組み立て", "test_cart.py"),
     ("店名検索", "test_store_search.py"),
+    ("店舗一覧の定期同期", "test_store_sync.py"),
     ("利用者の操作フロー", "test_ui_flows.py"),
     ("チャージ処理", "test_charge.py"),
     ("アカウント登録（OTP）", "test_account_setup.py"),

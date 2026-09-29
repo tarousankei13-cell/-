@@ -2,7 +2,7 @@
 店舗情報とメニューの取得・保存
 
 店舗JSONの store.api.ordRootUrl から group が直接わかるため、
-group-e〜h を総当たりする必要はない（docs/08 §4）。
+group-e〜j を総当たりする必要はない（docs/08 §4）。
 """
 
 from __future__ import annotations

@@ -38,7 +38,7 @@ DATA_CAT = "https://data.cat.{group}.prod.mop.mcd.qorcommerce.com"
 ORD = "https://ord.{group}.prod.mop.mcd.qorcommerce.com"
 TID = "https://tid.ord.{group}.prod.mop.mcd.qorcommerce.com"
 
-GROUPS = ["group-f", "group-h", "group-g", "group-e"]
+GROUPS = ["group-j", "group-i", "group-h", "group-g", "group-f", "group-e"]
 
 
 class McdError(Exception):

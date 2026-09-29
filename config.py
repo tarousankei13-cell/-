@@ -55,6 +55,11 @@ PREFETCH_TTL = 90
 # ETag により「変更が無ければ通信量ゼロ」で確認できるため、高頻度で同期する。
 MENU_SYNC_INTERVAL_MINUTES = 15   # メニューの定期同期（分）
 STORE_REFRESH_MINUTES = 30        # 店舗情報・営業時間の再取得（分）
+
+# 店舗一覧そのものの同期（新店舗・閉店・店名変更・モバイルオーダー可否）
+STORE_INDEX_SYNC_MINUTES = 15     # 巡回更新の間隔（分）
+STORE_INDEX_REFRESH_BATCH = 400   # 1回に取り直す店舗数（全3,036店舗を約2時間で一周）
+STORE_SITEMAP_CHECK_MINUTES = 60  # 店舗IDの一覧を照合する間隔（分）
 MENU_STALE_MINUTES = 10           # 注文直前に取り直す古さのしきい値（分）
 MENU_ACTIVE_STORE_DAYS = 30       # 「直近で使われた店舗」とみなす日数
 MENU_NOTIFY_DIFF = True           # 新商品・値上げを管理者へ通知するか
@@ -112,7 +117,10 @@ RECEIPT_VIEW_URL = "https://mcdon.asia/order/{store_id}?orderId={receipt_number}
 # ------------------------------------------------------------
 #  マクドナルド API
 # ------------------------------------------------------------
-MCD_GROUPS = ["group-f", "group-h", "group-g", "group-e"]
+# 店舗はこのいずれか1つのグループだけが配信している。
+# 店舗数の多い順に並べてあるので、総当たりでも早く当たる。
+# （j:693 i:686 h:649 g:631 f:374 e:3 / 全3,036店舗を実測）
+MCD_GROUPS = ["group-j", "group-i", "group-h", "group-g", "group-f", "group-e"]
 MCD_DATA_URL = "https://data.cat.{group}.prod.mop.mcd.qorcommerce.com/{path}"
 HTTP_TIMEOUT = 20
 

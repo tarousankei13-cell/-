@@ -20,7 +20,20 @@ from pathlib import Path
 
 log = logging.getLogger("bot.store_index")
 
-INDEX_PATH = Path(__file__).parent.parent.parent / "assets" / "stores.json"
+_ROOT = Path(__file__).parent.parent.parent
+# 同梱の一覧。更新されない代わりに必ず存在する。
+BUNDLED_PATH = _ROOT / "assets" / "stores.json"
+# 定期同期で書き出す一覧。こちらがあれば優先する。
+SYNCED_PATH = _ROOT / "data" / "stores.json"
+
+
+def default_path() -> Path:
+    """同期済みの一覧があればそれを、無ければ同梱の一覧を使う。"""
+    return SYNCED_PATH if SYNCED_PATH.exists() else BUNDLED_PATH
+
+
+# 後方互換（従来の名前で参照している箇所のため）
+INDEX_PATH = BUNDLED_PATH
 
 # 検索時に無視する文字（中黒・記号・空白など）
 _NOISE = re.compile(r"[\s　・･\-ー－―‐_,.。、（）()\[\]【】]+")
@@ -63,6 +76,12 @@ class StoreIndex:
         self._by_id: dict[str, StoreEntry] = {}
         self._norm_name: dict[str, str] = {}
         self._norm_addr: dict[str, str] = {}
+        self._meta: dict = {}
+
+    @property
+    def meta(self) -> dict:
+        """最後に同期した時刻などの付帯情報。"""
+        return self._meta
 
     @property
     def available(self) -> bool:
@@ -77,6 +96,7 @@ class StoreIndex:
         self._by_id.clear()
         self._norm_name.clear()
         self._norm_addr.clear()
+        self._meta = {}
 
     def load(self, path: Path | None = None) -> int:
         """
@@ -86,7 +106,7 @@ class StoreIndex:
         古い内容が残っていると「検索できるのに結果がおかしい」という
         分かりにくい状態になるため。
         """
-        path = path or INDEX_PATH
+        path = path or default_path()
         if not path.exists():
             self._clear()
             log.warning(
@@ -107,6 +127,14 @@ class StoreIndex:
         by_id: dict[str, StoreEntry] = {}
         norm_name: dict[str, str] = {}
         norm_addr: dict[str, str] = {}
+        # 同期で書き出した一覧は {"meta": {...}, "stores": {...}} の形。
+        # 同梱の一覧は店舗IDをそのまま並べた形。どちらも読めるようにする。
+        if isinstance(raw, dict) and isinstance(raw.get("stores"), dict):
+            self._meta = raw.get("meta") or {}
+            raw = raw["stores"]
+        else:
+            self._meta = {}
+
         for store_id, d in raw.items():
             entry = StoreEntry(
                 store_id=str(store_id),
@@ -128,7 +156,18 @@ class StoreIndex:
         return len(self._entries)
 
     def get(self, store_id: str) -> StoreEntry | None:
-        return self._by_id.get(str(store_id).strip())
+        """
+        店舗IDで引く。
+
+        店舗IDは5桁のゼロ埋め（北海道なら 01003）。
+        利用者が先頭の 0 を省いて「1003」と入れることがあるので、
+        そのままで見つからなければゼロ埋めしても探す。
+        """
+        sid = str(store_id).strip()
+        hit = self._by_id.get(sid)
+        if hit is None and sid.isdigit() and len(sid) < 5:
+            hit = self._by_id.get(sid.zfill(5))
+        return hit
 
     def search(self, query: str, limit: int = 25) -> list[StoreEntry]:
         """
@@ -196,3 +235,11 @@ def get(store_id: str) -> StoreEntry | None:
 
 def available() -> bool:
     return _index.available
+
+
+def meta() -> dict:
+    return _index.meta
+
+
+def count() -> int:
+    return _index.count

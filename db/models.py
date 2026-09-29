@@ -183,7 +183,7 @@ class StoreCache(Base):
     店舗情報のキャッシュ。
 
     store.api.ordRootUrl から group が直接わかるため、
-    group-e〜h の総当たりは不要（docs/08 §4）。
+    group-e〜j の総当たりは不要（docs/08 §4）。
     """
     __tablename__ = "store_cache"
 

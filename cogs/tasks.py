@@ -13,6 +13,7 @@ import emoji as E
 from core import saga, settings
 from db.session import session_scope
 from services import tasks as jobs
+from services.mcd import store_sync
 from ui import embeds
 
 log = logging.getLogger("bot.cogs.tasks")
@@ -36,12 +37,14 @@ class TasksCog(commands.Cog):
         cog_load の時点ではまだログインしていないため、ループ内の
         wait_until_ready() が例外を投げてループが静かに死ぬことがある。
         """
-        for loop in (self.menu_sync, self.health_check, self.token_warm, self.hourly_checks):
+        for loop in (self.menu_sync, self.store_index_sync, self.health_check,
+                     self.token_warm, self.hourly_checks):
             if not loop.is_running():
                 loop.start()
 
     async def cog_unload(self) -> None:
         self.menu_sync.cancel()
+        self.store_index_sync.cancel()
         self.health_check.cancel()
         self.token_warm.cancel()
         self.hourly_checks.cancel()
@@ -117,6 +120,49 @@ class TasksCog(commands.Cog):
 
     @menu_sync.before_loop
     async def before_menu_sync(self) -> None:
+        await self._wait_ready()
+
+    # -- 店舗一覧の同期 -----------------------------------------
+
+    @tasks.loop(minutes=config.STORE_INDEX_SYNC_MINUTES)
+    async def store_index_sync(self) -> None:
+        """
+        店舗一覧を最新に保つ。
+
+        新店舗の開店・閉店・店名変更・モバイルオーダー対応の切り替えを
+        自動で反映する。各店舗は ETag を使って取り直すので、
+        変わっていなければ 304（0バイト）で済む。
+        """
+        if not self._started:
+            return
+        interval = int(
+            settings.get("store_index_sync_minutes", config.STORE_INDEX_SYNC_MINUTES)
+        )
+        if self.store_index_sync.minutes != interval:
+            self.store_index_sync.change_interval(minutes=interval)
+
+        try:
+            report = await store_sync.sync()
+        except Exception:
+            log.exception("店舗一覧の同期に失敗しました")
+            return
+
+        if report.error:
+            log.warning("店舗一覧の同期: %s", report.error)
+        if not settings.get("store_notify_diff", True):
+            return
+        text = store_sync.format_report(report)
+        if text:
+            await self.notify_admin(
+                discord.Embed(
+                    title=f"{E.STORE} 店舗一覧が更新されました",
+                    description=text[:4000],
+                    color=embeds.BLUE,
+                )
+            )
+
+    @store_index_sync.before_loop
+    async def before_store_index_sync(self) -> None:
         await self._wait_ready()
 
     # -- アカウントの健全性 -------------------------------------

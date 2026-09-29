@@ -128,6 +128,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+# 通信ライブラリは1リクエストごとに INFO を出すため、店舗同期を回すと
+# 15分ごとに数百行が流れてログが読めなくなる。警告だけにしておく。
+for _noisy in ("httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 log = logging.getLogger("bot")
 
 

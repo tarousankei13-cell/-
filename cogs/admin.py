@@ -11,8 +11,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import config
 import emoji as E
 from core import ledger as L
+from core import settings
 from core import users as user_repo
 from db.session import session_scope, user_scope
 from cogs._checks import admin_only, handle_check_failure, owner_only
@@ -359,28 +361,70 @@ class AdminCog(commands.Cog):
     async def store_info(self, interaction: discord.Interaction) -> None:
         from services.mcd import store_index
 
+        from datetime import datetime, timezone
+
         idx = store_index.get_index()
         e = discord.Embed(title=f"{E.STORE} 店舗一覧", color=embeds.BLUE)
         if idx.available:
-            e.description = f"**{idx.count}** 店舗を読み込み済みです。店名で検索できます。"
+            e.description = f"**{idx.count:,}** 店舗を読み込み済みです。店名で検索できます。"
+            meta = idx.meta
+            src = (
+                "定期同期で取得した一覧"
+                if store_index.SYNCED_PATH.exists()
+                else "同梱の一覧（まだ同期していません）"
+            )
+            e.add_field(name=f"{E.INFO} 読み込み元", value=src, inline=False)
+            if meta.get("updated_at"):
+                when = datetime.fromtimestamp(int(meta["updated_at"]), timezone.utc)
+                e.add_field(
+                    name=f"{E.SYNC} 最終同期",
+                    value=f"<t:{int(meta['updated_at'])}:R>（{when:%m/%d %H:%M} UTC）",
+                    inline=True,
+                )
+            if meta.get("sitemap_at"):
+                e.add_field(
+                    name=f"{E.CHART} 店舗IDの照合",
+                    value=f"<t:{int(meta['sitemap_at'])}:R>",
+                    inline=True,
+                )
+            unresolved = meta.get("unresolved") or {}
+            if unresolved:
+                e.add_field(
+                    name=f"{E.WARN} 取得できない店舗",
+                    value=f"{len(unresolved)} 件（閉店直後などで配信元に無い）",
+                    inline=False,
+                )
+            interval = settings.get(
+                "store_index_sync_minutes", config.STORE_INDEX_SYNC_MINUTES
+            )
+            e.set_footer(
+                text=f"{interval}分ごとに巡回更新 / "
+                f"{config.STORE_SITEMAP_CHECK_MINUTES}分ごとに店舗IDを照合"
+            )
         else:
             e.color = embeds.ORANGE
             e.description = (
                 "店舗一覧が読み込まれていません。\n"
                 "利用者は店舗IDでの指定のみになります。\n\n"
-                "`/store reindex` で作成できます（15〜30分かかります）。"
+                "`/store reindex` で作成できます（数分で終わります）。"
             )
         await interaction.response.send_message(embed=e, ephemeral=True)
 
-    @store_group.command(name="reindex", description="店舗一覧を作り直します（時間がかかります）")
+    @store_group.command(name="reindex", description="店舗一覧を今すぐ作り直します")
     @owner_only()
     async def store_reindex(self, interaction: discord.Interaction) -> None:
-        from services.mcd import store_crawl, store_index
+        """
+        全店舗を取り直す。
+
+        通常は定期同期が自動で最新に保つので、この操作は
+        一覧を壊してしまったときや、すぐに反映したいときだけで足りる。
+        """
+        from services.mcd import store_index, store_sync
 
         await interaction.response.send_message(
             embed=embeds.info(
                 f"{E.LOADING} 店舗一覧を作り直しています…\n"
-                "**15〜30分**かかります。進み具合はこのメッセージに表示します。\n"
+                "**3〜5分**で終わります。進み具合はこのメッセージに表示します。\n"
                 f"{E.INFO} 作業中もBOTは通常どおり使えます。"
             ),
             ephemeral=True,
@@ -389,7 +433,7 @@ class AdminCog(commands.Cog):
         last = {"pct": -1}
 
         async def on_progress(done: int, total: int, found: int) -> None:
-            pct = done * 100 // total
+            pct = done * 100 // max(total, 1)
             if pct == last["pct"]:
                 return
             last["pct"] = pct
@@ -397,16 +441,14 @@ class AdminCog(commands.Cog):
                 await interaction.edit_original_response(
                     embed=embeds.info(
                         f"{E.LOADING} 店舗一覧を作成中… **{pct}%**\n"
-                        f"　{done:,} / {total:,} 件を確認　**{found:,}** 店舗を発見"
+                        f"　{done:,} / {total:,} 件を確認　**{found:,}** 店舗"
                     )
                 )
             except discord.HTTPException:
                 pass
 
         try:
-            stores = await store_crawl.crawl(progress=on_progress)
-            size = store_crawl.save_index(stores)
-            loaded = store_index.load_index()
+            report = await store_sync.sync(full=True, progress=on_progress)
         except Exception as e:
             log.exception("店舗一覧の作成に失敗しました")
             await interaction.edit_original_response(
@@ -414,11 +456,18 @@ class AdminCog(commands.Cog):
             )
             return
 
+        size = (
+            store_index.SYNCED_PATH.stat().st_size
+            if store_index.SYNCED_PATH.exists()
+            else 0
+        )
+        detail = store_sync.format_report(report)
         await interaction.edit_original_response(
             embed=embeds.ok(
                 f"店舗一覧を作り直しました。\n"
-                f"**{loaded:,}** 店舗（{size / 1024:.0f} KB）\n"
-                f"{E.INFO} 利用者は店名の一部で検索できます。"
+                f"**{report.total:,}** 店舗（{size / 1024:.0f} KB）\n"
+                + (f"\n{detail}\n" if detail else "")
+                + f"{E.INFO} 利用者は店名の一部で検索できます。"
             )
         )
 
