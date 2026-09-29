@@ -76,13 +76,20 @@ class RejectReasonModal(discord.ui.Modal, title="却下の理由"):
         max_length=400,
     )
 
-    def __init__(self, cog: "Reports", report_id: int):
+    def __init__(
+        self, cog: "Reports", report_id: int, source: Optional[discord.Message] = None
+    ):
         super().__init__()
         self.cog = cog
         self.report_id = report_id
+        # モーダルの interaction では承認メッセージを直接編集できないので、
+        # 押されたボタンが乗っていたメッセージを持ち回る
+        self.source = source
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await self.cog.finalize(interaction, self.report_id, False, str(self.reason.value))
+        await self.cog.finalize(
+            interaction, self.report_id, False, str(self.reason.value), self.source
+        )
 
 
 class ReportDecisionButton(
@@ -114,9 +121,13 @@ class ReportDecisionButton(
             await interaction.response.send_message("オーナー限定の操作です。", ephemeral=True)
             return
         if self.action == "ng":
-            await interaction.response.send_modal(RejectReasonModal(cog, self.report_id))
+            await interaction.response.send_modal(
+                RejectReasonModal(cog, self.report_id, interaction.message)
+            )
         else:
-            await cog.finalize(interaction, self.report_id, True, "")
+            await cog.finalize(
+                interaction, self.report_id, True, "", interaction.message
+            )
 
 
 class FlagButton(
@@ -172,7 +183,20 @@ class Reports(commands.Cog):
         uid = message.author.id
 
         order = await asyncio.to_thread(self.bot.store.blocking_order, uid)
-        if order is None or order["report_status"] not in ("awaiting", "rejected"):
+        if order is None:
+            return
+        if order["report_status"] == "submitted":
+            # 送りっぱなしで無反応だと不安になるので状態だけ返す
+            await message.reply(
+                embed=embed(
+                    f"{cfg.E_CLOCK} 承認をお待ちください",
+                    f"注文 #{order['id']} の感想は受付済みです。\n"
+                    "オーナーの承認が完了すると次の注文ができるようになります。",
+                    INFO,
+                )
+            )
+            return
+        if order["report_status"] not in ("awaiting", "rejected"):
             return
 
         text = (message.content or "").strip()
@@ -318,6 +342,13 @@ class Reports(commands.Cog):
             )
             return
 
+        # 承認待ち投稿の場所を残す。再起動でメモリ上の画像が消えても、
+        # 承認時にここから添付を取り直せる。
+        await asyncio.to_thread(
+            self.bot.store.set_report_approval_message,
+            report_id, posted.channel.id, posted.id,
+        )
+
         await interaction.followup.send(
             embed=embed(
                 f"{cfg.E_OK} 感想を受け付けました",
@@ -333,37 +364,71 @@ class Reports(commands.Cog):
 
     # ---------------------------------------------------------- 承認・却下
 
+    @staticmethod
+    async def _ack(interaction: discord.Interaction, e: discord.Embed) -> None:
+        """defer(thinking=True) で出した仮メッセージを結果で埋める。
+
+        followup.send を使うと仮メッセージとは別にもう1通出てしまうため、
+        元の応答を差し替える。
+        """
+        try:
+            await interaction.edit_original_response(embed=e)
+        except Exception:
+            try:
+                await interaction.followup.send(embed=e, ephemeral=True)
+            except Exception:
+                log.debug("操作結果を返せませんでした", exc_info=True)
+
+    async def _close_approval(
+        self, source: Optional[discord.Message], e: discord.Embed
+    ) -> None:
+        """承認待ちの投稿をボタンごと結果表示に差し替える。"""
+        if source is None:
+            return
+        try:
+            await source.edit(embed=e, view=None)
+        except Exception:
+            log.debug("承認メッセージを更新できませんでした", exc_info=True)
+
     async def finalize(
-        self, interaction: discord.Interaction, report_id: int, approve: bool, reason: str
+        self,
+        interaction: discord.Interaction,
+        report_id: int,
+        approve: bool,
+        reason: str,
+        source: Optional[discord.Message] = None,
     ) -> None:
         cfg = self.bot.cfg
         report = await asyncio.to_thread(self.bot.store.get_report, report_id)
         if report is None or report["status"] != "pending":
-            await interaction.response.send_message("この申請は処理済みです。", ephemeral=True)
+            if not interaction.response.is_done():
+                await interaction.response.send_message("この申請は処理済みです。", ephemeral=True)
+            else:
+                await interaction.followup.send("この申請は処理済みです。", ephemeral=True)
             return
 
         uid = int(report["user_id"])
         order_id = int(report["order_id"])
 
         if not interaction.response.is_done():
-            await interaction.response.defer()
+            await interaction.response.defer(ephemeral=True, thinking=True)
 
         await asyncio.to_thread(
             self.bot.store.decide_report, report_id, approve, interaction.user.id, reason
         )
 
         if not approve:
-            try:
-                await interaction.edit_original_response(
-                    embed=embed(
-                        f"{cfg.E_NG} 却下しました",
-                        f"report #{report_id} ・ <@{uid}>\n理由: {reason}",
-                        BAD,
-                    ),
-                    view=None,
-                )
-            except Exception:
-                pass
+            await self._close_approval(
+                source,
+                embed(
+                    f"{cfg.E_NG} 却下しました",
+                    f"report #{report_id} ・ <@{uid}>\n理由: {reason}",
+                    BAD,
+                ),
+            )
+            await self._ack(
+                interaction, embed(f"{cfg.E_NG} 却下しました", f"report #{report_id}", BAD)
+            )
             await dm(
                 self.bot, uid,
                 e=embed(
@@ -410,17 +475,13 @@ class Reports(commands.Cog):
                 ),
             )
 
-        try:
-            await interaction.edit_original_response(
-                embed=embed(
-                    f"{cfg.E_OK} 承認して投稿しました",
-                    f"report #{report_id} ・ <@{uid}>",
-                    OK,
-                ),
-                view=None,
-            )
-        except Exception:
-            pass
+        await self._close_approval(
+            source,
+            embed(f"{cfg.E_OK} 承認して投稿しました", f"report #{report_id} ・ <@{uid}>", OK),
+        )
+        await self._ack(
+            interaction, embed(f"{cfg.E_OK} 承認しました", f"report #{report_id}", OK)
+        )
 
         await dm(
             self.bot, uid,
@@ -444,34 +505,72 @@ class Reports(commands.Cog):
             except Exception:
                 log.exception("紹介報酬の判定に失敗しました (user=%s)", uid)
 
+    async def _resolve_channel(self, channel_id: int):
+        """DM チャンネルはキャッシュに乗っていないことが多いので取り直す。"""
+        if not channel_id:
+            return None
+        channel = self.bot.get_channel(channel_id)
+        if channel is not None:
+            return channel
+        try:
+            return await self.bot.fetch_channel(channel_id)
+        except Exception:
+            return None
+
+    async def _recover_blobs(self, report_id: int, report) -> list[tuple[str, bytes]]:
+        """投稿する画像を集める。
+
+        まずメモリ上のものを使い、無ければ承認待ち投稿の添付から取り直す。
+        BOT が再起動してもボーナス付きの実績が画像なしにならないようにする。
+        """
+        blobs = getattr(self.bot, "_report_blobs", {}).get(report_id)
+        if blobs:
+            return blobs
+
+        channel = await self._resolve_channel(int(report["approval_channel_id"] or 0))
+        if channel is None or not report["approval_message_id"]:
+            return []
+        try:
+            message = await channel.fetch_message(int(report["approval_message_id"]))
+        except Exception:
+            log.warning("承認メッセージから画像を取り直せませんでした (report=%s)", report_id)
+            return []
+
+        recovered: list[tuple[str, bytes]] = []
+        for attachment in message.attachments:
+            if not (attachment.content_type or "").startswith("image/"):
+                continue
+            try:
+                recovered.append((attachment.filename, await attachment.read()))
+            except Exception:
+                continue
+        return recovered
+
     async def _publish(self, report_id: int, uid: int, report, order_id: int) -> Optional[int]:
         """実績チャンネルへ投稿する。原本の転送を試み、駄目なら再アップロードする。"""
         cfg = self.bot.cfg
-        channel = self.bot.get_channel(cfg.ACHIEVEMENT_CHANNEL_ID)
+        channel = await self._resolve_channel(cfg.ACHIEVEMENT_CHANNEL_ID)
         if channel is None:
-            try:
-                channel = await self.bot.fetch_channel(cfg.ACHIEVEMENT_CHANNEL_ID)
-            except Exception:
-                log.warning("実績チャンネルを取得できませんでした")
-                return None
+            log.warning("実績チャンネルを取得できませんでした")
+            return None
 
         order = await asyncio.to_thread(self.bot.store.get_order, order_id)
         pickup = (order["pickup"] if order else "") or "-"
 
         forwarded = False
         try:
-            source = await self.bot.get_channel(int(report["source_channel_id"])).fetch_message(
-                int(report["source_message_id"])
-            ) if self.bot.get_channel(int(report["source_channel_id"])) else None
-            if source is not None:
-                await source.forward(channel)
+            dm_channel = await self._resolve_channel(int(report["source_channel_id"] or 0))
+            if dm_channel is not None:
+                original = await dm_channel.fetch_message(int(report["source_message_id"]))
+                await original.forward(channel)
                 forwarded = True
         except Exception:
+            log.debug("原本の転送に失敗しました。再アップロードに切り替えます", exc_info=True)
             forwarded = False
 
         if not forwarded:
             # 転送できないときは本文と画像を貼り直して同じ見た目にする
-            blobs = getattr(self.bot, "_report_blobs", {}).get(report_id, [])
+            blobs = await self._recover_blobs(report_id, report)
             files = [discord.File(io.BytesIO(data), filename=name) for name, data in blobs[:10]]
             quoted = "\n".join(f"> {line}" for line in str(report["content"]).splitlines())
             try:

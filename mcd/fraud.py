@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Callable, Optional
 
 from .cards import find_similar
 from .store import JST, Store, now_jst
@@ -61,9 +61,21 @@ class FraudConfig:
 
 
 class FraudEngine:
-    def __init__(self, store: Store, config: FraudConfig):
+    """判定のしきい値は実行のたびに読み直す。
+
+    ``/config`` で変更した値がすぐ効くように、固定値ではなく
+    ``FraudConfig`` を返す呼び出し可能オブジェクトを受け取る。
+    """
+
+    def __init__(self, store: Store, config: FraudConfig | Callable[[], FraudConfig]):
         self.store = store
-        self.config = config
+        self._provider: Callable[[], FraudConfig] = (
+            config if callable(config) else (lambda: config)
+        )
+
+    @property
+    def config(self) -> FraudConfig:
+        return self._provider()
 
     # ------------------------------------------------------------ 紹介
 

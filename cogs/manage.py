@@ -680,7 +680,7 @@ class Manage(commands.Cog):
             inline=False,
         )
 
-        running = active_campaigns(cfg.CAMPAIGNS)
+        running = active_campaigns(cfg.campaigns())
         e.add_field(
             name="適用中のキャンペーン",
             value=(
@@ -717,7 +717,7 @@ class Manage(commands.Cog):
     async def myrate(self, interaction: discord.Interaction) -> None:
         cfg = self.bot.cfg
         decision = resolve_rate(
-            cfg.DEFAULT_USER_RATE, cfg.ROLE_RATES, cfg.USER_RATES, cfg.CAMPAIGNS,
+            cfg.DEFAULT_USER_RATE, cfg.role_rates(), cfg.user_rates(), cfg.campaigns(),
             interaction.user.id, role_ids(interaction.user),
         )
         e = embed(f"{cfg.E_MONEY} あなたの負担率", None, MONEY, footer=cfg.BRAND_NAME)

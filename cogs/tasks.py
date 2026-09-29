@@ -31,6 +31,11 @@ class Tasks(commands.Cog):
         self._buzzer_tasks: set[asyncio.Task] = set()
 
     async def cog_load(self) -> None:
+        # 間隔は設定値に合わせる（デコレータの値は既定値でしかない）
+        try:
+            self.health_loop.change_interval(hours=int(self.bot.cfg.HEALTH_CHECK_HOURS))
+        except Exception:
+            log.warning("ヘルスチェックの間隔を設定できませんでした。既定値で動かします。")
         self.health_loop.start()
         self.panel_loop.start()
         self.daily_loop.start()
@@ -158,6 +163,7 @@ class Tasks(commands.Cog):
     @tasks.loop(minutes=30)
     async def daily_loop(self) -> None:
         await self._cleanup_stale_approvals()
+        await self._cleanup_stale_reservations()
         await self._maybe_monthly_report()
 
     @daily_loop.before_loop
@@ -182,6 +188,17 @@ class Tasks(commands.Cog):
                 ),
             )
             log.info("期限切れの承認待ちを解放しました (order=%s)", order["id"])
+
+    async def _cleanup_stale_reservations(self) -> None:
+        """受け取りに失敗したまま残った Kyash リンクの予約を掃除する。
+
+        予約直後にプロセスが落ちると user_id=0 の行が残り、そのリンクが
+        二度と使えなくなるため、1時間たったものは消す。
+        """
+        cutoff = now_jst() - timedelta(hours=1)
+        removed = await asyncio.to_thread(self.bot.store.drop_stale_reservations, cutoff)
+        if removed:
+            log.info("未完了のリンク予約を %s 件掃除しました", removed)
 
     async def _maybe_monthly_report(self) -> None:
         """機能13: 月次レポートを DM で送る。"""

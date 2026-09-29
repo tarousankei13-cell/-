@@ -5,9 +5,9 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import re
-from datetime import timedelta
 from typing import Optional
 
 import discord
@@ -390,7 +390,7 @@ class Panel(commands.Cog):
         )
 
         decision = resolve_rate(
-            cfg.DEFAULT_USER_RATE, cfg.ROLE_RATES, cfg.USER_RATES, cfg.CAMPAIGNS,
+            cfg.DEFAULT_USER_RATE, cfg.role_rates(), cfg.user_rates(), cfg.campaigns(),
             uid, role_ids(interaction.user),
         )
         face = int(decoded.amount_cents)
@@ -793,7 +793,7 @@ class Panel(commands.Cog):
             paid.short_code,
             cfg.BRAND_NAME,
         )
-        file = discord.File(__import__("io").BytesIO(png), filename="pickup.png")
+        file = discord.File(io.BytesIO(png), filename="pickup.png")
 
         e = embed(
             "注文完了！ 受け取り番号を保存してください",

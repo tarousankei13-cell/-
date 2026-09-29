@@ -186,7 +186,7 @@ class Referral(commands.Cog):
             await asyncio.to_thread(self.bot.fraud.record, uid, verdict, "referral.claim")
 
         # スコアが高ければオーナー承認へ回す
-        if verdict.score >= cfg.FRAUD.referral_review_score:
+        if verdict.score >= cfg.FRAUD_REVIEW_SCORE:
             await asyncio.to_thread(
                 self.bot.store.set_kv, f"{PENDING_KEY}:{uid}", inviter_id
             )
@@ -292,7 +292,7 @@ class Referral(commands.Cog):
             log.info("紹介報酬を見送りました (invitee=%s): %s", invitee_id, verdict.summary)
             return
 
-        if verdict.score >= cfg.FRAUD.referral_review_score:
+        if verdict.score >= cfg.FRAUD_REVIEW_SCORE:
             await asyncio.to_thread(self.bot.fraud.record, invitee_id, verdict, "referral.payout")
             await post(
                 self.bot,

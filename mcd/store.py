@@ -134,6 +134,8 @@ CREATE TABLE IF NOT EXISTS reports (
     reject_reason     TEXT,
     source_channel_id INTEGER,
     source_message_id INTEGER,
+    approval_message_id INTEGER,
+    approval_channel_id INTEGER,
     posted_message_id INTEGER,
     photo_bonus_paid  INTEGER NOT NULL DEFAULT 0,
     created_at        TEXT    NOT NULL,
@@ -220,7 +222,13 @@ class Store:
 
     def _migrate(self) -> None:
         """古い DB に足りない列を足す。"""
-        wanted = {"orders": [("raw_hex", "TEXT")]}
+        wanted = {
+            "orders": [("raw_hex", "TEXT")],
+            "reports": [
+                ("approval_message_id", "INTEGER"),
+                ("approval_channel_id", "INTEGER"),
+            ],
+        }
         for table, columns in wanted.items():
             have = {
                 row["name"]
@@ -515,6 +523,8 @@ class Store:
     ) -> None:
         with self.tx() as c:
             row = c.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"注文 #{order_id} が見つかりません")
             c.execute(
                 "UPDATE orders SET status='paid', report_status='awaiting', raw_hex=NULL, mcd_account_id=?,"
                 " receipt_number=?, short_code=?, order_token=?, group_name=?, paid_at=? "
@@ -650,6 +660,8 @@ class Store:
     ) -> tuple[int, int]:
         with self.tx() as c:
             row = c.execute("SELECT id FROM charges WHERE link_uuid=?", (link_uuid,)).fetchone()
+            if row is None:
+                raise DuplicateLink("予約されていないリンクです")
             charge_id = int(row["id"])
             c.execute(
                 "UPDATE charges SET user_id=?, kyash_account_id=?, amount=?, sender_name=?,"
@@ -665,6 +677,19 @@ class Store:
     def drop_reserved_link(self, link_uuid: str) -> None:
         with self.tx() as c:
             c.execute("DELETE FROM charges WHERE link_uuid=? AND user_id=0", (link_uuid,))
+
+    def drop_stale_reservations(self, older_than: datetime) -> int:
+        """受け取りに失敗したまま残った予約行を消す。
+
+        予約直後にプロセスが落ちると user_id=0 の行が残り、そのリンクが
+        永久に使えなくなるため、一定時間たったものは掃除する。
+        """
+        with self.tx() as c:
+            cur = c.execute(
+                "DELETE FROM charges WHERE user_id=0 AND created_at < ?",
+                (older_than.isoformat(timespec="seconds"),),
+            )
+            return int(cur.rowcount or 0)
 
     def users_sharing_sender(self, sender_public_id: str) -> list[int]:
         if not sender_public_id:
@@ -735,6 +760,20 @@ class Store:
     def set_report_message(self, report_id: int, message_id: int) -> None:
         with self.tx() as c:
             c.execute("UPDATE reports SET posted_message_id=? WHERE id=?", (message_id, report_id))
+
+    def set_report_approval_message(
+        self, report_id: int, channel_id: int, message_id: int
+    ) -> None:
+        """承認待ち投稿の場所を覚えておく。
+
+        BOT が再起動するとメモリ上の画像が消えるため、承認時はここから
+        添付を取り直す。
+        """
+        with self.tx() as c:
+            c.execute(
+                "UPDATE reports SET approval_channel_id=?, approval_message_id=? WHERE id=?",
+                (channel_id, message_id, report_id),
+            )
 
     def count_reports_since(self, user_id: int, since: datetime) -> int:
         row = self._q1(

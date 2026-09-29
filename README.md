@@ -17,50 +17,65 @@ Discord のパネルから注文コード (HEX) を投げると、登録済み�
 pip install -r requirements.txt
 ```
 
-### 2. .env
+### 2. main.py に書くのは2つだけ
 
-`.env.example` を `.env` にコピーして埋めます。**ここに入れるのはこの2つだけ**です。
+`main.py` の冒頭を書き換えます。**直書きするのはこの2つだけ**で、
+それ以外の設定はすべて Discord 上のコマンドで行います。
 
+```python
+DISCORD_TOKEN = "..."          # Discord の BOT トークン
+
+OWNER_IDS = {
+    123456789012345678,        # オーナーの Discord ユーザーID
+}
 ```
-DISCORD_TOKEN=...
-OWNER_IDS=123456789012345678
-```
 
-### 3. main.py の設定
+### 3. Discord Developer Portal の設定
 
-チャンネルID・ロールID・料率・上限などは `main.py` の
-「設定 — ここから」〜「ここまで」に直書きされています。最低限これらを埋めてください。
+Bot ページで次の2つを有効にしてください。無効のままだと起動時にエラーになります。
 
-| 項目 | 内容 |
-|------|------|
-| `GUILD_ID` | コマンドを即反映させたいサーバー。0 でグローバル |
-| `ORDER_ROLE_ID` | 注文できるロール |
-| `PANEL_CHANNEL_ID` | パネルを置くチャンネル |
-| `ACHIEVEMENT_CHANNEL_ID` | 実績の投稿先 |
-| `APPROVAL_CHANNEL_ID` | 承認待ちの投稿先 |
-| `LOG_*_CHANNEL_ID` | 各種ログの投稿先 |
+* **MESSAGE CONTENT INTENT** … DM で感想を受け取るために必要
+* **SERVER MEMBERS INTENT** … 紹介の不正判定で参加日時を見るために必要
 
-未設定の項目は起動時に警告として一覧表示されます。
-
-### 4. 起動とアカウント登録
+### 4. 起動して、コマンドで設定
 
 ```bash
 python main.py
 ```
 
-Discord 側で以下を実行します（すべてオーナー限定）。
+起動したら Discord 側で設定します（すべてオーナー限定）。
 
 ```
-/mcd login      マクドナルドにログイン（メール + パスワード + 確認コード）
-/kyash login    Kyash にログイン（メール + パスワード + SMS の6桁）
-/panel          パネルを設置
+/config setup        未設定の項目と手順を一覧表示
+/config guild        このサーバーをコマンドの同期先にする
+/config channel      パネル・実績・承認・各種ログのチャンネルを指定
+/config role         注文できるロールを指定
+/mcd login           マクドナルドにログイン（メール + パスワード + 確認コード）
+/kyash login         Kyash にログイン（メール + パスワード + SMS の6桁）
+/panel               パネルを設置
 ```
+
+`/config setup` が「設定は完了しています」になれば運用可能です。
 
 トークンを直接入れる場合は `/mcd token` と `/kyash token` があります。
 いずれも入力は Modal で受けるので、コマンド履歴にトークンは残りません。
 
 アカウントは**どちらも複数登録できます**。マクドナルド側は LRU で選ばれ、
 連続失敗すると自動で停止します。
+
+### 5. あとから変える設定
+
+```
+/config show              現在の設定を一覧（* が既定値から変更済み）
+/config set               負担率・上限・チャージ額・不正検知のしきい値など
+/config rate-role         ロールごとの負担率
+/config rate-user         利用者ごとの負担率
+/config campaign-add      時間帯限定の負担率
+/config terms             規約の版と本文（版を変えると全員に再同意を求める）
+/config reset             項目を既定値に戻す
+```
+
+値は SQLite に保存されるので、再起動しても残ります。
 
 ---
 
@@ -109,8 +124,9 @@ Discord 側で以下を実行します（すべてオーナー限定）。
 ## 構成
 
 ```
-main.py              設定と起動
+main.py              トークンとオーナーID、起動処理
 cogs/
+  config.py          設定コマンド
   panel.py           パネル、注文フロー、規約同意、上限超過の承認
   charge.py          Kyash チャージ
   referral.py        紹介制度
@@ -119,6 +135,7 @@ cogs/
   tasks.py           月次レポート、ヘルスチェック、呼び出し番号、パネル更新
   admin.py           再起動
 mcd/
+  settings.py        コマンドで変更する設定の定義と保存
   store.py           SQLite（台帳方式）
   logsetup.py        構造化ログとトークンのマスク
   mcdclient.py       マクドナルドアカウントのプール
