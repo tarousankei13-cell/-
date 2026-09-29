@@ -148,7 +148,7 @@ _ensure_auth()                     ③④⑤ を実行
       ↓
 decode_hex(hex)                    → store_id / amount / products / pickup
       ↓
-store_order(decoded, card_id)      group-e → f → g → h を総当たり
+store_order(decoded, card_id)      group-j → i → h → g → f → e を総当たり
       │  POST https://ord.{group}.prod.mop.mcd.qorcommerce.com
       │       /app/mcdord.UserOrderService/StoreOrder
       └→ order_token
@@ -188,9 +188,27 @@ get_store_name(store_id)           → 店名
 
 ### 4.3 group 総当たりのコスト
 
-`store_order()` は `group-e, f, g, h` を順に試し、各試行で `get_pos_paseto()` を叩く。
-**最悪ケースで 8 リクエスト**が無駄になる。
+`store_order()` は group を順に試し、各試行で `get_pos_paseto()` を叩く。
 → `store_id → group` の解決結果を**DBにキャッシュ**すれば2回目以降は1発（提案4）。
+
+> #### ⚠️ HATTIMCD は group を4つしか見ていない（実測で判明）
+> HATTIMCD は `group-e, f, g, h` の4つを試す。
+> しかし実際には **`group-i` と `group-j` も存在する**。
+> 全3,036店舗を実測した内訳:
+>
+> | group | 店舗数 |
+> |---|---|
+> | group-j | 693 |
+> | group-i | 686 |
+> | group-h | 649 |
+> | group-g | 631 |
+> | group-f | 374 |
+> | group-e | 3 |
+>
+> **i と j を見落とすと1,379店舗（45%）で group が特定できず注文できない。**
+> 山形・福島・福井・山梨・和歌山・鳥取・熊本は全店舗がこの2つに属するため、
+> 県ごと丸ごと注文不可になる。
+> 本BOTでは `config.MCD_GROUPS` に6つを店舗数の多い順で持つ。
 
 > なお `_DATA_GROUPS`（h,g,f,e）と `MCD._GROUPS`（e,f,g,h）で**順序が逆**。
 > 実測でヒット率の高い順に統一すべき。

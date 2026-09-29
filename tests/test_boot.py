@@ -43,13 +43,24 @@ async def main():
     check("名前の重複がない（二重表示の原因）",
           len(names) == len(set(names)), [n for n in names if names.count(n) > 1])
 
+    def full_path(group, cmd) -> str:
+        """親グループを含めた呼び出し名。Discordはこの単位で区別する。"""
+        parts, node = [cmd.name], getattr(cmd, "parent", None)
+        while node is not None:
+            parts.append(node.name)
+            node = getattr(node, "parent", None)
+        return "/" + " ".join(reversed(parts))
+
     total = 0
     for c in cmds:
         if isinstance(c, discord.app_commands.Group):
-            subs = [s.name for s in c.walk_commands()]
-            check(f"/{c.name} のサブコマンド {len(subs)}件に重複なし",
-                  len(subs) == len(set(subs)), subs)
-            total += len(subs)
+            # 同じ名前でも親グループが違えば別コマンドなので、
+            # 呼び出し名まで含めて重複を見る。
+            #（例: /config menu interval と /config store interval は別）
+            paths = [full_path(c, s) for s in c.walk_commands()]
+            dup = sorted({p for p in paths if paths.count(p) > 1})
+            check(f"/{c.name} のサブコマンド {len(paths)}件に重複なし", not dup, dup)
+            total += len(paths)
         else:
             total += 1
     check(f"総コマンド数 {total}件", total >= 20, total)

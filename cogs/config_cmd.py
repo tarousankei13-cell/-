@@ -9,10 +9,12 @@ from discord import app_commands
 from discord.ext import commands
 from sqlalchemy import select
 
+import config
 import emoji as E
 from core import settings
 from db.models import SubsidyRule
 from db.session import session_scope
+from services.mcd import store_index
 from cogs._checks import admin_only, handle_check_failure
 from ui import embeds
 
@@ -29,6 +31,7 @@ class ConfigCog(commands.Cog):
     subsidy_group = app_commands.Group(name="subsidy", description="負担率の設定", parent=group)
     channel_group = app_commands.Group(name="channel", description="チャンネルの設定", parent=group)
     menu_group = app_commands.Group(name="menu", description="メニュー同期の設定", parent=group)
+    store_group = app_commands.Group(name="store", description="店舗一覧の設定", parent=group)
 
     # -- 一覧 ---------------------------------------------------
 
@@ -356,6 +359,42 @@ class ConfigCog(commands.Cog):
         await settings.set_value("menu_notify_diff", enabled, updated_by=interaction.user.id)
         await interaction.response.send_message(
             embed=embeds.ok(f"メニュー差分の通知を **{'ON' if enabled else 'OFF'}** にしました。"),
+            ephemeral=True,
+        )
+
+    # -- 店舗一覧の同期 -----------------------------------------
+
+    @store_group.command(name="interval", description="店舗一覧を巡回更新する間隔を設定します")
+    @app_commands.describe(minutes="何分ごとに巡回するか（5〜1440）")
+    @admin_only()
+    async def store_interval(
+        self, interaction: discord.Interaction, minutes: app_commands.Range[int, 5, 1440]
+    ) -> None:
+        await settings.set_value(
+            "store_index_sync_minutes", int(minutes), updated_by=interaction.user.id
+        )
+        batch = config.STORE_INDEX_REFRESH_BATCH
+        total = store_index.count() or 3036
+        cycle = (total / max(batch, 1)) * int(minutes) / 60
+        await interaction.response.send_message(
+            embed=embeds.ok(
+                f"店舗一覧の巡回更新を **{minutes}分ごと** に設定しました。\n"
+                f"1回に {batch:,} 店舗を取り直すので、全 {total:,} 店舗を"
+                f"**約{cycle:.1f}時間**で一周します。\n"
+                f"{E.INFO} 変化が無ければ通信量は0バイトです（ETag）。"
+            ),
+            ephemeral=True,
+        )
+
+    @store_group.command(name="notify", description="店舗一覧の変化の通知を切り替えます")
+    @app_commands.describe(enabled="開店・閉店・店名変更を管理者チャンネルへ通知するか")
+    @admin_only()
+    async def store_notify(self, interaction: discord.Interaction, enabled: bool) -> None:
+        await settings.set_value("store_notify_diff", enabled, updated_by=interaction.user.id)
+        await interaction.response.send_message(
+            embed=embeds.ok(
+                f"店舗一覧の変化の通知を **{'ON' if enabled else 'OFF'}** にしました。"
+            ),
             ephemeral=True,
         )
 
