@@ -15,6 +15,7 @@ TESTS = [
     ("管理者コマンド", "test_admin_cmds.py"),
     ("注文Saga（端から端まで）", "test_order_e2e.py"),
     ("代理実績の同一性", "test_achievement.py"),
+    ("定期処理・バックアップ", "test_tasks.py"),
     ("安全性（認証情報・権限）", "test_security.py"),
 ]
 
