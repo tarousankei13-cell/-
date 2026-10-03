@@ -246,27 +246,29 @@ class AdminPanel(discord.ui.View):
 
 class InvitePanel(discord.ui.View):
     """
-    招待キャンペーンの常設パネル。
+    紹介プログラムの常設パネル。
 
-    ・自分の招待コードを見る（本人にだけ）
-    ・招待コードを入力して紐づける（新しく来た人）
-    ・いまの状況を見る（何人招待したか・あといくら配れるか）
+    ・招待リンクを発行（本人専用・1サーバーにつき1本）
+    ・プロモコード入力（手でコードを貼る方）
+    ・DMを再送信（受取ボタンのDMが届かなかった方）
+    ・紹介状況（何名達成したか・次の特典まであと何名か）
+    ・通知設定（お知らせを受け取るかどうか）
     """
 
     def __init__(self) -> None:
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="自分の招待コードを見る", emoji=E.KEY,
-        style=discord.ButtonStyle.primary, custom_id="panel:invite:mycode", row=0,
+        label="招待リンクを発行", emoji=E.CHARGE,
+        style=discord.ButtonStyle.primary, custom_id="panel:invite:link", row=0,
     )
-    async def mycode(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+    async def issue(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         from ui import invite_flows
 
-        await invite_flows.show_my_code(interaction)
+        await invite_flows.issue_link(interaction)
 
     @discord.ui.button(
-        label="招待コードを入力する", emoji=E.PLUS,
+        label="プロモコード入力", emoji=E.TICKET,
         style=discord.ButtonStyle.success, custom_id="panel:invite:enter", row=0,
     )
     async def enter(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -275,7 +277,16 @@ class InvitePanel(discord.ui.View):
         await invite_flows.open_code_modal(interaction)
 
     @discord.ui.button(
-        label="いまの状況", emoji=E.CHART,
+        label="DMを再送信", emoji=E.MAIL,
+        style=discord.ButtonStyle.secondary, custom_id="panel:invite:resend", row=1,
+    )
+    async def resend(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from ui import invite_flows
+
+        await invite_flows.resend_dm(interaction)
+
+    @discord.ui.button(
+        label="紹介状況", emoji=E.CHART,
         style=discord.ButtonStyle.secondary, custom_id="panel:invite:status", row=1,
     )
     async def status(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -283,9 +294,22 @@ class InvitePanel(discord.ui.View):
 
         await invite_flows.show_status(interaction)
 
+    @discord.ui.button(
+        label="通知設定", emoji=E.BELL,
+        style=discord.ButtonStyle.secondary, custom_id="panel:invite:notify", row=1,
+    )
+    async def notify(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from ui import invite_flows
+
+        await invite_flows.toggle_notify(interaction)
+
 
 # main.py の setup_hook が、ここに並んだビューを add_view() で復元する
-PERSISTENT_VIEWS = [OrderPanel, ChargePanel, AdminPanel, InvitePanel]
+# ⚠️ ClaimView は DM に出す。再起動したあとも押せるように、
+#    ここに並べて add_view() で復元する。
+from ui.invite_flows import ClaimView  # noqa: E402
+
+PERSISTENT_VIEWS = [OrderPanel, ChargePanel, AdminPanel, InvitePanel, ClaimView]
 
 def build_order_panel() -> tuple[discord.Embed, discord.ui.View]:
     """設置・貼り直し用。現在の注文方式を反映したパネルを作る。"""

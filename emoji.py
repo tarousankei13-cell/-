@@ -50,6 +50,10 @@ NOTE = "📝"        # メモ・感想
 
 # その他
 PARTY = "🎉"       # 初回・達成
+GIFT = "🎁"        # 特典
+TICKET = "🎟️"      # プロモコード
+MAIL = "📨"        # DM
+UNLOCK = "🔓"      # 利用条件
 PLUS = "➕"
 MINUS = "➖"
 

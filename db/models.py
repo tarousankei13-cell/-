@@ -103,6 +103,8 @@ class User(Base):
     # 招待キャンペーン用。本人の招待コードと、誰に招待されたか。
     invite_code: Mapped[str | None] = mapped_column(String(16), unique=True, index=True)
     invited_by: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    # 紹介プログラムのお知らせを受け取るか（通知設定ボタンで切り替える）
+    invite_notify: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -439,6 +441,52 @@ class Invite(Base):
     rewarded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     reward_amount: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     rewarded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    # ---- ここから下は、紹介プログラムのリニューアルで増えたもの ----
+    # どのサーバーでの招待か（リンクは1人1サーバーにつき1本）
+    guild_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    # 本人がDMの受取ボタンを押したか。押すまでは数に入れない。
+    claimed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # 条件を満たす注文（既定で定価400円以上）を終えたか
+    qualified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    qualified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class InviteLink(Base):
+    """
+    BOT が本人に代わって発行した Discord の招待リンク。
+
+    ⚠️ Discord 側の `invite.inviter` は **BOT** になるので、
+       そのままでは誰の招待か分からない。ここで結び付けておく。
+    """
+    __tablename__ = "invite_links"
+
+    code: Mapped[str] = mapped_column(String(32), primary_key=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    discord_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    channel_id: Mapped[int | None] = mapped_column(BigInteger)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class InvitePayout(Base):
+    """
+    紹介者へ渡した特典の記録。
+
+    ⚠️ 「2名ごとに¥500」は**何度も発火する**。同じ区切りで二度払わない
+       ことを、DBの形（主キー）で保証する。計算間違いで二重に配ると
+       実際にお金が出ていく。
+    """
+    __tablename__ = "invite_payouts"
+
+    inviter_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    # 何回目の発火か（1回目・2回目…）。達成人数ではなく回数で数える。
+    milestone: Mapped[int] = mapped_column(Integer, primary_key=True)
+    amount: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # この発火を満たした時点の達成人数（あとから検算できるように）
+    reached: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

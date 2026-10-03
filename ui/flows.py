@@ -740,7 +740,7 @@ async def run_order(
     await push_receipt_page(result)
     await saga.mark_notified(result.order_id)
     await post_achievement(interaction, result)
-    await grant_invite_reward(interaction)
+    await grant_invite_reward(interaction, result)
     confirm_choices(decoded, result)
 
 
@@ -787,7 +787,9 @@ async def push_receipt_page(result: saga.OrderResult) -> None:
         log.exception("注文番号をページへ送れませんでした")
 
 
-async def grant_invite_reward(interaction: discord.Interaction) -> None:
+async def grant_invite_reward(
+    interaction: discord.Interaction, result: "saga.OrderResult | None" = None
+) -> None:
     """
     招待の特典は「招待された人の初回注文」で確定することが多いので、
     注文が成立したここで確かめる。
@@ -798,7 +800,11 @@ async def grant_invite_reward(interaction: discord.Interaction) -> None:
         from core import invite as inv
         from ui import invite_flows
 
-        paid = await inv.grant_if_ready(interaction.user.id)
+        # ⚠️ 定価を渡すこと。渡さないと最低注文額の条件を判定できず、
+        #    100円の注文でも達成になってしまう。
+        paid = await inv.grant_if_ready(
+            interaction.user.id, int(getattr(result, "list_price", 0) or 0)
+        )
         if not paid:
             return
         async with session_scope() as s:

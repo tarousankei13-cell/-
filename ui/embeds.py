@@ -416,60 +416,81 @@ def receipt_fallback(
 
 
 def invite_panel() -> discord.Embed:
-    """招待キャンペーンの常設パネル。"""
+    """紹介プログラムの常設パネル。"""
     from core import invite as inv
-
-    reward = inv.reward_amount()
-    invitee = inv.invitee_amount()
-    cond = inv.condition()
 
     if not inv.enabled():
         return discord.Embed(
-            title=f"{E.PARTY} 招待キャンペーン",
+            title=f"{E.CHARGE} 紹介プログラムのご案内",
             description=(
-                "いまは開催していません。\n"
-                "次の開催までお待ちください。"
+                "ただいま開催しておりません。\n"
+                "次回の開催までお待ちください。"
             ),
             color=GREY,
         )
 
-    cond_text = {
-        "join": "お友だちがコードを入力した時点で",
-        "first_order": "お友だちが**はじめて注文された**時点で",
-    }.get(cond, "条件を満たした時点で")
+    every = inv.reward_every()
+    amount = inv.reward_amount()
+    invitee = inv.invitee_amount()
+    low = inv.min_order()
 
-    lines = [f"{cond_text}、**{yen(reward)}** を差し上げます。"]
+    if every <= 1:
+        bonus = (
+            f"招待された方がご注文を完了されるごとに、"
+            f"紹介者様へ **{yen(amount)}** を残高に加算いたします。"
+        )
+    else:
+        bonus = (
+            f"招待した方が **{every}名様** ご注文を完了されるごとに、"
+            f"紹介者様へ **{yen(amount)}** を残高に加算いたします。"
+        )
     if invitee:
-        lines.append(f"招待されたご本人にも **{yen(invitee)}** 差し上げます。")
+        bonus += f"\n招待された方ご本人にも **{yen(invitee)}** 差し上げます。"
 
     e = discord.Embed(
-        title=f"{E.PARTY} 招待キャンペーン",
-        description="\n".join(lines),
+        title="紹介プログラムの案内",
+        description="お友達を紹介いただき、双方で残高を積み上げましょう。",
         color=GREEN,
     )
+    e.add_field(name=f"{E.GIFT} 紹介の特典", value=bonus, inline=False)
+
+    steps = [
+        f"❶ 「{E.CHARGE} 招待リンクを発行」でご自身専用のリンクを作成"
+        "（1サーバーにつき1個）",
+        "❷ そのリンクをお友達に共有（参加時に自動でコード適用）",
+        f"❸ 手動でコードを入力される方は「{E.TICKET} プロモコード入力」より貼り付け",
+        f"❹ お友達が DM の受取ボタンを押し、ご注文"
+        + (f"（定価 {yen(low)}以上）" if low else "")
+        + "を完了",
+    ]
+    if every <= 1:
+        steps.append(f"❺ 1名様ごとに **{yen(amount)}** をあなたへ")
+    else:
+        steps.append(
+            f"❺ {every}名様の完了で **{yen(amount)}** をあなたへ"
+            f"（以降 {every}名ごとに繰り返し発火）"
+        )
+    e.add_field(name="利用の流れ", value="\n".join(steps), inline=False)
+
+    conds = []
+    if inv.min_account_days():
+        conds.append(
+            f"Discord アカウント作成から **{inv.min_account_days()}日以上**"
+        )
+    if inv.min_member_hours():
+        conds.append(
+            f"サーバー参加から **{inv.min_member_hours()}時間以上**（手動入力時）"
+        )
+    conds.append("ご自身の招待コードはご利用いただけません")
     e.add_field(
-        name=f"{E.KEY} お友だちを誘う方",
-        value=(
-            "1. 下の「自分の招待コードを見る」を押す\n"
-            "2. 出てきた**6文字のコード**をお友だちに伝える\n"
-            "3. お友だちがこのサーバーに参加して、コードを入力する"
-        ),
-        inline=False,
+        name="利用条件（被招待者様）", value="・" + "\n・".join(conds), inline=False
     )
-    e.add_field(
-        name=f"{E.PLUS} 招待された方",
-        value=(
-            "下の「招待コードを入力する」から、**6文字のコード**を入れてください。\n"
-            "入力は一度だけです。"
-        ),
-        inline=False,
-    )
-    limit = int(settings.get("invite_max_per_user", 0))
-    notes = ["押した先の画面は、あなたにしか見えません。"]
+
+    limit = inv.max_per_user()
+    foot = "押した先の画面は、あなたにしか見えません。"
     if limit:
-        notes.append(f"お一人が特典を受け取れるのは {limit} 名までです。")
-    notes.append("ご自身のコードは使えません。")
-    e.add_field(name=f"{E.INFO} ご注意", value="・" + "\n・".join(notes), inline=False)
+        foot += f" お一人あたり {limit} 名まで対象です。"
+    e.set_footer(text=foot)
     return e
 
 

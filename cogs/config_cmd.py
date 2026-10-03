@@ -1036,10 +1036,15 @@ class ConfigCog(commands.Cog):
 
     @campaign.command(name="start", description="招待キャンペーンを始めます")
     @app_commands.describe(
-        reward="招待した人に渡す額（円）",
+        reward="発火1回につき、紹介した人に渡す額（円）",
+        every="何名の達成ごとに発火するか（1なら1人ごと）",
+        min_order="達成とみなす最低の注文額（定価・円）。0で無制限",
         budget="全体で配る上限（円）。0で無制限",
-        max_per_user="1人が特典をもらえる招待の上限。0で無制限",
+        max_per_user="1人が特典をもらえる人数の上限。0で無制限",
         invitee_reward="招待された人にも渡す額（円）。0なら渡さない",
+        account_days="招待された人に求めるアカウント作成からの日数",
+        member_hours="招待された人に求める参加からの時間（手動入力時）",
+        link_days="発行する招待リンクの有効期限（日）",
         condition="特典を渡す条件",
     )
     @app_commands.choices(condition=[
@@ -1050,27 +1055,42 @@ class ConfigCog(commands.Cog):
     async def campaign_start(
         self, interaction: discord.Interaction,
         reward: app_commands.Range[int, 1, 100000],
+        every: app_commands.Range[int, 1, 100] = 2,
+        min_order: app_commands.Range[int, 0, 100000] = 400,
         budget: app_commands.Range[int, 0, 10000000] = 10000,
         max_per_user: app_commands.Range[int, 0, 1000] = 5,
         invitee_reward: app_commands.Range[int, 0, 100000] = 0,
+        account_days: app_commands.Range[int, 0, 365] = 14,
+        member_hours: app_commands.Range[int, 0, 720] = 1,
+        link_days: app_commands.Range[int, 1, 30] = 3,
         condition: app_commands.Choice[str] | None = None,
     ) -> None:
         cond = condition.value if condition else "first_order"
         for key, value in (
             ("invite_reward", int(reward)),
+            ("invite_reward_every", int(every)),
+            ("invite_min_order", int(min_order)),
             ("invite_budget", int(budget)),
             ("invite_max_per_user", int(max_per_user)),
             ("invite_reward_invitee", int(invitee_reward)),
+            ("invite_min_account_days", int(account_days)),
+            ("invite_min_member_hours", int(member_hours)),
+            ("invite_link_days", int(link_days)),
             ("invite_condition", cond),
             ("invite_enabled", True),
         ):
             await settings.set_value(key, value, updated_by=interaction.user.id)
 
-        per = int(reward) + int(invitee_reward)
+        per = int(reward) + int(invitee_reward) * int(every)
         possible = (int(budget) // per) if (budget and per) else None
         lines = [
-            f"{E.YEN} 招待した方へ　**{embeds.yen(int(reward))}**",
+            f"{E.YEN} 紹介した方へ　**{embeds.yen(int(reward))}**"
+            + (f"（**{every}名**の達成ごと・繰り返し）" if every > 1 else "（1名ごと）"),
         ]
+        if min_order:
+            lines.append(
+                f"{E.BURGER} 達成とみなす最低の注文額　**{embeds.yen(int(min_order))}**（定価）"
+            )
         if invitee_reward:
             lines.append(f"{E.YEN} 招待された方へ　**{embeds.yen(int(invitee_reward))}**")
         lines.append(
@@ -1087,7 +1107,21 @@ class ConfigCog(commands.Cog):
             f"{E.OK} 特典を渡す条件　"
             + ("お友だちのはじめての注文" if cond == "first_order" else "コードの入力時")
         )
+        lines.append(
+            f"{E.USER} 招待された方の条件　"
+            + "・".join(
+                ([f"アカウント{account_days}日以上"] if account_days else [])
+                + ([f"参加{member_hours}時間以上"] if member_hours else [])
+            or ["なし"])
+        )
+        lines.append(f"{E.CHARGE} 招待リンクの有効期限　**{link_days}日**")
         lines.append("")
+        if not int(settings.get("invite_link_channel", 0) or 0):
+            lines.append(
+                f"{E.WARN} **`/config campaign link_channel #チャンネル` で"
+                "招待リンクの発行先を指定してください。**\n"
+                "　 指定するまで、利用者は招待リンクを発行できません。"
+            )
         lines.append(f"`/panel invite #チャンネル` でパネルを設置してください。")
 
         await interaction.response.send_message(
@@ -1156,6 +1190,43 @@ class ConfigCog(commands.Cog):
                 f"招待の成立を {channel.mention} に投稿します。\n"
                 f"{E.INFO} 誰が誰を招待したかは出しません（成立件数だけ）。"
                 if channel else "招待の成立を投稿しないようにしました。"
+            ),
+            ephemeral=True,
+        )
+
+    @campaign.command(
+        name="link_channel",
+        description="招待リンクの発行先チャンネル（指定するまで発行できません）",
+    )
+    @admin_only()
+    async def campaign_link_channel(
+        self, interaction: discord.Interaction, channel: discord.TextChannel,
+    ) -> None:
+        """
+        ⚠️ ここで指定した場所へ、招待された人が入ってくる。
+           新しく来た人が読めるチャンネルを選ぶこと。
+        """
+        me = interaction.guild.me if interaction.guild else None
+        if me is not None:
+            perms = channel.permissions_for(me)
+            if not perms.create_instant_invite:
+                await interaction.response.send_message(
+                    embed=embeds.warn(
+                        f"{channel.mention} で招待を作る権限がありません。\n"
+                        "BOT に「招待を作成」の権限をお与えください。"
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+        await settings.set_value(
+            "invite_link_channel", channel.id, updated_by=interaction.user.id
+        )
+        await interaction.response.send_message(
+            embed=embeds.ok(
+                f"招待リンクの発行先を {channel.mention} にしました。\n"
+                f"{E.INFO} 招待された方は、このチャンネルに入ってきます。\n"
+                "新しく来た方が読める場所になっているか、ご確認ください。"
             ),
             ephemeral=True,
         )

@@ -82,8 +82,15 @@ async def main():
         all_ids += ids
     check("custom_idが全体で一意", len(all_ids) == len(set(all_ids)),
           [i for i in all_ids if all_ids.count(i) > 1])
-    check("命名規則 panel:*:* に従っている",
-          all(i.startswith("panel:") and i.count(":") == 2 for i in all_ids), all_ids)
+    # ⚠️ パネルのボタンは panel:<パネル名>:<操作>。
+    #    DM に出すビュー（受取ボタン）はパネルではないので <機能>:<操作>。
+    #    どちらもコロンで区切り、再起動後に見分けられる形にしておく。
+    check("命名規則に従っている",
+          all(
+              (i.startswith("panel:") and i.count(":") == 2)
+              or (not i.startswith("panel:") and i.count(":") == 1)
+              for i in all_ids
+          ), all_ids)
 
     print("\n[6] 永続ビューの登録")
     for factory in PERSISTENT_VIEWS:

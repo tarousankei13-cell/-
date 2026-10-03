@@ -406,21 +406,42 @@ class McdBot(commands.Bot):
             log.info("招待元を特定できませんでした（候補 %d 件）", len(grown))
             return
 
-        inviter = next(
-            (i.inviter for i in await member.guild.invites() if i.code == grown[0]),
-            None,
-        )
-        if inviter is None or inviter.bot or inviter.id == member.id:
+        code = grown[0]
+
+        # ⚠️ BOT が本人に代わって作った招待は、Discord 側の inviter が
+        #    **BOT** になる。先に控えの表から持ち主を引くこと。
+        #    ここを飛ばすと、紹介者ではなく BOT の実績になってしまう。
+        inviter_id = await inv.owner_of_link(code)
+        if inviter_id is None:
+            inviter = next(
+                (i.inviter for i in await member.guild.invites() if i.code == code),
+                None,
+            )
+            if inviter is None or inviter.bot:
+                return
+            inviter_id = inviter.id
+        if inviter_id == member.id:
             return
 
         await user_repo.get_or_create(member.id)
-        await user_repo.get_or_create(inviter.id)
+        await user_repo.get_or_create(inviter_id)
         try:
-            await inv.link(member.id, inviter.id, source="auto")
+            # 自動で入った方は「参加からの時間」は問わない（入った瞬間なので）
+            inv.check_eligibility(
+                account_created=member.created_at, joined_at=None, manual=False,
+            )
+            await inv.link(
+                member.id, inviter_id, source="auto", guild_id=member.guild.id,
+            )
         except inv.InviteError as e:
             log.info("自動の紐づけを見送りました: %s", e)
             return
-        await inv.grant_if_ready(member.id)
+
+        # ⚠️ ここではまだ特典を渡さない。本人が DM の受取ボタンを
+        #    押して初めて数に入る。
+        from ui import invite_flows
+
+        await invite_flows.send_claim_dm(self, member.id, inviter_id)
 
     async def _start_web(self) -> None:
         """

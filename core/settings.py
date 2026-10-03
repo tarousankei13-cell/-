@@ -59,6 +59,12 @@ DEFAULTS: dict[str, Any] = {
     "invite_max_per_user": defaults.INVITE_MAX_PER_USER,
     "invite_budget": defaults.INVITE_BUDGET,
     "invite_condition": defaults.INVITE_CONDITION,
+    "invite_reward_every": defaults.INVITE_REWARD_EVERY,
+    "invite_min_order": defaults.INVITE_MIN_ORDER,
+    "invite_min_account_days": defaults.INVITE_MIN_ACCOUNT_DAYS,
+    "invite_min_member_hours": defaults.INVITE_MIN_MEMBER_HOURS,
+    "invite_link_channel": defaults.INVITE_LINK_CHANNEL,
+    "invite_link_days": defaults.INVITE_LINK_DAYS,
     "channel_invite": None,
 }
 
