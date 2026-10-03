@@ -89,6 +89,13 @@ def shape(it):
 
 
 def main():
+    import tempfile
+    from pathlib import Path as _P
+
+    # 検証でプロジェクトの data/ を汚さないよう、控えの保存先を移す
+    SB.STORE_PATH = _P(tempfile.mkdtemp()) / "slot_bridge.json"
+    SB._loaded = True
+
     from ui.menu_flows import build_order_item
 
     menu = parse_menu("13934", build_catalog())
