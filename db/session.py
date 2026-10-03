@@ -84,12 +84,46 @@ async def _add_missing_columns(conn) -> None:
                 continue
             try:
                 col_type = col.type.compile(conn.dialect)
+                # ⚠️ ALTER TABLE ADD COLUMN は、既存の行を **NULL** にする。
+                #    「0 を入れておく」つもりの列が NULL になると、
+                #    足し算で落ちたり、件数の数え上げから漏れたりする。
+                #    モデルに既定値があるなら、それを使って必ず埋める。
+                default = _scalar_default(col)
+                suffix = "" if default is None else f" DEFAULT {default}"
                 await conn.exec_driver_sql(
-                    f"ALTER TABLE {table.name} ADD COLUMN {col.name} {col_type}"
+                    f"ALTER TABLE {table.name} ADD COLUMN {col.name} {col_type}{suffix}"
                 )
+                if default is not None:
+                    await conn.exec_driver_sql(
+                        f"UPDATE {table.name} SET {col.name} = {default} "
+                        f"WHERE {col.name} IS NULL"
+                    )
                 log.info("列を追加しました: %s.%s", table.name, col.name)
             except Exception as e:
                 log.warning("列 %s.%s を追加できませんでした: %s", table.name, col.name, e)
+
+
+def _scalar_default(col) -> str | None:
+    """
+    その列の既定値を、SQL にそのまま書ける形で返す。
+
+    関数で決まる既定値（作成日時など）は、あとから一律に入れる意味が
+    ないので扱わない（NULL のままにする）。
+    """
+    d = getattr(col, "default", None)
+    if d is None or getattr(d, "is_callable", False):
+        return None
+    arg = getattr(d, "arg", None)
+    if callable(arg) or arg is None:
+        return None
+    if isinstance(arg, bool):
+        return "1" if arg else "0"
+    if isinstance(arg, (int, float)):
+        return str(arg)
+    if isinstance(arg, str):
+        escaped = arg.replace("'", "''")
+        return f"'{escaped}'"
+    return None
 
 
 def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
