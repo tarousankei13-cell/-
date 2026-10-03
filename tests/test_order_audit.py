@@ -72,8 +72,7 @@ async def main():
                     cands = menu.choice_candidates(slot, minutes)
                     if cands:
                         picks[slot.code] = cands[0].code
-                class C:
-                    pickup = "takeOut"
+                C = type("C", (), {"pickup": "takeOut", "menu": menu})
                 try:
                     item = build_order_item(C, p, picks)
                     d = decode_hex(build_hex("13934", [item], "takeOut"))
@@ -112,7 +111,7 @@ async def main():
 
     print("\n[5] カートの中身が揃っているか、確定前に見る ★")
     c5 = cart()
-    item = build_order_item(type("C", (), {"pickup": "takeOut"}), meal, {})
+    item = build_order_item(type("C", (), {"pickup": "takeOut", "menu": menu}), meal, {})
     c5.items.append(item)               # 枠が空のまま入れる
     bad = c5._incomplete_items(12*60)
     check("揃っていない商品を見つける ★", bad, bad)
@@ -130,7 +129,7 @@ async def main():
         for code in ("1010", "1020", "9180"):
             p6 = menu.products[code]
             c6.items.append(build_order_item(
-                type("C", (), {"pickup": pickup}), p6,
+                type("C", (), {"pickup": pickup, "menu": menu}), p6,
                 {s.code: (menu.choice_candidates(s, 12*60) or [p6])[0].code
                  for s in p6.slots_of("choices")}))
         reprice(menu, c6.items, pickup)
@@ -172,6 +171,66 @@ async def main():
                         if not q.is_orderable_at(minutes):
                             odd.append((minutes // 60, f"{p.name}の{q.name}"))
     check("時間外のものが候補に混ざらない ★", not odd, odd[:4])
+
+    print("\n[10] ナゲットのソース枠 ★")
+    # ⚠️ 利用者から「食べくらべポテナゲ特大が注文できない」と報告。
+    #    原因はナゲットが持つソース枠(7251)を一切扱っていなかったこと。
+    nugget = menu.products["1610"]
+    sauce_slot = next(s for s in nugget.slots_of("choices") if s.code == "7251")
+    check("ナゲットにソース枠がある（前提）", sauce_slot.min_quantity >= 1,
+          sauce_slot.min_quantity)
+    check("枠に参照が書かれていない（前提）★", not sauce_slot.reference_product,
+          sauce_slot.reference_product)
+    check("他の商品の同じ枠から参照を引ける ★",
+          menu.slot_reference(sauce_slot) == "5502",
+          menu.slot_reference(sauce_slot))
+    sauces = menu.choice_candidates(sauce_slot, 12*60)
+    check("ソース3種が候補に出る ★", len(sauces) == 3, [q.name for q in sauces])
+    check("食べ物が混ざらない ★", all("ソース" in q.name for q in sauces),
+          [q.name for q in sauces])
+    check("単品のナゲットが注文できる ★", menu.orderable(nugget, 12*60))
+
+    print("\n[11] ポテナゲ（構成品がソース枠を持つ）★")
+    for code in ("9222", "9221", "9094", "9099"):
+        p11 = menu.products.get(code)
+        if p11 is None:
+            continue
+        nested = menu.nested_choices(p11)
+        check(f"{p11.name[:18]} の入れ子の枠を見つける ★", len(nested) == 1, nested)
+        picks = {f"{c}/{sl.code}": menu.choice_candidates(sl, 12*60)[0].code
+                 for c, sl in nested}
+        C11 = type("C", (), {"pickup": "takeOut", "menu": menu})
+        item = build_order_item(C11, p11, picks)
+        # セット → 構成品 → 枠 → ソース の4段になる
+        def depth(n):
+            return 1 + max([depth(c) for c in n.components], default=0)
+        d11 = decode_hex(build_hex("13934", [item], "takeOut")).items[0]
+        check(f"{p11.name[:18]} のソースが注文に入る ★", depth(d11) == 4, depth(d11))
+        leaves = [x.product_code for x in d11.walk()]
+        check(f"{p11.name[:18]} にソースの商品コードが入る ★",
+              any(c in ("5502", "5503", "5644") for c in leaves), leaves)
+
+    print("\n[12] ソースを選ばないと追加できない ★")
+    c12 = cart()
+    pote = menu.products["9222"]
+    ov12 = OptionView(c12, pote, pote.slots_of("choices"))
+    check("ソース枠が画面に出る ★", any(sl.code == "7251" for sl in ov12.choices),
+          [sl.code for sl in ov12.choices])
+    ov12.picks = {}
+    itx12 = FakeInteraction(user, client)
+    await ov12._on_ok(itx12)
+    check("選ばないとカートに入らない ★", len(c12.items) == 0, len(c12.items))
+    check("理由を伝える ★", "選ばれていません" in itx12.text(), itx12.text()[:140])
+
+    print("\n[13] 画面に枠コードを出さない ★")
+    # スクリーンショットで「選択枠 9987009」と出ていた
+    meal13 = menu.products["9180"]
+    ov13 = OptionView(cart(), meal13, meal13.slots_of("choices"))
+    body13 = "".join(f.name for f in ov13.build_embed().fields)
+    check("見出しに枠コードが出ない ★",
+          not any(sl.code in body13 for sl in ov13.choices), body13)
+    check("人が読める見出しになっている ★",
+          "ドリンク" in body13 or "サイド" in body13, body13)
 
     await close_db()
     print(f"\n{'='*52}\n  成功 {ok} / 失敗 {fail}\n{'='*52}")

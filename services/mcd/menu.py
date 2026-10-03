@@ -334,6 +334,10 @@ class ParsedMenu:
     collections: list[Collection]
 
     size_groups: dict[str, str] = field(default_factory=dict)   # code → 代表コード
+    # products に載っていない商品コード → 名前（groupMenu 由来）。
+    # 選択枠の参照を名前で読み替えるのに使う。
+    aliases: dict[str, str] = field(default_factory=dict)
+    _slot_ref_cache: dict[str, str] | None = field(default=None, repr=False)
 
     def collection_of(self, code: str) -> "Collection | None":
         """
@@ -357,6 +361,76 @@ class ParsedMenu:
         ]
         return sorted(out, key=lambda p: p.code)
 
+    # 選択枠の候補を絞る価格帯。参照商品の値段の何倍までを同じ枠の
+    # 仲間とみなすか。
+    # ⚠️ 実データで全枠を確認して決めた値（docs/05 §5.10）。
+    #    ナゲットのソース枠（参照50円）は3種のソースだけが残り、
+    #    セットのサイド枠（参照370円）からは50円のソースだけが外れ、
+    #    ドリンク枠（参照310円）は140円のコーヒーを含め24件すべて残る。
+    PRICE_BAND = (0.3, 3.0)
+
+    def slot_reference(self, slot: Slot) -> str:
+        """
+        その枠に入る商品の代表。見つからなければ空文字。
+
+        ⚠️ 3段階で探す。カタログがそのままでは引けない形をしている。
+          1. 枠が持つ既定・参照商品
+          2. **同じ枠コードを使う他の商品**の参照
+             （ナゲット5ピースの枠7251には参照が無いが、
+               15ピースの同じ枠には 6048 が入っている）
+          3. 参照が products に無ければ、**同じ名前の注文できる商品**
+             （6048「バーベキューソース」は products に無く、
+               注文できるのは同名の 5502）
+        """
+        base = slot.default_product or slot.reference_product
+        if not base:
+            base = self._slot_refs().get(slot.code, "")
+        if not base:
+            return ""
+        if base in self.products:
+            return base
+        # 名前で読み替える
+        want = self._display_name(base)
+        if want:
+            for code, q in self.products.items():
+                if q.name == want:
+                    return code
+        return ""
+
+    def _slot_refs(self) -> dict[str, str]:
+        """枠コード → 参照商品。全商品を走査して1度だけ作る。"""
+        if self._slot_ref_cache is None:
+            found: dict[str, str] = {}
+            for prod in self.products.values():
+                for sl in prod.slots_of("choices"):
+                    ref = sl.default_product or sl.reference_product
+                    if ref and sl.code not in found:
+                        found[sl.code] = ref
+            self._slot_ref_cache = found
+        return self._slot_ref_cache
+
+    def _display_name(self, code: str) -> str:
+        """products に無い商品の名前（groupMenu 由来）。"""
+        return self.aliases.get(str(code), "")
+
+    def _pool_for(self, base: str) -> list[str]:
+        """
+        候補の母集団。
+
+        ⚠️ サイズ違いしか載っていないカテゴリがある。
+           ポテトSは単体ではどのカテゴリにも入っていないが、
+           同じサイズ群のポテトMはサイドメニューに入っている。
+           自分で引けなければ、サイズ違いの仲間から引く。
+        """
+        col = self.collection_of(base)
+        if col:
+            return list(col.product_codes)
+        for q in self.size_variants(base):
+            col = self.collection_of(q.code)
+            if col:
+                return list(col.product_codes)
+        return [q.code for q in self.size_variants(base)] or [base]
+
     def choice_candidates(
         self, slot: Slot, minutes: int | None = None
     ) -> list[Product]:
@@ -374,15 +448,23 @@ class ParsedMenu:
         マクドナルド側から「ただいまのお時間は取り扱いがありません」と
         弾かれてしまうため。
         """
-        base = slot.default_product or slot.reference_product
+        base = self.slot_reference(slot)
         if not base:
             return []
 
-        col = self.collection_of(base)
-        codes = list(col.product_codes) if col else []
-        if not codes:
-            # カテゴリが分からないときは、せめてサイズ違いを出す
-            codes = [p.code for p in self.size_variants(base)] or [base]
+        codes = self._pool_for(base)
+        # ⚠️ 母集団には、その枠に入れられないものが混ざる。
+        #    サイドメニューには50円のソース（ナゲットの付属）が入っており、
+        #    セットのサイドとしては選べない。
+        #    参照商品とかけ離れた値段のものは、同じ枠の仲間ではない。
+        lo, hi = self.PRICE_BAND
+        ref_price = self.products[base].price_takeout or 0
+        if ref_price > 0:
+            codes = [
+                c for c in codes
+                if (q := self.products.get(str(c))) is None
+                or lo * ref_price <= (q.price_takeout or 0) <= hi * ref_price
+            ]
 
         from services.mcd import slot_rules
 
@@ -398,8 +480,8 @@ class ParsedMenu:
                 continue
             out.append(p)
 
-        # 既定の商品は、時間帯の判定に関わらず必ず残す
-        # （マクドナルド側が既定として指定しているものなので）
+        # 代表の商品は、時間帯の判定に関わらず必ず残す
+        # （マクドナルド側が代表として指定しているものなので）
         if base not in [p.code for p in out]:
             base_p = self.products.get(str(base))
             if base_p is not None and (
@@ -415,6 +497,27 @@ class ParsedMenu:
         out.sort(key=lambda q: (q.code not in safe, q.name))
         return out
 
+    def nested_choices(self, product: Product) -> list[tuple[str, Slot]]:
+        """
+        構成品が持っている選択枠。(構成品のコード, 枠) の一覧。
+
+        ⚠️ ポテナゲのように、セットの**構成品**（ナゲット）が
+           さらに選択枠（ソース）を持っていることがある。
+           実データで7商品。これを送らないと、必須の枠が空のまま
+           注文することになり、マクドナルドに断られる。
+
+           「食べくらべポテナゲ特大が注文できない」の原因がこれ。
+        """
+        out: list[tuple[str, Slot]] = []
+        for comp in product.slots_of("composition"):
+            inner = self.products.get(str(comp.code))
+            if inner is None:
+                continue
+            for slot in inner.slots_of("choices"):
+                if slot.min_quantity >= 1:
+                    out.append((str(comp.code), slot))
+        return out
+
     def unfillable_slots(self, product: Product, minutes: int | None = None) -> list[Slot]:
         """
         埋めようがない選択枠。
@@ -426,7 +529,9 @@ class ParsedMenu:
            利用者には理由が分からないので、**最初から出さない**。
         """
         out = []
-        for slot in product.slots_of("choices"):
+        slots = list(product.slots_of("choices"))
+        slots += [sl for _, sl in self.nested_choices(product)]
+        for slot in slots:
             if slot.min_quantity < 1:
                 continue                    # 入れなくてよい枠
             if slot.default_product:
@@ -608,6 +713,8 @@ def parse_menu(store_id: str, menu: dict) -> ParsedMenu:
     return ParsedMenu(
         store_id=store_id, products=products, collections=collections,
         size_groups=size_groups,
+        # products に無い商品の名前も持っておく（枠の参照を引き直すため）
+        aliases={c: n for c, n in names.items() if c not in products},
     )
 
 

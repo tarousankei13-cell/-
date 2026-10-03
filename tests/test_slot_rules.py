@@ -54,20 +54,28 @@ async def main():
     top = {p.code for p in cands[:len(sizes)]}
     check("サイズ違いも前のほう ★", sizes & top, (sorted(sizes), names[:4]))
 
-    print("\n[3] 断られたら次から出さない ★")
-    check("最初はソースも出てしまう（既知の問題）",
-          any("ソース" in n for n in names), names)
-    for code in ("5502", "5503", "5644"):
-        R.reject("13934", side.code, code)
+    print("\n[3] ソースはそもそも候補に出ない ★")
+    # ⚠️ ソースはナゲットの付属品で、セットのサイドとしては選べない。
+    #    値段が参照商品とかけ離れているので価格帯で外れる（docs/05 §5.10）。
+    check("サイド枠にソースが出ない ★", not any("ソース" in n for n in names), names)
+    sauce_slot = menu.products["1610"].slots_of("choices")[0]
+    sauces = [p.name for p in menu.choice_candidates(sauce_slot, MIN)]
+    check("ソース枠には3種とも出る ★", len(sauces) == 3, sauces)
+    check("ソース枠に食べ物が混ざらない ★",
+          all("ソース" in n for n in sauces), sauces)
+
+    print("\n[3.5] 断られたら次から出さない ★")
+    victim = names[-1]
+    victim_code = next(p.code for p in menu.choice_candidates(side, MIN) if p.name == victim)
+    R.reject("13934", side.code, victim_code)
     after = [p.name for p in menu.choice_candidates(side, MIN)]
-    check("ソースが消える ★", not any("ソース" in n for n in after), after)
-    check("他は残る ★", "マックフライポテト® M" in after and "サイドサラダ" in after, after)
-    check("消えたのは3件だけ", len(names) - len(after) == 3, (len(names), len(after)))
+    check("断られたものが消える ★", victim not in after, (victim, after))
+    check("他は残る ★", len(after) == len(names) - 1, (len(names), len(after)))
 
     print("\n[4] 店舗ごとに覚える ★")
     other = parse_menu("99999", json.load(open(os.path.join(HERE, "m13934.json"))))
     o_names = [p.name for p in other.choice_candidates(other.products["9180"].slots_of("choices")[0], MIN)]
-    check("別の店舗には影響しない ★", any("ソース" in n for n in o_names), o_names[:5])
+    check("別の店舗には影響しない ★", victim in o_names, (victim, o_names[:6]))
 
     print("\n[5] 一度通ったものは消さない ★")
     # 売り切れなど、その時だけの事情で断られることがある
@@ -103,15 +111,15 @@ async def main():
     R._loaded = False
     R._rejected.clear(); R._confirmed.clear()
     R.load()
-    check("再起動しても覚えている ★", not R.allowed("13934", side.code, "5502"))
+    check("再起動しても覚えている ★", not R.allowed("13934", side.code, victim_code))
     check("件数も一致", R.summary() == R2_rejected, (R.summary(), R2_rejected))
 
     print("\n[9] 管理者が消せる ★")
-    n = R.forget("13934", side.code, "5502")
-    check("1件だけ消せる ★", n == 1 and R.allowed("13934", side.code, "5502"), n)
+    n = R.forget("13934", side.code, victim_code)
+    check("1件だけ消せる ★", n == 1 and R.allowed("13934", side.code, victim_code), n)
     n = R.forget("13934")
     check("店舗ごとまとめて消せる ★", n > 0, n)
-    check("全部消えた", R.allowed("13934", side.code, "5503"))
+    check("全部消えた", R.allowed("13934", side.code, "9999"))
 
     print("\n[10] 壊れたファイルでも止まらない ★")
     R.STORE_PATH.write_text("これはJSONではない")

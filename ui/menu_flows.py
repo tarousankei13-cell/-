@@ -1747,12 +1747,31 @@ class OptionView(discord.ui.View):
         super().__init__(timeout=config.VIEW_TIMEOUT)
         self.cart = cart
         self.product = product
-        self.choices = choices
         self.back_to = back_to
-        self.picks: dict[str, str] = {
-            c.code: c.default_product for c in choices if c.default_product
-        }
+        # ⚠️ 構成品が持つ枠（ナゲットのソースなど）も一緒に聞く。
+        #    聞かずに送ると必須の枠が空になり、断られる。
+        #    鍵は「構成品コード/枠コード」。上位の枠と混ざらないように。
+        self.nested = cart.menu.nested_choices(product)
+        self.choices = list(choices)
+        self._keys: dict[int, str] = {}      # 枠の並び順 → picks の鍵
+        for i, c in enumerate(self.choices):
+            self._keys[i] = c.code
+        for comp_code, slot in self.nested:
+            self._keys[len(self.choices)] = f"{comp_code}/{slot.code}"
+            self.choices.append(slot)
+
+        self.picks: dict[str, str] = {}
+        for i, c in enumerate(self.choices):
+            if c.default_product:
+                self.picks[self._keys[i]] = c.default_product
         self._build()
+
+    def _key_of(self, slot) -> str:
+        """その枠を picks に記録するときの鍵。"""
+        for i, c in enumerate(self.choices):
+            if c is slot:
+                return self._keys[i]
+        return slot.code
 
     def build_embed(self) -> discord.Embed:
         e = discord.Embed(
@@ -1761,11 +1780,19 @@ class OptionView(discord.ui.View):
             color=embeds.GREEN,
         )
         for c in self.choices:
-            chosen = self.picks.get(c.code)
+            chosen = self.picks.get(self._key_of(c))
             p = self.cart.menu.products.get(chosen or "")
+            # ⚠️ 見出しに枠コード（9987009）をそのまま出さない。
+            #    利用者には何の枠か分からない。
+            name = self._slot_label(c)
+            if c.min_quantity > 1:
+                name += f"（{c.min_quantity}個）"
             e.add_field(
-                name=f"選択枠 {c.code}",
-                value=(p.name if p else "未選択") + (f"（+{embeds.yen(c.extra_price)}）" if c.extra_price else ""),
+                name=name,
+                value=(
+                    (p.name if p else f"{E.WARN} 未選択")
+                    + (f"（+{embeds.yen(c.extra_price)}）" if c.extra_price else "")
+                ),
                 inline=True,
             )
         e.add_field(
@@ -1775,46 +1802,69 @@ class OptionView(discord.ui.View):
         )
         return e
 
-    def _slot_label(self, slot, candidates: list[Product]) -> str:
-        """選択枠の見出し。中身から「ドリンク」「サイド」を言い当てる。"""
-        base = slot.default_product or slot.reference_product
-        col = self.cart.menu.collection_of(base) if base else None
-        return col.name if col else "お選びください"
+    def _slot_label(self, slot, candidates: list[Product] | None = None) -> str:
+        """
+        選択枠の見出し。
+
+        枠そのものに名前が無いので、中に入る商品から言い当てる。
+        カテゴリ名（ドリンク・サイドメニュー）が引ければそれを使い、
+        引けなければ候補の名前から推し量る。
+        """
+        if slot.name:
+            return slot.name
+        menu = self.cart.menu
+        base = menu.slot_reference(slot)
+        col = menu.collection_of(base) if base else None
+        if col:
+            return col.name
+        if base and base in menu.products:
+            name = menu.products[base].name
+            # 「バーベキューソース」→「ソース」
+            for word in ("ソース", "ドリンク", "サイド"):
+                if word in name:
+                    return word
+            return name
+        return "お選びください"
 
     def _build(self) -> None:
         self.clear_items()
         row = 0
-        for c in self.choices[:2]:
+        # ⚠️ 入れ子の枠（ナゲットのソース）を含めると3つ以上になることがある。
+        #    Discord は1画面5行まで。確定ボタン用に1行空けて4行まで使う。
+        for c in self.choices:
+            if row >= 4:
+                break
             candidates = self._candidates(c)
             if not candidates:
                 continue
+            key = self._key_of(c)
             label = self._slot_label(c, candidates)
             options = [
                 discord.SelectOption(
                     label=p.name[:100], value=p.code,
-                    default=(self.picks.get(c.code) == p.code),
+                    default=(self.picks.get(key) == p.code),
                 )
                 for p in candidates[:25]
             ]
             sel = discord.ui.Select(placeholder=label, options=options, row=row)
-            sel.callback = self._make_cb(c.code, sel)
+            sel.callback = self._make_cb(key, sel)
             self.add_item(sel)
             row += 1
 
             # サイズを選べる商品なら、その下にサイズも出す
             sizes = self._sizes(c)
-            if len(sizes) > 1 and row < 3:
+            if len(sizes) > 1 and row < 4:
                 size_options = [
                     discord.SelectOption(
                         label=p.name[:100], value=p.code,
-                        default=(self.picks.get(c.code) == p.code),
+                        default=(self.picks.get(key) == p.code),
                     )
                     for p in sizes[:25]
                 ]
                 ssel = discord.ui.Select(
                     placeholder=f"{label}のサイズ", options=size_options, row=row
                 )
-                ssel.callback = self._make_cb(c.code, ssel)
+                ssel.callback = self._make_cb(key, ssel)
                 self.add_item(ssel)
                 row += 1
 
@@ -1845,7 +1895,7 @@ class OptionView(discord.ui.View):
 
     def _sizes(self, slot) -> list[Product]:
         """いま選んでいる商品のサイズ違い。無ければ空。"""
-        chosen = self.picks.get(slot.code)
+        chosen = self.picks.get(self._key_of(slot))
         if not chosen:
             return []
         minutes = now_minutes()
@@ -1854,9 +1904,9 @@ class OptionView(discord.ui.View):
             if p.is_orderable_at(minutes)
         ]
 
-    def _make_cb(self, slot_code: str, sel: discord.ui.Select):
+    def _make_cb(self, key: str, sel: discord.ui.Select):
         async def cb(interaction: discord.Interaction) -> None:
-            self.picks[slot_code] = sel.values[0]
+            self.picks[key] = sel.values[0]
             self._build()
             await interaction.response.edit_message(embed=self.build_embed(), view=self)
         return cb
@@ -1874,7 +1924,7 @@ class OptionView(discord.ui.View):
         empty = [
             c for c in self.choices
             if c.min_quantity >= 1
-            and not (self.picks.get(c.code) or c.default_product)
+            and not (self.picks.get(self._key_of(c)) or c.default_product)
         ]
         if empty:
             names = "・".join(c.name or "お選びいただく内容" for c in empty)
@@ -2233,12 +2283,39 @@ def build_order_item(
     #    既定の内容は相手が分かっているので、送るのは
     #    「抜いた」「増やした」ものだけでよい。
     #    全部送ると相手が受け付けないことがある。
+    menu = cart.menu
+    # 構成品のうち、さらに選択枠を持つもの（ナゲットのソースなど）
+    nested = {}
+    for comp_code, slot in menu.nested_choices(product):
+        chosen = picks.get(f"{comp_code}/{slot.code}") or slot.default_product
+        if chosen:
+            nested.setdefault(comp_code, []).append((slot, chosen))
+
     for slot in product.slots_of("composition"):
         if not slot.code:
             continue
         qty = amounts.get(slot.code, slot.default_quantity)
         # カタログが許す範囲に収める（不正な数量を送らない）
         qty = max(slot.min_quantity, min(qty, slot.max_quantity))
+
+        # ⚠️ 構成品が選択枠を持っているときは、既定どおりでも**送る**。
+        #    中に「選んだもの」を入れて渡す必要があるため。
+        #    ポテナゲのナゲットのソースがこれ。送らないと
+        #    必須の枠が空のまま注文することになり、断られる。
+        inner = nested.get(slot.code)
+        if inner:
+            picked = [
+                OrderItem(
+                    product_code=sl.code, quantity=sl.default_quantity or 1,
+                    components=[OrderItem(product_code=chosen, quantity=1)],
+                )
+                for sl, chosen in inner
+            ]
+            components.append(
+                OrderItem(product_code=slot.code, quantity=qty, components=picked)
+            )
+            continue
+
         if qty == slot.default_quantity:
             continue        # 既定のまま＝送らない
         components.append(OrderItem(product_code=slot.code, quantity=qty))
