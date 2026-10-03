@@ -95,11 +95,32 @@ async def main():
     check("理由を伝える ★", "選ばれていません" in itx.text(), itx.text()[:140])
 
     print("\n[4] 埋められないセットは詳細画面でも押せない ★")
-    blocked = next(
-        (p for p in menu.products.values()
-         if p.product_class == "VALUE_MEAL" and menu.unfillable_slots(p, 12*60)),
-        None)
-    check("そういうセットが実在する（検証の前提）", blocked is not None)
+    # ⚠️ 実データ側は（ハッピーセットの手がかりを入れたことで）
+    #    埋まらない枠が0件になった。前提が無くなったので、
+    #    **埋まらない枠をわざと作って** 画面の動きを確かめる。
+    # ハッピーセット8商品は手がかりの表で解消した。残るのは
+    #   ・マカロンのボックス（枠の中身がカタログに一切無い）
+    #   ・エンプロイミール（従業員用。そもそも売らない）
+    left = {p.code for p in menu.products.values() if menu.unfillable_slots(p, 12*60)}
+    check("ハッピーセットは埋まるようになった ★",
+          not (left & {"9005", "9006", "9007", "9008",
+                       "9058", "9059", "9064", "9138"}), sorted(left))
+    check("残っているのはマカロンと従業員用だけ ★",
+          left == {"9122", "9125"} | set(menu.staff_only), sorted(left))
+    check("従業員用は注文できない ★",
+          all(not menu.orderable(menu.products[c], 12*60) for c in menu.staff_only),
+          sorted(menu.staff_only))
+
+    import copy
+    from services.mcd.menu import Slot
+    blocked = copy.deepcopy(meal)
+    blocked.slots.append(Slot(
+        kind="choices", code="9999999",      # どこにも載っていない枠
+        min_quantity=1, max_quantity=1, default_quantity=1,
+    ))
+    check("作った枠は埋められない（検証の前提）",
+          [s.code for s in menu.unfillable_slots(blocked, 12*60)] == ["9999999"],
+          [s.code for s in menu.unfillable_slots(blocked, 12*60)])
     if blocked:
         dv = ProductDetailView(cart(), blocked)
         btn = [c for c in dv.children if not hasattr(c, "options")]

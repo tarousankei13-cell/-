@@ -290,6 +290,7 @@ class Product:
     price_takeout: int = 0
     price_other: int = 0
     pre_price: int = 0                 # セットの表示価格
+    delivery_pre_price: int = 0        # セットの宅配の表示価格
     slots: list[Slot] = field(default_factory=list)
     # 注文できる時間帯。
     #   None … カタログに登録が無い（分からないので止めない）
@@ -309,9 +310,15 @@ class Product:
            実データ（247商品）では全部そろっていたが、欠けたときに
            **¥0 と出すのが一番まずい**。ただより安いものは無い。
         """
-        if self.product_class == "VALUE_MEAL" and self.pre_price:
-            return self.pre_price
         code = PRICE_CODE.get(pickup_method, "TAKEOUT")
+        if self.product_class == "VALUE_MEAL":
+            # ⚠️ 宅配はセットでも値段が違う（ハンバーガー ハッピーセットは
+            #    店内/持ち帰り540円・宅配630円）。pre_price を一律で返すと
+            #    宅配のときに安く請求してしまう。
+            if code == "OTHER" and self.delivery_pre_price:
+                return self.delivery_pre_price
+            if self.pre_price:
+                return self.pre_price
         by_code = {
             "EATIN": self.price_eatin,
             "TAKEOUT": self.price_takeout,
@@ -437,6 +444,8 @@ class ParsedMenu:
     aliases: dict[str, str] = field(default_factory=dict)
     # 選択肢専用の商品（ソース・ドレッシング・おもちゃ）
     extras: dict[str, Extra] = field(default_factory=dict)
+    # 従業員向けの食事（エンプロイミール）。利用者には売らない。
+    staff_only: frozenset[str] = frozenset()
     _slot_ref_cache: dict[str, str] | None = field(default=None, repr=False)
 
     def collection_of(self, code: str) -> "Collection | None":
@@ -479,6 +488,9 @@ class ParsedMenu:
              （ナゲット5ピースの枠7251には参照が無いが、
                15ピースの同じ枠には 6048 が入っている）
           3. 参照が選択肢専用の商品（6xxx）ならそのまま使う
+          4. それでも分からない枠は、手がかりの表から引く
+             （ハッピーセットのドリンク枠は全商品で参照が空。
+               services/mcd/slot_hints.py を参照）
 
         ⚠️ 同じ名前で products にもある商品に読み替えてはいけない。
              5502 バーベキューソース price=50 … 単品で買うソース
@@ -488,6 +500,10 @@ class ParsedMenu:
         base = slot.default_product or slot.reference_product
         if not base:
             base = self._slot_refs().get(slot.code, "")
+        if not base:
+            # カタログのどこにも参照が無い枠（ハッピーセットのドリンク）
+            from services.mcd import slot_hints
+            base = slot_hints.reference_for(slot.code)
         if not base:
             return ""
         if base in self.products or base in self.extras:
@@ -564,9 +580,23 @@ class ParsedMenu:
             for q in self.products.values()
             if q.name and q.name in e.name and q.code != parent.code
         }
+        # ⚠️ **他の枠がはっきり参照しているグループは候補にしない。**
+        #    おもちゃは枠9997008が 6118 を参照しているし、ナゲットの
+        #    ソースは枠7251が 6048 を参照している。つまり「行き先の
+        #    決まっているグループ」であって、参照の無い枠の中身ではない。
+        #    これを外さないと、マカロンのボックスセットやエンプロイミールの
+        #    枠に **おもちゃ・えほん・プラレール** が並んでしまい、
+        #    選んで注文してもマクドナルドに断られる。
+        spoken = {
+            self.extras[ref].group
+            for ref in self._slot_refs().values()
+            if ref in self.extras
+        }
         free = [
             e for e in self.extras.values()
-            if e.code not in claimed and e.group not in taken
+            if e.code not in claimed
+            and e.group not in taken
+            and e.group not in spoken
         ]
 
         # ① 名前に親商品の名前が入っている（「シャカチキ チェダーチーズ味…」）
@@ -577,21 +607,15 @@ class ParsedMenu:
         if named:
             return sorted(named, key=lambda e: e.code)
 
-        # ② 親と同じ kind・dayPart
-        same = [
-            e for e in free
-            if e.kind == parent.display.kind and e.day_part == parent.display.set_type
-        ]
-        same = same or [
-            e for e in free
-            if e.kind == parent.display.kind and e.day_part == parent.day_part
-        ]
-        if same:
-            return sorted(same, key=lambda e: e.code)
-
-        # ③ 親と同じ kind のうち、他の商品に取られていないもの
+        # ② 残ったものが **ひとつのグループに絞れたときだけ** 使う。
+        #    絞れないなら「何の枠か分からない」ので候補を出さない。
+        #    分からないまま並べると、選べないものを選ばせてしまう。
         rest = [e for e in free if e.kind == parent.display.kind]
-        return sorted(rest, key=lambda e: e.code) or None
+        if not rest:
+            return None
+        if len({e.group for e in rest}) > 1:
+            return None                     # 複数のグループ → 判断できない
+        return sorted(rest, key=lambda e: e.code)
 
     def choice_candidates(
         self, slot: Slot, minutes: int | None = None,
@@ -666,7 +690,15 @@ class ParsedMenu:
         #    参照商品とそのサイズ違いだけ。利用者が上から選ぶほど
         #    通りやすくなるようにしておく。
         safe = {str(base)} | {q.code for q in self.size_variants(base)}
-        out.sort(key=lambda q: (q.code not in safe, q.name))
+        # 手がかりの表で「確実に選べる」と分かっているものは、さらに先へ。
+        # ハッピーセットのドリンクは枠の中身がカタログに無いため、
+        # 上から選ぶほど通りやすい並びにしておく。
+        from services.mcd import slot_hints
+        prefer = slot_hints.preferred(slot.code)
+        rank = {code: i for i, code in enumerate(prefer)}
+        out.sort(
+            key=lambda q: (rank.get(q.code, len(rank)), q.code not in safe, q.name)
+        )
         return out
 
     def nested_choices(self, product: Product) -> list[tuple[str, Slot]]:
@@ -714,6 +746,10 @@ class ParsedMenu:
 
     def orderable(self, product: Product, minutes: int | None = None) -> bool:
         """注文として成立させられるか。時間帯と、枠を埋められるかの両方。"""
+        # ⚠️ エンプロイミール（従業員向けの食事）は利用者には売らない。
+        #    値段が従業員価格で、一般の注文として送っても断られる。
+        if product.code in self.staff_only:
+            return False
         if minutes is not None and not product.is_orderable_at(minutes):
             return False
         return not self.unfillable_slots(product, minutes)
@@ -861,6 +897,7 @@ def parse_menu(store_id: str, menu: dict) -> ParsedMenu:
             price_takeout=pl.get("TAKEOUT", 0),
             price_other=pl.get("OTHER", 0),
             pre_price=_price_of(raw, "prePrice"),
+            delivery_pre_price=_price_of(raw, "deliveryPrePrice"),
             slots=_parse_slots(raw, names),
             time_windows=_windows_of(ability, code),
             size_group=size_groups.get(code, ""),
@@ -888,6 +925,10 @@ def parse_menu(store_id: str, menu: dict) -> ParsedMenu:
         # products に無い商品の名前も持っておく（枠の参照を引き直すため）
         aliases={c: n for c, n in names.items() if c not in products},
         extras=harvest_extras(menu, products, ability),
+        staff_only=frozenset(
+            str(x) for x in
+            ((menu.get("employeeMealCollection") or {}).get("productCodes") or [])
+        ),
     )
 
 
