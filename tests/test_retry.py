@@ -46,7 +46,6 @@ async def main():
     check("ONCE は1回しか呼ばない ★", n[0] == 1, n[0])
     check("失敗はそのまま投げる", err == "一時的", err)
     n[0] = 0
-    await retry.call(flaky, idempotency=I.ONCE, attempts=10) if False else None
     try:
         await retry.call(flaky, idempotency=I.ONCE, attempts=10)
     except RuntimeError:
