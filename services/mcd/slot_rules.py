@@ -142,23 +142,71 @@ def summary() -> dict[str, int]:
         return {"rejected": len(_rejected), "confirmed": len(_confirmed)}
 
 
+def _leaves(node) -> list[str]:
+    """その節の下にある一番奥の商品コード（複数ありうる）。"""
+    kids = getattr(node, "components", None) or []
+    if not kids:
+        code = str(getattr(node, "product_code", ""))
+        return [code] if code else []
+    out: list[str] = []
+    for k in kids:
+        out.extend(_leaves(k))
+    return out
+
+
 def choices_of(item) -> list[tuple[str, str]]:
     """
     注文1品から (枠コード, 選んだ商品コード) を取り出す。
 
-    枠 →（中間ノード）→ 商品 と入れ子になっているので、
-    一番奥の商品まで辿る。
+    形は3通りある。
+
+        枠 → 商品                     サイド枠 9987009 → 2020
+        枠 → 中間 → 商品              ドリンク枠 9997918 → 9997914 → 3120
+        構成品 → 枠 → 商品            ポテナゲの中のナゲット → ソース枠 7251 → 6048
+
+    ⚠️ 3つめ（入れ子）を **構成品のコードを枠として** 報告していたため、
+       ポテナゲのソースの可否を学習しても引けず、カートの未選択検査も
+       すり抜けていた。中間ノードと構成品を見分けて、本当の枠を返す。
     """
     out: list[tuple[str, str]] = []
-    for comp in getattr(item, "components", None) or []:
-        slot = str(getattr(comp, "product_code", ""))
-        inner = getattr(comp, "components", None) or []
-        if not inner:
-            continue        # 具材の調整（選択枠ではない）
-        leaf = inner[0]
-        while getattr(leaf, "components", None):
-            leaf = leaf.components[0]
-        chosen = str(getattr(leaf, "product_code", ""))
-        if slot and chosen:
-            out.append((slot, chosen))
-    return out
+
+    bridges = _bridges()
+
+    def is_slot(node) -> bool:
+        """
+        その節が「枠」か。構成品と枠は、下にあるものの形で見分ける。
+
+            枠      … 下は商品だけ、または中間ノードだけ
+            構成品  … 下に **枠** がある（ポテナゲの中のナゲット）
+        """
+        for k in getattr(node, "components", None) or []:
+            if (getattr(k, "components", None) or []) and str(
+                getattr(k, "product_code", "")
+            ) not in bridges:
+                return False
+        return True
+
+    def walk(node, depth: int) -> None:
+        kids = getattr(node, "components", None) or []
+        code = str(getattr(node, "product_code", ""))
+        if not kids:
+            return
+        # depth 0 は商品そのもの。中間ノードは枠ではない。
+        if depth > 0 and code and code not in bridges and is_slot(node):
+            for leaf in _leaves(node):
+                out.append((code, leaf))
+        for k in kids:
+            walk(k, depth + 1)
+
+    walk(item, 0)
+    # 同じ組み合わせは1回だけ
+    return list(dict.fromkeys(out))
+
+
+def _bridges() -> set[str]:
+    """枠と商品の間に入る中間ノードのコード（枠ではない）。"""
+    try:
+        from services.mcd import slot_bridge
+        return set(slot_bridge.all_known().values())
+    except Exception:          # 読めなくても判定は続ける
+        return set()

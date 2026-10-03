@@ -254,6 +254,22 @@ class Slot:
         """増やせる具材か（チーズ追加など）。"""
         return self.max_quantity > self.default_quantity
 
+    @property
+    def need(self) -> int:
+        """
+        この枠に入れる個数。
+
+        ⚠️ ほとんどの枠は1個だが、チキンマックナゲット15ピースの
+           ソース枠（7251）は **3個必須**（min=max=default=3）。
+           1個しか送らないとマクドナルドに断られる。
+        """
+        return max(self.default_quantity or 1, self.min_quantity or 0, 1)
+
+    @property
+    def multi(self) -> bool:
+        """2個以上入れる枠か（ナゲット15ピースのソースなど）。"""
+        return self.need > 1
+
     def to_dict(self) -> dict:
         return self.__dict__.copy()
 

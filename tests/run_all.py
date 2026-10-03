@@ -14,6 +14,7 @@ TESTS = [
     ("カートの編集と再開", "test_cart_edit.py"),
     ("セットの選択枠・時間帯", "test_menu_choices.py"),
     ("選択枠の学習", "test_slot_rules.py"),
+    ("複数個必須の選択枠", "test_slot_quantity.py"),
     ("注文できない商品の除外", "test_menu_filter.py"),
     ("具材の調整（抜き・増量）", "test_customize.py"),
     ("商品詳細と受取方法", "test_product_detail.py"),

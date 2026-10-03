@@ -931,7 +931,12 @@ class CartView(discord.ui.View):
             if product is None:
                 continue
             chosen = {slot for slot, _ in slot_rules.choices_of(item)}
-            for c in product.slots_of("choices"):
+            # ⚠️ 入れ子の枠（ポテナゲの中のナゲットのソース）も見ること。
+            #    見落とすと、必須の枠が空のまま注文してしまう。
+            slots = list(product.slots_of("choices")) + [
+                c for _comp, c in self.menu.nested_choices(product)
+            ]
+            for c in slots:
                 if c.min_quantity < 1:
                     continue
                 if c.code in chosen or c.default_product:
@@ -1780,17 +1785,21 @@ class OptionView(discord.ui.View):
             color=embeds.GREEN,
         )
         for c in self.choices:
-            chosen = self.picks.get(self._key_of(c))
-            p = self.cart.menu.products.get(chosen or "")
+            codes = picked_codes(self.picks.get(self._key_of(c)))
+            shown = [
+                f"{pp.name}×{n}" if n > 1 else pp.name
+                for code, n in spread_quantity(codes, c.need)
+                if (pp := self.cart.menu.products.get(code))
+            ]
             # ⚠️ 見出しに枠コード（9987009）をそのまま出さない。
             #    利用者には何の枠か分からない。
             name = self._slot_label(c)
-            if c.min_quantity > 1:
-                name += f"（{c.min_quantity}個）"
+            if c.multi:
+                name += f"（{c.need}個）"
             e.add_field(
                 name=name,
                 value=(
-                    (p.name if p else f"{E.WARN} 未選択")
+                    ("\n".join(shown) if shown else f"{E.WARN} 未選択")
                     + (f"（+{embeds.yen(c.extra_price)}）" if c.extra_price else "")
                 ),
                 inline=True,
@@ -1839,14 +1848,25 @@ class OptionView(discord.ui.View):
                 continue
             key = self._key_of(c)
             label = self._slot_label(c, candidates)
+            now = picked_codes(self.picks.get(key))
             options = [
                 discord.SelectOption(
-                    label=p.name[:100], value=p.code,
-                    default=(self.picks.get(key) == p.code),
+                    label=p.name[:100], value=p.code, default=(p.code in now),
                 )
                 for p in candidates[:25]
             ]
-            sel = discord.ui.Select(placeholder=label, options=options, row=row)
+            # ⚠️ ナゲット15ピースのソースのように3個必須の枠は、
+            #    実際のアプリと同じく **種類を分けて選べる** ようにする。
+            #    足りない分は選んだものを増やして埋めるので、
+            #    1種類だけ選んでも注文できる。
+            if c.multi:
+                sel = discord.ui.Select(
+                    placeholder=f"{label}（{c.need}個までお選びいただけます）"[:150],
+                    options=options, row=row,
+                    min_values=1, max_values=min(c.need, len(options)),
+                )
+            else:
+                sel = discord.ui.Select(placeholder=label, options=options, row=row)
             sel.callback = self._make_cb(key, sel)
             self.add_item(sel)
             row += 1
@@ -1857,7 +1877,7 @@ class OptionView(discord.ui.View):
                 size_options = [
                     discord.SelectOption(
                         label=p.name[:100], value=p.code,
-                        default=(self.picks.get(key) == p.code),
+                        default=(p.code in picked_codes(self.picks.get(key))),
                     )
                     for p in sizes[:25]
                 ]
@@ -1902,9 +1922,11 @@ class OptionView(discord.ui.View):
 
     def _sizes(self, slot) -> list[Product]:
         """いま選んでいる商品のサイズ違い。無ければ空。"""
-        chosen = self.picks.get(self._key_of(slot))
-        if not chosen:
+        codes = picked_codes(self.picks.get(self._key_of(slot)))
+        # 複数選べる枠はサイズ違いを出さない（どれのサイズか決められない）
+        if len(codes) != 1:
             return []
+        chosen = codes[0]
         minutes = now_minutes()
         return [
             p for p in self.cart.menu.size_variants(chosen)
@@ -1913,7 +1935,7 @@ class OptionView(discord.ui.View):
 
     def _make_cb(self, key: str, sel: discord.ui.Select):
         async def cb(interaction: discord.Interaction) -> None:
-            self.picks[key] = sel.values[0]
+            self.picks[key] = ",".join(sel.values)
             self._build()
             await interaction.response.edit_message(embed=self.build_embed(), view=self)
         return cb
@@ -2265,6 +2287,33 @@ async def _add_to_cart(
     return True
 
 
+def picked_codes(value: str | None) -> list[str]:
+    """
+    picks に入っている「選んだもの」を取り出す。
+
+    ⚠️ ナゲット15ピースのソースのように **複数選べる枠** があるため、
+       picks の値はコンマ区切りで複数入ることがある。
+    """
+    if not value:
+        return []
+    return [c for c in str(value).split(",") if c]
+
+
+def spread_quantity(codes: list[str], need: int) -> list[tuple[str, int]]:
+    """
+    選んだものに個数を割り振る。
+
+    3個必須の枠で1種類だけ選ばれたら、その1種類を3個にする。
+    3種類選ばれたら1個ずつ。2種類なら 2個+1個。
+    """
+    codes = list(dict.fromkeys(codes))      # 重複は除く（順序は保つ）
+    if not codes:
+        return []
+    need = max(need, len(codes))
+    base, rest = divmod(need, len(codes))
+    return [(c, base + (1 if i < rest else 0)) for i, c in enumerate(codes)]
+
+
 def build_order_item(
     cart: CartView,
     product: Product,
@@ -2294,7 +2343,9 @@ def build_order_item(
     # 構成品のうち、さらに選択枠を持つもの（ナゲットのソースなど）
     nested = {}
     for comp_code, slot in menu.nested_choices(product):
-        chosen = picks.get(f"{comp_code}/{slot.code}") or slot.default_product
+        chosen = picked_codes(
+            picks.get(f"{comp_code}/{slot.code}")
+        ) or picked_codes(slot.default_product)
         if chosen:
             nested.setdefault(comp_code, []).append((slot, chosen))
 
@@ -2313,8 +2364,11 @@ def build_order_item(
         if inner:
             picked = [
                 OrderItem(
-                    product_code=sl.code, quantity=sl.default_quantity or 1,
-                    components=[OrderItem(product_code=chosen, quantity=1)],
+                    product_code=sl.code, quantity=sl.need,
+                    components=[
+                        OrderItem(product_code=code, quantity=n)
+                        for code, n in spread_quantity(chosen, sl.need)
+                    ],
                 )
                 for sl, chosen in inner
             ]
@@ -2334,15 +2388,28 @@ def build_order_item(
     # この中間はカタログに載っていないため、分かっているものを
     # services/mcd/slot_bridge.py に持たせてある（docs/09 §2）。
     for slot in product.slots_of("choices"):
-        chosen = picks.get(slot.code) or slot.default_product
+        chosen = picked_codes(picks.get(slot.code)) or picked_codes(
+            slot.default_product
+        )
         if not chosen:
             continue
-        leaf = OrderItem(product_code=chosen, quantity=1)
+        # ⚠️ 枠が求める個数をそのまま送る。1個固定で送っていたため、
+        #    ソース3個必須のナゲット15ピースが注文できなかった。
+        leaves = [
+            OrderItem(product_code=code, quantity=n)
+            for code, n in spread_quantity(chosen, slot.need)
+        ]
         bridge = slot_bridge.bridge_for(slot.code)
         if bridge:
-            leaf = OrderItem(product_code=bridge, quantity=1, components=[leaf])
+            leaves = [
+                OrderItem(product_code=bridge, quantity=leaf.quantity,
+                          components=[leaf])
+                for leaf in leaves
+            ]
         components.append(
-            OrderItem(product_code=slot.code, quantity=1, components=[leaf])
+            OrderItem(
+                product_code=slot.code, quantity=slot.need, components=leaves
+            )
         )
 
     return OrderItem(
