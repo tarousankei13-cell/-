@@ -18,7 +18,7 @@ from sqlalchemy import select
 import config
 import emoji as E
 from core import ledger as L
-from core import saga, settings, subsidy
+from core import limits, saga, settings, subsidy
 from core import users as user_repo
 from core import fraud
 from core import queue as order_gate
@@ -143,10 +143,28 @@ class ChargeModal(discord.ui.Modal, title="残高チャージ"):
             return
 
         e = discord.Embed(title=f"{E.OK} チャージ完了", color=embeds.GREEN)
-        e.add_field(name=f"{E.YEN} 受取額", value=f"**{embeds.yen(result.amount)}**", inline=True)
+        if result.bonus > 0:
+            e.add_field(
+                name=f"{E.YEN} 受取額",
+                value=(
+                    f"**{embeds.yen(result.credited)}**\n"
+                    f"{E.PARTY} {embeds.yen(result.amount)} → "
+                    f"**{result.rate}%** ぶん（+{embeds.yen(result.bonus)}）"
+                ),
+                inline=True,
+            )
+        else:
+            e.add_field(
+                name=f"{E.YEN} 受取額",
+                value=f"**{embeds.yen(result.credited or result.amount)}**",
+                inline=True,
+            )
         e.add_field(name=f"{E.WALLET} 残高", value=f"**{embeds.yen(result.balance)}**", inline=True)
         if result.sender_name:
             e.add_field(name=f"{E.USER} 送金者", value=result.sender_name, inline=True)
+        notice = await limits.first_order_notice(interaction.user.id)
+        if notice:
+            e.add_field(name=f"{E.INFO} ご注文について", value=notice, inline=False)
         await interaction.followup.send(embed=e, ephemeral=True)
 
 
@@ -390,6 +408,13 @@ async def open_preview(interaction: discord.Interaction, hex_text: str) -> None:
         supported = {m: (m in av.methods) for m in (supported or {})} or {
             m: True for m in av.methods
         }
+
+    # ⚠️ お金を押さえる前に見ること。押さえてから断ると、戻す処理が要る。
+    try:
+        await limits.check_order(interaction.user.id, decoded.total_amount)
+    except limits.LimitError as e:
+        await interaction.followup.send(embed=embeds.warn(str(e)), ephemeral=True)
+        return
 
     async with session_scope() as s:
         quote = await subsidy.resolve(

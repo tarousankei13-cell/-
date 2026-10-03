@@ -277,7 +277,10 @@ async def main():
     import services.kyash.charge as kyash_charge
 
     class Result:
-        amount = 3000
+        amount = 3000          # 実際に送金された額
+        credited = 3000        # 残高に入れた額（チャージ率を掛けたあと）
+        rate = 100
+        bonus = 0
         balance = 8000
         sender_name = "送った人"
 

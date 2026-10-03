@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from sqlalchemy.exc import IntegrityError
 
 from core import ledger as L
-from core import settings
+from core import limits, settings
 from db.models import KyashReceipt
 from db.session import session_scope, user_scope
 from services.kyash import accounts as kyash_accounts
@@ -45,10 +45,17 @@ class ChargeError(Exception):
 
 @dataclass
 class ChargeResult:
-    amount: int
-    balance: int
+    amount: int               # 実際に送金された額
+    balance: int              # 記帳後の残高
     sender_name: str = ""
     receipt_id: str = ""
+    credited: int = 0         # 残高に入れた額（チャージ率を掛けたあと）
+    rate: int = 100           # 適用したチャージ率（％）
+
+    @property
+    def bonus(self) -> int:
+        """チャージ率で上乗せされたぶん。"""
+        return max(0, self.credited - self.amount)
 
 
 async def charge_from_link(discord_id: int, url: str) -> ChargeResult:
@@ -125,11 +132,19 @@ async def charge_from_link(discord_id: int, url: str) -> ChargeResult:
             )
 
         # ⑥ 記帳
+        # ⚠️ 残高に入れるのは **チャージ率を掛けたあと** の額。
+        #    受け取った額（info.amount）は現実に動いたお金なので、
+        #    KyashReceipt にはそのまま残す。混同しないこと。
+        rate = limits.charge_rate()
+        credited = limits.credited_for(info.amount)
+        memo = f"Kyash {info.sender_name}".strip()
+        if credited != info.amount:
+            memo = f"{memo}（チャージ率{rate}%: ¥{info.amount:,}→¥{credited:,}）"
         async with user_scope(discord_id) as s:
             await L.charge(
-                s, discord_id, info.amount,
+                s, discord_id, credited,
                 receipt_id=receipt_id,
-                memo=f"Kyash {info.sender_name}".strip(),
+                memo=memo,
             )
             balance = await L.user_balance(s, discord_id)
 
@@ -138,10 +153,14 @@ async def charge_from_link(discord_id: int, url: str) -> ChargeResult:
             row.status = CREDITED
 
         await kyash_accounts.record_received(handle.account_id, info.amount, after)
-        log.info("チャージ完了: %s に ¥%d（残高 ¥%d）", discord_id, info.amount, balance)
+        log.info(
+            "チャージ完了: %s に ¥%d（送金 ¥%d・率%d%%・残高 ¥%d）",
+            discord_id, credited, info.amount, rate, balance,
+        )
         return ChargeResult(
             amount=info.amount, balance=balance,
             sender_name=info.sender_name, receipt_id=receipt_id,
+            credited=credited, rate=rate,
         )
 
     except IntegrityError:

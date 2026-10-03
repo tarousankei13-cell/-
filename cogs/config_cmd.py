@@ -52,9 +52,34 @@ class ConfigCog(commands.Cog):
             value=f"管理者負担 **{g:g}%** → 利用者の支払い **{100 - g:g}%**",
             inline=False,
         )
+        from core import limits
+
+        rate = limits.charge_rate()
         e.add_field(
             name=f"{E.CHARGE} チャージ",
-            value=f"{embeds.yen(int(v.get('charge_min', 100)))} 〜 {embeds.yen(int(v.get('charge_max', 50000)))}",
+            value=(
+                f"{embeds.yen(int(v.get('charge_min', 100)))} 〜 "
+                f"{embeds.yen(int(v.get('charge_max', 50000)))}\n"
+                + (
+                    f"率 **{rate}%**（{embeds.yen(1000)}→"
+                    f"{embeds.yen(limits.credited_for(1000))}）"
+                    if rate != 100 else "率 100%（そのまま）"
+                )
+            ),
+            inline=True,
+        )
+        omin = limits.order_min()
+        e.add_field(
+            name=f"{E.BURGER} 注文の最低額",
+            value=f"{embeds.yen(omin)}（定価）" if omin else "制限なし",
+            inline=True,
+        )
+        e.add_field(
+            name=f"{E.INFO} はじめての注文の条件",
+            value=(
+                f"累計 **{embeds.yen(limits.first_charge_min())}** 以上のチャージ"
+                if limits.first_charge_gate() else "なし"
+            ),
             inline=True,
         )
         cap = v.get("monthly_subsidy_cap")
@@ -340,6 +365,122 @@ class ConfigCog(commands.Cog):
                 f"チャージ額を {embeds.yen(minimum)} 〜 {embeds.yen(maximum)} に設定しました。"
             ),
             ephemeral=True,
+        )
+
+    @group.command(
+        name="charge_rate",
+        description="チャージ率を設定します（120%なら1,000円の送金で1,200円ぶん）",
+    )
+    @app_commands.describe(percent="チャージ率(%)。100でそのまま、120で2割増し")
+    @admin_only()
+    async def charge_rate_cmd(
+        self, interaction: discord.Interaction,
+        percent: app_commands.Range[int, 1, 1000],
+    ) -> None:
+        """
+        ⚠️ 100 を超えたぶんは運営の持ち出し。
+           上げる前に、どれだけ配るつもりかを決めること。
+        """
+        from core import limits
+
+        before = limits.charge_rate()
+        await settings.set_value(
+            "charge_rate", int(percent), updated_by=interaction.user.id
+        )
+        cmax = int(settings.get("charge_max", 50_000))
+        lines = [f"チャージ率を **{before}% → {percent}%** にしました。"]
+        if percent > 100:
+            lines += [
+                "",
+                f"{E.YEN} {embeds.yen(1000)} の送金 → "
+                f"**{embeds.yen(limits.credited_for(1000))}** ぶんの残高",
+                f"{E.YEN} {embeds.yen(cmax)} の送金 → "
+                f"**{embeds.yen(limits.credited_for(cmax))}** ぶんの残高",
+                "",
+                f"{E.WARN} 1回のチャージで最大 "
+                f"**{embeds.yen(limits.bonus_for(cmax))}** の持ち出しになります。",
+                f"{E.INFO} 端数は切り捨てです（{embeds.yen(333)} → "
+                f"{embeds.yen(limits.credited_for(333))}）。",
+            ]
+        elif percent < 100:
+            lines.append(
+                f"{E.WARN} 100%未満です。送金額より少ない残高になります。"
+            )
+        else:
+            lines.append("送金された額が、そのまま残高になります。")
+        lines.append("")
+        lines.append(f"{E.INFO} すでに済んだチャージには影響しません。")
+        await interaction.response.send_message(
+            embed=embeds.ok("\n".join(lines)), ephemeral=True
+        )
+
+    @group.command(
+        name="order_min", description="注文できる最低額（定価）を設定します"
+    )
+    @app_commands.describe(amount="最低額(円・定価)。0で制限なし")
+    @admin_only()
+    async def order_min_cmd(
+        self, interaction: discord.Interaction,
+        amount: app_commands.Range[int, 0, 1000000],
+    ) -> None:
+        await settings.set_value(
+            "order_min", int(amount), updated_by=interaction.user.id
+        )
+        await interaction.response.send_message(
+            embed=embeds.ok(
+                f"ご注文の最低額を **{embeds.yen(int(amount))}**（定価）にしました。\n"
+                f"{E.INFO} 負担率を変えても基準がぶれないよう、定価で判定します。\n"
+                f"{E.INFO} 注文パネルにも表示されます（`/panel refresh`）。"
+                if amount else
+                "ご注文の最低額をなくしました（いくらでも注文できます）。"
+            ),
+            ephemeral=True,
+        )
+
+    @group.command(
+        name="first_charge",
+        description="はじめての注文の前に、累計いくらチャージしてもらうか",
+    )
+    @app_commands.describe(
+        enabled="この条件を使うか",
+        amount="累計いくら以上か(円)。省略すると今の金額のまま",
+    )
+    @admin_only()
+    async def first_charge_cmd(
+        self, interaction: discord.Interaction, enabled: bool,
+        amount: app_commands.Range[int, 1, 1000000] | None = None,
+    ) -> None:
+        """
+        ⚠️ 数えるのは **実際に送金された額**。チャージ率で増えたぶんは
+           含めない。含めると、率を上げたぶんだけ条件が緩くなる。
+        """
+        from core import limits
+
+        if amount is not None:
+            await settings.set_value(
+                "first_charge_min", int(amount), updated_by=interaction.user.id
+            )
+        await settings.set_value(
+            "first_charge_gate", bool(enabled), updated_by=interaction.user.id
+        )
+        need = limits.first_charge_min()
+        if enabled:
+            body = (
+                f"はじめてのご注文の前に、累計 **{embeds.yen(need)}** 以上の"
+                "チャージを求めるようにしました。\n\n"
+                f"{E.INFO} 数えるのは**実際に送金された額**です。"
+                "チャージ率で増えたぶんは含めません。\n"
+                f"{E.INFO} 2回目以降のご注文では、この条件はかかりません。\n"
+                f"{E.INFO} チャージパネルにも表示されます（`/panel refresh`）。"
+            )
+        else:
+            body = (
+                "はじめてのご注文の条件を**なし**にしました。\n"
+                f"{E.INFO} 金額（{embeds.yen(need)}）は残してあるので、"
+                "いつでも戻せます。"
+            )
+        await interaction.response.send_message(
+            embed=embeds.ok(body), ephemeral=True
         )
 
     @group.command(name="order_limit", description="1注文あたりの上限金額を設定します")

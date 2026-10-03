@@ -98,16 +98,26 @@ def order_panel(mode: str | None = None) -> discord.Embed:
     buttons.append(f"{E.HISTORY} **履歴**\n　これまでの注文と残高を確認します。")
     e.add_field(name="💡 ボタンの説明", value="\n".join(buttons), inline=False)
 
-    # ── 割引 ──
-    e.add_field(
-        name="💴 いまの割引",
-        value=(
-            f"定価の **{user_rate:g}%** のお支払いで注文できます"
-            f"（**{rate:g}% OFF**）\n"
-            f"　例）定価 ¥590 → お支払い **¥{math.ceil(590 * user_rate / 100):,}**"
-        ),
-        inline=False,
-    )
+    # ── お支払い ──
+    # ⚠️ 「○% OFF」という書き方はしない。その数字は運営の負担率
+    #    そのものなので、いくら持ち出しているかが分かってしまう。
+    #    定価と、実際に払う額だけを出す。
+    if user_rate < 100:
+        e.add_field(
+            name="💴 お支払いについて",
+            value=(
+                f"定価の **{user_rate:g}%** のお支払いで注文できます\n"
+                f"　例）定価 ¥590 → お支払い **¥{math.ceil(590 * user_rate / 100):,}**"
+            ),
+            inline=False,
+        )
+    low = int(settings.get("order_min", 0) or 0)
+    if low > 0:
+        e.add_field(
+            name=f"{E.INFO} ご注文の条件",
+            value=f"ご注文は **{yen(low)}**（定価）以上から承っております。",
+            inline=False,
+        )
 
     e.set_footer(text="残高が足りないときは、チャージパネルからチャージしてください")
     return e
@@ -116,11 +126,17 @@ def order_panel(mode: str | None = None) -> discord.Embed:
 def charge_panel() -> discord.Embed:
     cmin = int(settings.get("charge_min", 100))
     cmax = int(settings.get("charge_max", 50_000))
-    e = discord.Embed(
-        title=f"{E.YEN} 残高チャージ",
-        description="Kyash の送金リンクで残高をチャージできます。",
-        color=BLUE,
-    )
+    from core import limits
+
+    rate = limits.charge_rate()
+    desc = "Kyash の送金リンクで残高をチャージできます。"
+    if rate > 100:
+        example = limits.credited_for(1000)
+        desc += (
+            f"\n\n{E.PARTY} **いまなら {rate}% 増量中**\n"
+            f"　例）{yen(1000)} の送金で **{yen(example)}** ぶんの残高になります"
+        )
+    e = discord.Embed(title=f"{E.YEN} 残高チャージ", description=desc, color=BLUE)
     e.add_field(
         name="手順",
         value=(
@@ -139,6 +155,16 @@ def charge_panel() -> discord.Embed:
         ),
         inline=False,
     )
+    if limits.first_charge_gate() and limits.first_charge_min() > 0:
+        e.add_field(
+            name=f"{E.INFO} はじめてご注文の方へ",
+            value=(
+                f"はじめてのご注文には、累計 **{yen(limits.first_charge_min())}** 以上の"
+                "チャージが必要です。\n"
+                "2回目以降のご注文では、この条件はありません。"
+            ),
+            inline=False,
+        )
     return e
 
 
@@ -226,12 +252,12 @@ def order_preview(
     e.add_field(name=f"{E.CART} ご注文", value=body[:1024], inline=False)
 
     after = balance - quote.user_amount
+    # ⚠️ 「負担 40% 適用」のような、運営がいくら持ち出しているかが
+    #    分かる書き方はしない。利用者が知るべきなのは、定価と
+    #    自分がいくら払うかだけ。
     e.add_field(
         name=f"{E.YEN} お支払い",
-        value=(
-            f"**{yen(quote.user_amount)}**\n"
-            f"{quote.describe()}（負担 {quote.subsidy_rate:g}% 適用）"
-        ),
+        value=f"**{yen(quote.user_amount)}**\n{quote.describe()}",
         inline=True,
     )
     e.add_field(
@@ -241,7 +267,7 @@ def order_preview(
     )
     if quote.capped:
         e.add_field(
-            name=f"{E.WARN} 負担率について",
+            name=f"{E.INFO} お支払いについて",
             value=quote.source,
             inline=False,
         )
@@ -313,10 +339,7 @@ def dm_complete(
     e.add_field(name=f"{E.PIN} 受取方法", value=pickup_label, inline=True)
     e.add_field(
         name=f"{E.YEN} お支払い",
-        value=(
-            f"**{yen(user_amount)}**\n"
-            f"定価 {yen(list_price)} のうち {user_rate:g}%（負担 {subsidy_rate:g}% 適用）"
-        ),
+        value=f"**{yen(user_amount)}**（定価 {yen(list_price)}）",
         inline=False,
     )
     e.add_field(name=f"{E.WALLET} 残りの残高", value=f"**{yen(balance)}**", inline=True)
@@ -566,8 +589,9 @@ def achievement(
         e.add_field(name=f"{E.USER} ユーザー", value=username, inline=True)
     if "list_price" in fields:
         e.add_field(name=f"{E.YEN} 定価", value=yen(list_price), inline=True)
-    if "subsidy_rate" in fields:
-        e.add_field(name=f"{E.CHART} 負担率", value=f"{subsidy_rate:g}%", inline=True)
+    # ⚠️ 負担率はここに出さない。公開パネルは誰でも見られるので、
+    #    運営がいくら持ち出しているかが分かってしまう。
+    #    管理者が見たいときは /config subsidy と管理パネルにある。
     if "user_amount" in fields:
         e.add_field(name=f"{E.YEN} お支払い", value=f"**{yen(user_amount)}**", inline=True)
     if "daily_count" in fields:

@@ -33,6 +33,7 @@ TESTS = [
     ("利用者カード", "test_user_card.py"),
     ("気になる動きの検知", "test_fraud.py"),
     ("一斉通知", "test_broadcast.py"),
+    ("チャージ率・注文の条件", "test_limits.py"),
     ("紹介プログラム", "test_invite.py"),
     ("紹介プログラムの画面", "test_invite_ui.py"),
     ("バックアップと復元", "test_backup.py"),

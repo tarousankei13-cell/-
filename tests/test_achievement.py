@@ -83,7 +83,11 @@ async def main():
     SENT.clear()
     await flows.send_achievement(client, **ARGS)
     names = [n for n, _, _ in dump(SENT[0]["embed"])["fields"]]
-    check(f"全項目ONなら8項目（実際{len(names)}）", len(names) == 8, names)
+    # ⚠️ 負担率は公開パネルに出さない（運営の持ち出しが分かってしまう）。
+    #    設定に入れても無視されるので、全部ONでも7項目になる。
+    check(f"全項目ONでも7項目（実際{len(names)}）", len(names) == 7, names)
+    check("負担率は公開パネルに出ない ★",
+          not any("負担" in n for n in names), names)
 
     print("\n[3] 匿名コードが本人のものと一致するか")
     SENT.clear()
