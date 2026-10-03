@@ -459,15 +459,6 @@ class McdBot(commands.Bot):
         if url:
             log.info("注文番号ページ: %s", url)
 
-    async def close(self) -> None:
-        try:
-            from services import web as web_site
-
-            await web_site.stop()
-        except Exception:
-            log.exception("注文番号ページの停止に失敗しました")
-        await super().close()
-
     async def _refresh_panels(self) -> None:
         """
         設置済みパネルを起動時に最新にする。
@@ -583,12 +574,41 @@ class McdBot(commands.Bot):
     # -- 後片付け ---------------------------------------------
 
     async def close(self) -> None:
+        """
+        終了時の後片付け。
+
+        ⚠️ close は1つだけにすること。以前は2つ定義してしまっていて、
+           あとに書いたほうが勝ち、注文番号ページが止まらないままだった。
+           同じポートで立ち上げ直すと「使用中」で失敗する。
+
+        ⚠️ ひとつ失敗しても残りは必ず片付ける。
+           途中で例外が出ると、その先が実行されない。
+        """
+        for name, job in (
+            ("注文番号ページ", self._stop_web),
+            ("通信の後始末", self._stop_http),
+            ("データベース", self._stop_db),
+        ):
+            try:
+                await job()
+            except Exception:
+                log.exception("%sの停止に失敗しました", name)
+        await super().close()
+
+    async def _stop_web(self) -> None:
+        from services import web as web_site
+
+        await web_site.stop()
+
+    async def _stop_http(self) -> None:
         from core.http import close_shared
-        from db.session import close_db
 
         await close_shared()
+
+    async def _stop_db(self) -> None:
+        from db.session import close_db
+
         await close_db()
-        await super().close()
 
 
 # ------------------------------------------------------------

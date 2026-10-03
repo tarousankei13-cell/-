@@ -1066,6 +1066,14 @@ class ConfigCog(commands.Cog):
         condition: app_commands.Choice[str] | None = None,
     ) -> None:
         cond = condition.value if condition else "first_order"
+
+        # ⚠️ 開催中に「何名ごと」を下げると、**すでに達成している人数**が
+        #    新しい区切りで数え直され、過去ぶんが遡って発火する。
+        #    計算としては正しいが、管理者は驚くので先に伝える。
+        was_on = bool(settings.get("invite_enabled", False))
+        was_every = int(settings.get("invite_reward_every", 2) or 2)
+        warn_retro = was_on and int(every) < was_every
+
         for key, value in (
             ("invite_reward", int(reward)),
             ("invite_reward_every", int(every)),
@@ -1123,6 +1131,13 @@ class ConfigCog(commands.Cog):
                 "　 指定するまで、利用者は招待リンクを発行できません。"
             )
         lines.append(f"`/panel invite #チャンネル` でパネルを設置してください。")
+        if warn_retro:
+            lines.insert(0, (
+                f"{E.WARN} **「何名ごと」を {was_every} → {every} に下げました。**\n"
+                "　 すでに達成している人数が新しい区切りで数え直され、"
+                "**過去ぶんが遡ってお支払いになります**。\n"
+                "　 （全体の上限までで止まります）\n"
+            ))
 
         await interaction.response.send_message(
             embed=embeds.ok("招待キャンペーンを開始しました。\n\n" + "\n".join(lines)),

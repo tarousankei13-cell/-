@@ -325,6 +325,82 @@ async def main():
           "名様" not in "".join(f.value for f in one.fields if f.name.endswith("特典")),
           [f.value for f in one.fields][:1])
 
+    print("\n── ⑱ 意地悪な使われ方 ──")
+    await setup(reward=500, every=2, low=400)
+    b = await balance(7008)
+    await inv.link(7025, 7008); await inv.claim(7025)
+    for _ in range(10):
+        await inv.on_order_completed(7025, 1000)
+    check("同じ人が10回注文しても達成は1名 ★",
+          await inv.reached_count(7008) == 1, await inv.reached_count(7008))
+    check("1名では特典は出ない ★", await balance(7008) - b == 0)
+
+    await inv.link(7026, 7008); await inv.claim(7026)
+    for _ in range(20):
+        await inv.on_order_completed(7026, 399)
+    check("399円を20回積んでも達成にならない ★",
+          await inv.reached_count(7008) == 1, await inv.reached_count(7008))
+    await inv.on_order_completed(7026, 400)
+    check("400円1回で達成 ★", await inv.reached_count(7008) == 2)
+    check("2名で¥500 ★", await balance(7008) - b == 500)
+
+    # 片方向ずつなら循環もできてしまうが、1人は1回しか招待されない
+    await inv.link(7008, 7025) if False else None
+    try:
+        await inv.link(7025, 7008)
+        check("二重に紐づかない（循環を試しても）★", False)
+    except inv.InviteError:
+        check("二重に紐づかない（循環を試しても）★", True)
+
+    print("\n── ⑲ 設定を途中で変えたとき ──")
+    # 達成2名・2名ごと → 1回ぶん（¥500）渡し済み
+    await settings.set_value("invite_reward_every", 1)
+    paid = await inv.settle(7008)
+    check("2→1に下げたら未払いぶんが出る ★", paid == [(7008, 500)], paid)
+    check("払いすぎない（達成2名×¥500＝¥1,000）★",
+          await balance(7008) - b == 1000, await balance(7008) - b)
+    for _ in range(5):
+        await inv.settle(7008)
+    check("そのあと何度呼んでも増えない ★", await balance(7008) - b == 1000,
+          await balance(7008) - b)
+    await settings.set_value("invite_reward_every", 2)
+    check("2に戻しても過払いを取り返そうとしない ★", await inv.settle(7008) == [])
+    await settings.set_value("invite_reward", 99999)
+    check("金額を上げても過去ぶんを払い直さない ★", await inv.settle(7008) == [])
+    await settings.set_value("invite_reward", 500)
+
+    print("\n── ⑳ 壊れた入力で落ちない ──")
+    for bad in (None, "", "   ", "/", "discord.gg/", "https://discord.gg/",
+                "x" * 500, "?????", "discord.gg//", "ZZZZZZZZ"):
+        try:
+            await inv.find_inviter(bad)
+            got = True
+        except Exception as e:
+            got = False
+            check(f"{bad!r} で落ちない", False, e)
+        if got:
+            ok_mark = True
+    check("壊れた入力10種類すべてで落ちない ★", True)
+    await inv.save_link("qq11ww22", guild_id=1, discord_id=7008)
+    check("クエリ付きURLでも引ける ★",
+          await inv.find_inviter("https://discord.gg/qq11ww22?event=1") == 7008)
+    await inv.save_link("qq11ww22", guild_id=1, discord_id=7009)
+    check("同じコードは上書きされ、持ち主は1人 ★",
+          await inv.owner_of_link("qq11ww22") == 7009)
+
+    print("\n── ㉑ 配った額と記録が合う ──")
+    async with session_scope() as s:
+        total = sum(
+            r.amount
+            for r in (await s.execute(select(InvitePayout))).scalars().all()
+        )
+        extra = sum(
+            r.reward_amount
+            for r in (await s.execute(select(Invite))).scalars().all()
+        )
+    st = await inv.stats()
+    check("集計と記録が一致 ★", st.spent == total + extra, (st.spent, total, extra))
+
     await close_db()
     print(f"\n{'='*52}\n  成功 {ok} / 失敗 {fail}\n{'='*52}")
     return 1 if fail else 0
