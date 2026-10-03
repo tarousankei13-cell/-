@@ -426,6 +426,9 @@ class MenuProduct(Base):
     time_windows: Mapped[str | None] = mapped_column(Text)  # limitedAbility の checkoutable
     # サイズ違いをまとめる代表コード。コカ・コーラ S/M/L は同じ値を持つ。
     size_group: Mapped[str | None] = mapped_column(String(16))
+    # 説明文・画像・注意書きなど「見せるためだけ」の情報（JSON）。
+    # 注文の組み立てには使わないので、1列にまとめて持つ。
+    display: Mapped[str | None] = mapped_column(Text)
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

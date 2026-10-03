@@ -59,6 +59,58 @@ def harvest_names(node: Any, out: dict[str, str] | None = None) -> dict[str, str
     return out
 
 
+def _ja(node: Any, key: str) -> str:
+    """{"en": ..., "ja": ...} から日本語を取り出す。無ければ空。"""
+    v = node.get(key)
+    if isinstance(v, dict):
+        return str(v.get("ja") or "").strip()
+    return ""
+
+
+def harvest_display(menu: dict) -> dict[str, Display]:
+    """
+    `groupMenu.products` から、見せるための情報を集める。
+
+    実物のアプリが出しているのと同じ説明文・画像・注意書きを
+    ここで拾う。注文の組み立てには使わない。
+
+    ⚠️ `showLimitedTimeIcon` は全商品が true になっていて役に立たない。
+       期間限定の判定には `timeLimitedOffer.valid` を使う。
+    """
+    out: dict[str, Display] = {}
+    products = ((menu.get("groupMenu") or {}).get("products") or {})
+    if not isinstance(products, dict):
+        return out
+
+    for code, raw in products.items():
+        if not isinstance(raw, dict):
+            continue
+        image = raw.get("image") if isinstance(raw.get("image"), dict) else {}
+        offer = raw.get("timeLimitedOffer") if isinstance(raw.get("timeLimitedOffer"), dict) else {}
+        durl = raw.get("detailUrl") if isinstance(raw.get("detailUrl"), dict) else {}
+
+        out[str(code)] = Display(
+            subtitle=_ja(raw, "tSubtitle"),
+            description=_ja(raw, "tDescription"),
+            # small と middle と large は同じURLのことが多い。
+            # 大きいものから順に、あるものを使う。
+            image_url=str(
+                image.get("large") or image.get("middle") or image.get("small") or ""
+            ),
+            notes=_ja(raw, "tNotes"),
+            precautions=_ja(raw, "tPrecautions"),
+            kind=str(raw.get("kind") or ""),
+            set_type=str(raw.get("setType") or ""),
+            limited=bool(offer.get("valid")),
+            limited_from=str(offer.get("startedAt") or ""),
+            limited_to=str(offer.get("endedAt") or ""),
+            detail_url=_ja(durl, "tUrl") if isinstance(durl.get("tUrl"), dict) else "",
+            msc=bool(raw.get("isMscCertified")),
+            rainforest=bool(raw.get("isRainforestAllianceCertified")),
+        )
+    return out
+
+
 def build_size_names(menu: dict) -> dict[str, str]:
     """
     サイズ違いの商品名を「親の名前 + サイズ」に直す。
@@ -84,6 +136,59 @@ def build_size_names(menu: dict) -> dict[str, str]:
 # ============================================================
 #  データ構造
 # ============================================================
+
+@dataclass
+class Display:
+    """
+    実物のアプリと同じ情報を出すための、見せるためだけの値。
+
+    注文の組み立てには一切使わない。`groupMenu.products` から拾う
+    （`products` の側には名前すら入っていない / docs/08）。
+    """
+    subtitle: str = ""          # 商品名の補足
+    description: str = ""       # 商品説明
+    image_url: str = ""         # 商品画像
+    notes: str = ""             # ※一部店舗及びデリバリーでは価格が異なります。
+    precautions: str = ""       # 注意書き
+    kind: str = ""              # KIND_BURGER / KIND_SIDE / KIND_DRINK / KIND_MCCAFE
+    set_type: str = ""          # SET_TYPE_VALUE_SET / SET_TYPE_HAPPY_SET ...
+    limited_from: str = ""      # 期間限定の開始（ISO8601）
+    limited_to: str = ""        # 〃 終了（空なら未定）
+    limited: bool = False       # 期間限定かどうか
+    detail_url: str = ""        # 公式のアレルギー・栄養情報ページ
+    msc: bool = False           # MSC認証（白身魚）
+    rainforest: bool = False    # レインフォレスト・アライアンス認証（コーヒー）
+
+    @property
+    def has_any(self) -> bool:
+        return bool(self.description or self.image_url or self.subtitle)
+
+    def to_dict(self) -> dict:
+        """空の値は捨てる。1店舗ぶんで数百件あるので、持ち物は軽くする。"""
+        return {k: v for k, v in self.__dict__.items() if v}
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "Display":
+        if not d:
+            return cls()
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})
+
+
+KIND_LABEL = {
+    "KIND_BURGER": "バーガー",
+    "KIND_SIDE": "サイドメニュー",
+    "KIND_DRINK": "ドリンク",
+    "KIND_MCCAFE": "McCafé",
+}
+
+SET_TYPE_LABEL = {
+    "SET_TYPE_VALUE_SET": "バリューセット",
+    "SET_TYPE_HAPPY_SET": "ハッピーセット",
+    "SET_TYPE_COMBINATION": "コンビ",
+    "SET_TYPE_VALUE_LUNCH": "バリューランチ",
+}
+
 
 @dataclass
 class Slot:
@@ -138,21 +243,30 @@ class Product:
     #   [..] … その時間帯だけ注文できる
     time_windows: list[dict] | None = None
     size_group: str = ""      # サイズ違いをまとめる代表コード
+    display: Display = field(default_factory=Display)   # 見せるためだけの情報
 
     def price_for(self, pickup_method: str) -> int:
         """
         受取方法に応じた価格。
 
         セット商品は prePrice（構成込みの表示価格）を使う。
+
+        ⚠️ その受取方法の価格が入っていなければ、他の価格で代える。
+           実データ（247商品）では全部そろっていたが、欠けたときに
+           **¥0 と出すのが一番まずい**。ただより安いものは無い。
         """
         if self.product_class == "VALUE_MEAL" and self.pre_price:
             return self.pre_price
         code = PRICE_CODE.get(pickup_method, "TAKEOUT")
-        return {
+        by_code = {
             "EATIN": self.price_eatin,
             "TAKEOUT": self.price_takeout,
             "OTHER": self.price_other,
-        }.get(code, self.price_takeout)
+        }
+        for key in (code, "TAKEOUT", "EATIN", "OTHER"):
+            if by_code.get(key):
+                return by_code[key]
+        return self.pre_price or 0
 
     def is_orderable_at(self, minutes: int) -> bool:
         """
@@ -410,6 +524,7 @@ def parse_menu(store_id: str, menu: dict) -> ParsedMenu:
 
     ability = _limited_ability(menu)
     size_groups = parse_size_groups(menu)
+    display = harvest_display(menu)
 
     products: dict[str, Product] = {}
     for code, raw in (menu.get("products") or {}).items():
@@ -429,6 +544,7 @@ def parse_menu(store_id: str, menu: dict) -> ParsedMenu:
             slots=_parse_slots(raw, names),
             time_windows=_windows_of(ability, code),
             size_group=size_groups.get(code, ""),
+            display=display.get(code, Display()),
         )
 
     collections: list[Collection] = []

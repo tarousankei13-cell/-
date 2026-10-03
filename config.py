@@ -163,11 +163,12 @@ MCD_DATA_URL = "https://data.cat.{group}.prod.mop.mcd.qorcommerce.com/{path}"
 HTTP_TIMEOUT = 20
 
 # 受取方法（docs/07 §4.2 / CreateDeliveryMethod の oneof）
+# 表示名は実物のモバイルオーダーに合わせる（services/mcd/protocol.PICKUP_LABEL と同じ）
 PICKUP_METHODS = {
-    "takeOut":        {"field": 2, "label": "テイクアウト",           "enabled": True},
-    "eatIn":          {"field": 1, "label": "店内（カウンター受取）", "enabled": True},
-    "tableDelivery":  {"field": 3, "label": "店内（席まで）",         "enabled": False},
-    "curbsidePickUp": {"field": 4, "label": "駐車場で受け取る",       "enabled": False},
+    "eatIn":          {"field": 1, "label": "店内でお召し上がり",     "enabled": True},
+    "takeOut":        {"field": 2, "label": "お持ち帰り",             "enabled": True},
+    "tableDelivery":  {"field": 3, "label": "席までお届け",           "enabled": False},
+    "curbsidePickUp": {"field": 4, "label": "パーキングでお受け取り", "enabled": False},
     "driveThru":      {"field": 5, "label": "ドライブスルー",         "enabled": False},
     "addressDelivery":{"field": 6, "label": "デリバリー",             "enabled": False},
 }

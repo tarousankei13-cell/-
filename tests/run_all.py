@@ -14,6 +14,7 @@ TESTS = [
     ("セットの選択枠・時間帯", "test_menu_choices.py"),
     ("注文できない商品の除外", "test_menu_filter.py"),
     ("具材の調整（抜き・増量）", "test_customize.py"),
+    ("商品詳細と受取方法", "test_product_detail.py"),
     ("セット注文の組み立て", "test_set_order.py"),
     ("店名検索", "test_store_search.py"),
     ("店舗の注文可否", "test_availability.py"),

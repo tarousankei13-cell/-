@@ -31,6 +31,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import config
+
 # ============================================================
 #  低レベル protobuf
 # ============================================================
@@ -146,14 +148,9 @@ PICKUP_FIELD = {
 }
 FIELD_PICKUP = {v: k for k, v in PICKUP_FIELD.items()}
 
-PICKUP_LABEL = {
-    "eatIn": "店内（カウンター受取）",
-    "takeOut": "テイクアウト",
-    "tableDelivery": "店内（席まで）",
-    "curbsidePickUp": "駐車場で受け取る",
-    "driveThru": "ドライブスルー",
-    "addressDelivery": "デリバリー",
-}
+# 受取方法の表示名。実物のモバイルオーダーと同じ言い回しにしてある。
+# ⚠️ 2か所に書くと必ずずれるので、config.PICKUP_METHODS から引く。
+PICKUP_LABEL = {k: v["label"] for k, v in config.PICKUP_METHODS.items()}
 
 # 店舗JSONの deliveryMethod キーとの対応（docs/08 §4）
 STORE_DELIVERY_KEY = {

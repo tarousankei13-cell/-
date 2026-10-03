@@ -21,7 +21,7 @@ from db.session import session_scope
 from services.mcd.client import McdClient, McdError
 from services.mcd import availability
 from services.mcd.menu import (
-    Collection, MenuDiff, ParsedMenu, Product, Slot,
+    Collection, Display, MenuDiff, ParsedMenu, Product, Slot,
     diff_menus, parse_dayparts, parse_menu, supported_pickup_methods,
 )
 
@@ -245,6 +245,10 @@ async def sync_menu(
                         None if p.time_windows is None else json.dumps(p.time_windows)
                     ),
                     size_group=p.size_group or None,
+                    display=(
+                        json.dumps(p.display.to_dict(), ensure_ascii=False)
+                        if p.display.to_dict() else None
+                    ),
                     synced_at=now,
                 )
             )
@@ -306,6 +310,7 @@ async def load_menu(store_id: str) -> ParsedMenu:
                 None if r.time_windows is None else json.loads(r.time_windows)
             ),
             size_group=r.size_group or "",
+            display=Display.from_dict(json.loads(r.display) if r.display else None),
         )
     collections = [
         Collection(
