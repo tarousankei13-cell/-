@@ -28,6 +28,7 @@ TESTS = [
     ("並列化と下ごしらえ", "test_warmup.py"),
     ("メニュー同期", "test_menu_sync.py"),
     ("外形監視", "test_monitor.py"),
+    ("注文の順番待ち", "test_queue.py"),
     ("注文Saga（端から端まで）", "test_order_e2e.py"),
     ("エラーの判別と対処", "test_errors.py"),
     ("代理実績の同一性", "test_achievement.py"),

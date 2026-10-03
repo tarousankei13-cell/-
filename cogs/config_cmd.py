@@ -488,6 +488,32 @@ class ConfigCog(commands.Cog):
             ephemeral=True,
         )
 
+    @group.command(name="order_concurrency", description="同時に処理する注文の数を設定します")
+    @app_commands.describe(count="同時に処理する数（1〜20）")
+    @admin_only()
+    async def order_concurrency(
+        self, interaction: discord.Interaction, count: app_commands.Range[int, 1, 20]
+    ) -> None:
+        """
+        大人数が一斉に注文すると、マクドナルド側から見て不自然な量の
+        要求が短時間に集中する。同時に処理する数を絞ると、それを避けられる。
+        """
+        from core import queue as order_gate
+
+        await settings.set_value(
+            "order_concurrency", int(count),
+            updated_by=interaction.user.id, actor_name=str(interaction.user),
+        )
+        order_gate.gate.set_limit(int(count))
+        await interaction.response.send_message(
+            embed=embeds.ok(
+                f"同時に処理する注文を **{count}件** までにしました。\n"
+                f"{E.INFO} 超えた分は順番にお待ちいただきます。\n"
+                f"現在: {order_gate.gate.describe()}"
+            ),
+            ephemeral=True,
+        )
+
     @group.command(name="achievement_fields", description="実績パネルの表示項目を設定します")
     @app_commands.describe(
         anon_code="匿名コード", list_price="定価", subsidy_rate="負担率",

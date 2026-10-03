@@ -334,6 +334,12 @@ class TasksCog(commands.Cog):
         self._started = True
 
         await settings.load_all()
+        # 設定してある上限を反映する
+        from core import queue as order_gate
+
+        order_gate.gate.set_limit(
+            int(settings.get("order_concurrency", config.ORDER_CONCURRENCY))
+        )
         self._start_loops()
 
         # 未完了の注文とチャージを復旧する

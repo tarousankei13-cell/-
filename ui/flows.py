@@ -20,6 +20,7 @@ import emoji as E
 from core import ledger as L
 from core import saga, settings, subsidy
 from core import users as user_repo
+from core import queue as order_gate
 from core.telemetry import traced
 from db.models import as_utc, Order, User
 from db.session import session_scope
@@ -520,6 +521,62 @@ class ConfirmView(discord.ui.View):
 #  注文の実行と通知
 # ============================================================
 
+async def wait_for_recovery(interaction: discord.Interaction) -> bool:
+    """
+    マクドナルド側が落ちていたら、復帰を少し待つ。
+
+    戻り値が False なら、待っても復帰しなかったということ。
+    呼び出し側は注文を取り消すこと。
+
+    ⚠️ 判断には外形監視の結果を使う。ここで改めて通信はしない
+       （落ちている相手にさらに要求を足さないため）。
+    """
+    from services import monitor
+
+    healthy = [h for h in monitor.snapshot() if h.ok]
+    if healthy or not monitor.snapshot():
+        # 生きている配信元がある、またはまだ一度も確認していない
+        return True
+
+    waited = 0.0
+    step = 5.0
+    limit = float(config.ORDER_OUTAGE_WAIT_SECONDS)
+    try:
+        await interaction.edit_original_response(
+            embed=embeds.warn(
+                f"{E.LOADING} マクドナルドへ接続できない状態です。\n"
+                "復旧を待っていますので、そのままお待ちください。\n\n"
+                f"{E.INFO} 最大 {limit:.0f} 秒お待ちします。",
+                title=f"{E.WARN} 接続を待っています",
+            )
+        )
+    except discord.HTTPException:
+        pass
+
+    while waited < limit:
+        await asyncio.sleep(step)
+        waited += step
+        try:
+            report = await monitor.check()
+        except Exception:
+            continue
+        if report.healthy:
+            log.info("接続が復帰したため注文を続けます（%.0f秒待ちました）", waited)
+            return True
+
+    log.warning("復帰しなかったため注文を取り消します（%.0f秒）", waited)
+    await interaction.edit_original_response(
+        embed=embeds.error(
+            "マクドナルドへ接続できませんでした。\n"
+            "しばらくしてからもう一度お試しください。\n\n"
+            "残高は元に戻っています。",
+            title=f"{E.NG} ただいま注文できません",
+        )
+    )
+    return False
+
+
+
 @traced("注文")
 async def run_order(
     interaction: discord.Interaction,
@@ -558,8 +615,42 @@ async def run_order(
         idempotency_key=idempotency_key,
     )
 
+    # マクドナルド側が落ちている間は、送っても失敗するだけ。
+    # 復帰を少し待ってから流すほうが、利用者にとっても相手にとってもよい。
+    if not await wait_for_recovery(interaction):
+        await saga.cancel_waiting(
+            order_id, "マクドナルドへ接続できませんでした"
+        )
+        return
+
+    # 同時に処理する注文の数に上限がある。混んでいれば順番を待つ。
+    # 待っている間も残高は確保したまま（先に解放すると、順番が来たときに
+    # 残高が足りなくなりうる）。
+    if order_gate.gate.running >= order_gate.gate.limit:
+        try:
+            await interaction.edit_original_response(
+                embed=embeds.info(
+                    f"{E.LOADING} ただいま混み合っています。\n"
+                    f"順番にお通ししますので、そのままお待ちください。\n\n"
+                    f"{E.INFO} あなたの前に **{order_gate.gate.waiting}** 人います。"
+                )
+            )
+        except discord.HTTPException:
+            pass
+
     try:
-        result = await saga.execute(order_id, progress)
+        async with order_gate.gate.enter(interaction.user.id):
+            result = await saga.execute(order_id, progress)
+    except (order_gate.QueueFull, order_gate.QueueTimeout) as e:
+        log.info("混雑のため注文を受け付けられませんでした: %s", e)
+        await saga.cancel_waiting(order_id, str(e))
+        await interaction.edit_original_response(
+            embed=embeds.warn(
+                f"{e}\n\n残高は元に戻っています。",
+                title=f"{E.WARN} 混み合っています",
+            )
+        )
+        return
     except Exception:
         log.exception("注文の実行に失敗しました")
         await interaction.edit_original_response(

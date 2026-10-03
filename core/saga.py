@@ -401,6 +401,50 @@ async def _fetch_receipt(handle, group: str, token: str, attempts: int = 5) -> s
     return ""
 
 
+async def cancel_waiting(order_id: str, reason: str) -> None:
+    """
+    まだ何も送っていない注文を取り消す。
+
+    順番待ちで諦めた場合に使う。マクドナルドへは一切送っていないので、
+    確保した残高を戻して終わりにできる。
+
+    ⚠️ すでに送信を始めていたら何もしない。取り消してよいのは
+       BALANCE_HELD（残高を確保しただけ）の状態だけ。
+    """
+    async with session_scope() as s:
+        order = await s.get(Order, order_id)
+        if order is None:
+            return
+        state = order.state
+        discord_id = order.discord_id
+        user_amount = order.user_amount
+
+    # 取り消してよいのは、まだ何も送っていない状態だけ。
+    #   CREATED / QUOTED  … 残高もまだ確保していない
+    #   BALANCE_HELD      … 残高を確保しただけ。解放が必要
+    if state not in (CREATED, QUOTED, BALANCE_HELD):
+        log.warning(
+            "取り消せない状態です（%s）。そのまま処理を続けます: %s", state, order_id[:8]
+        )
+        return
+
+    await _record(order_id, state, COMPENSATING, {"error": reason})
+
+    if state == BALANCE_HELD:
+        try:
+            async with user_scope(discord_id) as s:
+                await L.release(
+                    s, discord_id, user_amount, order_id=order_id, memo=reason[:200]
+                )
+        except Exception:
+            log.exception("ホールドの解放に失敗しました。手動確認が必要です")
+            await _record(order_id, COMPENSATING, MANUAL_REVIEW, {"error": reason})
+            return
+
+    await _record(order_id, COMPENSATING, REFUNDED, {"error": reason})
+    log.info("順番待ちで取り消しました: %s（%s）", order_id[:8], reason)
+
+
 async def _handle_failure(order_id: str, state: str, handle, error: Exception, result: OrderResult) -> OrderResult:
     message = str(error)
     info = getattr(error, "info", None)

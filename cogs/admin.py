@@ -248,6 +248,34 @@ class AdminCog(commands.Cog):
             e.set_footer(text=f"{config.MONITOR_INTERVAL_MINUTES}分ごとに自動で確認しています")
         await interaction.followup.send(embed=e, ephemeral=True)
 
+    @stats_group.command(name="queue", description="注文の混雑状況を表示します")
+    @admin_only()
+    async def stats_queue(self, interaction: discord.Interaction) -> None:
+        from core import queue as order_gate
+
+        g = order_gate.gate
+        e = discord.Embed(
+            title=f"{E.CART} 注文の混雑",
+            description=g.describe(),
+            color=embeds.ORANGE if g.waiting else embeds.GREEN,
+        )
+        e.add_field(name="同時に処理する上限", value=f"{g.limit} 件", inline=True)
+        e.add_field(name="いま処理中", value=f"{g.running} 件", inline=True)
+        e.add_field(name="順番待ち", value=f"{g.waiting} 人", inline=True)
+        e.add_field(name="通した注文", value=f"{g.total_queued:,} 件", inline=True)
+        if g.total_rejected:
+            e.add_field(
+                name=f"{E.WARN} 混雑でお断りした数",
+                value=f"{g.total_rejected:,} 件", inline=True,
+            )
+        if g.longest_wait > 1:
+            e.add_field(
+                name="最も長かった待ち時間",
+                value=f"{g.longest_wait:.0f} 秒", inline=True,
+            )
+        e.set_footer(text="/config order_concurrency で上限を変えられます")
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
     @stats_group.command(name="account", description="アカウント別の使用状況")
     @admin_only()
     async def stats_account(self, interaction: discord.Interaction) -> None:
