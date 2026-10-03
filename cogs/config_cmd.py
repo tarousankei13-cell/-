@@ -1160,6 +1160,45 @@ class ConfigCog(commands.Cog):
             ephemeral=True,
         )
 
+    @group.command(
+        name="slot_rules",
+        description="セットの選択枠で断られた組み合わせを確認・取り消します",
+    )
+    @app_commands.describe(
+        forget_store="この店舗の学習結果を消す（店舗ID）。省略すると確認だけ",
+    )
+    @admin_only()
+    async def slot_rules_cmd(
+        self, interaction: discord.Interaction, forget_store: str | None = None
+    ) -> None:
+        from services.mcd import slot_rules
+
+        if forget_store:
+            n = slot_rules.forget(forget_store.strip())
+            await interaction.response.send_message(
+                embed=embeds.ok(
+                    f"店舗 `{forget_store}` の学習結果を {n} 件消しました。\n"
+                    "次の注文からまた候補に出ます。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        st = slot_rules.summary()
+        await interaction.response.send_message(
+            embed=embeds.info(
+                "**セットの選択枠の学習結果**\n\n"
+                f"{E.NG} 断られた組み合わせ　**{st['rejected']} 件**\n"
+                f"{E.OK} 通った組み合わせ　　**{st['confirmed']} 件**\n\n"
+                f"{E.INFO} カタログには「どの枠に何を入れられるか」が書かれて"
+                "いないため、実際に断られたものを覚えて次から出さないように"
+                "しています。\n"
+                "店側の都合で一時的に断られた場合は、"
+                "`/config slot_rules forget_store:<店舗ID>` で消せます。"
+            ),
+            ephemeral=True,
+        )
+
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:

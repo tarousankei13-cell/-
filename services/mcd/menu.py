@@ -384,12 +384,17 @@ class ParsedMenu:
             # カテゴリが分からないときは、せめてサイズ違いを出す
             codes = [p.code for p in self.size_variants(base)] or [base]
 
+        from services.mcd import slot_rules
+
         out = []
         for code in codes:
             p = self.products.get(str(code))
             if p is None:
                 continue
             if minutes is not None and not p.is_orderable_at(minutes):
+                continue
+            # 一度マクドナルドに断られた組み合わせは、もう出さない
+            if not slot_rules.allowed(self.store_id, slot.code, p.code):
                 continue
             out.append(p)
 
@@ -401,6 +406,13 @@ class ParsedMenu:
                 minutes is None or base_p.is_orderable_at(minutes)
             ):
                 out.insert(0, base_p)
+
+        # 確かなものを先に並べる。
+        # ⚠️ カタログに候補一覧が無い以上、確実に選べると分かっているのは
+        #    参照商品とそのサイズ違いだけ。利用者が上から選ぶほど
+        #    通りやすくなるようにしておく。
+        safe = {str(base)} | {q.code for q in self.size_variants(base)}
+        out.sort(key=lambda q: (q.code not in safe, q.name))
         return out
 
     def visible_products(self, collection_id: str, minutes: int | None = None) -> list[Product]:

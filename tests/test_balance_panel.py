@@ -104,7 +104,7 @@ async def main():
     ch = FakeChannel()
     it = FakeInteraction(UID, ch)
     sent = await balance_panel.post(
-        it, amount=3000, balance=5000, reason=balance_panel.REASON_CHARGE
+        it, amount=3000, balance=5000, reason="管理者による調整：チャージ分"
     )
     check("投稿された", sent is True)
     check("使ったチャンネルに出た", len(ch.sent) == 1, ch.sent)
@@ -112,7 +112,7 @@ async def main():
     check("ephemeral を付けていない（誰にでも見える）",
           "ephemeral" not in kw or kw.get("ephemeral") is not True, kw)
     d = dump(kw["embed"])
-    check("チャージと分かるタイトル", "チャージ" in (d["title"] or ""), d["title"])
+    check("プラスだと分かる", "チャージ" in (d["title"] or ""), d["title"])
     check("増減額が出ている", any("+¥3,000" in v for v in d["fields"].values()), d)
 
     print("\n[2] 既定では残高そのものを出さない（プライバシー）")
@@ -151,13 +151,13 @@ async def main():
     ch4 = FakeChannel()
     await balance_panel.post(
         FakeInteraction(UID, ch4), amount=-480, balance=4520,
-        reason=f"{balance_panel.REASON_ORDER}（南砂町店）", total_orders=12,
+        reason="管理者による調整：返金", total_orders=12,
     )
     d4 = dump(ch4.sent[0]["embed"])
-    check("注文と分かるタイトル", "注文" in (d4["title"] or ""), d4["title"])
+    check("マイナスだと分かる", "注文" in (d4["title"] or ""), d4["title"])
     check("マイナス表記", any("-¥480" in v for v in d4["fields"].values()), d4)
     check("色がチャージと違う", d4["color"] != d["color"], (d4["color"], d["color"]))
-    check("店舗名が内容に入る", any("南砂町店" in v for v in d4["fields"].values()), d4)
+    check("理由が内容に入る", any("返金" in v for v in d4["fields"].values()), d4)
 
     print("\n[6] orders は既定では出ない / 設定すれば出る")
     check("既定では利用回数が出ない",
@@ -267,7 +267,7 @@ async def main():
     check("送り先は既定で未設定＝操作したチャンネル",
           settings.DEFAULTS["channel_balance"] is None)
 
-    print("\n[14] チャージの完了からも、同じパネルが出る")
+    print("\n[14] チャージでは出さない ★")
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _fake_discord import (
         FakeClient as FakeBot,
@@ -293,16 +293,22 @@ async def main():
     modal.link._value = "https://kyash.me/payments/aaa"
     await modal.on_submit(itc)
 
-    pub = itc.public_embeds
-    check("チャージでもパネルが出る", len(pub) == 1, f"{len(pub)}件")
-    if pub:
-        body = (pub[0].title or "") + "".join(
-            f"{f.name}{f.value}" for f in pub[0].fields)
-        check("＋で出る", "+¥3,000" in body, body[:160])
-        check("チャージだと分かる", "チャージ" in body, body[:160])
-        check("残高は既定では出さない", "¥8,000" not in body, body[:160])
-    check("本人向けの完了案内も出ている",
+    check("チャージでは公開パネルを出さない ★", len(itc.public_embeds) == 0,
+          str(itc.public_embeds)[:120])
+    check("本人向けの完了案内は出る",
           any(k == "followup" for k, _ in itc.actions), itc.actions)
+    check("本人にしか見えない ★",
+          all(kw.get("ephemeral") for k, kw in itc.actions if k == "followup"),
+          itc.actions)
+
+    print("\n[15] 出すのは管理者の増減だけ ★")
+    import inspect
+    from ui import flows as F
+    src = inspect.getsource(F)
+    check("注文の経路から呼んでいない ★", "balance_panel" not in src, "まだ残っている")
+    from cogs import admin as A
+    check("/admin grant からは呼んでいる ★",
+          "balance_panel.post" in inspect.getsource(A))
 
     await close_db()
     print(f"\n{'='*52}\n  成功 {ok} / 失敗 {fail}\n{'='*52}")

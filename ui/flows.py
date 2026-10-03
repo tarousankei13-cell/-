@@ -27,12 +27,13 @@ from db.models import as_utc, Order, User
 from db.session import session_scope
 from services.mcd import accounts as mcd_accounts
 from services.mcd import availability, slot_bridge
+from services.mcd.menu import minutes_of
 from services.mcd import stores as mcd_stores
 from services.mcd.client import McdError
 from services.mcd.protocol import (
     PICKUP_LABEL, DecodedOrder, ProtocolError, decode_hex,
 )
-from ui import balance_panel, embeds
+from ui import embeds
 
 log = logging.getLogger("bot.flows")
 
@@ -147,14 +148,6 @@ class ChargeModal(discord.ui.Modal, title="残高チャージ"):
         if result.sender_name:
             e.add_field(name=f"{E.USER} 送金者", value=result.sender_name, inline=True)
         await interaction.followup.send(embed=e, ephemeral=True)
-
-        # 残高が増えたことを、使ったチャンネルに誰でも見える形で出す
-        await balance_panel.post(
-            interaction,
-            amount=result.amount,
-            balance=result.balance,
-            reason=balance_panel.REASON_CHARGE,
-        )
 
 
 async def open_charge_modal(interaction: discord.Interaction) -> None:
@@ -704,13 +697,26 @@ async def run_order(
         return
 
     if not result.succeeded:
-        # 解析できていれば、原因に応じた説明を出す。
-        # 生の応答をそのまま見せても利用者には分からないため。
+        # セットの中身が原因で断られたなら、それを覚えて次から出さない
+        learned = await learn_rejected_choices(decoded, result)
+
+        message, title = result.user_message, f"{E.NG} 注文できませんでした"
+        if learned:
+            # ⚠️ マクドナルドは組み合わせが悪いときも「時間外」と言ってくる。
+            #    そのまま伝えると、待てば直ると誤解させてしまう。
+            message = (
+                "セットの中身の組み合わせが、この店舗では選べませんでした。\n"
+                + "・" + "\n・".join(learned) + "\n\n"
+                "この組み合わせは次から出さないようにしました。\n"
+                "お手数ですが、別のものを選んでもう一度お試しください。\n"
+                "残高は元に戻っています。"
+            )
+            title = f"{E.NG} この組み合わせは選べません"
         await interaction.edit_original_response(
-            embed=embeds.error(result.user_message, title=f"{E.NG} 注文できませんでした")
+            embed=embeds.error(message, title=title)
         )
         # 管理者側にだけ、原因と対処を知らせる
-        await notify_admin_failure(interaction, result)
+        await notify_admin_failure(interaction, result, learned=learned)
         return
 
     # DMへ完了パネルを送る
@@ -734,8 +740,28 @@ async def run_order(
     await push_receipt_page(result)
     await saga.mark_notified(result.order_id)
     await post_achievement(interaction, result)
-    await post_balance_change(interaction, result)
     await grant_invite_reward(interaction)
+    confirm_choices(decoded, result)
+
+
+def confirm_choices(decoded, result) -> None:
+    """
+    通った組み合わせを覚える。
+
+    一度通ったものは、あとで断られても候補から外さない。
+    売り切れなど、その時だけの事情で断られることがあるため。
+    """
+    try:
+        from services.mcd import slot_rules
+
+        store_id = result.store_id or getattr(decoded, "store_id", "") or ""
+        if not store_id:
+            return
+        for item in getattr(decoded, "items", None) or []:
+            for slot_code, product_code in slot_rules.choices_of(item):
+                slot_rules.confirm(store_id, slot_code, product_code)
+    except Exception:
+        log.exception("通った組み合わせを覚えられませんでした")
 
 
 async def push_receipt_page(result: saga.OrderResult) -> None:
@@ -980,21 +1006,6 @@ async def post_achievement(interaction: discord.Interaction, result: saga.OrderR
     )
 
 
-async def post_balance_change(
-    interaction: discord.Interaction, result: saga.OrderResult
-) -> None:
-    """注文で残高が減ったことを、使ったチャンネルへ公開パネルで出す。"""
-    store = result.store_name or result.store_id or ""
-    reason = f"{balance_panel.REASON_ORDER}{f'（{store}）' if store else ''}"
-    await balance_panel.post(
-        interaction,
-        amount=-abs(result.user_amount),
-        balance=result.balance_after,
-        reason=reason,
-        total_orders=result.total_orders,
-    )
-
-
 async def notify_admin_fraud(
     interaction: discord.Interaction, report
 ) -> None:
@@ -1031,8 +1042,55 @@ async def notify_admin_fraud(
         log.exception("不正検知の通知を送れませんでした")
 
 
+async def learn_rejected_choices(decoded, result) -> list[str]:
+    """
+    セットの中身が原因で断られたなら覚える。覚えた商品名を返す。
+
+    ⚠️ カタログには「どの枠に何を入れられるか」が書かれていないため、
+       候補を出しすぎている（services/mcd/slot_rules.py）。
+       実際に断られたものを覚えて、次から出さないようにする。
+
+    ⚠️ 本当の時間外と取り違えないこと。
+       **こちらの時間判定が通っていたのに**マクドナルドが「時間外」と
+       言ってきた場合だけ、組み合わせの問題として扱う。
+       こちらも時間外と分かっていたなら、それはただの時間外。
+    """
+    from services.mcd import errors as mcd_errors
+    from services.mcd import slot_rules
+
+    info = result.error_info
+    kind = getattr(info, "kind", "") if info else ""
+    if kind not in (mcd_errors.PRODUCT_TIME, mcd_errors.PRODUCT_GONE):
+        return []
+
+    store_id = result.store_id or getattr(decoded, "store_id", "") or ""
+    if not store_id:
+        return []
+
+    try:
+        menu = await mcd_stores.load_menu(store_id)
+    except Exception:
+        log.exception("メニューを読めず、組み合わせを学習できませんでした")
+        return []
+
+    minutes = minutes_of(config.now_jst())
+    learned: list[str] = []
+    for item in getattr(decoded, "items", None) or []:
+        for slot_code, product_code in slot_rules.choices_of(item):
+            product = menu.products.get(product_code)
+            if product is None:
+                continue
+            # こちらが「時間外」と分かっていたものは、組み合わせのせいにしない
+            if not product.is_orderable_at(minutes):
+                continue
+            if slot_rules.reject(store_id, slot_code, product_code):
+                learned.append(product.name)
+    return learned
+
+
 async def notify_admin_failure(
-    interaction: discord.Interaction, result: saga.OrderResult
+    interaction: discord.Interaction, result: saga.OrderResult,
+    learned: list[str] | None = None,
 ) -> None:
     """
     注文の失敗を管理者チャンネルへ知らせる。
@@ -1047,7 +1105,9 @@ async def notify_admin_failure(
     from services.mcd import errors as mcd_errors
 
     quiet = {mcd_errors.PRODUCT_TIME, mcd_errors.PRODUCT_GONE, mcd_errors.STORE}
-    if info is not None and getattr(info, "kind", "") in quiet:
+    # 組み合わせが原因だったときは知らせる。
+    # カタログに無い情報を学習した記録なので、管理者が把握できたほうがよい。
+    if not learned and info is not None and getattr(info, "kind", "") in quiet:
         return
 
     channel_id = settings.get("channel_admin")
