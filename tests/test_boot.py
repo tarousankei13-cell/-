@@ -96,6 +96,49 @@ async def main():
     check("同じ定義なら同じハッシュ", sig1 == sig2)
     check("ハッシュが生成される", len(sig1) == 64, sig1[:16])
 
+    print("\n[7.5] 起動したらパネルを自動で最新にする ★")
+    # ボタンは add_view で戻るが、チャンネルに貼ってあるメッセージの
+    # 中身は古いまま。新しいボタンを足しても、貼り直すか
+    # /panel refresh を叩くまで出てこない。
+    # 管理者がそれを覚えておくのは無理なので、起動のたびに自動で合わせる。
+    from db.models import Panel
+    from db.session import session_scope as _scope
+
+    edited = []
+
+    class FakeMessage:
+        async def edit(self, **kw):
+            edited.append(kw)
+
+    class FakePanelChannel:
+        def __init__(self, cid): self.id = cid
+        async def fetch_message(self, mid): return FakeMessage()
+
+    async with _scope() as s:
+        s.add(Panel(kind="order", guild_id=1, channel_id=10,
+                    message_id=100, deployed_by=1))
+        s.add(Panel(kind="charge", guild_id=1, channel_id=11,
+                    message_id=101, deployed_by=1))
+
+    bot.get_channel = lambda cid: FakePanelChannel(cid)
+    await bot._refresh_panels()
+    check("設置済みパネルを貼り直す ★", len(edited) == 2, len(edited))
+    check("中身（embed）を差し替える",
+          all(kw.get("embed") is not None for kw in edited), edited)
+    check("ボタン（view）も差し替える ★",
+          all(kw.get("view") is not None for kw in edited), edited)
+
+    # チャンネルが消えていても起動は止めない
+    bot.get_channel = lambda cid: None
+    await bot._refresh_panels()
+    check("チャンネルが無くても落ちない ★", True)
+
+    # 更新中に何が起きても起動を止めない
+    def boom(cid): raise RuntimeError("壊れた")
+    bot.get_channel = boom
+    await bot._refresh_panels()
+    check("例外が出ても起動を止めない ★", True)
+
     print("\n[8] 絵文字がすべてUnicode（カスタム絵文字なし）")
     import emoji as E
     customs = [k for k, v in vars(E).items()

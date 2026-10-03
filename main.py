@@ -131,6 +131,7 @@ logging.basicConfig(
 )
 
 # 相関IDを全てのログ行に載せる（付いていない行は空欄になる）
+import emoji as E  # noqa: E402
 from core.telemetry import CorrelationFilter  # noqa: E402
 
 for _handler in logging.root.handlers:
@@ -332,6 +333,37 @@ class McdBot(commands.Bot):
             except Exception:
                 log.exception("スラッシュコマンドの同期に失敗しました")
             self._synced = True
+
+        await self._refresh_panels()
+
+    async def _refresh_panels(self) -> None:
+        """
+        設置済みパネルを起動時に最新にする。
+
+        ボタンの反応は `_register_persistent_views` で戻るが、
+        **チャンネルに貼ってあるメッセージの中身は古いまま**になる。
+        新しいボタンを足しても、貼り直すか `/panel refresh` を
+        叩くまで出てこない。管理者がそれを覚えておくのは無理なので、
+        起動のたびに自動で合わせる。
+
+        ⚠️ ここで失敗しても BOT は動く。絶対に起動を止めない。
+        """
+        try:
+            from cogs.panel import refresh_all
+
+            lines = await refresh_all(self)
+        except Exception:
+            log.exception("パネルの更新に失敗しました")
+            return
+
+        if not lines:
+            return
+        failed = [l for l in lines if l.startswith(E.NG)]
+        if failed:
+            log.warning("パネルを更新しました（%d件中%d件が失敗）: %s",
+                        len(lines), len(failed), " / ".join(failed))
+        else:
+            log.info("パネルを最新にしました（%d件）", len(lines))
 
     # -- スラッシュコマンドの同期（二重表示の解消） -------------
 

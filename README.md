@@ -230,7 +230,7 @@ AKIBA    → ビックカメラＡＫＩＢＡ店
 | `/panel order <ch>` | 注文パネルを設置 |
 | `/panel charge <ch>` | チャージパネルを設置 |
 | `/panel admin <ch>` | 管理パネルを設置 |
-| `/panel refresh` | 設置済みパネルを最新にする |
+| `/panel refresh` | 設置済みパネルを最新にする（**起動時にも自動で走ります**） |
 
 ### 設定
 | コマンド | 説明 |

@@ -18,6 +18,49 @@ from ui import admin_flows, embeds, panels
 log = logging.getLogger("bot.cogs.panel")
 
 
+async def refresh_all(bot: commands.Bot) -> list[str]:
+    """
+    設置済みパネルの文言とボタンを最新にする。
+
+    `/panel refresh` からも、起動時からも、ここだけを通す。
+    別々に書くと、片方を直し忘れて食い違う。
+
+    戻り値は1行ずつの結果（表示用）。例外は外へ出さない。
+    """
+    async with session_scope() as s:
+        from sqlalchemy import select
+
+        rows = (await s.execute(select(Panel))).scalars().all()
+        targets = [(r.kind, r.channel_id, r.message_id) for r in rows]
+
+    if not targets:
+        return []
+
+    stats = await admin_flows.collect_stats()
+    builders = {
+        "order": panels.build_order_panel(),
+        "charge": (embeds.charge_panel(), panels.ChargePanel()),
+        "admin": (embeds.admin_panel(stats), panels.AdminPanel()),
+    }
+
+    lines: list[str] = []
+    for kind, channel_id, message_id in targets:
+        channel = bot.get_channel(channel_id)
+        if channel is None or kind not in builders:
+            lines.append(f"{E.NG} {kind}: チャンネルが見つかりません")
+            continue
+        embed, view = builders[kind]
+        try:
+            message = await channel.fetch_message(message_id)
+            await message.edit(embed=embed, view=view)
+            lines.append(f"{E.OK} {kind}: 更新しました")
+        except discord.NotFound:
+            lines.append(f"{E.NG} {kind}: メッセージが見つかりません（再設置してください）")
+        except discord.HTTPException as e:
+            lines.append(f"{E.NG} {kind}: {e}")
+    return lines
+
+
 class PanelCog(commands.Cog):
     """利用者パネル・管理者パネルの設置"""
 
@@ -89,40 +132,12 @@ class PanelCog(commands.Cog):
     @admin_only()
     async def refresh(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
-        async with session_scope() as s:
-            from sqlalchemy import select
-
-            rows = (await s.execute(select(Panel))).scalars().all()
-            targets = [(r.kind, r.channel_id, r.message_id) for r in rows]
-
-        if not targets:
+        lines = await refresh_all(self.bot)
+        if not lines:
             await interaction.followup.send(
                 embed=embeds.info("設置済みのパネルがありません。"), ephemeral=True
             )
             return
-
-        stats = await admin_flows.collect_stats()
-        builders = {
-            "order": panels.build_order_panel(),
-            "charge": (embeds.charge_panel(), panels.ChargePanel()),
-            "admin": (embeds.admin_panel(stats), panels.AdminPanel()),
-        }
-
-        lines = []
-        for kind, channel_id, message_id in targets:
-            channel = self.bot.get_channel(channel_id)
-            if channel is None or kind not in builders:
-                lines.append(f"{E.NG} {kind}: チャンネルが見つかりません")
-                continue
-            embed, view = builders[kind]
-            try:
-                message = await channel.fetch_message(message_id)
-                await message.edit(embed=embed, view=view)
-                lines.append(f"{E.OK} {kind}: 更新しました")
-            except discord.NotFound:
-                lines.append(f"{E.NG} {kind}: メッセージが見つかりません（再設置してください）")
-            except discord.HTTPException as e:
-                lines.append(f"{E.NG} {kind}: {e}")
 
         await interaction.followup.send(
             embed=discord.Embed(
