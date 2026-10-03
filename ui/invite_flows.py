@@ -101,8 +101,10 @@ async def issue_link(interaction: discord.Interaction) -> None:
         )
         return
 
+    # ⚠️ 「招待を作れる場所か」で判定する。種類で判定すると、
+    #    カテゴリやフォーラムのように作れない場所を取りこぼす。
     channel = guild.get_channel(int(channel_id))
-    if channel is None or not isinstance(channel, discord.abc.GuildChannel):
+    if channel is None or not hasattr(channel, "create_invite"):
         await interaction.followup.send(
             embed=embeds.warn(
                 "招待リンクの発行先チャンネルが見つかりませんでした。\n"

@@ -6,6 +6,8 @@ Discordに接続せずに、パネルやボタンの流れを確かめるため�
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import discord
 
 
@@ -63,6 +65,9 @@ class FakeUser:
         self.dm_ok = True
         self.dms: list[dict] = []
         self.guild_permissions = discord.Permissions(administrator=False)
+        # 紹介プログラムの条件判定に使う（既定は条件を満たす古さ）
+        self.created_at = datetime.now(timezone.utc) - timedelta(days=365)
+        self.joined_at = datetime.now(timezone.utc) - timedelta(days=30)
 
     async def send(self, **kw):
         if not self.dm_ok:
@@ -108,9 +113,25 @@ class FakeChannel:
         self.client = client
         self.name = name
         self.sent: list[dict] = []
+        self.guild = None
+        self.can_invite = True
+        self.invite_seq = 0
+        self.invites_made: list["FakeInvite"] = []
 
     def permissions_for(self, _member):
         return None   # 判定できないときは送れる扱い（ui/balance_panel 参照）
+
+    async def create_invite(self, **kw):
+        """招待リンクの発行。can_invite=False にすると権限なしを再現する。"""
+        if not self.can_invite:
+            raise discord.Forbidden(_FakeResp(403), "招待を作れません")
+        self.invite_seq += 1
+        code = f"code{self.invite_seq:04d}"
+        inv = FakeInvite(code, channel=self)
+        self.invites_made.append(inv)
+        if self.guild is not None:
+            self.guild.invite_list.append(inv)
+        return inv
 
     async def send(self, **kw):
         self.sent.append(kw)
@@ -118,10 +139,36 @@ class FakeChannel:
             self.client.sent.setdefault(self.id, []).append(kw)
 
 
+class FakeInvite:
+    def __init__(self, code: str, channel=None, inviter=None, uses: int = 0) -> None:
+        self.code = code
+        self.channel = channel
+        self.inviter = inviter
+        self.uses = uses
+        self.url = f"https://discord.gg/{code}"
+
+
 class FakeGuild:
-    def __init__(self, gid: int = 1) -> None:
+    def __init__(self, gid: int = 1, name: str = "マクドナルドジャパン") -> None:
         self.id = gid
+        self.name = name
         self.me = None
+        self.channels: dict[int, "FakeChannel"] = {}
+        self.invite_list: list[FakeInvite] = []
+        self.can_list_invites = True
+
+    def add_channel(self, channel: "FakeChannel") -> "FakeChannel":
+        channel.guild = self
+        self.channels[channel.id] = channel
+        return channel
+
+    def get_channel(self, cid):
+        return self.channels.get(int(cid))
+
+    async def invites(self):
+        if not self.can_list_invites:
+            raise discord.Forbidden(_FakeResp(403), "招待を見られません")
+        return list(self.invite_list)
 
 
 class FakeInteraction:
