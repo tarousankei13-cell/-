@@ -312,6 +312,11 @@ class McdBot(commands.Bot):
 
         await self._load_cogs()
         await self._register_persistent_views()
+        # ⚠️ 注文番号ページは on_ready を待たずに立ち上げる。
+        #    ホスティングサービスは「すぐポートが開くか」で起動の成否を
+        #    判断することが多く、Discordへの接続完了まで待つと
+        #    起動失敗と見なされることがある。
+        await self._start_web()
 
     async def _load_cogs(self) -> None:
         if not COGS_DIR.exists():
@@ -355,7 +360,6 @@ class McdBot(commands.Bot):
             self._synced = True
 
         await self._refresh_panels()
-        await self._start_web()
         await self._refresh_invite_cache()
 
     # -- 招待の自動追跡 -----------------------------------------

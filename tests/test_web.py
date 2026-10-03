@@ -144,7 +144,43 @@ async def main():
     check("タグとして出さない ★", "<script>" not in resp.text, resp.text[:300])
     check("エスケープされている", "&lt;script&gt;" in resp.text)
 
-    print("\n[11] 停止したあとに止めても落ちない")
+    print("\n[11] ホスティングの環境変数に従う ★")
+    # ⚠️ 多くのホスティングは起動のたびにポートを決めて PORT で渡してくる。
+    #    そこで待ち受けないとサイトが開けない。
+    #    HOST も 0.0.0.0 でないと外から届かない。
+    old_env = {k: os.environ.get(k) for k in ("PORT", "HOST", "WEB_BASE_URL")}
+    for k in old_env:
+        os.environ.pop(k, None)
+
+    await settings.set_value("web_enabled", False)
+    check("PORT が無く設定も無効なら立ち上げない", not W.should_start())
+
+    os.environ["PORT"] = "3000"
+    check("PORT があれば設定を待たずに立ち上げる ★", W.should_start())
+    check("HOST 未指定なら 0.0.0.0 ★", W._from_env() == ("0.0.0.0", 3000), W._from_env())
+    check("127.0.0.1 を既定にしない ★", W._from_env()[0] != "127.0.0.1")
+
+    os.environ["HOST"] = "0.0.0.0"
+    check("HOST の指定に従う", W._from_env() == ("0.0.0.0", 3000), W._from_env())
+
+    os.environ["PORT"] = "ポート"
+    check("数字でない PORT は無視する ★", W._from_env() is None)
+    os.environ["PORT"] = "3000"
+
+    await settings.set_value("web_base_url", "")
+    os.environ["WEB_BASE_URL"] = "https://example.puratya.com/order"
+    check("公開URLも環境変数で渡せる ★",
+          W.page_url("abc") == "https://example.puratya.com/order/abc",
+          W.page_url("abc"))
+
+    for k, v in old_env.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+    await settings.set_value("web_enabled", True)
+
+    print("\n[12] 停止したあとに止めても落ちない")
     await W.stop()
     await W.stop()
     check("二重に止めても例外にならない", not W.running())

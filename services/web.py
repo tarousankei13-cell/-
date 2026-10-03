@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import html
 import logging
+import os
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -50,9 +51,13 @@ def page_url(token: str | None) -> str:
     """
     if not token:
         return ""
-    if not settings.get("web_enabled", config.WEB_ENABLED):
+    if not should_start():
         return ""
-    base = str(settings.get("web_base_url", config.WEB_BASE_URL) or "").strip()
+    # 公開URLは環境変数でも渡せる（ホスティングのサイトURLをそのまま入れる）
+    base = (
+        os.environ.get("WEB_BASE_URL", "").strip()
+        or str(settings.get("web_base_url", config.WEB_BASE_URL) or "").strip()
+    )
     if not base:
         return ""
     return f"{base.rstrip('/')}/{token}"
@@ -197,6 +202,43 @@ def build_app() -> web.Application:
 _runner: web.AppRunner | None = None
 
 
+def _from_env() -> tuple[str, int] | None:
+    """
+    ホスティングサービスが指定してくる待ち受け先。
+
+    多くのサービス（Render / Railway / Fly / puratya など）は、
+    起動のたびにポートを決めて環境変数 PORT で渡してくる。
+    そこを使わないとサイトが開けないので、**設定より環境変数を優先**する。
+
+    ⚠️ HOST は 0.0.0.0 でなければ外から届かない。
+       127.0.0.1 や localhost にすると、立ち上がっているのに
+       「サイトが開けません」になる。
+    """
+    raw = os.environ.get("PORT", "").strip()
+    if not raw:
+        return None
+    try:
+        port = int(raw)
+    except ValueError:
+        log.warning("環境変数 PORT の値が数字ではありません: %r", raw)
+        return None
+    host = os.environ.get("HOST", "").strip() or "0.0.0.0"
+    return host, port
+
+
+def should_start() -> bool:
+    """
+    立ち上げるかどうか。
+
+    PORT が渡されている＝ホスティング側がHTTPサーバを待っている、
+    ということなので、設定を待たずに立ち上げる。
+    そうしないと、置いただけでは「サイトが開けません」になる。
+    """
+    if _from_env() is not None:
+        return True
+    return bool(settings.get("web_enabled", config.WEB_ENABLED))
+
+
 async def start() -> str:
     """
     サイトを立ち上げる。立ち上げたURLを返す（無効なら空文字）。
@@ -206,11 +248,16 @@ async def start() -> str:
     global _runner
     if _runner is not None:
         return ""
-    if not settings.get("web_enabled", config.WEB_ENABLED):
+    if not should_start():
         return ""
 
-    host = str(settings.get("web_host", config.WEB_HOST))
-    port = int(settings.get("web_port", config.WEB_PORT))
+    env = _from_env()
+    if env is not None:
+        host, port = env
+        log.info("待ち受け先を環境変数から読みました（HOST=%s PORT=%s）", host, port)
+    else:
+        host = str(settings.get("web_host", config.WEB_HOST))
+        port = int(settings.get("web_port", config.WEB_PORT))
     try:
         _runner = web.AppRunner(build_app(), access_log=None)
         await _runner.setup()
