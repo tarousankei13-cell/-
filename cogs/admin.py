@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
@@ -341,6 +342,60 @@ class AdminCog(commands.Cog):
         )
         await interaction.response.send_message(
             embed=embeds.ok(f"{user.mention} の利用停止を解除しました。"), ephemeral=True
+        )
+
+    @admin.command(name="restore", description="バックアップから復元します（要注意）")
+    @app_commands.describe(file="復元するバックアップファイル（.db）")
+    @owner_only()
+    async def admin_restore(
+        self, interaction: discord.Interaction, file: discord.Attachment
+    ) -> None:
+        """
+        バックアップから戻す。
+
+        ⚠️ いまの内容は失われる。中身を確かめ、確認を取ってから実行する。
+           戻す直前のものは別名で残すので、間違えても戻せる。
+        """
+        from services import backup as backup_svc
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if file.size > 200 * 1024 * 1024:
+            await interaction.followup.send(
+                embed=embeds.error("ファイルが大きすぎます（200MBまで）。"),
+                ephemeral=True,
+            )
+            return
+        try:
+            data = await file.read()
+        except Exception as e:
+            await interaction.followup.send(
+                embed=embeds.error(f"ファイルを読めませんでした。\n```{e}```"),
+                ephemeral=True,
+            )
+            return
+
+        good, message = await asyncio.to_thread(backup_svc.verify, data)
+        if not good:
+            await interaction.followup.send(
+                embed=embeds.error(
+                    f"このファイルからは復元できません。\n{message}"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        e = discord.Embed(
+            title=f"{E.WARN} 本当に復元しますか",
+            description=(
+                f"`{file.filename}`（{file.size / 1024:.0f} KB）\n{message}\n\n"
+                "**いまの残高・注文履歴は、このファイルの内容で置き換わります。**\n"
+                "復元する直前の内容は別名で残すので、間違えても戻せます。\n\n"
+                f"{E.INFO} 復元後は**BOTの再起動が必要**です。"
+            ),
+            color=embeds.RED,
+        )
+        await interaction.followup.send(
+            embed=e, view=RestoreConfirm(data, file.filename), ephemeral=True
         )
 
     @admin.command(name="broadcast", description="利用者へお知らせを送ります")
@@ -830,6 +885,47 @@ class AdminCog(commands.Cog):
     ) -> None:
         if not await handle_check_failure(interaction, error):
             log.exception("admin コマンドでエラー", exc_info=error)
+
+
+class RestoreConfirm(discord.ui.View):
+    """復元の最終確認。押し間違いが起きないよう、文言と色を強くする。"""
+
+    def __init__(self, data: bytes, filename: str) -> None:
+        super().__init__(timeout=120)
+        self.data = data
+        self.filename = filename
+
+    @discord.ui.button(
+        label="復元する（元に戻せません）", emoji="⚠️", style=discord.ButtonStyle.danger
+    )
+    async def do_restore(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        from services import backup as backup_svc
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        database_url = getattr(interaction.client, "database_url", "")
+        good, message = await asyncio.to_thread(
+            backup_svc.restore, self.data, database_url
+        )
+        await audit.record(
+            actor_id=interaction.user.id, actor_name=str(interaction.user),
+            action="backup.restore", target=self.filename,
+            after="成功" if good else "失敗", detail=message,
+        )
+        await interaction.followup.send(
+            embed=(embeds.ok if good else embeds.error)(message), ephemeral=True
+        )
+        self.stop()
+
+    @discord.ui.button(label="やめる", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await interaction.response.edit_message(
+            embed=embeds.info("復元をやめました。"), view=None
+        )
+        self.stop()
 
 
 async def setup(bot: commands.Bot) -> None:

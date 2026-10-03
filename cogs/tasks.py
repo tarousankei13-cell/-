@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -19,6 +20,83 @@ from services.mcd import store_sync
 from ui import embeds
 
 log = logging.getLogger("bot.cogs.tasks")
+
+
+async def save_backup(bot, name: str, data: bytes):
+    """
+    控えを設定された保存先へ置く。
+
+    どれか1つでも成功すれば ok。全部失敗したときだけ騒ぐ。
+    """
+    import io
+
+    from services import backup as backup_svc
+
+    where = str(settings.get("backup_where", "channel")).lower()
+    targets = (
+        ["channel", "dm", "local"] if where == "all" else [where]
+    )
+    saved: list[str] = []
+    errors: list[str] = []
+
+    note = (
+        f"{E.OK} 定期バックアップ（{len(data) / 1024:.0f} KB）\n"
+        f"{E.INFO} 残高・注文履歴はこのファイルだけで復元できます。\n"
+        f"　　登録済みアカウントも戻すには、サーバーの "
+        f"`data/encryption_key.txt` も必要です"
+    )
+
+    for target in targets:
+        try:
+            if target == "channel":
+                channel_id = settings.get("channel_admin")
+                channel = bot.get_channel(int(channel_id)) if channel_id else None
+                if channel is None:
+                    errors.append("管理者チャンネルが設定されていません")
+                    continue
+                await channel.send(
+                    content=note, file=discord.File(io.BytesIO(data), filename=name)
+                )
+                saved.append("管理者チャンネル")
+
+            elif target == "dm":
+                owners = list(getattr(bot, "owner_ids", None) or [])
+                if not owners:
+                    errors.append("オーナーが設定されていません")
+                    continue
+                delivered = 0
+                for uid in owners:
+                    user = bot.get_user(int(uid))
+                    if user is None:
+                        try:
+                            user = await bot.fetch_user(int(uid))
+                        except Exception:
+                            continue
+                    try:
+                        await user.send(
+                            content=note,
+                            file=discord.File(io.BytesIO(data), filename=name),
+                        )
+                        delivered += 1
+                    except discord.HTTPException:
+                        continue
+                if delivered:
+                    saved.append(f"オーナーのDM（{delivered}人）")
+                else:
+                    errors.append("オーナーのDMへ送れませんでした")
+
+            elif target == "local":
+                path = await asyncio.to_thread(backup_svc.save_local, name, data)
+                saved.append(f"サーバー上（{path.parent.name}/）")
+
+            else:
+                errors.append(f"知らない保存先です: {target}")
+        except Exception as e:
+            errors.append(f"{target}: {e}")
+
+    return backup_svc.Saved(
+        name=name, size=len(data), where=saved, errors=errors
+    )
 
 
 class TasksCog(commands.Cog):
@@ -317,32 +395,37 @@ class TasksCog(commands.Cog):
         await self._wait_ready()
 
     async def _send_backup(self) -> None:
-        import io
+        """
+        控えを保存する。
 
-        channel_id = settings.get("channel_admin")
-        if not channel_id:
-            return
-        channel = self.bot.get_channel(int(channel_id))
-        if channel is None:
-            return
+        保存先は設定で選べる（/config backup where）。
+        1か所しか無いと、そこが消えたときに復旧できなくなる。
+        """
         try:
             name, data = await jobs.make_backup()
         except Exception as e:
             log.warning("バックアップを作成できませんでした: %s", e)
             return
-        try:
-            await channel.send(
-                content=(
-                    f"{E.OK} 定期バックアップ（{len(data) / 1024:.0f} KB）\n"
-                    f"{E.INFO} 残高・注文履歴はこのファイルだけで復元できます。\n"
-                    f"　　登録済みアカウントも戻すには、サーバーの "
-                    f"`data/encryption_key.txt` も必要です"
-                ),
-                file=discord.File(io.BytesIO(data), filename=name),
+
+        result = await save_backup(self.bot, name, data)
+        if result.ok:
+            log.info(
+                "バックアップを保存しました: %s（%s）", name, " / ".join(result.where)
             )
-            log.info("バックアップを送信しました: %s", name)
-        except discord.HTTPException:
-            log.exception("バックアップの送信に失敗しました")
+        if result.errors:
+            log.warning("保存できなかった先があります: %s", " / ".join(result.errors))
+            # 1か所も保存できなかったときは必ず知らせる
+            if not result.where:
+                await self.notify_admin(
+                    discord.Embed(
+                        title=f"{E.NG} バックアップを保存できませんでした",
+                        description=(
+                            "\n".join(f"・{e}" for e in result.errors)
+                            + "\n\n`/config backup where` で保存先を確認してください。"
+                        ),
+                        color=embeds.RED,
+                    )
+                )
 
     # -- 起動時 -------------------------------------------------
 

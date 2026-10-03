@@ -15,7 +15,7 @@ from core import settings
 from db.models import SubsidyRule
 from db.session import session_scope
 from services.mcd import store_index
-from cogs._checks import admin_only, handle_check_failure
+from cogs._checks import admin_only, handle_check_failure, owner_only
 from ui import embeds
 
 log = logging.getLogger("bot.cogs.config")
@@ -581,6 +581,96 @@ class ConfigCog(commands.Cog):
                 "設定しました。\n" + "\n".join(f"・{c}" for c in changed)
                 + f"\n\n{E.INFO} 自動で止めることはありません。管理者へ知らせるだけです。"
             ),
+            ephemeral=True,
+        )
+
+    backup_group = app_commands.Group(
+        name="backup", description="バックアップの設定", parent=group
+    )
+
+    @backup_group.command(name="where", description="バックアップの保存先を設定します")
+    @app_commands.describe(place="保存先", keep="サーバー上に残す世代の数（1〜90）")
+    @app_commands.choices(place=[
+        app_commands.Choice(name="管理者チャンネル", value="channel"),
+        app_commands.Choice(name="オーナーのDM", value="dm"),
+        app_commands.Choice(name="サーバー上（data/backups）", value="local"),
+        app_commands.Choice(name="すべて（おすすめ）", value="all"),
+    ])
+    @owner_only()
+    async def backup_where(
+        self,
+        interaction: discord.Interaction,
+        place: app_commands.Choice[str] | None = None,
+        keep: app_commands.Range[int, 1, 90] | None = None,
+    ) -> None:
+        """
+        控えの保存先。
+
+        1か所しか無いと、そこが消えたときに復旧できなくなる。
+        「すべて」にしておくのが安全。
+        """
+        from services import backup as backup_svc
+
+        changed = []
+        if place is not None:
+            await settings.set_value(
+                "backup_where", place.value,
+                updated_by=interaction.user.id, actor_name=str(interaction.user),
+            )
+            changed.append(f"保存先 **{place.name}**")
+        if keep is not None:
+            await settings.set_value(
+                "backup_keep", int(keep),
+                updated_by=interaction.user.id, actor_name=str(interaction.user),
+            )
+            changed.append(f"残す世代 **{keep}個**")
+
+        current = settings.get("backup_where", "channel")
+        local = backup_svc.list_local()
+        e = discord.Embed(
+            title=f"{E.NOTE} バックアップの保存先",
+            description=(
+                ("設定しました。\n" + "\n".join(f"・{c}" for c in changed) + "\n\n")
+                if changed else ""
+            ) + f"いまの保存先: **{current}**",
+            color=embeds.GREEN if changed else embeds.BLUE,
+        )
+        if local:
+            newest = local[0]
+            e.add_field(
+                name="サーバー上の控え",
+                value=(
+                    f"**{len(local)}** 個\n"
+                    f"最新 `{newest[0]}`（{newest[1] / 1024:.0f} KB）\n"
+                    f"<t:{int(newest[2])}:R>"
+                ),
+                inline=False,
+            )
+        e.set_footer(text="1か所しか無いと、そこが消えると復旧できません")
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+    @backup_group.command(name="now", description="いますぐバックアップを取ります")
+    @owner_only()
+    async def backup_now(self, interaction: discord.Interaction) -> None:
+        from cogs.tasks import save_backup
+        from services import tasks as jobs
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            name, data = await jobs.make_backup()
+        except Exception as e:
+            await interaction.followup.send(
+                embed=embeds.error(f"作成できませんでした。\n```{e}```"), ephemeral=True
+            )
+            return
+        result = await save_backup(interaction.client, name, data)
+        lines = [f"`{name}`（{len(data) / 1024:.0f} KB）"]
+        if result.where:
+            lines.append(f"{E.OK} 保存先: " + " / ".join(result.where))
+        for err in result.errors:
+            lines.append(f"{E.WARN} {err}")
+        await interaction.followup.send(
+            embed=(embeds.ok if result.ok else embeds.error)("\n".join(lines)),
             ephemeral=True,
         )
 
