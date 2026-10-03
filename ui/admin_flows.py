@@ -22,7 +22,8 @@ log = logging.getLogger("bot.admin_flows")
 
 
 async def collect_stats() -> dict:
-    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    # 日本時間の0時から数える（UTC基準だと日本の朝9時で切り替わってしまう）
+    today = config.jst_midnight_utc()
     async with session_scope() as s:
         mcd_total = await s.scalar(select(func.count()).select_from(McdAccount)) or 0
         mcd_active = await s.scalar(
@@ -71,7 +72,7 @@ async def refresh_admin_panel(interaction: discord.Interaction) -> None:
 async def show_stats(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True, thinking=True)
     stats = await collect_stats()
-    week = datetime.now(timezone.utc) - timedelta(days=7)
+    week = config.utcnow_naive() - timedelta(days=7)
     async with session_scope() as s:
         total_orders = await s.scalar(select(func.count()).select_from(Order)) or 0
         succeeded = await s.scalar(
@@ -217,9 +218,8 @@ async def show_user(interaction: discord.Interaction, user: discord.User) -> Non
     discord_id = user.id
 
     role_ids = [r.id for r in getattr(user, "roles", [])] if hasattr(user, "roles") else []
-    month_start = config.now_jst().replace(
-        day=1, hour=0, minute=0, second=0, microsecond=0
-    )
+    # 月の区切りは日本時間で決め、DBと比べる前にUTCへ直す
+    month_start = config.jst_month_start_utc()
 
     async with session_scope() as s:
         row = await s.get(User, discord_id)

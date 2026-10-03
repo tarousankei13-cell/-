@@ -20,6 +20,7 @@ import emoji as E
 from core import ledger as L
 from core import saga, settings, subsidy
 from core import users as user_repo
+from core import fraud
 from core import queue as order_gate
 from core.telemetry import traced
 from db.models import as_utc, Order, User
@@ -625,6 +626,19 @@ async def run_order(
         idempotency_key=idempotency_key,
     )
 
+    # 気になる動きがないか見ておく。
+    # ⚠️ ここで利用者を止めることはしない。ふつうに使っている人を
+    #    誤って止めるほうが痛いため。管理者に知らせるだけにする。
+    try:
+        report = await fraud.check_user(interaction.user.id)
+        report.findings += (
+            await fraud.check_order(interaction.user.id, quote.list_price)
+        ).findings
+        if report.any:
+            await notify_admin_fraud(interaction, report)
+    except Exception:
+        log.debug("不正検知に失敗しました（注文には影響しません）", exc_info=True)
+
     # マクドナルド側が落ちている間は、送っても失敗するだけ。
     # 復帰を少し待ってから流すほうが、利用者にとっても相手にとってもよい。
     if not await wait_for_recovery(interaction):
@@ -817,8 +831,9 @@ async def daily_order_count() -> int:
     """本日成立した注文の件数。実績パネルの「本日◯件目」に使う。"""
     from sqlalchemy import func
 
-    # 日本時間の0時から数える（UTCの0時だと日本の朝9時で切り替わってしまう）
-    today = config.jst_midnight()
+    # 日本時間の0時から数える（UTCの0時だと日本の朝9時で切り替わってしまう）。
+    # ⚠️ DBはUTCで保存しているので、比較する前にUTCへ直す。
+    today = config.jst_midnight_utc()
     async with session_scope() as s:
         count = await s.scalar(
             select(func.count()).select_from(Order).where(
@@ -895,6 +910,42 @@ async def post_achievement(interaction: discord.Interaction, result: saga.OrderR
         receipt_number=result.receipt_number,
         pickup_label=result.pickup_label,
     )
+
+
+async def notify_admin_fraud(
+    interaction: discord.Interaction, report
+) -> None:
+    """
+    気になる動きを管理者へ知らせる。
+
+    止めるかどうかは人が決める。設定で自動停止もできるが、既定は通知だけ。
+    """
+    channel_id = settings.get("channel_admin")
+    if not channel_id:
+        return
+    channel = interaction.client.get_channel(int(channel_id))
+    if channel is None:
+        return
+
+    color = {
+        fraud.HIGH: embeds.RED, fraud.WARN: embeds.ORANGE,
+    }.get(report.worst, embeds.BLUE)
+    e = discord.Embed(
+        title=f"{E.WARN} 気になる動きがあります",
+        description=fraud.format_report(report)[:4000],
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+    e.add_field(
+        name=f"{E.USER} 利用者",
+        value=f"{interaction.user.mention}\n`{interaction.user.id}`",
+        inline=True,
+    )
+    e.set_footer(text="/admin user で詳しく見られます")
+    try:
+        await channel.send(embed=e)
+    except discord.HTTPException:
+        log.exception("不正検知の通知を送れませんでした")
 
 
 async def notify_admin_failure(

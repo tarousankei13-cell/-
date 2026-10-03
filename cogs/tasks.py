@@ -280,6 +280,25 @@ class TasksCog(commands.Cog):
             self._last_daily_reset_day = now.day
             await jobs.daily_reset()
 
+        # 気になる動きがないか、全体を見渡す
+        if settings.get("fraud_scan", True):
+            try:
+                from core import fraud
+
+                report = await fraud.scan_all()
+                text = fraud.format_report(report)
+                if text:
+                    await self.notify_admin(
+                        discord.Embed(
+                            title=f"{E.WARN} 気になる動きがあります",
+                            description=text[:4000],
+                            color=embeds.RED if report.worst == fraud.HIGH
+                            else embeds.ORANGE,
+                        )
+                    )
+            except Exception:
+                log.exception("不正検知の点検に失敗しました")
+
         # 月次リセット
         self._last_month = await jobs.monthly_reset_if_needed(self._last_month)
 

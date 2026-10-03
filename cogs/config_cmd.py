@@ -514,6 +514,76 @@ class ConfigCog(commands.Cog):
             ephemeral=True,
         )
 
+    @group.command(name="fraud", description="気になる動きの検知を設定します")
+    @app_commands.describe(
+        enabled="検知を有効にするか",
+        burst_count="この回数を超えて短時間に注文したら知らせる（既定5）",
+        big_order="この金額以上の注文を知らせる（既定10000円）",
+    )
+    @admin_only()
+    async def fraud_config(
+        self,
+        interaction: discord.Interaction,
+        enabled: bool | None = None,
+        burst_count: app_commands.Range[int, 2, 100] | None = None,
+        big_order: app_commands.Range[int, 1000, 1000000] | None = None,
+    ) -> None:
+        """
+        気になる動きの検知。
+
+        ⚠️ これは**自動で止める仕組みではありません**。
+           ふつうに使っている人を誤って止めるほうが痛いので、
+           管理者に知らせるところまでにしてあります。
+        """
+        changed = []
+        if enabled is not None:
+            for key in ("fraud_burst", "fraud_big_order", "fraud_quick_spend",
+                        "fraud_heavy", "fraud_reused_link", "fraud_scan"):
+                await settings.set_value(
+                    key, enabled, updated_by=interaction.user.id, audit=False
+                )
+            await settings.set_value(
+                "fraud_enabled", enabled,
+                updated_by=interaction.user.id, actor_name=str(interaction.user),
+            )
+            changed.append(f"検知を **{'ON' if enabled else 'OFF'}**")
+        if burst_count is not None:
+            await settings.set_value(
+                "fraud_burst_count", int(burst_count),
+                updated_by=interaction.user.id, actor_name=str(interaction.user),
+            )
+            changed.append(f"短時間の注文 **{burst_count}回**")
+        if big_order is not None:
+            await settings.set_value(
+                "fraud_big_order_amount", int(big_order),
+                updated_by=interaction.user.id, actor_name=str(interaction.user),
+            )
+            changed.append(f"高額注文 **{big_order:,}円**")
+
+        if not changed:
+            e = discord.Embed(
+                title=f"{E.WARN} 気になる動きの検知",
+                description=(
+                    "いまの設定です。変えるには項目を指定してください。\n\n"
+                    f"短時間の注文　**{settings.get('fraud_burst_count', 5)}回** / "
+                    f"{settings.get('fraud_burst_minutes', 10)}分\n"
+                    f"高額注文　**{int(settings.get('fraud_big_order_amount', 10000)):,}円** 以上\n"
+                    f"全体の点検　**{'ON' if settings.get('fraud_scan', True) else 'OFF'}**"
+                ),
+                color=embeds.BLUE,
+            )
+            e.set_footer(text="自動で止めることはありません。管理者へ知らせるだけです")
+            await interaction.response.send_message(embed=e, ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            embed=embeds.ok(
+                "設定しました。\n" + "\n".join(f"・{c}" for c in changed)
+                + f"\n\n{E.INFO} 自動で止めることはありません。管理者へ知らせるだけです。"
+            ),
+            ephemeral=True,
+        )
+
     @group.command(name="achievement_fields", description="実績パネルの表示項目を設定します")
     @app_commands.describe(
         anon_code="匿名コード", list_price="定価", subsidy_rate="負担率",

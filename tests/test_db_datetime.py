@@ -185,6 +185,62 @@ async def main():
     check("日本時間である", mid.utcoffset() == timedelta(hours=9), str(mid.utcoffset()))
     check("未来にならない", mid <= config.now_jst())
 
+    print("\n[11] 日本時間の値をSQLの比較に使わない ★")
+    # DBはUTCのタイムゾーン無しで保存している。日本時間の値をそのまま
+    # 条件に使うと9時間ずれ、集計が合わなくなる。
+    check("DB比較用はタイムゾーン無し", config.jst_midnight_utc().tzinfo is None,
+          config.jst_midnight_utc().tzinfo)
+    diff = config.jst_midnight() .astimezone(timezone.utc).replace(tzinfo=None) \
+        - config.jst_midnight_utc()
+    check("UTCへ正しく直している", diff == timedelta(0), diff)
+    check("日本の0時はUTCの前日15時",
+          config.jst_midnight_utc().hour == 15, config.jst_midnight_utc().hour)
+    check("今月1日も同じ扱い", config.jst_month_start_utc().tzinfo is None)
+
+    import pathlib as _p, re as _re
+    root = _p.Path(__file__).parent.parent
+    leaks = []
+    for f in root.rglob("*.py"):
+        if "tests" in f.parts or ".git" in f.parts or f.name == "config.py":
+            continue
+        body = f.read_text(encoding="utf-8")
+        if "created_at >=" not in body and "created_at <" not in body:
+            continue
+        for i, line in enumerate(body.splitlines(), 1):
+            # SQLの比較に使う変数へ、タイムゾーン付きの値を入れていないか
+            if _re.search(r"=\s*config\.(now_jst|jst_midnight)\(\)", line):
+                leaks.append(f"{f.relative_to(root)}:{i}  {line.strip()}")
+    check("SQLを使うファイルで日本時間の値を変数に入れていない ★", not leaks, leaks)
+
+    print("\n[12] 集計が日本時間の一日で合う ★")
+    from db.models import Order as _Order
+    import uuid as _uuid
+    jst = config.JST
+    today_jst = config.now_jst()
+    # 日本の今日の午前2時（UTCだと前日17時）
+    early = today_jst.replace(hour=2, minute=0, second=0, microsecond=0)
+    # 日本の昨日の午後11時
+    yesterday = early - timedelta(hours=3)
+    async with session_scope() as s:
+        for when, label in ((early, "今日の2時"), (yesterday, "昨日の23時")):
+            s.add(_Order(
+                id=str(_uuid.uuid4()), discord_id=7777, state="COMPLETED",
+                store_id="13934", store_name=label, pickup_method="eatIn",
+                hex_payload="0a05", items_json="[]",
+                list_price=800, user_amount=480, subsidy_rate=40, subsidy_amount=320,
+                idempotency_key=str(_uuid.uuid4()),
+                created_at=when.astimezone(timezone.utc).replace(tzinfo=None),
+            ))
+    from sqlalchemy import func as _func, select as _select
+    async with session_scope() as s:
+        n = int(await s.scalar(
+            _select(_func.count()).select_from(_Order).where(
+                _Order.discord_id == 7777,
+                _Order.created_at >= config.jst_midnight_utc(),
+            )
+        ) or 0)
+    check("日本時間の今日のぶんだけ数える ★", n == 1, f"{n}件（2件中）")
+
     await close_db()
     print(f"\n{'='*46}\n  成功 {ok} 件 / 失敗 {fail} 件\n{'='*46}")
     return 1 if fail else 0

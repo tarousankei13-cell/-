@@ -187,6 +187,36 @@ def today_jst() -> str:
 
 
 def jst_midnight() -> datetime:
-    """日本時間の今日の0時。「本日の件数」の集計に使う。"""
+    """日本時間の今日の0時（タイムゾーン付き）。表示に使う。"""
     return now_jst().replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def to_db(dt: datetime) -> datetime:
+    """
+    DBの比較に使える形へ直す。
+
+    ⚠️ DBには**UTCのタイムゾーン無し**で入っている。
+       日本時間の値をそのままSQLの条件に使うと、
+       「2026-10-03 00:00（日本）」と「2026-10-02 15:00（UTC）」を
+       比べることになり、9時間ずれる。
+       日付の区切りは日本時間で決め、比較はUTCに直してから行うこと。
+    """
+    if dt.tzinfo is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def jst_midnight_utc() -> datetime:
+    """日本時間の今日の0時を、DBの比較に使える形で。"""
+    return to_db(jst_midnight())
+
+
+def jst_month_start_utc() -> datetime:
+    """日本時間の今月1日0時を、DBの比較に使える形で。"""
+    return to_db(jst_midnight().replace(day=1))
+
+
+def utcnow_naive() -> datetime:
+    """いまのUTC（タイムゾーン無し）。DBの比較に使う。"""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 

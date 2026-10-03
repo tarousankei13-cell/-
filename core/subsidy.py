@@ -23,6 +23,7 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import config
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -68,8 +69,9 @@ def calculate(list_price: int, subsidy_rate: float) -> tuple[int, int]:
 
 async def monthly_subsidy_used(session: AsyncSession, discord_id: int) -> int:
     """今月その利用者に使った負担額の合計。"""
-    now = datetime.now(timezone.utc)
-    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    # 月の区切りは日本時間で決める（UTC基準だと日本の朝9時で月が変わる）。
+    # DBはUTCで保存しているので、比較する前にUTCへ直す。
+    start = config.jst_month_start_utc()
     # subsidy_pool からの支出のうち、この利用者の注文に紐づくもの
     from db.models import Order
 
