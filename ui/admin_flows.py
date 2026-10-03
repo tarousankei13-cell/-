@@ -191,7 +191,207 @@ async def show_accounts(interaction: discord.Interaction) -> None:
         e.add_field(name="Kyash", value="\n".join(lines)[:1024], inline=False)
     else:
         e.add_field(name="Kyash", value=f"{E.WARN} 未登録（`/kyash add` で追加）", inline=False)
-    await interaction.followup.send(embed=e, ephemeral=True)
+    await interaction.followup.send(
+        embed=e, view=AccountHealthView(mcd_rows), ephemeral=True
+    )
+
+
+# ============================================================
+#  アカウントの健全性（管理1）
+# ============================================================
+
+class AccountHealthView(discord.ui.View):
+    """
+    アカウントの状態を見て、その場で手当てできるようにする。
+
+    一覧を見て「このアカウントが止まっている」と分かっても、
+    別のコマンドを打ちに行くのでは手間がかかる。
+    """
+
+    def __init__(self, mcd_rows: list) -> None:
+        super().__init__(timeout=300)
+        self.mcd_rows = mcd_rows
+        self._build()
+
+    def _build(self) -> None:
+        self.clear_items()
+        detail = discord.ui.Button(
+            label="詳しく見る", emoji=E.CHART, style=discord.ButtonStyle.primary, row=0
+        )
+        detail.callback = self._on_detail
+        self.add_item(detail)
+
+        # 止まっているアカウントがあれば、戻すボタンを出す
+        from core import breaker
+
+        blocked = [b for b in breaker.accounts.snapshot() if b.state != breaker.CLOSED]
+        if blocked:
+            revive = discord.ui.Button(
+                label=f"止まっている{len(blocked)}件を戻す", emoji=E.SYNC,
+                style=discord.ButtonStyle.success, row=0,
+            )
+            revive.callback = self._on_revive
+            self.add_item(revive)
+
+        quarantined = [r for r in self.mcd_rows if r[2] not in ("ACTIVE", "DEGRADED")]
+        if quarantined:
+            unlock = discord.ui.Button(
+                label=f"隔離中の{len(quarantined)}件を復帰", emoji=E.OK,
+                style=discord.ButtonStyle.secondary, row=0,
+            )
+            unlock.callback = self._on_unlock
+            self.add_item(unlock)
+
+        check = discord.ui.Button(
+            label="いま確かめる", emoji=E.SYNC, style=discord.ButtonStyle.secondary, row=1
+        )
+        check.callback = self._on_check
+        self.add_item(check)
+
+    async def _on_detail(self, interaction: discord.Interaction) -> None:
+        """1件ずつの詳しい状態。何をすべきかまで書く。"""
+        from core import breaker
+        from db.models import as_utc
+        from services.kyash.accounts import token_days_left
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with session_scope() as s:
+            mcds = (
+                await s.execute(select(McdAccount).order_by(McdAccount.id))
+            ).scalars().all()
+            rows = [
+                (a.id, a.label, a.status, a.consecutive_failures, a.orders_today,
+                 bool(a.card_id), a.last_error or "", as_utc(a.last_used_at))
+                for a in mcds
+            ]
+            kyashes = (
+                await s.execute(select(KyashAccount).order_by(KyashAccount.id))
+            ).scalars().all()
+            krows = [(a.id, a.label, a.status, token_days_left(a)) for a in kyashes]
+
+        e = discord.Embed(title=f"{E.KEY} アカウントの詳しい状態", color=embeds.BLUE)
+        for aid, label, status, fails, today, has_card, err, last_used in rows:
+            mark = E.HEALTH.get(status, E.YELLOW)
+            br = breaker.accounts.get(f"mcd:{aid}")
+            body = [f"状態 **{status}**（{br.describe()}）"]
+            body.append(f"本日 {today} 件　連続失敗 {fails} 回")
+            if last_used:
+                body.append(f"最後に使用 <t:{int(last_used.timestamp())}:R>")
+            if not has_card:
+                body.append(f"{E.WARN} **カード未設定** → `/mcd card {aid}`")
+            if err:
+                body.append(f"{E.NG} `{err[:90]}`")
+            todo = _account_todo(status, has_card, err)
+            if todo:
+                body.append(f"{E.INFO} {todo}")
+            e.add_field(
+                name=f"{mark} #{aid} {label}", value="\n".join(body)[:1024], inline=False
+            )
+        for aid, label, status, days in krows:
+            mark = E.HEALTH.get(status, E.YELLOW)
+            body = [f"状態 **{status}**"]
+            if days is not None:
+                body.append(
+                    f"トークン残り **{int(days)}日**"
+                    + (f"　{E.WARN} `/kyash relogin {aid}` を" if days <= 7 else "")
+                )
+            e.add_field(
+                name=f"{mark} Kyash #{aid} {label}", value="\n".join(body)[:1024],
+                inline=False,
+            )
+        await interaction.followup.send(embed=e, ephemeral=True)
+
+    async def _on_revive(self, interaction: discord.Interaction) -> None:
+        """一時的に止めている経路を戻す。"""
+        from core import audit, breaker
+
+        blocked = [b.name for b in breaker.accounts.snapshot()
+                   if b.state != breaker.CLOSED]
+        breaker.accounts.reset_all()
+        breaker.groups.reset_all()
+        await audit.record(
+            actor_id=interaction.user.id, actor_name=str(interaction.user),
+            action="account.quarantine", target="breaker",
+            before=",".join(blocked)[:200], after="戻した",
+        )
+        await interaction.response.send_message(
+            embed=embeds.ok(
+                f"止めていた経路を戻しました（{len(blocked)}件）。\n"
+                f"{E.INFO} 原因が直っていなければ、また止まります。"
+            ),
+            ephemeral=True,
+        )
+
+    async def _on_unlock(self, interaction: discord.Interaction) -> None:
+        """隔離したアカウントを使える状態に戻す。"""
+        from core import audit, breaker
+        from services.mcd.accounts import STATUS_ACTIVE
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        restored = []
+        async with session_scope() as s:
+            rows = (await s.execute(select(McdAccount))).scalars().all()
+            for a in rows:
+                if a.status not in ("ACTIVE", "DEGRADED", "BANNED"):
+                    a.status = STATUS_ACTIVE
+                    a.consecutive_failures = 0
+                    a.last_error = None
+                    restored.append(f"#{a.id} {a.label}")
+                    breaker.accounts.get(f"mcd:{a.id}").reset()
+        await audit.record(
+            actor_id=interaction.user.id, actor_name=str(interaction.user),
+            action="account.quarantine", target="restore",
+            after=", ".join(restored)[:500],
+        )
+        await interaction.followup.send(
+            embed=embeds.ok(
+                f"{len(restored)}件を使える状態に戻しました。\n"
+                + ("\n".join(f"・{r}" for r in restored) if restored else "")
+                + f"\n\n{E.WARN} カードの残高など、原因が直っているか確認してください。"
+            ),
+            ephemeral=True,
+        )
+
+    async def _on_check(self, interaction: discord.Interaction) -> None:
+        """いま本当に使えるか、実際に確かめる。"""
+        from services.mcd import accounts as mcd_accounts
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            results = await mcd_accounts.healthcheck_all()
+        except Exception as e:
+            await interaction.followup.send(
+                embed=embeds.error(f"確認できませんでした。\n```{e}```"), ephemeral=True
+            )
+            return
+        good = [r for r in results if r[2]]
+        bad = [r for r in results if not r[2]]
+        e = discord.Embed(
+            title=f"{E.KEY} 確認しました",
+            description=f"使える **{len(good)}** / {len(results)} 件",
+            color=embeds.GREEN if not bad else embeds.ORANGE,
+        )
+        if bad:
+            e.add_field(
+                name=f"{E.NG} 使えないアカウント",
+                value="\n".join(f"`#{i}` {lbl}" for i, lbl, _ in bad)[:1024],
+                inline=False,
+            )
+        await interaction.followup.send(embed=e, ephemeral=True)
+
+
+def _account_todo(status: str, has_card: bool, error: str) -> str:
+    """何をすべきかを一言で。"""
+    if not has_card:
+        return "決済カードを設定してください"
+    low = (error or "").lower()
+    if "決済" in error or "payment" in low or "残高" in error:
+        return "カードの残高・利用限度額・有効期限を確認してください"
+    if "認証" in error or "auth" in low or "token" in low:
+        return "再ログインしてください"
+    if status not in ("ACTIVE", "DEGRADED"):
+        return "原因を直してから「隔離中の件を復帰」を押してください"
+    return ""
 
 
 class ReviewView(discord.ui.View):
