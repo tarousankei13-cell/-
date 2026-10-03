@@ -107,13 +107,17 @@ def main():
     item = build_order_item(cart, burger, {}, {"99901032": 0})
     qty = {c.product_code: c.quantity for c in item.components}
     check("ピクルスが0になる", qty.get("99901032") == 0, qty)
-    check("他の具材は既定のまま", qty.get("99901031") == 1 and qty.get("99901030") == 1, qty)
-    check("固定の具材も残る", qty.get("99901099") == 1, qty)
+    # ⚠️ 既定のままの具材は送らない。実物の注文コードにも入っていなかった。
+    #    相手は既定の内容を知っているので、変えたものだけ伝えればよい。
+    check("変えていない具材は送らない", "99901031" not in qty and "99901030" not in qty, qty)
+    check("固定の具材も送らない", "99901099" not in qty, qty)
+    check("送るのは変えた1件だけ", list(qty) == ["99901032"], qty)
 
     print("\n[4] カタログの範囲を超えた指定は丸める")
     item = build_order_item(cart, burger, {}, {"99901099": 0, "99801019": 99})
     qty = {c.product_code: c.quantity for c in item.components}
-    check("抜けない具材を0にしようとしても1のまま", qty.get("99901099") == 1, qty)
+    # 抜けない具材は既定(1)に丸められ、既定と同じなので送られない
+    check("抜けない具材を0にしようとしても送らない", "99901099" not in qty, qty)
     check("上限を超える増量は上限で止まる", qty.get("99801019") == 2, qty)
 
     print("\n[5] 氷抜き")
@@ -141,7 +145,7 @@ def main():
     top = decoded.items[0]
     got = {c.product_code: c.quantity for c in top.components}
     check("読み直してもピクルスが0", got.get("99901032") == 0, got)
-    check("他の具材は1のまま", got.get("99901031") == 1, got)
+    check("変えていない具材は入っていない", "99901031" not in got, got)
     check("商品コードは変わらない", top.product_code == "1010", top.product_code)
 
     print("\n[8] 保存して読み戻しても消えない")

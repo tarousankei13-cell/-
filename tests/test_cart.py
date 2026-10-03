@@ -32,7 +32,8 @@ item = build_order_item(cart, p, {})          # 既定の選択で組む
 check("商品コード 9180", item.product_code == "9180", item.product_code)
 check("金額 800円（セットのprePrice）", item.amount == 800, item.amount)
 codes = [x.product_code for x in item.walk()]
-check("固定構成 1566 が入る", "1566" in codes, codes)
+# ⚠️ 既定のままの具材は送らない（実物の注文コードに合わせた / docs/09）
+check("セットの中のバーガー1566は送らない", "1566" not in codes, codes)
 check("サイド枠 9987009 が入る", "9987009" in codes, codes)
 check("既定のポテトM(2020)が入る", "2020" in codes, codes)
 

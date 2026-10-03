@@ -28,7 +28,7 @@ from services.mcd import accounts as mcd_accounts
 from services.mcd import store_index
 from services.mcd import stores as mcd_stores
 from services.mcd.client import McdError
-from services.mcd import availability
+from services.mcd import availability, slot_bridge
 from services.mcd.menu import (
     ParsedMenu, Product, customization_note, minutes_of,
 )
@@ -1116,20 +1116,39 @@ def build_order_item(
     amounts = amounts or {}
     components: list[OrderItem] = []
 
+    # ---- 具材（composition）----
+    # ⚠️ **既定のままの具材は送らない。**
+    #    実物の注文コードを調べたところ、セットの中のバーガーも、
+    #    ドリンクの氷も、何も指定していない具材は一切入っていなかった。
+    #    既定の内容は相手が分かっているので、送るのは
+    #    「抜いた」「増やした」ものだけでよい。
+    #    全部送ると相手が受け付けないことがある。
     for slot in product.slots_of("composition"):
         if not slot.code:
             continue
-        # 抜く・増やすの指定があればそれを使う。無ければ既定のまま。
         qty = amounts.get(slot.code, slot.default_quantity)
         # カタログが許す範囲に収める（不正な数量を送らない）
         qty = max(slot.min_quantity, min(qty, slot.max_quantity))
+        if qty == slot.default_quantity:
+            continue        # 既定のまま＝送らない
         components.append(OrderItem(product_code=slot.code, quantity=qty))
 
+    # ---- 選択枠（choices）----
+    # 枠によっては、枠と商品の間にもう1段ある。
+    #   サイド枠    9987009 → 2020
+    #   ドリンク枠  9997918 → 9997914 → 3120
+    # この中間はカタログに載っていないため、分かっているものを
+    # services/mcd/slot_bridge.py に持たせてある（docs/09 §2）。
     for slot in product.slots_of("choices"):
         chosen = picks.get(slot.code) or slot.default_product
-        inner = [OrderItem(product_code=chosen, quantity=1)] if chosen else []
+        if not chosen:
+            continue
+        leaf = OrderItem(product_code=chosen, quantity=1)
+        bridge = slot_bridge.bridge_for(slot.code)
+        if bridge:
+            leaf = OrderItem(product_code=bridge, quantity=1, components=[leaf])
         components.append(
-            OrderItem(product_code=slot.code, quantity=1, components=inner)
+            OrderItem(product_code=slot.code, quantity=1, components=[leaf])
         )
 
     return OrderItem(

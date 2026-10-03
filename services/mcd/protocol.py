@@ -344,8 +344,24 @@ def decode_hex(hex_str: str) -> DecodedOrder:
 
 
 def build_item(item: OrderItem, *, top_level: bool = False) -> bytes:
+    """
+    注文の1品をバイト列にする。
+
+    ⚠️ field 1 のフラグには規則がある。実物の注文コードを調べると、
+
+        9180        最上位の商品      フラグなし
+          9987009   選択枠            フラグあり
+            2020    実際の商品        フラグなし
+          9997918   選択枠            フラグあり
+            9997914 中間ノード        フラグあり
+              3120  実際の商品        フラグなし
+
+    つまり「**子を持っていて、かつ最上位でない**」ものだけに付く。
+    組み立てる側が付け忘れると相手が受け付けないため、
+    持っている値を信じず、構造から決める。
+    """
     b = b""
-    if item.has_flag:
+    if item.components and not top_level:
         b += pb_int(1, 1)
     b += pb_str(2, item.product_code)
     b += pb_int(3, item.quantity)

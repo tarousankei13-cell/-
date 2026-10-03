@@ -25,7 +25,7 @@ from core.telemetry import traced
 from db.models import as_utc, Order, User
 from db.session import session_scope
 from services.mcd import accounts as mcd_accounts
-from services.mcd import availability
+from services.mcd import availability, slot_bridge
 from services.mcd import stores as mcd_stores
 from services.mcd.client import McdError
 from services.mcd.protocol import (
@@ -321,6 +321,16 @@ async def open_preview(interaction: discord.Interaction, hex_text: str) -> None:
             ephemeral=True,
         )
         return
+
+    # 実際に通った注文コードから、選択枠の中間ノードを学ぶ。
+    # この情報はメニューカタログに載っていないため、
+    # 貼られたコードが唯一の手がかりになる（docs/09 §2）。
+    try:
+        learned = slot_bridge.learn_from_order(decoded.items)
+        if learned:
+            log.info("注文コードから選択枠の構造を %d 件おぼえました", learned)
+    except Exception:
+        log.debug("選択枠の学習に失敗しました（注文には影響しません）", exc_info=True)
 
     if not decoded.store_id:
         await interaction.followup.send(
