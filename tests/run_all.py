@@ -19,6 +19,7 @@ TESTS = [
     ("店舗の注文可否", "test_availability.py"),
     ("店舗一覧の定期同期", "test_store_sync.py"),
     ("利用者の操作フロー", "test_ui_flows.py"),
+    ("使いやすさ", "test_usability.py"),
     ("チャージ処理", "test_charge.py"),
     ("アカウント登録（OTP）", "test_account_setup.py"),
     ("管理者コマンド", "test_admin_cmds.py"),

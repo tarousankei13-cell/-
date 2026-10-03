@@ -421,6 +421,17 @@ class CartView(discord.ui.View):
             rm.callback = self._on_remove
             self.add_item(rm)
 
+            # 直前に入れた商品が具材を変えられるなら、ここから入れるようにする。
+            # わざわざ画面を挟まず、必要な人だけが押せばよい。
+            last = self.menu.products.get(self.items[-1].product_code)
+            if last is not None and last.customizations():
+                cz = discord.ui.Button(
+                    label=f"{last.name[:20]}の具材を変える", emoji=E.NOTE,
+                    style=discord.ButtonStyle.secondary, row=0,
+                )
+                cz.callback = self._on_customize_last
+                self.add_item(cz)
+
         options = []
         for method, cfg in config.PICKUP_METHODS.items():
             if not cfg["enabled"]:
@@ -480,6 +491,38 @@ class CartView(discord.ui.View):
         # 同じメッセージを書き換えて進む。
         # 別メッセージを出すと、商品を足してもカートの表示が古いまま残ってしまう。
         view = CategoryView(self)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+    async def _on_customize_last(self, interaction: discord.Interaction) -> None:
+        """
+        直前に入れた商品の具材を変える。
+
+        いったん取り出して、調整してから入れ直す。
+        """
+        if not self.items:
+            await interaction.response.defer()
+            return
+        item = self.items[-1]
+        product = self.menu.products.get(item.product_code)
+        if product is None:
+            await interaction.response.defer()
+            return
+
+        # 選択枠の内容を引き継ぐ（サイドやドリンクを選び直さなくて済むように）
+        picks: dict[str, str] = {}
+        for comp in item.components:
+            inner = comp.components
+            while inner and inner[0].components:
+                inner = inner[0].components
+            if inner:
+                picks[comp.product_code] = inner[0].product_code
+
+        self.items.pop()
+        await save_cart(
+            self.owner_id, purpose=self.purpose, store_id=self.store_id,
+            pickup=self.pickup, items=self.items,
+        )
+        view = CustomizeView(self, product, picks)
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
     async def _on_remove(self, interaction: discord.Interaction) -> None:
@@ -776,16 +819,27 @@ class ProductView(discord.ui.View):
     async def _add_and_close(
         self, interaction: discord.Interaction, product: Product, picks: dict[str, str]
     ) -> None:
-        # 具材を調整できる商品なら、その画面を挟む
-        if product.customizations():
-            view = CustomizeView(self.cart, product, picks)
-            await interaction.response.edit_message(
-                embed=view.build_embed(), view=view
-            )
-            return
+        """
+        カートに入れる。
+
+        ⚠️ 具材を調整できる商品でも、その画面を**勝手に挟まない**。
+           ほとんどの人はそのまま注文するので、全員に1画面増やすのは
+           かえって不親切。調整したい人だけが別のボタンから入る。
+        """
         await _add_to_cart(self.cart, product, picks)
         self.stop()
-        await self.cart.show(interaction, note=f"{E.OK} **{product.name}** を追加しました。")
+        note = f"{E.OK} **{product.name}** を追加しました。"
+        if product.customizations():
+            names = "・".join(s.name for s in product.customizations()[:3])
+            note += f"\n{E.INFO} {names}などを抜くこともできます（「具材を変える」から）"
+        await self.cart.show(interaction, note=note)
+
+    async def _customize_and_close(
+        self, interaction: discord.Interaction, product: Product, picks: dict[str, str]
+    ) -> None:
+        """具材を調整してから入れたい人だけが通る道。"""
+        view = CustomizeView(self.cart, product, picks)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
 
 class OptionView(discord.ui.View):
@@ -868,6 +922,13 @@ class OptionView(discord.ui.View):
         ok = discord.ui.Button(label="カートに追加", emoji=E.PLUS, style=discord.ButtonStyle.success, row=3)
         ok.callback = self._on_ok
         self.add_item(ok)
+        if self.product.customizations():
+            cz = discord.ui.Button(
+                label="具材を変える", emoji=E.NOTE,
+                style=discord.ButtonStyle.secondary, row=3,
+            )
+            cz.callback = self._on_customize
+            self.add_item(cz)
         back = discord.ui.Button(label="戻る", style=discord.ButtonStyle.secondary, row=3)
         back.callback = self._on_back
         self.add_item(back)
@@ -909,18 +970,16 @@ class OptionView(discord.ui.View):
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
     async def _on_ok(self, interaction: discord.Interaction) -> None:
-        # 具材を調整できる商品なら、その画面を挟む
-        if self.product.customizations():
-            view = CustomizeView(self.cart, self.product, self.picks)
-            await interaction.response.edit_message(
-                embed=view.build_embed(), view=view
-            )
-            return
         await _add_to_cart(self.cart, self.product, self.picks)
         self.stop()
         await self.cart.show(
             interaction, note=f"{E.OK} **{self.product.name}** を追加しました。"
         )
+
+    async def _on_customize(self, interaction: discord.Interaction) -> None:
+        """具材を調整してから入れる。"""
+        view = CustomizeView(self.cart, self.product, self.picks)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
 
 class CustomizeView(discord.ui.View):
