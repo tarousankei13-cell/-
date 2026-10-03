@@ -178,6 +178,67 @@ async def main():
     found = [w for w in jargon if any(w.lower() in t.lower() for t in texts)]
     check("利用者向けの画面に専門用語が無い ★", not found, found)
 
+    print("\n[9] 前回のお店を1回で選べる ★")
+    from db.models import User
+    from ui.menu_flows import StoreSelectView, start_store_select
+    from core import users as user_repo
+    await user_repo.get_or_create(user.id)
+
+    itx9 = FakeInteraction(user, client)
+    await start_store_select(itx9, "order")
+    v9 = itx9.last_view()
+    labels9 = [getattr(c, "label", "") for c in v9.children]
+    check("初回は前回のお店が出ない", not any("前回" in l for l in labels9), labels9)
+
+    async with session_scope() as s:
+        row = await s.get(User, user.id)
+        row.last_store_id = "13934"
+        row.last_store_name = "南砂町店"
+        row.last_pickup = "takeOut"
+    itx10 = FakeInteraction(user, client)
+    await start_store_select(itx10, "order")
+    v10 = itx10.last_view()
+    labels10 = [getattr(c, "label", "") for c in v10.children]
+    check("2回目は前回のお店が出る ★", any("前回のお店" in l for l in labels10), labels10)
+    check("店名が見える", any("南砂町店" in l for l in labels10), labels10)
+    check("一番上に置く ★", "前回のお店" in labels10[0], labels10)
+    check("案内文でも触れる", "前回のお店" in itx10.text(), itx10.text()[:150])
+
+    print("\n[10] 受取方法を覚えている ★")
+    cart4 = CartView(user.id, "order", "13934", "テスト店",
+                     {"takeOut": True, "eatIn": True}, menu, pickup="takeOut")
+    check("最初から選ばれている ★", cart4.pickup == "takeOut", cart4.pickup)
+    cart5 = CartView(user.id, "order", "13934", "テスト店",
+                     {"takeOut": True}, menu)
+    check("覚えていなければ未選択", cart5.pickup is None, cart5.pickup)
+
+    print("\n[11] カテゴリを選ばずに商品へ進める ★")
+    cart6 = CartView(user.id, "order", "13934", "テスト店", {"takeOut": True}, menu)
+    popular = cart6.popular_products()
+    check("人気の商品が並ぶ ★", len(popular) >= 2, [p.name for p in popular])
+    check("セットも単品も入る",
+          len({p.product_class for p in popular}) >= 1,
+          [p.product_class for p in popular])
+    check("重複しない", len(popular) == len({p.code for p in popular}))
+
+    cat6 = CategoryView(cart6)
+    selects = [c for c in cat6.children if hasattr(c, "options")]
+    check("選択肢が2つ出る（人気／カテゴリ）★", len(selects) == 2, len(selects))
+    check("人気の商品が先に来る ★",
+          "人気" in (selects[0].placeholder or ""), selects[0].placeholder)
+
+    itx11 = FakeInteraction(user, client)
+    cat6._quick._values = ["1010"]
+    await cat6._on_quick(itx11)
+    check("カテゴリを飛ばして追加できる ★", len(cart6.items) == 1,
+          [i.product_code for i in cart6.items])
+
+    print("\n[12] 2回目の注文は操作が少ない ★")
+    # パネル→メニュー→前回の店→商品を追加→人気から選ぶ→確定
+    check("前回のお店で検索3操作が減る ★", any("前回のお店" in l for l in labels10))
+    check("人気の商品でカテゴリ1操作が減る ★", len(selects) == 2)
+    check("受取方法で1操作が減る ★", cart4.pickup == "takeOut")
+
     await close_db()
     print(f"\n{'='*46}\n  成功 {ok} 件 / 失敗 {fail} 件\n{'='*46}")
     return 1 if fail else 0

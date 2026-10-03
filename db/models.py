@@ -95,6 +95,11 @@ class User(Base):
     # 感想ゲートが有効なときだけ使う
     feedback_required: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     note: Mapped[str | None] = mapped_column(Text)
+    # 前回の注文内容。次回の手数を減らすために覚えておく。
+    #   同じ店・同じ受取方法で頼む人が多いので、1タップで戻せるようにする。
+    last_store_id: Mapped[str | None] = mapped_column(String(8))
+    last_store_name: Mapped[str | None] = mapped_column(String(128))
+    last_pickup: Mapped[str | None] = mapped_column(String(24))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

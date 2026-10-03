@@ -341,6 +341,12 @@ async def execute(order_id: str, progress: ProgressCallback | None = None) -> Or
                 user = await s.get(User, discord_id)
                 if user:
                     user.total_orders += 1
+                    # 次回の手数を減らすため、今回の店舗と受取方法を覚えておく
+                    order = await s.get(Order, order_id)
+                    if order is not None:
+                        user.last_store_id = order.store_id
+                        user.last_store_name = order.store_name
+                        user.last_pickup = order.pickup_method
 
         if handle:
             await mcd_accounts.report_success(handle.account_id)

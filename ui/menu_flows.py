@@ -22,7 +22,7 @@ from sqlalchemy import select
 import config
 import emoji as E
 from core import users as user_repo
-from db.models import Cart, StoreCache, utcnow
+from db.models import User, Cart, StoreCache, utcnow
 from db.session import session_scope
 from services.mcd import accounts as mcd_accounts
 from services.mcd import store_index
@@ -225,26 +225,51 @@ class SearchResultView(discord.ui.View):
 
 
 class StoreSelectView(discord.ui.View):
-    def __init__(self, owner_id: int, purpose: str) -> None:
+    """
+    お店の選び方。
+
+    前回と同じお店で頼む人が多いので、覚えてある場合は
+    **1回押すだけ**で済むようにしてある。
+    """
+    def __init__(
+        self, owner_id: int, purpose: str,
+        last_store: tuple[str, str] | None = None,
+    ) -> None:
         """
         お店の選び方を出す。
 
         以前は「最近よく使われているお店」のプルダウンも出していたが、
         他の利用者がどこで注文したかが伝わってしまうため取りやめた。
         （プライバシー重視の方針・docs/05 §0）
+        代わりに、**その人自身の**前回のお店だけを出す。
         """
         super().__init__(timeout=config.VIEW_TIMEOUT)
         self.owner_id = owner_id
         self.purpose = purpose
+        self.last_store = last_store
+
+        # 前回と同じお店なら、探さずに1回押すだけで進める
+        if last_store:
+            store_id, store_name = last_store
+            again = discord.ui.Button(
+                label=f"前回のお店（{store_name[:24]}）", emoji=E.REPEAT,
+                style=discord.ButtonStyle.success, row=0,
+            )
+            again.callback = self._on_last
+            self.add_item(again)
 
         search = discord.ui.Button(
-            label="店名でさがす", emoji="🔍", style=discord.ButtonStyle.primary, row=0
+            label="店名でさがす", emoji="🔍",
+            style=discord.ButtonStyle.primary if not last_store
+            else discord.ButtonStyle.secondary,
+            row=0 if not last_store else 1,
         )
         search.callback = self._on_search
         self.add_item(search)
 
         by_id = discord.ui.Button(
-            label="店舗IDで指定", emoji="🔢", style=discord.ButtonStyle.secondary, row=0
+            label="店舗IDで指定", emoji="🔢", style=discord.ButtonStyle.secondary,
+            row=0 if not last_store else 1,
         )
         by_id.callback = self._on_input
         self.add_item(by_id)
@@ -257,6 +282,11 @@ class StoreSelectView(discord.ui.View):
             return False
         return True
 
+    async def _on_last(self, interaction: discord.Interaction) -> None:
+        """前回のお店へそのまま進む。"""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await open_menu(interaction, self.last_store[0], self.purpose)
+
     async def _on_search(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(StoreSearchModal(self.purpose))
 
@@ -265,8 +295,22 @@ class StoreSelectView(discord.ui.View):
 
 async def start_store_select(interaction: discord.Interaction, purpose: str) -> None:
     await user_repo.get_or_create(interaction.user.id)
+
+    # その人自身の前回のお店を覚えていれば、1回押すだけで進めるようにする
+    last_store = None
+    async with session_scope() as s:
+        row = await s.get(User, interaction.user.id)
+        if row and row.last_store_id:
+            last_store = (row.last_store_id, row.last_store_name or row.last_store_id)
+
     title = "注文するお店を選んでください" if purpose == "order" else "注文コードを作るお店を選んでください"
-    if store_index.available():
+    if last_store:
+        desc = (
+            f"{E.REPEAT} **前回のお店**（{last_store[1]}）なら、"
+            "一番上のボタンを押すだけです。\n\n"
+            "別のお店にする場合は「店名でさがす」から**店名の一部**を入れてください。"
+        )
+    elif store_index.available():
         desc = (
             "**店名の一部**を入れるだけで探せます。\n"
             "例）`南砂`　`所沢`　`AKIBA`　`イオン`\n\n"
@@ -280,7 +324,7 @@ async def start_store_select(interaction: discord.Interaction, purpose: str) -> 
         )
     e = discord.Embed(title=f"{E.STORE} {title}", description=desc, color=embeds.GREEN)
 
-    view = StoreSelectView(interaction.user.id, purpose)
+    view = StoreSelectView(interaction.user.id, purpose, last_store)
     if interaction.response.is_done():
         await interaction.followup.send(embed=e, view=view, ephemeral=True)
     else:
@@ -338,10 +382,21 @@ async def open_menu(interaction: discord.Interaction, store_id: str, purpose: st
     await save_cart(interaction.user.id, purpose=purpose, store_id=store_id, pickup=None, items=[])
     # いまの時間に使える受取方法だけを選択肢に出す
     usable = {m: (m in av.methods) for m in info.delivery_methods}
+    # 前回と同じ受取方法を最初から選んでおく。
+    # 毎回選び直すのは手間なので、違うときだけ変えてもらえばよい。
+    last_pickup = None
+    async with session_scope() as s:
+        row = await s.get(User, interaction.user.id)
+        if row and row.last_pickup and (usable or info.delivery_methods).get(
+            row.last_pickup
+        ):
+            last_pickup = row.last_pickup
+
     view = CartView(
         interaction.user.id, purpose, store_id, info.name,
         usable or info.delivery_methods, menu,
         active_dayparts=await availability.active_dayparts_for(store_id),
+        pickup=last_pickup,
     )
     await interaction.followup.send(embed=await view.build_embed(), view=view, ephemeral=True)
 
@@ -355,6 +410,7 @@ class CartView(discord.ui.View):
         self, owner_id: int, purpose: str, store_id: str, store_name: str,
         supported: dict[str, bool], menu: ParsedMenu,
         active_dayparts: set[str] | None = None,
+        pickup: str | None = None,
     ) -> None:
         super().__init__(timeout=config.VIEW_TIMEOUT)
         self.owner_id = owner_id
@@ -367,7 +423,8 @@ class CartView(discord.ui.View):
         # 終わったカテゴリを出さないために使う。
         self.active_dayparts: set[str] = set(active_dayparts or ())
         self.items: list[OrderItem] = []
-        self.pickup: str | None = None
+        # 前回と同じ受取方法を最初から選んでおく（手数を1つ減らす）
+        self.pickup: str | None = pickup
         self._build()
 
     # -- 見た目 -------------------------------------------------
@@ -491,6 +548,36 @@ class CartView(discord.ui.View):
         if note:
             embed.description = note
         await interaction.response.edit_message(embed=embed, view=self)
+
+    def popular_products(self, limit: int = 20) -> list[Product]:
+        """
+        すぐ選べるように出す商品。
+
+        「おすすめ」と「セット」を先に、残りを人気の順で。
+        カテゴリを選ばずに商品へ進めるようにするため。
+        """
+        minutes = now_minutes()
+        seen: set[str] = set()
+        out: list[Product] = []
+        priority = ("おすすめ", "セット", "バーガー")
+        ordered = sorted(
+            self.menu.collections,
+            key=lambda c: (
+                priority.index(c.name) if c.name in priority else len(priority),
+                c.sort_order,
+            ),
+        )
+        for col in ordered:
+            if not availability.collection_available(col.name, self.active_dayparts):
+                continue
+            for p in self.menu.visible_products(col.id, minutes):
+                if p.code in seen or p.product_class not in ("PRODUCT", "VALUE_MEAL"):
+                    continue
+                seen.add(p.code)
+                out.append(p)
+                if len(out) >= limit:
+                    return out
+        return out
 
     async def _on_add(self, interaction: discord.Interaction) -> None:
         # 同じメッセージを書き換えて進む。
@@ -691,15 +778,58 @@ class CategoryView(discord.ui.View):
             )
         if not options:
             options = [discord.SelectOption(label="（今は選べる商品がありません）", value="_none")]
-        sel = discord.ui.Select(placeholder="カテゴリ", options=options, row=0)
+        # よく頼まれる商品は、カテゴリを選ばずにここから直接選べるようにする。
+        # 「カテゴリ → 商品」の2段を踏まずに済み、操作が1つ減る。
+        popular = cart.popular_products(limit=25)
+        if popular:
+            psel = discord.ui.Select(
+                placeholder="人気の商品からすぐ選ぶ",
+                options=[
+                    discord.SelectOption(
+                        label=p.name[:100], value=p.code,
+                        description=f"{embeds.yen(p.price_for(cart.pickup or 'takeOut'))}",
+                    )
+                    for p in popular
+                ],
+                row=0,
+            )
+            psel.callback = self._on_quick
+            self.add_item(psel)
+            self._quick = psel
+
+        sel = discord.ui.Select(
+            placeholder="カテゴリから探す", options=options,
+            row=1 if popular else 0,
+        )
         sel.callback = self._on_pick
         self.add_item(sel)
         self._sel = sel
 
         back = discord.ui.Button(label="カートに戻る", emoji=E.CART,
-                                 style=discord.ButtonStyle.secondary, row=1)
+                                 style=discord.ButtonStyle.secondary, row=2)
         back.callback = self._on_back
         self.add_item(back)
+
+    async def _on_quick(self, interaction: discord.Interaction) -> None:
+        """人気の商品から直接選ぶ。カテゴリを飛ばす。"""
+        code = self._quick.values[0]
+        product = self.cart.menu.products.get(code)
+        if product is None:
+            await interaction.response.edit_message(
+                embed=embeds.error("商品が見つかりませんでした。"), view=None
+            )
+            return
+        choices = product.slots_of("choices")
+        if choices:
+            view = OptionView(self.cart, product, choices)
+            await interaction.response.edit_message(embed=view.build_embed(), view=view)
+        else:
+            await _add_to_cart(self.cart, product, {})
+            note = f"{E.OK} **{product.name}** を追加しました。"
+            if product.customizations():
+                names = "・".join(sl.name for sl in product.customizations()[:3])
+                note += f"\n{E.INFO} {names}などを抜くこともできます"
+            await self.cart.show(interaction, note=note)
 
     def build_embed(self) -> discord.Embed:
         return discord.Embed(
