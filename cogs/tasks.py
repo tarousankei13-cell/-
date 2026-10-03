@@ -110,6 +110,20 @@ class TasksCog(commands.Cog):
         self._last_backup_day: int | None = None
         self._started = False
 
+    def _loops(self) -> list[tasks.Loop]:
+        """
+        このコグが持っている定期ループを全部拾う。
+
+        ⚠️ 手で並べてはいけない。足したループを起動し忘れると、
+           その機能だけ**黙って定期更新されなくなる**。
+           気付くのは利用者が古い情報で注文に失敗したときになる。
+        """
+        return [
+            getattr(self, name)
+            for name, value in vars(type(self)).items()
+            if isinstance(value, tasks.Loop)
+        ]
+
     def _start_loops(self) -> None:
         """
         ループの開始は on_ready 以降に行う。
@@ -117,18 +131,13 @@ class TasksCog(commands.Cog):
         cog_load の時点ではまだログインしていないため、ループ内の
         wait_until_ready() が例外を投げてループが静かに死ぬことがある。
         """
-        for loop in (self.menu_sync, self.store_index_sync, self.health_check,
-                     self.token_warm, self.hourly_checks, self.outage_watch):
+        for loop in self._loops():
             if not loop.is_running():
                 loop.start()
 
     async def cog_unload(self) -> None:
-        self.menu_sync.cancel()
-        self.store_index_sync.cancel()
-        self.outage_watch.cancel()
-        self.health_check.cancel()
-        self.token_warm.cancel()
-        self.hourly_checks.cancel()
+        for loop in self._loops():
+            loop.cancel()
 
     async def _wait_ready(self) -> None:
         """準備完了を待つ。まだ接続していない場合でもループを殺さない。"""
@@ -304,13 +313,24 @@ class TasksCog(commands.Cog):
     async def health_check(self) -> None:
         if not self._started:
             return
+        # ⚠️ マクドナルドだけでなく **Kyash も** 確かめる。
+        #    Kyash のトークンは1ヶ月で切れ、凍結もありうる。
+        #    チャージしようとした利用者が最初に気付く形になっていた。
         results = await jobs.mcd_accounts.healthcheck_all()
-        dead = [(i, l) for i, l, alive in results if not alive]
+        dead = [(f"#{i}", l, "マクドナルド") for i, l, alive in results if not alive]
+        try:
+            kyash = await jobs.kyash_accounts.healthcheck_all()
+        except Exception as e:          # Kyash 側で落ちても点検は続ける
+            log.warning("Kyash口座の生存確認に失敗しました: %s", e)
+        else:
+            dead += [(f"#{i}", l, "Kyash") for i, l, alive in kyash if not alive]
         if dead:
             await self.notify_admin(
                 discord.Embed(
                     title=f"{E.RED} 応答しないアカウントがあります",
-                    description="\n".join(f"`#{i}` **{l}**" for i, l in dead),
+                    description="\n".join(
+                        f"`{i}` **{l}**（{kind}）" for i, l, kind in dead
+                    ),
                     color=embeds.RED,
                 )
             )

@@ -114,6 +114,55 @@ async def report_failure(account_id: int, error: str) -> None:
             acc.status = STATUS_DEGRADED
 
 
+async def report_success_healthcheck(account_id: int) -> None:
+    """生存確認に成功した。落としていた口座は戻す。"""
+    async with session_scope() as s:
+        acc = await s.get(KyashAccount, account_id)
+        if acc is None:
+            return
+        acc.last_error = None
+        if acc.status == STATUS_DEGRADED:
+            acc.status = STATUS_ACTIVE
+            log.info("Kyash口座 %s が復帰しました", acc.label)
+
+
+async def healthcheck_all() -> list[tuple[int, str, bool]]:
+    """
+    全口座の生存確認。(id, label, 結果) を返す。
+
+    ⚠️ Kyash のトークンは1ヶ月で切れ、取り直しにはOTPが必要なため
+       **自動では更新できない**。切れる前に気付けるよう、
+       残り日数の通知とは別に、実際に通信して確かめておく。
+       （凍結・ログアウトは期限とは関係なく起きる）
+    """
+    async with session_scope() as s:
+        rows = (
+            await s.execute(
+                select(KyashAccount).where(KyashAccount.status != STATUS_DISABLED)
+            )
+        ).scalars().all()
+        # ⚠️ トークンがまだ無い口座は、確かめる相手がいない。
+        #    「応答しない」と報告すると管理者を驚かせるので外す。
+        targets = [
+            KyashHandle(account_id=a.id, label=a.label, client=build_client(a))
+            for a in rows if a.access_token_enc
+        ]
+
+    results = []
+    for handle in targets:
+        alive = False
+        try:
+            alive = await handle.client.healthcheck()
+        except Exception as e:                   # 通信も認証も落ちうる
+            await report_failure(handle.account_id, str(e))
+        finally:
+            await handle.aclose()
+        if alive:
+            await report_success_healthcheck(handle.account_id)
+        results.append((handle.account_id, handle.label, alive))
+    return results
+
+
 async def reset_monthly_counters() -> None:
     async with session_scope() as s:
         for acc in (await s.execute(select(KyashAccount))).scalars().all():
