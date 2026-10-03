@@ -43,12 +43,13 @@ class FakeFollowup:
     def __init__(self, parent: "FakeInteraction") -> None:
         self.parent = parent
 
-    async def send(self, content=None, *, embed=None, view=None, ephemeral=False, file=None, **kw):
+    async def send(self, content=None, *, embed=None, embeds=None, view=None,
+                   ephemeral=False, file=None, **kw):
         if not self.parent.response.is_done():
             raise RuntimeError("defer していないのに followup.send を呼びました")
         self.parent.actions.append(
-            ("followup", {"content": content, "embed": embed, "view": view,
-                          "file": file, "ephemeral": ephemeral})
+            ("followup", {"content": content, "embed": embed, "embeds": embeds,
+                          "view": view, "file": file, "ephemeral": ephemeral})
         )
 
 
@@ -78,9 +79,20 @@ class FakeClient:
         self.owner_ids = {1}
         self.admin_role_ids = set()
         self.sent: dict[int, list] = {}
+        self.users: dict[int, "FakeUser"] = {}
 
     def get_channel(self, cid):
         return FakeChannel(cid, self)
+
+    # -- 利用者の取得（一斉通知の検証に使う） --
+    def get_user(self, uid):
+        return self.users.get(int(uid))
+
+    async def fetch_user(self, uid):
+        u = self.users.get(int(uid))
+        if u is None:
+            raise discord.NotFound(_FakeResp(404), "見つかりません")
+        return u
 
 
 class FakeChannel:
@@ -131,10 +143,14 @@ class FakeInteraction:
         for _, kw in self.actions:
             if kw.get("content"):
                 parts.append(str(kw["content"]))
-            e = kw.get("embed")
-            if e is not None:
+            group = list(kw.get("embeds") or [])
+            if kw.get("embed") is not None:
+                group.append(kw["embed"])
+            for e in group:
                 parts += [e.title or "", e.description or ""]
                 parts += [f"{f.name}{f.value}" for f in e.fields]
+                if getattr(e, "footer", None) is not None and e.footer.text:
+                    parts.append(e.footer.text)
         return "\n".join(parts)
 
 

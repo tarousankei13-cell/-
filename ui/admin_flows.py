@@ -199,6 +199,193 @@ async def show_accounts(interaction: discord.Interaction) -> None:
 
 
 # ============================================================
+#  一斉通知（管理6）
+# ============================================================
+
+class BroadcastModal(discord.ui.Modal, title="利用者へのお知らせ"):
+    """管理者が文章を書いて、利用者全員へ配る。"""
+
+    heading = discord.ui.TextInput(
+        label="見出し", placeholder="例）メンテナンスのお知らせ",
+        max_length=200, required=True,
+    )
+    body = discord.ui.TextInput(
+        label="本文", style=discord.TextStyle.paragraph,
+        placeholder="例）本日22時から30分ほど、注文を停止します。",
+        max_length=1800, required=True,
+    )
+
+    def __init__(self, target: str) -> None:
+        super().__init__()
+        self.target = target     # "dm" / "channel"
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await preview_broadcast(
+            interaction, str(self.heading.value), str(self.body.value), self.target
+        )
+
+
+async def start_broadcast(interaction: discord.Interaction, target: str) -> None:
+    await interaction.response.send_modal(BroadcastModal(target))
+
+
+def _broadcast_embed(heading: str, body: str) -> discord.Embed:
+    from datetime import datetime, timezone
+
+    e = discord.Embed(
+        title=f"{E.BELL} {heading}",
+        description=body,
+        color=embeds.BLUE,
+        timestamp=datetime.now(timezone.utc),
+    )
+    e.set_footer(text="運営からのお知らせ")
+    return e
+
+
+async def preview_broadcast(
+    interaction: discord.Interaction, heading: str, body: str, target: str
+) -> None:
+    """
+    送る前に、実際の見た目と宛先の数を見せる。
+
+    一斉送信は取り消せないので、必ず確認を挟む。
+    """
+    from db.models import User
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    async with session_scope() as s:
+        count = int(
+            await s.scalar(
+                select(func.count()).select_from(User).where(User.is_banned.is_(False))
+            ) or 0
+        )
+
+    where = "利用者全員のDM" if target == "dm" else "お知らせチャンネル"
+    note = discord.Embed(
+        title=f"{E.INFO} この内容で送ります",
+        description=(
+            f"宛先: **{where}**"
+            + (f"（**{count:,}人**）" if target == "dm" else "")
+            + "\n\n下が実際の見た目です。よければ「送信する」を押してください。"
+        ),
+        color=embeds.ORANGE,
+    )
+    await interaction.followup.send(
+        embeds=[note, _broadcast_embed(heading, body)],
+        view=BroadcastConfirm(heading, body, target, count),
+        ephemeral=True,
+    )
+
+
+class BroadcastConfirm(discord.ui.View):
+    def __init__(self, heading: str, body: str, target: str, count: int) -> None:
+        super().__init__(timeout=300)
+        self.heading, self.body, self.target, self.count = heading, body, target, count
+
+    @discord.ui.button(label="送信する", emoji="📣", style=discord.ButtonStyle.success)
+    async def send(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from core import audit, settings
+        from db.models import User
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        embed = _broadcast_embed(self.heading, self.body)
+
+        if self.target == "channel":
+            channel_id = settings.get("channel_achievement")
+            channel = (
+                interaction.client.get_channel(int(channel_id)) if channel_id else None
+            )
+            if channel is None:
+                await interaction.followup.send(
+                    embed=embeds.error(
+                        "お知らせを出すチャンネルが設定されていません。\n"
+                        "`/config channel achievement` で設定してください。"
+                    ),
+                    ephemeral=True,
+                )
+                return
+            try:
+                await channel.send(embed=embed)
+            except discord.HTTPException as e:
+                await interaction.followup.send(
+                    embed=embeds.error(f"送信できませんでした。\n```{e}```"),
+                    ephemeral=True,
+                )
+                return
+            sent, blocked, failed = 1, 0, 0
+        else:
+            async with session_scope() as s:
+                rows = (
+                    await s.execute(
+                        select(User.discord_id).where(User.is_banned.is_(False))
+                    )
+                ).scalars().all()
+            sent, blocked, failed = await _deliver_dms(
+                interaction.client, list(rows), embed
+            )
+
+        await audit.record(
+            actor_id=interaction.user.id, actor_name=str(interaction.user),
+            action="broadcast", target=self.target,
+            after=self.heading[:200],
+            detail={"届いた": sent, "DM拒否": blocked, "失敗": failed},
+        )
+
+        lines = [f"{E.OK} 届いた **{sent:,}** 件"]
+        if blocked:
+            lines.append(
+                f"{E.WARN} DMを受け取らない設定の方 **{blocked:,}** 件"
+            )
+        if failed:
+            lines.append(f"{E.NG} 送れなかった **{failed:,}** 件")
+        await interaction.followup.send(
+            embed=embeds.ok("お知らせを送りました。\n" + "\n".join(lines)),
+            ephemeral=True,
+        )
+        self.stop()
+
+    @discord.ui.button(label="やめる", emoji=E.NG, style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(
+            embed=embeds.info("送信をやめました。"), view=None
+        )
+        self.stop()
+
+
+async def _deliver_dms(client, ids: list[int], embed: discord.Embed):
+    """
+    DMを順に送る。
+
+    ⚠️ 一気に送るとDiscordの制限にかかる。少しずつ間を空ける。
+       途中で失敗しても最後まで続ける。
+    """
+    import asyncio
+
+    sent = blocked = failed = 0
+    for i, uid in enumerate(ids):
+        user = client.get_user(int(uid))
+        if user is None:
+            try:
+                user = await client.fetch_user(int(uid))
+            except Exception:
+                failed += 1
+                continue
+        try:
+            await user.send(embed=embed)
+            sent += 1
+        except discord.Forbidden:
+            blocked += 1
+        except discord.HTTPException:
+            failed += 1
+        # 20件ごとに少し休む
+        if (i + 1) % 20 == 0:
+            await asyncio.sleep(1.0)
+    log.info("お知らせを送りました: 届いた%d / 拒否%d / 失敗%d", sent, blocked, failed)
+    return sent, blocked, failed
+
+
+# ============================================================
 #  利用者カード（管理5）
 # ============================================================
 

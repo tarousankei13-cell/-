@@ -26,6 +26,7 @@ TESTS = [
     ("アカウント健全性パネル", "test_admin_panel.py"),
     ("利用者カード", "test_user_card.py"),
     ("気になる動きの検知", "test_fraud.py"),
+    ("一斉通知", "test_broadcast.py"),
     ("再送の方針（冪等性）", "test_retry.py"),
     ("サーキットブレーカー", "test_breaker.py"),
     ("名前解決の控え", "test_dns.py"),

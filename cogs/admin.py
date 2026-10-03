@@ -343,6 +343,29 @@ class AdminCog(commands.Cog):
             embed=embeds.ok(f"{user.mention} の利用停止を解除しました。"), ephemeral=True
         )
 
+    @admin.command(name="broadcast", description="利用者へお知らせを送ります")
+    @app_commands.describe(
+        target="送り先（DM: 利用者全員 / channel: お知らせチャンネル）"
+    )
+    @app_commands.choices(target=[
+        app_commands.Choice(name="利用者全員のDM", value="dm"),
+        app_commands.Choice(name="お知らせチャンネル", value="channel"),
+    ])
+    @owner_only()
+    async def admin_broadcast(
+        self, interaction: discord.Interaction,
+        target: app_commands.Choice[str] | None = None,
+    ) -> None:
+        """
+        お知らせを配る。
+
+        送る前に、実際の見た目と宛先の数を確認してから送信する。
+        一斉送信は取り消せないため。
+        """
+        await admin_flows.start_broadcast(
+            interaction, target.value if target else "dm"
+        )
+
     @admin.command(name="user", description="利用者の情報をまとめて表示します")
     @app_commands.describe(user="対象の利用者")
     @admin_only()

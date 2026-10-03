@@ -213,6 +213,28 @@ class AdminPanel(discord.ui.View):
         await admin_flows.sync_menus(interaction)
 
     @discord.ui.button(
+        label="お知らせを送る", emoji=E.BELL,
+        style=discord.ButtonStyle.primary, custom_id="panel:admin:broadcast", row=2,
+    )
+    async def broadcast(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from ui import admin_flows
+
+        await admin_flows.start_broadcast(interaction, "dm")
+
+    @discord.ui.button(
+        label="利用者を調べる", emoji=E.USER,
+        style=discord.ButtonStyle.secondary, custom_id="panel:admin:finduser", row=2,
+    )
+    async def finduser(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_message(
+            embed=embeds.info(
+                "`/admin user @利用者` で、その方の残高・利用状況・"
+                "適用中の負担率をまとめて確認できます。"
+            ),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
         label="更新", emoji=E.SYNC,
         style=discord.ButtonStyle.secondary, custom_id="panel:admin:refresh", row=1,
     )
