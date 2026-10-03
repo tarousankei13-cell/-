@@ -22,16 +22,20 @@ def check(name, cond, extra=""):
 
 class FakeClient:
     """マクドナルドAPIの偽物。どこで失敗させるかを指定できる。"""
-    def __init__(self, fail_at=None, error=McdOrderError("テスト用の失敗")):
+    def __init__(self, fail_at=None, error=McdOrderError("テスト用の失敗"),
+                 total_amount=0):
         self.fail_at = fail_at
         self.error = error
         self.authorise_calls = 0
+        # マクドナルドが言う金額。0 なら「言ってこなかった」扱い
+        self.total_amount = total_amount
 
     async def ensure_auth(self, force=False): self._maybe("auth")
     async def get_pos_paseto(self, group): self._maybe("pos"); return "v2.local.fake"
     async def store_order(self, group, body):
         self._maybe("store")
-        return OrderResponse(order_code="OC123", order_token="TOKEN123")
+        return OrderResponse(order_code="OC123", order_token="TOKEN123",
+                             total_amount=self.total_amount)
     async def authorise_order(self, group, token):
         self.authorise_calls += 1
         self._maybe("authorise")
@@ -254,6 +258,54 @@ async def main():
     async with session_scope() as s:
         u1 = await s.get(User, 1001)
         check(f"正常注文1件で利用回数1（実際{u1.total_orders}）", u1.total_orders == 1, u1.total_orders)
+
+    print("\n[9d] ★値段が変わっていたら、決済せずに止める")
+    # ⚠️ カタログは最大 MENU_STALE_MINUTES 分古いことがある。
+    #    値上げに気づかずに進むと、利用者からは古い安い金額を取り、
+    #    カードには新しい高い金額が請求される。差額は管理者が被る。
+    #    StoreOrder は課金前なので、ここで止めれば1円も動かない。
+    uid9 = 1009
+    await user_repo.get_or_create(uid9)
+    async with user_scope(uid9) as s:
+        await L.charge(s, uid9, 5000, receipt_id="r9")
+    async with session_scope() as s:
+        bal9 = await L.user_balance(s, uid9)
+
+    CURRENT["client"] = FakeClient(total_amount=850)      # 見積り800 → 実際850
+    oid9 = await new_order(uid9, make_quote())
+    r9 = await saga.execute(oid9)
+    check("注文は成立しない ★", not r9.succeeded, r9.state)
+    check("返金された（課金前なので全額戻る）★", r9.state == saga.REFUNDED, r9.state)
+    async with session_scope() as s:
+        now9 = await L.user_balance(s, uid9)
+    check("残高が元どおり ★", now9 == bal9, (bal9, now9))
+    check("決済を呼んでいない ★", CURRENT["client"].authorise_calls == 0,
+          CURRENT["client"].authorise_calls)
+    check("食い違いを記録している ★", r9.price_changed == (800, 850), r9.price_changed)
+    msg = r9.user_message
+    check("利用者に金額の変化を伝える ★", "¥800" in msg and "¥850" in msg, msg[:160])
+    check("支払いが無いことを伝える ★", "発生していません" in msg, msg[:200])
+    check("「時間外」とは言わない ★", "お時間" not in msg, msg[:200])
+
+    print("\n[9e] 金額が一致していれば、そのまま通る ★")
+    uid10 = 1010
+    await user_repo.get_or_create(uid10)
+    async with user_scope(uid10) as s:
+        await L.charge(s, uid10, 5000, receipt_id="r10")
+    CURRENT["client"] = FakeClient(total_amount=800)      # 見積りと一致
+    r10 = await saga.execute(await new_order(uid10, make_quote()))
+    check("注文が成立する ★", r10.succeeded, (r10.state, r10.error))
+    check("食い違いの記録は無い", r10.price_changed is None, r10.price_changed)
+
+    print("\n[9f] 金額を言ってこない相手でも止めない ★")
+    # 応答に金額が入らない実装・将来の仕様変更で注文が全部止まると困る
+    uid11 = 1011
+    await user_repo.get_or_create(uid11)
+    async with user_scope(uid11) as s:
+        await L.charge(s, uid11, 5000, receipt_id="r11")
+    CURRENT["client"] = FakeClient(total_amount=0)
+    r11 = await saga.execute(await new_order(uid11, make_quote()))
+    check("金額不明でも注文は通る ★", r11.succeeded, (r11.state, r11.error))
 
     print("\n[10] 元帳の最終整合性")
     async with session_scope() as s:

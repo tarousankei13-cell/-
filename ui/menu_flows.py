@@ -29,7 +29,7 @@ from services.mcd import accounts as mcd_accounts
 from services.mcd import store_index
 from services.mcd import stores as mcd_stores
 from services.mcd.client import McdError
-from services.mcd import availability, slot_bridge
+from services.mcd import availability, slot_bridge, slot_rules
 from services.mcd.menu import (
     ParsedMenu, Product, customization_note, minutes_of,
 )
@@ -919,6 +919,27 @@ class CartView(discord.ui.View):
             walk(item)
         return out
 
+    def _incomplete_items(self, minutes: int) -> list[str]:
+        """
+        必須の枠が埋まっていない商品の名前。
+
+        空のまま送るとマクドナルドに断られ、利用者には理由が分からない。
+        """
+        out: list[str] = []
+        for item in self.items:
+            product = self.menu.products.get(str(item.product_code))
+            if product is None:
+                continue
+            chosen = {slot for slot, _ in slot_rules.choices_of(item)}
+            for c in product.slots_of("choices"):
+                if c.min_quantity < 1:
+                    continue
+                if c.code in chosen or c.default_product:
+                    continue
+                out.append(product.name)
+                break
+        return out
+
     async def _on_go(self, interaction: discord.Interaction) -> None:
         """中身が決まったので、最後に受取方法を聞く。"""
         # 販売時間を確定直前に再確認する（カート投入後に時間帯を跨ぐことがある）
@@ -930,6 +951,20 @@ class CartView(discord.ui.View):
         #    「ただいまのお時間は選択した商品のお取り扱いがありません」
         #    で弾かれ、利用者には原因が分からない。
         minutes = now_minutes()
+        # ⚠️ カートを「続きから」で拾うと、15分前の内容がそのまま入っている。
+        #    その間にメニューが変わって、埋まっていない枠が生まれることがある。
+        broken = self._incomplete_items(minutes)
+        if broken:
+            await interaction.response.edit_message(
+                embed=embeds.warn(
+                    "お選びいただく内容がそろっていない商品があります。\n"
+                    + "\n".join(f"・{n}" for n in broken)
+                    + "\n\nカートから外して、選び直してください。"
+                ),
+                view=self,
+            )
+            return
+
         unavailable = [p.name for p in self._unavailable_items(minutes)]
         if unavailable:
             await interaction.response.edit_message(
@@ -1496,6 +1531,17 @@ class ProductDetailView(discord.ui.View):
 
         # ---- セットの選択枠 ----
         choices = p.slots_of("choices")
+        unfillable = self.cart.menu.unfillable_slots(p, now_minutes())
+        if unfillable:
+            e.add_field(
+                name=f"{E.WARN} ただいま承れません",
+                value=(
+                    "この商品は、お選びいただく内容を"
+                    "こちらで用意できないため承れません。\n"
+                    "恐れ入りますが、別の商品をお選びください。"
+                ),
+                inline=False,
+            )
         if choices:
             names = [c.name or "お好きなもの" for c in choices]
             e.add_field(
@@ -1575,10 +1621,19 @@ class ProductDetailView(discord.ui.View):
         choices = self.product.slots_of("choices")
 
         if choices:
-            # セットは中身を選んでからでないと足せない
+            # ⚠️ 埋めようがない枠を持つセットは、そもそも追加させない。
+            #    選び終えてからマクドナルドに断られるのが一番つらい。
+            blocked = bool(
+                self.cart.menu.unfillable_slots(self.product, now_minutes())
+            )
             go = discord.ui.Button(
-                label="中身を選ぶ", emoji=E.CART,
-                style=discord.ButtonStyle.success, row=0,
+                label="中身を選べません" if blocked else "中身を選ぶ",
+                emoji=E.NG if blocked else E.CART,
+                style=(
+                    discord.ButtonStyle.secondary if blocked
+                    else discord.ButtonStyle.success
+                ),
+                disabled=blocked, row=0,
             )
             go.callback = self._on_choose
             self.add_item(go)
@@ -1814,6 +1869,23 @@ class OptionView(discord.ui.View):
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
     async def _on_ok(self, interaction: discord.Interaction) -> None:
+        # ⚠️ 必須の枠が埋まっていない注文は送らない。
+        #    空のまま送るとマクドナルドに断られ、理由が分からない。
+        empty = [
+            c for c in self.choices
+            if c.min_quantity >= 1
+            and not (self.picks.get(c.code) or c.default_product)
+        ]
+        if empty:
+            names = "・".join(c.name or "お選びいただく内容" for c in empty)
+            await interaction.response.send_message(
+                embed=embeds.warn(
+                    f"{names} が選ばれていません。\n"
+                    "お選びいただいてから、カートに追加してください。"
+                ),
+                ephemeral=True,
+            )
+            return
         await _add_to_cart(self.cart, self.product, self.picks)
         self.stop()
         await self.cart.show(

@@ -41,6 +41,7 @@ TESTS = [
     ("外形監視", "test_monitor.py"),
     ("注文の順番待ち", "test_queue.py"),
     ("注文Saga（端から端まで）", "test_order_e2e.py"),
+    ("注文経路の総点検", "test_order_audit.py"),
     ("エラーの判別と対処", "test_errors.py"),
     ("代理実績の同一性", "test_achievement.py"),
     ("残高の増減パネル", "test_balance_panel.py"),

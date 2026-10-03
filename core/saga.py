@@ -40,6 +40,20 @@ from services.web import new_view_token
 log = logging.getLogger("bot.saga")
 
 # 状態
+class PriceChanged(Exception):
+    """
+    見積りと、マクドナルドが言う金額が食い違った。
+
+    決済前に気づけるので、ここで止めれば1円も動かない。
+    カタログを取り直せば直るので、利用者には「もう一度」と伝える。
+    """
+
+    def __init__(self, expected: int, actual: int) -> None:
+        self.expected = expected
+        self.actual = actual
+        super().__init__(f"見積り {expected}円 に対して実際は {actual}円 でした")
+
+
 CREATED = "CREATED"
 QUOTED = "QUOTED"
 BALANCE_HELD = "BALANCE_HELD"
@@ -79,6 +93,8 @@ class OrderResult:
     store_id: str = ""
     pickup_label: str = ""
     list_price: int = 0
+    # 見積りと実際の金額が食い違ったとき (ご案内した額, 実際の額)
+    price_changed: tuple[int, int] | None = None
     user_amount: int = 0
     subsidy_rate: float = 0.0
     balance_after: int = 0
@@ -90,6 +106,16 @@ class OrderResult:
     @property
     def user_message(self) -> str:
         """利用者に見せる説明。解析できていればその文言を使う。"""
+        if self.price_changed is not None:
+            before, after = self.price_changed
+            return (
+                "お値段が変わっていたため、注文を中止しました。\n\n"
+                f"ご案内した金額　**¥{before:,}**\n"
+                f"実際の金額　　　**¥{after:,}**\n\n"
+                "最新のお値段を取り直しましたので、"
+                "お手数ですがもう一度お試しください。\n"
+                "**お支払いは発生していません。** 残高は元に戻っています。"
+            )
         info = self.error_info
         if info is not None and getattr(info, "user_text", ""):
             return info.user_text
@@ -204,6 +230,7 @@ async def execute(order_id: str, progress: ProgressCallback | None = None) -> Or
         discord_id = order.discord_id
         user_amount = order.user_amount
         subsidy_amount = order.subsidy_amount
+        list_price = order.list_price          # 金額の食い違いを見つけるため
         state = order.state
         store_id = order.store_id or ""
 
@@ -268,6 +295,21 @@ async def execute(order_id: str, progress: ProgressCallback | None = None) -> Or
             stored = await handle.client.store_order(info.group, body)
             if not stored.order_token:
                 raise McdOrderError("注文トークンを取得できませんでした")
+
+            # ⚠️ マクドナルドが言う金額と、こちらの見積りを突き合わせる。
+            #    カタログは最大 MENU_STALE_MINUTES 分古いことがある。
+            #    値上げに気づかずに進むと、利用者からは古い安い金額を
+            #    取り、カードには新しい高い金額が請求される。
+            #    差額は管理者が黙って被ることになる。
+            #
+            #    ここはまだ決済前（④の AuthoriseOrder が課金）なので、
+            #    止めれば1円も動かない。必ずここで確かめる。
+            if stored.total_amount and stored.total_amount != list_price:
+                log.warning(
+                    "見積りと実際の金額が違います: 注文=%s 見積り=%d 実際=%d",
+                    order_id, list_price, stored.total_amount,
+                )
+                raise PriceChanged(list_price, stored.total_amount)
 
             async with session_scope() as s:
                 order = await s.get(Order, order_id)
@@ -357,6 +399,9 @@ async def execute(order_id: str, progress: ProgressCallback | None = None) -> Or
         if handle:
             await mcd_accounts.report_success(handle.account_id)
 
+    except PriceChanged as e:
+        # まだ決済していないので、確保していた残高を戻すだけでよい
+        return await _handle_failure(order_id, state, handle, e, result)
     except (McdError, McdNetworkError, McdOrderError) as e:
         return await _handle_failure(order_id, state, handle, e, result)
     except Exception as e:  # 想定外
@@ -461,9 +506,13 @@ async def _handle_failure(order_id: str, state: str, handle, error: Exception, r
     message = str(error)
     info = getattr(error, "info", None)
     result.error_info = info
+    if isinstance(error, PriceChanged):
+        result.price_changed = (error.expected, error.actual)
     log.warning("注文 %s が状態 %s で失敗しました: %s", order_id[:8], state, message)
 
-    if handle:
+    # ⚠️ 金額の食い違いはアカウントのせいではない。
+    #    これで健全性を下げると、値上げのたびにアカウントが止まる。
+    if handle and not isinstance(error, PriceChanged):
         # カードが使えない・認証が切れているなど、そのアカウントを
         # 使い続けても直らない種類のときは、すぐ候補から外す。
         # 放っておくと以降の注文が全部同じ理由で失敗し続けるため。

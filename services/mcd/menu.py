@@ -415,6 +415,32 @@ class ParsedMenu:
         out.sort(key=lambda q: (q.code not in safe, q.name))
         return out
 
+    def unfillable_slots(self, product: Product, minutes: int | None = None) -> list[Slot]:
+        """
+        埋めようがない選択枠。
+
+        ⚠️ ハッピーセットのように、参照商品がカタログの products に
+           載っていない枠や、参照が空の枠がある（実データで9商品）。
+           候補を1つも出せないのに必須なので、そのまま注文を送ると
+           マクドナルドから「お取り扱いがありません」で断られる。
+           利用者には理由が分からないので、**最初から出さない**。
+        """
+        out = []
+        for slot in product.slots_of("choices"):
+            if slot.min_quantity < 1:
+                continue                    # 入れなくてよい枠
+            if slot.default_product:
+                continue                    # 既定があるので埋まる
+            if not self.choice_candidates(slot, minutes):
+                out.append(slot)
+        return out
+
+    def orderable(self, product: Product, minutes: int | None = None) -> bool:
+        """注文として成立させられるか。時間帯と、枠を埋められるかの両方。"""
+        if minutes is not None and not product.is_orderable_at(minutes):
+            return False
+        return not self.unfillable_slots(product, minutes)
+
     def visible_products(self, collection_id: str, minutes: int | None = None) -> list[Product]:
         col = next((c for c in self.collections if c.id == collection_id), None)
         if not col:
@@ -422,7 +448,9 @@ class ParsedMenu:
         out = []
         for code in col.product_codes:
             p = self.products.get(str(code))
-            if p and (minutes is None or p.is_orderable_at(minutes)):
+            # ⚠️ 時間帯だけでなく「枠を埋められるか」も見る。
+            #    埋められないセットを出すと、選び終えてから断られる。
+            if p and self.orderable(p, minutes):
                 out.append(p)
         return out
 

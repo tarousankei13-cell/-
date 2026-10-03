@@ -1,0 +1,182 @@
+"""
+注文経路の総点検
+
+実データ（247商品・81セット）を全部通して、
+「表示したのに注文できない」経路が残っていないかを確かめる。
+"""
+import asyncio, json, os, sys, tempfile
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import config
+from core.crypto import init_cipher
+from db.session import init_db, session_scope, close_db
+from _fake_discord import FakeInteraction, FakeUser, FakeClient
+
+ok = fail = 0
+def check(name, cond, extra=""):
+    global ok, fail
+    if cond: ok += 1; print(f"  ✅ {name}")
+    else:    fail += 1; print(f"  ❌ {name}  {extra}")
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+HOURS = [6*60, 8*60, 10*60+30, 12*60, 15*60, 18*60, 22*60]
+
+
+async def main():
+    tmp = tempfile.mkdtemp()
+    init_cipher("dGVzdC1rZXktMzJieXRlcy1mb3ItdGVzdGluZy0xMjM0")
+    await init_db(f"sqlite+aiosqlite:///{tmp}/au.db")
+    from core import settings, users as user_repo
+    await settings.load_all()
+
+    from services.mcd.menu import parse_menu
+    from services.mcd.protocol import build_hex, decode_hex
+    from services.mcd import slot_rules
+    import pathlib
+    slot_rules.STORE_PATH = pathlib.Path(tmp) / "sr.json"
+    slot_rules.load()
+    from ui.menu_flows import (
+        CartView, OptionView, ProductDetailView, build_order_item, price_of,
+    )
+
+    menu = parse_menu("13934", json.load(open(os.path.join(HERE, "m13934.json"))))
+    user = FakeUser(8001)
+    await user_repo.get_or_create(user.id)
+    client = FakeClient()
+
+    def cart():
+        return CartView(user.id, "order", "13934", "南砂町店",
+                        {"takeOut": True, "eatIn": True}, menu)
+
+    # ========================================================
+    print("\n[1] 一覧に出る商品は、すべて注文を組み立てられる ★")
+    # ⚠️ 「表示したのに注文できない」が一番つらい。全時間帯で確かめる。
+    problems = []
+    for minutes in HOURS:
+        for col in menu.collections:
+            for p in menu.visible_products(col.id, minutes):
+                missing = menu.unfillable_slots(p, minutes)
+                if missing:
+                    problems.append((f"{minutes//60}時", p.name, "埋まらない枠"))
+    check("埋められない枠を持つ商品が一覧に出ない ★", not problems,
+          problems[:4])
+
+    print("\n[2] 一覧に出る商品から hex を作れる ★")
+    broke = []
+    for minutes in HOURS:
+        for col in menu.collections:
+            for p in menu.visible_products(col.id, minutes):
+                picks = {}
+                for slot in p.slots_of("choices"):
+                    cands = menu.choice_candidates(slot, minutes)
+                    if cands:
+                        picks[slot.code] = cands[0].code
+                class C:
+                    pickup = "takeOut"
+                try:
+                    item = build_order_item(C, p, picks)
+                    d = decode_hex(build_hex("13934", [item], "takeOut"))
+                    if d.items[0].product_code != p.code:
+                        broke.append((p.name, "商品コードが違う"))
+                except Exception as e:
+                    broke.append((p.name, str(e)[:50]))
+    check("全部 hex にできる ★", not broke, broke[:4])
+
+    print("\n[3] 必須の枠が空のまま注文できない ★")
+    meal = next(p for p in menu.products.values()
+                if p.product_class == "VALUE_MEAL" and p.slots_of("choices")
+                and all(not s.default_product for s in p.slots_of("choices")[:1]))
+    c3 = cart()
+    ov = OptionView(c3, meal, meal.slots_of("choices"))
+    ov.picks = {}                       # わざと空にする
+    itx = FakeInteraction(user, client)
+    await ov._on_ok(itx)
+    check("カートに入らない ★", len(c3.items) == 0, len(c3.items))
+    check("理由を伝える ★", "選ばれていません" in itx.text(), itx.text()[:140])
+
+    print("\n[4] 埋められないセットは詳細画面でも押せない ★")
+    blocked = next(
+        (p for p in menu.products.values()
+         if p.product_class == "VALUE_MEAL" and menu.unfillable_slots(p, 12*60)),
+        None)
+    check("そういうセットが実在する（検証の前提）", blocked is not None)
+    if blocked:
+        dv = ProductDetailView(cart(), blocked)
+        btn = [c for c in dv.children if not hasattr(c, "options")]
+        choose = next((c for c in btn if "中身" in getattr(c, "label", "")), None)
+        check("ボタンが押せない ★", choose is not None and choose.disabled, 
+              [(getattr(c,'label',''), getattr(c,'disabled',None)) for c in btn])
+        body = "".join(f.name + f.value for f in dv.build_embed().fields)
+        check("理由が書いてある ★", "承れません" in body, body[:200])
+
+    print("\n[5] カートの中身が揃っているか、確定前に見る ★")
+    c5 = cart()
+    item = build_order_item(type("C", (), {"pickup": "takeOut"}), meal, {})
+    c5.items.append(item)               # 枠が空のまま入れる
+    bad = c5._incomplete_items(12*60)
+    check("揃っていない商品を見つける ★", bad, bad)
+    itx5 = FakeInteraction(user, client)
+    await c5._on_go(itx5)
+    check("受取方法の画面へ進ませない ★", "そろっていない" in itx5.text(),
+          itx5.text()[:140])
+
+    print("\n[6] カートの表示金額と、送る金額が一致する ★")
+    # ⚠️ ここがずれると、見せた額と請求額が食い違う
+    from ui.menu_flows import reprice
+    mismatches = []
+    for pickup in ("eatIn", "takeOut"):
+        c6 = cart()
+        for code in ("1010", "1020", "9180"):
+            p6 = menu.products[code]
+            c6.items.append(build_order_item(
+                type("C", (), {"pickup": pickup}), p6,
+                {s.code: (menu.choice_candidates(s, 12*60) or [p6])[0].code
+                 for s in p6.slots_of("choices")}))
+        reprice(menu, c6.items, pickup)
+        shown = c6.total(pickup)
+        sent = decode_hex(build_hex("13934", c6.items, pickup)).total_amount
+        if shown != sent:
+            mismatches.append((pickup, shown, sent))
+    check("表示と送信が一致 ★", not mismatches, mismatches)
+
+    print("\n[7] 断られた組み合わせが候補から消える ★")
+    meal7 = menu.products["9180"]
+    slot7 = meal7.slots_of("choices")[0]
+    before = len(menu.choice_candidates(slot7, 12*60))
+    victim = menu.choice_candidates(slot7, 12*60)[-1]
+    slot_rules.reject("13934", slot7.code, victim.code)
+    after = menu.choice_candidates(slot7, 12*60)
+    check("1件だけ減る ★", len(after) == before - 1, (before, len(after)))
+    check("消えたのは断られたもの ★", victim.code not in [q.code for q in after])
+    check("既定の商品は残る ★",
+          any(q.code == slot7.reference_product for q in after))
+
+    print("\n[8] 全部断られても、既定だけは残る ★")
+    # ⚠️ 候補が0になると注文を組み立てられなくなる
+    for q in list(menu.choice_candidates(slot7, 12*60)):
+        slot_rules.reject("13934", slot7.code, q.code)
+    left = menu.choice_candidates(slot7, 12*60)
+    check("候補が空にならない ★", left, [q.name for q in left])
+    slot_rules.forget("13934")
+
+    print("\n[9] 時間帯をまたいでも矛盾しない ★")
+    odd = []
+    for minutes in HOURS:
+        for col in menu.collections:
+            for p in menu.visible_products(col.id, minutes):
+                if not p.is_orderable_at(minutes):
+                    odd.append((minutes // 60, p.name))
+                for slot in p.slots_of("choices"):
+                    for q in menu.choice_candidates(slot, minutes):
+                        if not q.is_orderable_at(minutes):
+                            odd.append((minutes // 60, f"{p.name}の{q.name}"))
+    check("時間外のものが候補に混ざらない ★", not odd, odd[:4])
+
+    await close_db()
+    print(f"\n{'='*52}\n  成功 {ok} / 失敗 {fail}\n{'='*52}")
+    return 1 if fail else 0
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))
