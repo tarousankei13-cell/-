@@ -14,7 +14,8 @@ from __future__ import annotations
 import json
 import asyncio
 import logging
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import discord
 from sqlalchemy import select
@@ -22,7 +23,7 @@ from sqlalchemy import select
 import config
 import emoji as E
 from core import users as user_repo
-from db.models import User, Cart, StoreCache, utcnow
+from db.models import User, Cart, StoreCache, as_utc, utcnow
 from db.session import session_scope
 from services.mcd import accounts as mcd_accounts
 from services.mcd import store_index
@@ -54,13 +55,57 @@ def now_minutes() -> int:
 #  カートの保存
 # ============================================================
 
-async def load_cart(discord_id: int) -> tuple[str, str | None, list[OrderItem]]:
+@dataclass
+class SavedCart:
+    """組み立て途中のカート。"続きから" で拾い直すために使う。"""
+    purpose: str
+    store_id: str
+    pickup: str | None
+    items: list[OrderItem]
+    age_minutes: float
+
+    @property
+    def resumable(self) -> bool:
+        """拾い直せるか。中身・お店・新しさの3つがそろって初めて拾える。"""
+        return (
+            bool(self.items)
+            and bool(self.store_id)
+            and self.age_minutes <= config.CART_RESUME_MINUTES
+        )
+
+
+async def load_cart(discord_id: int) -> SavedCart | None:
+    """
+    保存してあるカートを読み出す。無ければ None。
+
+    ⚠️ 保存だけして読み出していなかった時期がある。ビューが
+       タイムアウト（VIEW_TIMEOUT秒）するとカートに手が届かなくなり、
+       次に注文を始めた時点で空で上書きされて消えていた。
+    """
     async with session_scope() as s:
         row = await s.get(Cart, discord_id)
         if row is None:
-            return "", None, []
-        items = [OrderItem.from_dict(d) for d in json.loads(row.items_json or "[]")]
-        return row.store_id or "", row.pickup_method, items
+            return None
+        try:
+            items = [OrderItem.from_dict(d) for d in json.loads(row.items_json or "[]")]
+        except (ValueError, KeyError, TypeError):
+            log.warning("カートを読めませんでした（discord_id=%s）", discord_id)
+            return None
+
+        # ⚠️ SQLite から読んだ日時は naive なので as_utc を通す。
+        #    そのまま引き算すると offset-naive と offset-aware で落ちる。
+        updated = as_utc(row.updated_at)
+        age = (
+            (datetime.now(timezone.utc) - updated).total_seconds() / 60
+            if updated else float("inf")
+        )
+        return SavedCart(
+            purpose=row.purpose or "order",
+            store_id=row.store_id or "",
+            pickup=row.pickup_method,
+            items=items,
+            age_minutes=max(0.0, age),
+        )
 
 
 async def save_cart(
@@ -293,8 +338,98 @@ class StoreSelectView(discord.ui.View):
     async def _on_input(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(StoreIdModal(self.purpose))
 
+class ResumeCartView(discord.ui.View):
+    """
+    途中まで作ったカートを拾い直すか聞く。
+
+    少し目を離しただけで最初からやり直しになるのは不親切なので、
+    `config.CART_RESUME_MINUTES` 分以内なら続きから始められるようにする。
+    """
+
+    def __init__(self, owner_id: int, purpose: str, saved: SavedCart) -> None:
+        super().__init__(timeout=config.VIEW_TIMEOUT)
+        self.owner_id = owner_id
+        self.purpose = purpose
+        self.saved = saved
+        self._build()
+
+    async def build_embed(self) -> discord.Embed:
+        store_name = await _store_name_of(self.saved.store_id)
+        left = max(0, int(config.CART_RESUME_MINUTES - self.saved.age_minutes))
+        e = discord.Embed(
+            title=f"{E.CART} 途中のご注文があります",
+            description=(
+                f"**{store_name}** で組み立てた内容が残っています。\n"
+                "続きから進められます。"
+            ),
+            color=embeds.GREEN,
+        )
+        e.add_field(name=f"{E.CART} 商品数", value=f"{len(self.saved.items)} 点", inline=True)
+        e.add_field(
+            name=f"{E.LOADING} 残り時間",
+            value=f"あと約 {left} 分" if left else "まもなく消えます",
+            inline=True,
+        )
+        e.set_footer(text="値段や販売時間は、続きを開いたときに取り直します")
+        return e
+
+    def _build(self) -> None:
+        self.clear_items()
+        go = discord.ui.Button(
+            label="続きから", emoji=E.REPEAT, style=discord.ButtonStyle.success, row=0
+        )
+        go.callback = self._on_resume
+        self.add_item(go)
+
+        fresh = discord.ui.Button(
+            label="最初から選びなおす", style=discord.ButtonStyle.secondary, row=0
+        )
+        fresh.callback = self._on_fresh
+        self.add_item(fresh)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                embed=embeds.error("この操作は開いた本人のみ行えます。"), ephemeral=True
+            )
+            return False
+        return True
+
+    async def _on_resume(self, interaction: discord.Interaction) -> None:
+        self.stop()
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await open_menu(
+            interaction, self.saved.store_id, self.purpose, resume=self.saved
+        )
+
+    async def _on_fresh(self, interaction: discord.Interaction) -> None:
+        self.stop()
+        await clear_cart(self.owner_id)
+        await interaction.response.defer(ephemeral=True)
+        await start_store_select(interaction, self.purpose)
+
+
+async def _store_name_of(store_id: str) -> str:
+    """キャッシュしてある店名。無ければ店舗IDをそのまま返す。"""
+    async with session_scope() as s:
+        row = await s.get(StoreCache, store_id)
+    return (row.store_name if row and row.store_name else store_id) or store_id
+
+
 async def start_store_select(interaction: discord.Interaction, purpose: str) -> None:
     await user_repo.get_or_create(interaction.user.id)
+
+    # 途中まで組み立てたカートが残っていれば、作り直さずに済ませる。
+    # ビューは VIEW_TIMEOUT 秒で反応しなくなるが、中身は残っている。
+    saved = await load_cart(interaction.user.id)
+    if saved is not None and saved.resumable and saved.purpose == purpose:
+        view = ResumeCartView(interaction.user.id, purpose, saved)
+        e = await view.build_embed()
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=e, view=view, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=e, view=view, ephemeral=True)
+        return
 
     # その人自身の前回のお店を覚えていれば、1回押すだけで進めるようにする
     last_store = None
@@ -335,7 +470,16 @@ async def start_store_select(interaction: discord.Interaction, purpose: str) -> 
 #  メニューを開く
 # ============================================================
 
-async def open_menu(interaction: discord.Interaction, store_id: str, purpose: str) -> None:
+async def open_menu(
+    interaction: discord.Interaction, store_id: str, purpose: str,
+    resume: "SavedCart | None" = None,
+) -> None:
+    """
+    お店のメニューを開く。
+
+    resume を渡すと、保存してあったカートの中身を引き継ぐ。
+    渡さなければ空のカートから始める（既存のカートは捨てる）。
+    """
     if not store_id.isdigit():
         await interaction.followup.send(
             embed=embeds.error("店舗IDは数字で入力してください。"), ephemeral=True
@@ -379,7 +523,24 @@ async def open_menu(interaction: discord.Interaction, store_id: str, purpose: st
     if purpose == "order":
         asyncio.create_task(mcd_accounts.warm_up(store_id, info.group))
 
-    await save_cart(interaction.user.id, purpose=purpose, store_id=store_id, pickup=None, items=[])
+    # ---- 続きから始める場合は、残っていた中身を引き継ぐ ----
+    # ⚠️ 15分の間に終売・時間帯外・メニュー改定が起きることがある。
+    #    いま取り直したメニューに無い商品は、黙って持ち越さない。
+    items: list[OrderItem] = []
+    dropped = 0
+    if resume is not None:
+        for item in resume.items:
+            if str(item.product_code) in menu.products:
+                items.append(item)
+            else:
+                dropped += 1
+        # 値段は取り直したメニューで入れ直す（15分の間に変わりうる）
+        reprice(menu, items, "takeOut")
+
+    await save_cart(
+        interaction.user.id, purpose=purpose, store_id=store_id,
+        pickup=None, items=items,
+    )
     # いまの時間に使える受取方法だけを選択肢に出す
     usable = {m: (m in av.methods) for m in info.delivery_methods}
     # 前回と同じ受取方法を最初から選んでおく。
@@ -397,8 +558,17 @@ async def open_menu(interaction: discord.Interaction, store_id: str, purpose: st
         usable or info.delivery_methods, menu,
         active_dayparts=await availability.active_dayparts_for(store_id),
         pickup=last_pickup,
+        items=items,
     )
-    await interaction.followup.send(embed=await view.build_embed(), view=view, ephemeral=True)
+    embed = await view.build_embed()
+    if resume is not None:
+        note = f"{E.REPEAT} 続きから始めます。"
+        if dropped:
+            note += (
+                f"\n{E.WARN} お取り扱いが終わった商品を {dropped} 点だけ外しました。"
+            )
+        embed.description = note
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 # ============================================================
@@ -411,6 +581,7 @@ class CartView(discord.ui.View):
         supported: dict[str, bool], menu: ParsedMenu,
         active_dayparts: set[str] | None = None,
         pickup: str | None = None,
+        items: list[OrderItem] | None = None,
     ) -> None:
         super().__init__(timeout=config.VIEW_TIMEOUT)
         self.owner_id = owner_id
@@ -422,7 +593,10 @@ class CartView(discord.ui.View):
         # いま注文を受け付けている時間帯（朝マック・夜マックなど）。
         # 終わったカテゴリを出さないために使う。
         self.active_dayparts: set[str] = set(active_dayparts or ())
-        self.items: list[OrderItem] = []
+        # 「続きから」で開いたときは、残っていた中身を引き継ぐ
+        self.items: list[OrderItem] = list(items or [])
+        # カートの中で選んでいる行（group_items の添字）。未選択なら None
+        self.selected: int | None = None
         # 前回と同じ受取方法を最初から選んでおく（手数を1つ減らす）
         self.pickup: str | None = pickup
         self._build()
@@ -480,19 +654,70 @@ class CartView(discord.ui.View):
         self.add_item(add)
 
         if self.items:
-            rm = discord.ui.Button(label="最後の商品を削除", emoji=E.MINUS, style=discord.ButtonStyle.secondary, row=0)
-            rm.callback = self._on_remove
-            self.add_item(rm)
+            groups = group_items(self.items)
+            # 選んだ商品が消えていたら選択を外す（削除の直後など）
+            if self.selected is not None and self.selected >= len(groups):
+                self.selected = None
 
-            # 直前に入れた商品が具材を変えられるなら、ここから入れるようにする。
-            # わざわざ画面を挟まず、必要な人だけが押せばよい。
-            last = self.menu.products.get(self.items[-1].product_code)
-            if last is not None and last.customizations():
-                cz = discord.ui.Button(
-                    label=f"{last.name[:20]}の具材を変える", emoji=E.NOTE,
-                    style=discord.ButtonStyle.secondary, row=0,
+            options = []
+            for i, g in enumerate(groups[:25]):
+                prod = self.menu.products.get(g.item.product_code)
+                name = prod.name if prod else g.item.product_code
+                note = customization_note(self.menu, g.item)
+                options.append(
+                    discord.SelectOption(
+                        label=f"{i + 1}. {name}{note}"[:100],
+                        value=str(i),
+                        description=(
+                            f"{g.count} 個　"
+                            f"{embeds.yen(price_of(self.menu, g.item, self.pickup or 'takeOut') * g.count)}"
+                        )[:100],
+                        default=(self.selected == i),
+                    )
                 )
-                cz.callback = self._on_customize_last
+            sel = discord.ui.Select(
+                placeholder="変更する商品を選んでください（削除・個数）",
+                options=options, row=1,
+            )
+            sel.callback = self._on_select
+            self.add_item(sel)
+            self._item_select = sel
+
+            picked = self.selected is not None and self.selected < len(groups)
+            g = groups[self.selected] if picked else None
+
+            minus = discord.ui.Button(
+                label="1個 減らす", emoji=E.MINUS,
+                style=discord.ButtonStyle.secondary, row=2,
+                disabled=not picked,
+            )
+            minus.callback = self._on_minus
+            self.add_item(minus)
+
+            plus = discord.ui.Button(
+                label="1個 増やす", emoji=E.PLUS,
+                style=discord.ButtonStyle.secondary, row=2,
+                disabled=not picked,
+            )
+            plus.callback = self._on_plus
+            self.add_item(plus)
+
+            drop = discord.ui.Button(
+                label="この商品を削除", emoji=E.NG,
+                style=discord.ButtonStyle.danger, row=2,
+                disabled=not picked,
+            )
+            drop.callback = self._on_drop
+            self.add_item(drop)
+
+            # 選んだ商品の具材を変える。選んでいないときは出さない。
+            prod = self.menu.products.get(g.item.product_code) if g else None
+            if prod is not None and prod.customizations():
+                cz = discord.ui.Button(
+                    label=f"{prod.name[:16]}の具材を変える", emoji=E.NOTE,
+                    style=discord.ButtonStyle.secondary, row=3,
+                )
+                cz.callback = self._on_customize_selected
                 self.add_item(cz)
 
         # ⚠️ 受取方法はここでは聞かない。
@@ -574,16 +799,73 @@ class CartView(discord.ui.View):
         view = CategoryView(self)
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
-    async def _on_customize_last(self, interaction: discord.Interaction) -> None:
-        """
-        直前に入れた商品の具材を変える。
+    # -- カートの中身を編集する ---------------------------------
 
-        いったん取り出して、調整してから入れ直す。
-        """
-        if not self.items:
+    def _selected_group(self) -> "CartGroup | None":
+        groups = group_items(self.items)
+        if self.selected is None or self.selected >= len(groups):
+            return None
+        return groups[self.selected]
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        self.selected = int(self._item_select.values[0])
+        await self.refresh(interaction)
+
+    async def _on_minus(self, interaction: discord.Interaction) -> None:
+        """選んだ商品を1個だけ減らす。最後の1個なら、その行ごと消える。"""
+        g = self._selected_group()
+        if g is None:
             await interaction.response.defer()
             return
-        item = self.items[-1]
+        del self.items[g.indexes[-1]]
+        if g.count == 1:
+            self.selected = None     # 行ごと消えたので選択を外す
+        await self.refresh(interaction)
+
+    async def _on_plus(self, interaction: discord.Interaction) -> None:
+        """選んだ商品を1個増やす。具材の調整もそのまま複製する。"""
+        g = self._selected_group()
+        if g is None:
+            await interaction.response.defer()
+            return
+        if len(self.items) >= config.CART_MAX_ITEMS:
+            await interaction.response.send_message(
+                embed=embeds.warn(
+                    f"カートに入れられるのは {config.CART_MAX_ITEMS} 点までです。"
+                ),
+                ephemeral=True,
+            )
+            return
+        # 同じ内容を作り直す。参照を共有すると、片方の調整が
+        # もう片方にも効いてしまう。
+        copy = OrderItem.from_dict(g.item.to_dict())
+        self.items.insert(g.indexes[-1] + 1, copy)
+        await self.refresh(interaction)
+
+    async def _on_drop(self, interaction: discord.Interaction) -> None:
+        """選んだ商品を、同じ内容のぶんまとめて削除する。"""
+        g = self._selected_group()
+        if g is None:
+            await interaction.response.defer()
+            return
+        for i in sorted(g.indexes, reverse=True):
+            del self.items[i]
+        self.selected = None
+        await self.refresh(interaction)
+
+    async def _on_customize_selected(self, interaction: discord.Interaction) -> None:
+        """
+        選んだ商品の具材を変える。
+
+        いったん取り出して、調整してから入れ直す。
+        ⚠️ 同じ内容が複数あっても、取り出すのは**1個だけ**。
+           まとめて消すと、調整していない残りまで巻き添えになる。
+        """
+        g = self._selected_group()
+        if g is None:
+            await interaction.response.defer()
+            return
+        item = g.item
         product = self.menu.products.get(item.product_code)
         if product is None:
             await interaction.response.defer()
@@ -598,18 +880,14 @@ class CartView(discord.ui.View):
             if inner:
                 picks[comp.product_code] = inner[0].product_code
 
-        self.items.pop()
+        del self.items[g.indexes[-1]]
+        self.selected = None
         await save_cart(
             self.owner_id, purpose=self.purpose, store_id=self.store_id,
             pickup=self.pickup, items=self.items,
         )
         view = CustomizeView(self, product, picks)
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
-
-    async def _on_remove(self, interaction: discord.Interaction) -> None:
-        if self.items:
-            self.items.pop()
-        await self.refresh(interaction)
 
     async def _on_cancel(self, interaction: discord.Interaction) -> None:
         await clear_cart(self.owner_id)
@@ -824,6 +1102,143 @@ class PickupView(discord.ui.View):
         await self.cart.show(interaction)
 
 
+def search_products(
+    menu: ParsedMenu, query: str, minutes: int,
+    active_dayparts: set[str] | None = None, limit: int = 25,
+) -> list[Product]:
+    """
+    商品名で探す。
+
+    ・ひらがな・カタカナ・全角半角・大文字小文字のどれでも当たるようにする
+    ・いま注文できないものは出さない（出しても選べないので)
+    ・前方一致を先に、部分一致をあとに並べる
+    """
+    q = store_index.normalize(query)
+    if not q:
+        return []
+
+    starts: list[Product] = []
+    contains: list[Product] = []
+    for p in menu.products.values():
+        if p.product_class not in ("PRODUCT", "VALUE_MEAL"):
+            continue
+        if not p.is_orderable_at(minutes):
+            continue
+        # 日本語名と英語名の両方で当てる。
+        # カタログに "Big Mac" が入っているので「Big」でも引ける。
+        names = [store_index.normalize(p.name)]
+        if p.display.name_en:
+            names.append(store_index.normalize(p.display.name_en))
+        if any(n.startswith(q) for n in names):
+            starts.append(p)
+        elif any(q in n for n in names):
+            contains.append(p)
+
+    both = starts + contains
+    return both[:limit]
+
+
+class ProductSearchModal(discord.ui.Modal, title="商品名でさがす"):
+    query = discord.ui.TextInput(
+        label="商品名の一部",
+        placeholder="例: ポテト　／　てりやき　／　コーヒー",
+        required=True, max_length=40,
+    )
+
+    def __init__(self, cart: "CartView") -> None:
+        super().__init__()
+        self.cart = cart
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        text = str(self.query.value).strip()
+        hits = search_products(
+            self.cart.menu, text, now_minutes(), self.cart.active_dayparts
+        )
+        if not hits:
+            await interaction.response.send_message(
+                embed=embeds.warn(
+                    f"「{text}」に当てはまる商品は見つかりませんでした。\n"
+                    "いまの時間に注文できない商品は出てきません。\n"
+                    "カテゴリからも探せます。",
+                    title=f"{E.INFO} 見つかりませんでした",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        view = ProductSearchView(self.cart, text, hits)
+        await interaction.response.edit_message(
+            embed=view.build_embed(), view=view
+        )
+
+
+class ProductSearchView(discord.ui.View):
+    """商品名の検索結果。選ぶと商品の詳細へ進む。"""
+
+    def __init__(self, cart: "CartView", query: str, hits: list[Product]) -> None:
+        super().__init__(timeout=config.VIEW_TIMEOUT)
+        self.cart = cart
+        self.query = query
+        self.hits = hits
+        self._build()
+
+    def build_embed(self) -> discord.Embed:
+        return discord.Embed(
+            title=f"🔍 「{self.query}」の検索結果",
+            description=f"{len(self.hits)} 品見つかりました。",
+            color=embeds.GREEN,
+        )
+
+    def _build(self) -> None:
+        self.clear_items()
+        pickup = self.cart.pickup or "takeOut"
+        sel = discord.ui.Select(
+            placeholder="商品を選んでください",
+            options=[
+                discord.SelectOption(
+                    label=p.name[:100], value=p.code,
+                    description=(
+                        embeds.yen(p.price_for(pickup))
+                        + ("　セット" if p.product_class == "VALUE_MEAL" else "")
+                    ),
+                )
+                for p in self.hits[:25]
+            ],
+            row=0,
+        )
+        sel.callback = self._on_pick
+        self.add_item(sel)
+        self._sel = sel
+
+        again = discord.ui.Button(label="もう一度さがす", emoji="🔍",
+                                  style=discord.ButtonStyle.secondary, row=1)
+        again.callback = self._on_again
+        self.add_item(again)
+
+        back = discord.ui.Button(label="カテゴリに戻る",
+                                 style=discord.ButtonStyle.secondary, row=1)
+        back.callback = self._on_back
+        self.add_item(back)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.cart.owner_id
+
+    async def _on_pick(self, interaction: discord.Interaction) -> None:
+        product = self.cart.menu.products.get(self._sel.values[0])
+        if product is None:
+            await interaction.response.defer()
+            return
+        view = ProductDetailView(self.cart, product)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+    async def _on_again(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(ProductSearchModal(self.cart))
+
+    async def _on_back(self, interaction: discord.Interaction) -> None:
+        view = CategoryView(self.cart)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+
 class CategoryView(discord.ui.View):
     def __init__(self, cart: CartView) -> None:
         super().__init__(timeout=config.VIEW_TIMEOUT)
@@ -876,10 +1291,20 @@ class CategoryView(discord.ui.View):
         self.add_item(sel)
         self._sel = sel
 
+        # 店名が検索できるのに商品名が検索できないのは不便。
+        # 247商品あるので、名前が分かっているなら辿るより速い。
+        find = discord.ui.Button(label="商品名でさがす", emoji="🔍",
+                                 style=discord.ButtonStyle.primary, row=2)
+        find.callback = self._on_search
+        self.add_item(find)
+
         back = discord.ui.Button(label="カートに戻る", emoji=E.CART,
                                  style=discord.ButtonStyle.secondary, row=2)
         back.callback = self._on_back
         self.add_item(back)
+
+    async def _on_search(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(ProductSearchModal(self.cart))
 
     async def _on_quick(self, interaction: discord.Interaction) -> None:
         """人気の商品から直接選ぶ。カテゴリを飛ばす。"""
@@ -1203,8 +1628,20 @@ class ProductDetailView(discord.ui.View):
 
     def _make_add(self, quantity: int):
         async def cb(interaction: discord.Interaction) -> None:
+            # 上限を超える分は足さない。黙って減らさず、足せた数を伝える。
+            room = config.CART_MAX_ITEMS - len(self.cart.items)
+            added = max(0, min(quantity, room))
+            if added == 0:
+                await interaction.response.send_message(
+                    embed=embeds.warn(
+                        f"カートに入れられるのは {config.CART_MAX_ITEMS} 点までです。"
+                    ),
+                    ephemeral=True,
+                )
+                return
+
             # まとめて足してから1回だけ保存する（押すたびに書かない）
-            for _ in range(quantity):
+            for _ in range(added):
                 self.cart.items.append(
                     build_order_item(self.cart, self.product, {})
                 )
@@ -1214,11 +1651,11 @@ class ProductDetailView(discord.ui.View):
                 items=self.cart.items,
             )
             self.stop()
-            suffix = f" ×{quantity}" if quantity > 1 else ""
-            await self.cart.show(
-                interaction,
-                note=f"{E.OK} **{self.product.name}**{suffix} を追加しました。",
-            )
+            suffix = f" ×{added}" if added > 1 else ""
+            note = f"{E.OK} **{self.product.name}**{suffix} を追加しました。"
+            if added < quantity:
+                note += f"\n{E.WARN} 上限のため {quantity - added} 点は追加できませんでした。"
+            await self.cart.show(interaction, note=note)
         return cb
 
     async def _on_choose(self, interaction: discord.Interaction) -> None:
@@ -1578,6 +2015,85 @@ def reprice(menu: ParsedMenu, items: list[OrderItem], pickup: str) -> None:
         item.amount = price_of(menu, item, pickup)
 
 
+@dataclass
+class CartGroup:
+    """カートの中で同じ内容がいくつ並んでいるか。"""
+    item: OrderItem
+    count: int
+    indexes: list[int]      # self.items の中での位置
+
+
+def group_items(items: list[OrderItem]) -> list[CartGroup]:
+    """
+    まったく同じ内容のものをまとめる。
+
+    ⚠️ 表示と削除・増減で**必ず同じまとめ方**を使うこと。
+       別々に数えると、画面の「3.」と消える商品がずれる。
+    """
+    groups: list[CartGroup] = []
+    keys: list[str] = []
+    for i, item in enumerate(items):
+        key = json.dumps(item.to_dict(), sort_keys=True, ensure_ascii=False)
+        if keys and keys[-1] == key:
+            groups[-1].count += 1
+            groups[-1].indexes.append(i)
+            continue
+        groups.append(CartGroup(item=item, count=1, indexes=[i]))
+        keys.append(key)
+    return groups
+
+
+def _slot_labels(menu: ParsedMenu, product: Product | None) -> dict[str, str]:
+    """
+    選択枠のコード → 「サイドメニュー」「ドリンク」などの名前。
+
+    枠そのものに名前が付いていないことが多い（9987009 のような符号だけ）。
+    その場合は、その枠に入る商品が属するカテゴリ名で代える。
+    「ハッシュポテト」とだけ出るより「サイドメニュー：ハッシュポテト」の
+    ほうが、何の枠なのか分かる。
+    """
+    if product is None:
+        return {}
+    out: dict[str, str] = {}
+    for slot in product.slots_of("choices"):
+        code = str(slot.code)
+        if slot.name:
+            out[code] = slot.name
+            continue
+        ref = str(slot.reference_product or slot.default_product or "")
+        col = menu.collection_of(ref) if ref else None
+        if col and col.name:
+            out[code] = col.name
+    return out
+
+
+def cart_item_lines(
+    menu: ParsedMenu, item: OrderItem, pickup: str = "takeOut"
+) -> list[str]:
+    """
+    セットの中身を1品ぶん書き出す。
+
+    枠の名前が分かるときは「サイド：マックフライポテト(M)」と出す。
+    ただ商品名が並ぶだけだと、何がどの枠なのか分からないため。
+    """
+    parent = menu.products.get(str(item.product_code))
+    labels = _slot_labels(menu, parent)
+    lines: list[str] = []
+    for comp in item.components:
+        label = labels.get(str(comp.product_code), "")
+        # 枠 → （中間ノード）→ 商品 と辿って、一番奥の商品名を出す
+        leaves = [
+            menu.products[str(x.product_code)]
+            for x in comp.walk()
+            if x is not comp and str(x.product_code) in menu.products
+        ]
+        if not leaves:
+            continue
+        name = leaves[-1].name
+        lines.append(f"　└ {label}：{name}" if label else f"　└ {name}")
+    return lines
+
+
 def cart_lines(
     menu: ParsedMenu, items: list[OrderItem], pickup: str = "takeOut"
 ) -> list[str]:
@@ -1587,31 +2103,15 @@ def cart_lines(
     まったく同じ内容のものは「×3」とまとめる。
     「3個 追加」で3行並ぶと読みにくいため。
     """
-    groups: list[tuple[OrderItem, int]] = []
-    keys: list[str] = []
-    for item in items:
-        key = json.dumps(item.to_dict(), sort_keys=True, ensure_ascii=False)
-        if keys and keys[-1] == key:
-            groups[-1] = (groups[-1][0], groups[-1][1] + 1)
-            continue
-        groups.append((item, 1))
-        keys.append(key)
-
     lines: list[str] = []
-    for idx, (item, count) in enumerate(groups, 1):
-        p = menu.products.get(item.product_code)
-        name = p.name if p else item.product_code
-        note = customization_note(menu, item)
-        qty = f" ×{count}" if count > 1 else ""
-        money = embeds.yen(price_of(menu, item, pickup) * count)
+    for idx, g in enumerate(group_items(items), 1):
+        p = menu.products.get(g.item.product_code)
+        name = p.name if p else g.item.product_code
+        note = customization_note(menu, g.item)
+        qty = f" ×{g.count}" if g.count > 1 else ""
+        money = embeds.yen(price_of(menu, g.item, pickup) * g.count)
         lines.append(f"**{idx}.** {name}{note}{qty}　{money}")
-        for comp in item.components:
-            for leaf in comp.walk():
-                if leaf is comp:
-                    continue
-                cp = menu.products.get(leaf.product_code)
-                if cp:
-                    lines.append(f"　└ {cp.name}")
+        lines += cart_item_lines(menu, g.item, pickup)
     return lines
 
 
@@ -1620,13 +2120,20 @@ async def _add_to_cart(
     product: Product,
     picks: dict[str, str],
     amounts: dict[str, int] | None = None,
-) -> None:
-    """カートに1品足して保存する。追加の経路はここに一本化する。"""
+) -> bool:
+    """
+    カートに1品足して保存する。追加の経路はここに一本化する。
+
+    上限に達していたら足さずに False を返す。
+    """
+    if len(cart.items) >= config.CART_MAX_ITEMS:
+        return False
     cart.items.append(build_order_item(cart, product, picks, amounts))
     await save_cart(
         cart.owner_id, purpose=cart.purpose, store_id=cart.store_id,
         pickup=cart.pickup, items=cart.items,
     )
+    return True
 
 
 def build_order_item(

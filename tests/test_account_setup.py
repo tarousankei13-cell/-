@@ -8,7 +8,7 @@ from core.crypto import init_cipher, get_cipher
 from db.session import init_db, session_scope, close_db
 from core import settings
 from db.models import KyashAccount, McdAccount
-from services.mcd.client import McdAuthError, TokenSet
+from services.mcd.client import LoginResult, McdAuthError, TokenSet
 from services.kyash.client import KyashError, KyashSession, Profile, Wallet
 
 ok = fail = 0
@@ -32,8 +32,10 @@ class FakeValue:
     def __str__(self): return self.value
 
 class FakeMcd:
-    def __init__(self, login_error=None, mfa_error=None, cards=None):
+    def __init__(self, login_error=None, mfa_error=None, cards=None, need_otp=True):
         self.login_error = login_error; self.mfa_error = mfa_error
+        self.need_otp = need_otp
+        self.tokens = TokenSet()
         self.cards = cards if cards is not None else [
             {"card_id": "card-1", "masked": "**** 1234", "expiry": "12/28", "name": "TARO"},
             {"card_id": "card-2", "masked": "**** 5678", "expiry": "03/27", "name": "TARO"},
@@ -41,10 +43,15 @@ class FakeMcd:
         self.closed = False
     async def login(self, email, password):
         if self.login_error: raise self.login_error
-        return "mfa-token"
+        if not self.need_otp:
+            # マクドナルドが認証コードを求めてこなかった場合
+            self.tokens = TokenSet(access_token="a", refresh_token="r")
+            return LoginResult(needs_otp=False, tokens=self.tokens)
+        return LoginResult(needs_otp=True, mfa_token="mfa-token")
     async def login_with_mfa(self, mfa, otp):
         if self.mfa_error: raise self.mfa_error
-        return TokenSet(access_token="a", refresh_token="r")
+        self.tokens = TokenSet(access_token="a", refresh_token="r")
+        return self.tokens
     async def get_cards(self): return self.cards
     async def aclose(self): self.closed = True
 
@@ -86,6 +93,31 @@ async def main():
     view = itx.last_view()
     check("「認証コードを入力」ボタンが出る", view is not None and len(view.children) == 1)
 
+    print("\n[1.5] マクドナルド: 認証コードを求められなかったとき ★")
+    # ⚠️ 以前は jwtMfaToken と jwtAccessToken を区別しておらず、
+    #    求められていないのに必ず6桁を聞いていた。届かないコードは
+    #    入力できないので、そこで進めなくなっていた。
+    mcd_no_otp = FakeMcd(need_otp=False)
+    acc.McdClient = lambda fp, *a, **kw: mcd_no_otp
+    modal15 = acc.McdCredModal()
+    modal15.label, modal15.email, modal15.password = (
+        FakeValue("コード不要"), FakeValue("x@y.z"), FakeValue("pw"))
+    itx15 = FakeInteraction(owner, client)
+    await modal15.on_submit(itx15)
+    check("認証コードを聞かない ★", "認証コードを送信" not in itx15.text(), itx15.text()[:120])
+    check("そのまま登録が終わる ★", "登録しました" in itx15.text(), itx15.text()[:120])
+    check("入力ボタンを出さない ★", itx15.last_view() is None, itx15.last_view())
+    check("次の手順を案内する", "/mcd card" in itx15.text(), itx15.text()[:200])
+    check("接続を閉じる", mcd_no_otp.closed)
+    async with session_scope() as s:
+        from sqlalchemy import select as _sel
+        rows = (await s.execute(_sel(McdAccount))).scalars().all()
+    saved = [r for r in rows if r.label == "コード不要"]
+    check("アカウントが保存される ★", len(saved) == 1, [r.label for r in rows])
+    if saved:
+        check("リフレッシュトークンが入る ★", bool(saved[0].refresh_token_enc))
+
+    acc.McdClient = lambda fp, *a, **kw: mcd
     print("\n[2] マクドナルド: 認証コードを入れる")
     otp_modal = acc.McdOtpModal(view)
     otp_modal.otp = FakeValue("123456")
@@ -93,8 +125,10 @@ async def main():
     await otp_modal.on_submit(itx2)
     async with session_scope() as s:
         from sqlalchemy import select
-        rows = (await s.execute(select(McdAccount))).scalars().all()
-    check("アカウントが保存される", len(rows) == 1, len(rows))
+        all_rows = (await s.execute(select(McdAccount))).scalars().all()
+    # [1.5] でも1件保存しているので、こちらの表示名で絞る
+    rows = [r for r in all_rows if r.label == "メイン"]
+    check("アカウントが保存される", len(rows) == 1, [r.label for r in all_rows])
     if rows:
         a = rows[0]
         cipher = get_cipher()

@@ -112,6 +112,19 @@ class TokenSet:
         return bool(self.root_paseto) and time.time() + margin < self.root_exp
 
 
+@dataclass
+class LoginResult:
+    """
+    ログインの結果。
+
+    needs_otp が True なら mfa_token を持って `login_with_mfa` へ。
+    False なら tokens が入っていて、もうログインは終わっている。
+    """
+    needs_otp: bool
+    mfa_token: str = ""
+    tokens: TokenSet | None = None
+
+
 def jwt_exp(token: str) -> float:
     try:
         payload = token.split(".")[1]
@@ -211,8 +224,19 @@ class McdClient:
 
     # -- 認証 -------------------------------------------------
 
-    async def login(self, email: str, password: str) -> str:
-        """メールとパスワードでログインし、MFAトークンを返す。"""
+    async def login(self, email: str, password: str) -> "LoginResult":
+        """
+        メールとパスワードでログインする。
+
+        マクドナルドは**認証コードを求めてこないことがある**。
+        その場合は `jwtMfaToken` ではなく `jwtAccessToken` が返り、
+        そのままログインが完了している。
+
+        ⚠️ 以前はこの2つを区別せず、どちらが返っても6桁を聞いていた。
+           求められていないコードは届かないので、利用者は何も入力できず
+           先へ進めなくなる。Kyash 側（start_login）は最初から
+           区別していたので、同じ形にそろえた。
+        """
         try:
             r = await self._client.post(
                 f"{CON_BASE}/v3/logins",
@@ -232,10 +256,29 @@ class McdClient:
                 else f"ログインに失敗しました (HTTP {r.status_code})"
             )
         d = r.json()
-        token = d.get("jwtMfaToken") or d.get("jwtAccessToken", "")
-        if not token:
-            raise McdAuthError("認証コードの送信に失敗しました")
-        return token
+
+        # 認証コードを求められた
+        if mfa := d.get("jwtMfaToken"):
+            return LoginResult(needs_otp=True, mfa_token=mfa)
+
+        # 求められなかった。この時点でログインは終わっている
+        access = d.get("jwtAccessToken", "")
+        refresh = d.get("jwtRefreshToken", "")
+        if access and refresh:
+            self.tokens = TokenSet(
+                access_token=access, refresh_token=refresh,
+                access_exp=jwt_exp(access),
+            )
+            await self._save_tokens()
+            return LoginResult(needs_otp=False, tokens=self.tokens)
+
+        # アクセストークンだけでリフレッシュトークンが無いと、
+        # 次回以降ログインし直せない。認証コードの経路に進めない以上、
+        # ここで止めて理由を伝える。
+        raise McdAuthError(
+            "ログインには成功しましたが、必要なトークンを取得できませんでした。"
+            "しばらく時間をおいてからもう一度お試しください。"
+        )
 
     async def login_with_mfa(self, mfa_token: str, otp: str) -> TokenSet:
         """SMS/メールで届いた6桁を入力してログインを完了する。"""

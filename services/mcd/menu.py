@@ -89,7 +89,9 @@ def harvest_display(menu: dict) -> dict[str, Display]:
         offer = raw.get("timeLimitedOffer") if isinstance(raw.get("timeLimitedOffer"), dict) else {}
         durl = raw.get("detailUrl") if isinstance(raw.get("detailUrl"), dict) else {}
 
+        tname = raw.get("tName") if isinstance(raw.get("tName"), dict) else {}
         out[str(code)] = Display(
+            name_en=str(tname.get("en") or "").strip(),
             subtitle=_ja(raw, "tSubtitle"),
             description=_ja(raw, "tDescription"),
             # small と middle と large は同じURLのことが多い。
@@ -145,6 +147,7 @@ class Display:
     注文の組み立てには一切使わない。`groupMenu.products` から拾う
     （`products` の側には名前すら入っていない / docs/08）。
     """
+    name_en: str = ""           # 英語名（"Big Mac" などで検索できるように）
     subtitle: str = ""          # 商品名の補足
     description: str = ""       # 商品説明
     image_url: str = ""         # 商品画像

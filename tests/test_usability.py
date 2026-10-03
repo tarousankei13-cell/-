@@ -214,9 +214,12 @@ async def main():
 
     print("\n[9] 前回のお店を1回で選べる ★")
     from db.models import User
-    from ui.menu_flows import StoreSelectView, start_store_select
+    from ui.menu_flows import StoreSelectView, start_store_select, clear_cart
     from core import users as user_repo
     await user_repo.get_or_create(user.id)
+
+    # 途中のカートが残っていると「続きから」が先に出る（別途 [13] で検証）
+    await clear_cart(user.id)
 
     itx9 = FakeInteraction(user, client)
     await start_store_select(itx9, "order")
@@ -229,6 +232,7 @@ async def main():
         row.last_store_id = "13934"
         row.last_store_name = "南砂町店"
         row.last_pickup = "takeOut"
+    await clear_cart(user.id)
     itx10 = FakeInteraction(user, client)
     await start_store_select(itx10, "order")
     v10 = itx10.last_view()

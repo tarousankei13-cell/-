@@ -38,6 +38,33 @@ log = logging.getLogger("bot.cogs.account")
 #  マクドナルド
 # ============================================================
 
+async def _save_mcd(client, fp, email: str, label: str) -> int:
+    """
+    ログイン済みのマクドナルドアカウントを保存して、IDを返す。
+
+    ⚠️ 認証コードを求められた場合と求められなかった場合の**両方**が
+       ここを通る。別々に書くと、片方だけ列が増えて食い違う。
+    """
+    refresh = client.tokens.refresh_token
+    if not refresh:
+        raise RuntimeError("リフレッシュトークンがありません")
+
+    cipher = get_cipher()
+    async with session_scope() as s:
+        acc = McdAccount(
+            label=label,
+            email_enc=cipher.encrypt(email),
+            refresh_token_enc=cipher.encrypt(refresh),
+            device_uid=fp.device_uid,
+            wmop_device_id=fp.wmop_device_id,
+            fb_instance_id=fp.fb_instance_id,
+            home_lat=fp.latitude, home_lng=fp.longitude,
+        )
+        s.add(acc)
+        await s.flush()
+        return acc.id
+
+
 class McdCredModal(discord.ui.Modal, title="マクドナルドアカウントを追加"):
     label = discord.ui.TextInput(label="表示名（任意）", required=False, max_length=32,
                                  placeholder="例: メイン")
@@ -59,10 +86,33 @@ class McdCredModal(discord.ui.Modal, title="マクドナルドアカウントを
         fp = Fingerprint.generate(*mcd_accounts.random_home_location())
         client = McdClient(fp)
         try:
-            mfa_token = await client.login(email, password)
+            result = await client.login(email, password)
         except McdError as e:
             await client.aclose()
             await interaction.edit_original_response(embed=embeds.error(str(e)))
+            return
+
+        # 認証コードを求められなかったときは、ここで終わり。
+        # 届かないコードの入力画面を出しても進めない。
+        if not result.needs_otp:
+            try:
+                account_id = await _save_mcd(client, fp, email, label)
+            except Exception:
+                log.exception("マクドナルドアカウントの保存に失敗しました")
+                await client.aclose()
+                await interaction.edit_original_response(
+                    embed=embeds.error("アカウントの保存に失敗しました。")
+                )
+                return
+            await client.aclose()
+            await interaction.edit_original_response(
+                embed=embeds.ok(
+                    f"マクドナルドアカウント `#{account_id}` **{label}** を登録しました。\n"
+                    f"{E.INFO} 認証コードは求められませんでした。\n"
+                    f"続けて `/mcd card {account_id}` で決済カードを選んでください。"
+                ),
+                view=None,
+            )
             return
 
         await interaction.edit_original_response(
@@ -70,7 +120,9 @@ class McdCredModal(discord.ui.Modal, title="マクドナルドアカウントを
                 f"{E.KEY} 認証コードを送信しました。\n"
                 "SMS またはメールに届いた **6桁** を、下のボタンから入力してください。"
             ),
-            view=McdOtpView(interaction.user.id, client, fp, mfa_token, email, label),
+            view=McdOtpView(
+                interaction.user.id, client, fp, result.mfa_token, email, label
+            ),
         )
 
 
@@ -107,7 +159,7 @@ class McdOtpModal(discord.ui.Modal, title="認証コードの入力"):
         await interaction.response.defer(ephemeral=True, thinking=True)
         p = self.parent
         try:
-            tokens = await p.client.login_with_mfa(p.mfa_token, str(self.otp.value).strip())
+            await p.client.login_with_mfa(p.mfa_token, str(self.otp.value).strip())
         except McdError as e:
             p.attempts += 1
             if p.attempts >= 3:
@@ -124,21 +176,7 @@ class McdOtpModal(discord.ui.Modal, title="認証コードの入力"):
             )
             return
 
-        cipher = get_cipher()
-        lat, lng = p.fp.latitude, p.fp.longitude
-        async with session_scope() as s:
-            acc = McdAccount(
-                label=p.label,
-                email_enc=cipher.encrypt(p.email),
-                refresh_token_enc=cipher.encrypt(tokens.refresh_token),
-                device_uid=p.fp.device_uid,
-                wmop_device_id=p.fp.wmop_device_id,
-                fb_instance_id=p.fp.fb_instance_id,
-                home_lat=lat, home_lng=lng,
-            )
-            s.add(acc)
-            await s.flush()
-            account_id = acc.id
+        account_id = await _save_mcd(p.client, p.fp, p.email, p.label)
 
         # カードを取得して選ばせる
         cards = []

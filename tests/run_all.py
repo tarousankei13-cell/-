@@ -11,6 +11,7 @@ TESTS = [
     ("DBの日時の扱い", "test_db_datetime.py"),
     ("相関IDと通信計測", "test_telemetry.py"),
     ("カート組み立て", "test_cart.py"),
+    ("カートの編集と再開", "test_cart_edit.py"),
     ("セットの選択枠・時間帯", "test_menu_choices.py"),
     ("注文できない商品の除外", "test_menu_filter.py"),
     ("具材の調整（抜き・増量）", "test_customize.py"),
