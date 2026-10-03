@@ -239,7 +239,11 @@ async def sync_menu(
                     price_eatin=p.price_eatin, price_takeout=p.price_takeout,
                     price_other=p.price_other, pre_price=p.pre_price,
                     structure=p.structure_json(),
-                    time_windows=json.dumps(p.time_windows),
+                    # None（登録なし）と []（扱っていない）を区別して保存する。
+                    # 混同すると、注文できない商品を表示してしまう。
+                    time_windows=(
+                        None if p.time_windows is None else json.dumps(p.time_windows)
+                    ),
                     size_group=p.size_group or None,
                     synced_at=now,
                 )
@@ -298,7 +302,9 @@ async def load_menu(store_id: str) -> ParsedMenu:
             price_eatin=r.price_eatin or 0, price_takeout=r.price_takeout or 0,
             price_other=r.price_other or 0, pre_price=r.pre_price or 0,
             slots=[Slot.from_dict(d) for d in json.loads(r.structure or "[]")],
-            time_windows=json.loads(r.time_windows or "[]"),
+            time_windows=(
+                None if r.time_windows is None else json.loads(r.time_windows)
+            ),
             size_group=r.size_group or "",
         )
     collections = [

@@ -132,7 +132,11 @@ class Product:
     price_other: int = 0
     pre_price: int = 0                 # セットの表示価格
     slots: list[Slot] = field(default_factory=list)
-    time_windows: list[dict] = field(default_factory=list)  # [{start,end}] 分単位
+    # 注文できる時間帯。
+    #   None … カタログに登録が無い（分からないので止めない）
+    #   []   … 登録はあるが空＝**この店舗では扱っていない**
+    #   [..] … その時間帯だけ注文できる
+    time_windows: list[dict] | None = None
     size_group: str = ""      # サイズ違いをまとめる代表コード
 
     def price_for(self, pickup_method: str) -> int:
@@ -151,10 +155,27 @@ class Product:
         }.get(code, self.price_takeout)
 
     def is_orderable_at(self, minutes: int) -> bool:
-        """その時刻に注文できるか。時間帯の定義が無ければ常に可。"""
+        """
+        その時刻に注文できるか。
+
+        ⚠️ **空の時間帯を「制限なし」と読んではいけない。**
+           カタログには `checkoutable: []` の商品がある。これは
+           「見えるが注文はできない」＝この店舗では扱っていない、という意味。
+           実例: ひるまックを扱わない店舗では、ひるまック商品がこの形になる。
+           制限なしと誤読すると、注文できない商品をいつでも表示してしまう。
+
+           登録そのものが無い（None）ときだけ「分からないので止めない」。
+        """
+        if self.time_windows is None:
+            return True                      # 分からない → 止めない
         if not self.time_windows:
-            return True
+            return False                     # 登録はあるが空 → 扱っていない
         return any(w["start"] <= minutes < w["end"] for w in self.time_windows)
+
+    @property
+    def never_orderable(self) -> bool:
+        """この店舗では扱っていない商品か。"""
+        return self.time_windows is not None and not self.time_windows
 
     def slots_of(self, kind: str) -> list[Slot]:
         return [s for s in self.slots if s.kind == kind]
@@ -345,10 +366,17 @@ def _limited_ability(menu: dict, date_key: str | None = None) -> dict:
     return (day or {}).get("ability") or {}
 
 
-def _windows_of(ability: dict, code: str) -> list[dict]:
+def _windows_of(ability: dict, code: str) -> list[dict] | None:
+    """
+    注文できる時間帯。
+
+    登録が無ければ None（分からない）、
+    登録はあるが空なら [] （扱っていない）を返す。
+    この2つを混同すると、注文できない商品を表示してしまう。
+    """
     entry = ability.get(code)
-    if not entry:
-        return []
+    if entry is None:
+        return None
     return [
         {"start": int(w["start"]), "end": int(w["end"])}
         for w in (entry.get("checkoutable") or [])

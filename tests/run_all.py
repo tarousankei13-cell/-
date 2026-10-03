@@ -12,6 +12,7 @@ TESTS = [
     ("相関IDと通信計測", "test_telemetry.py"),
     ("カート組み立て", "test_cart.py"),
     ("セットの選択枠・時間帯", "test_menu_choices.py"),
+    ("注文できない商品の除外", "test_menu_filter.py"),
     ("具材の調整（抜き・増量）", "test_customize.py"),
     ("セット注文の組み立て", "test_set_order.py"),
     ("店名検索", "test_store_search.py"),

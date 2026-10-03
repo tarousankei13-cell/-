@@ -341,6 +341,7 @@ async def open_menu(interaction: discord.Interaction, store_id: str, purpose: st
     view = CartView(
         interaction.user.id, purpose, store_id, info.name,
         usable or info.delivery_methods, menu,
+        active_dayparts=await availability.active_dayparts_for(store_id),
     )
     await interaction.followup.send(embed=await view.build_embed(), view=view, ephemeral=True)
 
@@ -353,6 +354,7 @@ class CartView(discord.ui.View):
     def __init__(
         self, owner_id: int, purpose: str, store_id: str, store_name: str,
         supported: dict[str, bool], menu: ParsedMenu,
+        active_dayparts: set[str] | None = None,
     ) -> None:
         super().__init__(timeout=config.VIEW_TIMEOUT)
         self.owner_id = owner_id
@@ -361,6 +363,9 @@ class CartView(discord.ui.View):
         self.store_name = store_name
         self.supported = supported
         self.menu = menu
+        # いま注文を受け付けている時間帯（朝マック・夜マックなど）。
+        # 終わったカテゴリを出さないために使う。
+        self.active_dayparts: set[str] = set(active_dayparts or ())
         self.items: list[OrderItem] = []
         self.pickup: str | None = None
         self._build()
@@ -666,8 +671,13 @@ class CategoryView(discord.ui.View):
         super().__init__(timeout=config.VIEW_TIMEOUT)
         self.cart = cart
         minutes = now_minutes()
+        # 時間帯が終わったカテゴリは出さない。
+        # 夜に「朝マック」を出しても、中身はほとんど注文できない。
+        active = cart.active_dayparts
         options = []
         for c in cart.menu.collections[:25]:
+            if not availability.collection_available(c.name, active):
+                continue
             count = len(
                 [
                     p for p in cart.menu.visible_products(c.id, minutes)

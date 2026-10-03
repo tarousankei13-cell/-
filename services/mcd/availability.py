@@ -176,6 +176,47 @@ def daypart_now(raw: dict, date_key: str, minutes: int) -> str:
     return DAYPART_LABEL.get(best, "")
 
 
+# カテゴリ名と時間帯の対応。
+# 「朝マック」のカテゴリを夜に出しても、中身はほとんど注文できない。
+COLLECTION_DAYPART = {
+    "朝マック": "DAYPART_BREAKFAST",
+    "ヒルマック": "DAYPART_HIRU_MAC",
+    "ひるまック": "DAYPART_HIRU_MAC",
+    "夜マック": "DAYPART_YORU_MAC",
+    "よるマック": "DAYPART_YORU_MAC",
+}
+
+
+def active_dayparts(raw: dict, date_key: str, minutes: int) -> set[str]:
+    """いま注文を受け付けている時間帯の名前。"""
+    lists = raw.get("mopDaypartAbilityLists") or {}
+    day = lists.get(date_key)
+    if not day:
+        return set()
+    out = set()
+    for ability in day.get("daypartAbilities") or []:
+        windows = _merge(ability.get("checkoutable") or [])
+        if windows and _contains(minutes, windows):
+            out.add(str(ability.get("daypart") or ""))
+    return out
+
+
+def collection_available(name: str, active: set[str]) -> bool:
+    """
+    そのカテゴリを出してよいか。
+
+    時間帯に結びついたカテゴリ（朝マック・夜マックなど）は、
+    その時間帯が終わっていれば出さない。
+    時間帯が分からない場合は出す（止めるほどの確証が無いため）。
+    """
+    daypart = COLLECTION_DAYPART.get((name or "").strip())
+    if daypart is None:
+        return True          # 時間帯に結びついていないカテゴリ
+    if not active:
+        return True          # 時間帯が分からない
+    return daypart in active
+
+
 def _method_windows(store: dict, method: str, date_key: str) -> list[dict]:
     """受取方法ごとの営業時間。"""
     key = STORE_DELIVERY_KEY.get(method)
@@ -434,3 +475,40 @@ async def check_store(
         } if parts else {},
     }
     return check(raw, minutes=minutes, date_key=date_key, pickup_method=pickup_method)
+
+
+async def active_dayparts_for(
+    store_id: str, *, minutes: int | None = None, date_key: str | None = None
+) -> set[str]:
+    """
+    保存済みの情報から、いま受け付けている時間帯の名前を返す。
+
+    通信はしない。店舗を選んだ直後に呼ぶため。
+    """
+    from db.models import StoreDaypart
+    from db.session import session_scope
+    from sqlalchemy import select
+
+    now = config.now_jst()
+    if minutes is None:
+        minutes = now.hour * 60 + now.minute
+    if date_key is None:
+        date_key = now.strftime("%Y-%m-%d")
+
+    async with session_scope() as s:
+        rows = (
+            await s.execute(
+                select(StoreDaypart).where(
+                    StoreDaypart.store_id == str(store_id),
+                    StoreDaypart.date == date_key,
+                )
+            )
+        ).scalars().all()
+        parts = [(d.daypart, json.loads(d.checkoutable or "[]")) for d in rows]
+
+    out = set()
+    for name, windows in parts:
+        merged = _merge(windows)
+        if merged and _contains(minutes, merged):
+            out.add(str(name))
+    return out
