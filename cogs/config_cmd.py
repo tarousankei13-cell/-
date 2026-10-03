@@ -911,17 +911,100 @@ class ConfigCog(commands.Cog):
             ephemeral=True,
         )
 
+    @web_group.command(
+        name="remote",
+        description="別の場所に置いた注文番号ページへ送るようにします",
+    )
+    @app_commands.describe(
+        api_url="ページ側の登録先（例 https://xxx.example.com/api/receipts）",
+        secret="ページ側の PUSH_SECRET と同じ合い言葉",
+        page_url="控えに出すURL（省略すると api_url から推測します）",
+    )
+    @admin_only()
+    async def web_remote(
+        self, interaction: discord.Interaction,
+        api_url: str, secret: str, page_url: str | None = None,
+    ) -> None:
+        url = api_url.strip()
+        if not url.startswith("https://"):
+            await interaction.response.send_message(
+                embed=embeds.error(
+                    "登録先は `https://` から始めてください。\n"
+                    "合い言葉をそのまま流すので、暗号化されていない通信は使えません。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await settings.set_value("web_push_url", url, updated_by=interaction.user.id)
+        await settings.set_value(
+            "web_push_secret", secret.strip(), updated_by=interaction.user.id,
+            audit=False,          # 合い言葉は監査ログに残さない
+        )
+        if page_url:
+            await settings.set_value(
+                "web_base_url", page_url.strip().rstrip("/"),
+                updated_by=interaction.user.id,
+            )
+        # BOT が自分で配信する方は止める（二重に出す意味がない）
+        await settings.set_value("web_enabled", False, updated_by=interaction.user.id)
+
+        from services import web as web_site
+        from services import web_push
+
+        await web_site.stop()
+        okay, note = await web_push.check()
+        link = web_push.page_link("<合い言葉>")
+        body = (
+            f"{E.OK if okay else E.WARN} {note}\n\n"
+            f"{E.CHARGE} 登録先　`{url}`\n"
+            f"{E.RECEIPT} 控えのリンク　{link}\n\n"
+        )
+        if okay:
+            body += "次のご注文から、このページのリンクが控えに付きます。"
+        else:
+            body += (
+                f"{E.INFO} ページ側で環境変数 `PUSH_SECRET` に"
+                "**同じ合い言葉**を入れて、起動し直してください。\n"
+                "設定は保存してあるので、直したら `/config web test` で確認できます。"
+            )
+        await interaction.followup.send(
+            embed=(embeds.ok if okay else embeds.warn)(body), ephemeral=True
+        )
+
+    @web_group.command(name="test", description="別置きページとつながるか確かめます")
+    @admin_only()
+    async def web_test(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        from services import web_push
+
+        if not web_push.configured():
+            await interaction.followup.send(
+                embed=embeds.info(
+                    "別置きのページは設定されていません。\n"
+                    "`/config web remote` で設定できます。"
+                ),
+                ephemeral=True,
+            )
+            return
+        okay, note = await web_push.check()
+        await interaction.followup.send(
+            embed=(embeds.ok if okay else embeds.error)(note), ephemeral=True
+        )
+
     @web_group.command(name="disable", description="注文番号ページを止めます")
     @admin_only()
     async def web_disable(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         await settings.set_value("web_enabled", False, updated_by=interaction.user.id)
+        await settings.set_value("web_push_url", "", updated_by=interaction.user.id)
         from services import web as web_site
 
         await web_site.stop()
         await interaction.followup.send(
             embed=embeds.ok(
-                "注文番号ページを止めました。\n"
+                "注文番号ページを止めました（内蔵・別置きのどちらも）。\n"
                 "控えは今までどおり DM に届きます。"
             ),
             ephemeral=True,

@@ -33,6 +33,7 @@ import config
 from core import settings
 from db.models import Order, as_utc
 from db.session import session_scope
+from services import receipt_page
 from services.mcd.protocol import PICKUP_LABEL
 from sqlalchemy import select
 
@@ -77,86 +78,34 @@ def _expired(created: datetime | None) -> bool:
 #  見た目
 # ============================================================
 
-_STYLE = """
-:root{--bg:#f5f5f7;--card:#fff;--fg:#1d1d1f;--sub:#6e6e73;--line:#e3e3e6;--accent:#bf0a30}
-@media (prefers-color-scheme:dark){
-  :root{--bg:#000;--card:#1c1c1e;--fg:#f5f5f7;--sub:#98989d;--line:#2c2c2e;--accent:#ff5a5f}
-}
-*{box-sizing:border-box}
-body{margin:0;min-height:100vh;background:var(--bg);color:var(--fg);
-  font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;
-  display:flex;align-items:center;justify-content:center;padding:16px}
-.card{background:var(--card);border-radius:20px;padding:32px 24px;width:100%;max-width:420px;
-  box-shadow:0 2px 24px rgba(0,0,0,.08);text-align:center}
-.label{font-size:13px;color:var(--sub);letter-spacing:.08em;margin:0 0 4px}
-.number{font-size:72px;font-weight:700;line-height:1.1;margin:0;
-  font-variant-numeric:tabular-nums;letter-spacing:.02em}
-.store{font-size:18px;font-weight:600;margin:24px 0 2px}
-.meta{font-size:14px;color:var(--sub);margin:0}
-hr{border:0;border-top:1px solid var(--line);margin:24px 0}
-.note{font-size:13px;color:var(--sub);line-height:1.7;text-align:left}
-.bad{font-size:17px;font-weight:600;margin:0 0 8px}
-.accent{color:var(--accent)}
-"""
-
+# ============================================================
+#  経路
+# ============================================================
 
 def _shell(title: str, body: str) -> web.Response:
-    doc = (
-        "<!doctype html><html lang='ja'><head><meta charset='utf-8'>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<meta name='robots' content='noindex,nofollow'>"
-        f"<title>{html.escape(title)}</title><style>{_STYLE}</style></head>"
-        f"<body><div class='card'>{body}</div></body></html>"
-    )
+    """receipt_page が組んだHTMLを、そのまま返す。"""
     return web.Response(
-        text=doc,
-        content_type="text/html",
-        charset="utf-8",
-        headers={
-            "X-Robots-Tag": "noindex, nofollow",
-            "Cache-Control": "no-store",
-            "Referrer-Policy": "no-referrer",
-            "X-Content-Type-Options": "nosniff",
-        },
+        text=body, content_type="text/html", charset="utf-8",
+        headers=dict(receipt_page.HEADERS),
     )
 
 
 def _not_found() -> web.Response:
-    return _shell(
-        "見つかりません",
-        "<p class='bad'>このページは見つかりませんでした</p>"
-        "<p class='note'>リンクが間違っているか、"
-        "受け取りの期限を過ぎています。<br>"
-        "注文番号は Discord に届いた控えでも確認できます。</p>",
-    )
+    return _shell("見つかりません", receipt_page.not_found_html())
 
 
 def render_order(
     *, receipt_number: str, store_name: str, store_id: str,
     pickup_label: str, created: datetime | None,
 ) -> web.Response:
-    when = ""
-    if created:
-        when = created.astimezone(config.JST).strftime("%-m月%-d日 %H:%M")
-    rows = "".join(
-        f"<p class='meta'>{html.escape(x)}</p>"
-        for x in (pickup_label, when) if x
+    return _shell(
+        f"ご注文番号 {receipt_number}",
+        receipt_page.order_html(
+            receipt_number=receipt_number, store_name=store_name,
+            store_id=store_id, pickup_label=pickup_label, created=created,
+        ),
     )
-    body = (
-        "<p class='label'>ご注文番号</p>"
-        f"<p class='number accent'>{html.escape(receipt_number)}</p>"
-        f"<p class='store'>{html.escape(store_name or store_id)}</p>"
-        f"{rows}"
-        "<hr>"
-        "<p class='note'>カウンターでこの番号をお伝えください。<br>"
-        "お受け取りの際、画面をそのままお見せいただけます。</p>"
-    )
-    return _shell(f"ご注文番号 {receipt_number}", body)
 
-
-# ============================================================
-#  経路
-# ============================================================
 
 async def handle_order(request: web.Request) -> web.Response:
     token = request.match_info.get("token", "")

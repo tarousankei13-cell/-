@@ -731,10 +731,34 @@ async def run_order(
         )
         await send_completion_here(interaction, result)
 
+    await push_receipt_page(result)
     await saga.mark_notified(result.order_id)
     await post_achievement(interaction, result)
     await post_balance_change(interaction, result)
     await grant_invite_reward(interaction)
+
+
+async def push_receipt_page(result: saga.OrderResult) -> None:
+    """
+    別置きの注文番号ページへ登録する。
+
+    ⚠️ 送れなくても注文は成立している。例外を外へ出さない。
+       控えのDMには注文番号が入っているので、ページが無くても困らない。
+    """
+    try:
+        from services import web_push
+
+        if not web_push.configured():
+            return
+        await web_push.send(
+            token=result.view_token,
+            receipt_number=result.receipt_number,
+            store_name=result.store_name or "",
+            store_id=result.store_id or "",
+            pickup_label=result.pickup_label or "",
+        )
+    except Exception:
+        log.exception("注文番号をページへ送れませんでした")
 
 
 async def grant_invite_reward(interaction: discord.Interaction) -> None:
@@ -789,9 +813,14 @@ async def send_completion_dm(interaction: discord.Interaction, result: saga.Orde
     # 受け取り画面のリンク。自前のサイトを立てているならそちらを優先する。
     # どちらも無ければ空文字が返るのでボタンを出さない。
     from services import web as web_site
+    from services import web_push
 
-    link = web_site.page_url(result.view_token) or receipt_svc.receipt_view_url(
-        result.store_id, result.receipt_number
+    link = (
+        web_push.page_link(result.view_token)      # 別の場所に置いたページ
+        or web_site.page_url(result.view_token)    # BOTが自分で配信するページ
+        or receipt_svc.receipt_view_url(           # 外部サイト（飾り）
+            result.store_id, result.receipt_number
+        )
     )
     if link:
         view.add_item(

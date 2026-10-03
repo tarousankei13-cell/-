@@ -245,8 +245,26 @@ Render / Railway / puratya などに置くときは、**設定は要りません
 | `HOST` | 待ち受けるアドレス（未指定なら `0.0.0.0`） |
 | `WEB_BASE_URL` | 控えに出すリンクの元。例 `https://xxxx.example.com/order` |
 
-> ⚠️ **BOT と同じ場所に置いてください。** このページは BOT のデータベースを
-> 読んで注文番号を出すので、別々の場所に分けると動きません。
+### BOT と別の場所に置く場合
+
+`receipt_site/` を別のサーバーに置いてください（専用のZIPがあります）。
+データベースを共有せず、**BOT が注文のたびに送る**方式です。
+
+```
+BOT（別の場所）                 ページ（receipt_site）
+  注文成立 → 注文番号を送信  →   受け取って保存 → 表示
+          合い言葉（PUSH_SECRET）を両方に入れるだけ
+```
+
+1. ページ側: 環境変数 `PUSH_SECRET` に長めの合い言葉を入れて起動
+2. BOT 側: `/config web remote api_url:https://…/api/receipts secret:同じ合い言葉`
+3. `/config web test` でつながるか確認
+
+ページ側には**残高も認証情報も置かれません**。再起動で消える環境でも、
+失われるのはその時点の注文番号ページだけです。
+
+> 合い言葉はそのまま流れません。BOT は指紋（SHA-256）を送ります。
+> 日本語の合い言葉も使えます。
 
 ```nginx
 location /order/ {
@@ -335,6 +353,8 @@ location /order/ {
 | `/config campaign stop` / `status` | 終了 / 状況の確認 |
 | `/config campaign channel <ch>` | 招待の成立を知らせるチャンネル |
 | `/config web enable <公開URL>` | **注文番号ページを公開** |
+| `/config web remote <URL> <合い言葉>` | **別の場所に置いたページへ送る** |
+| `/config web test` | 別置きページとつながるか確認 |
 | `/config web disable` / `expire <時間>` | 停止 / 開ける時間の設定 |
 
 ### アカウント

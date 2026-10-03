@@ -51,6 +51,8 @@ DEFAULTS: dict[str, Any] = {
     "web_port": defaults.WEB_PORT,
     "web_base_url": defaults.WEB_BASE_URL,
     "receipt_page_hours": defaults.RECEIPT_PAGE_HOURS,
+    "web_push_url": defaults.WEB_PUSH_URL,
+    "web_push_secret": defaults.WEB_PUSH_SECRET,
     "invite_enabled": defaults.INVITE_ENABLED,
     "invite_reward": defaults.INVITE_REWARD,
     "invite_reward_invitee": defaults.INVITE_REWARD_INVITEE,

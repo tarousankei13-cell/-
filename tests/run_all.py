@@ -45,6 +45,7 @@ TESTS = [
     ("残高の増減パネル", "test_balance_panel.py"),
     ("控えの届け方", "test_delivery.py"),
     ("注文番号ページ", "test_web.py"),
+    ("別置きの注文番号ページ", "test_web_remote.py"),
     ("定期処理・バックアップ", "test_tasks.py"),
     ("安全性（認証情報・権限）", "test_security.py"),
 ]
