@@ -849,6 +849,234 @@ class ConfigCog(commands.Cog):
             embed=embeds.ok("\n".join(lines)), ephemeral=True
         )
 
+    # -- 注文番号ページ -------------------------------------
+
+    web_group = app_commands.Group(
+        name="web", description="注文番号ページの設定", parent=group
+    )
+
+    @web_group.command(name="enable", description="注文番号ページを公開します")
+    @app_commands.describe(
+        base_url="公開URL（例 https://example.com/order）",
+        port="BOTが待ち受けるポート（既定 8080）",
+        host="待ち受けるアドレス。前段にnginx等があるなら 127.0.0.1 のまま",
+    )
+    @admin_only()
+    async def web_enable(
+        self, interaction: discord.Interaction,
+        base_url: str,
+        port: app_commands.Range[int, 1, 65535] = 8080,
+        host: str = "127.0.0.1",
+    ) -> None:
+        url = base_url.strip().rstrip("/")
+        if not url.startswith(("http://", "https://")):
+            await interaction.response.send_message(
+                embed=embeds.error(
+                    "公開URLは `https://` から始めてください。\n"
+                    "例: `https://example.com/order`"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        for key, value in (
+            ("web_base_url", url), ("web_port", int(port)),
+            ("web_host", host.strip()), ("web_enabled", True),
+        ):
+            await settings.set_value(key, value, updated_by=interaction.user.id)
+
+        from services import web as web_site
+
+        await web_site.stop()
+        started = await web_site.start()
+        if not started:
+            await interaction.followup.send(
+                embed=embeds.error(
+                    f"{host}:{port} で待ち受けられませんでした。\n"
+                    "ポートが使われていないか確認してください。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            embed=embeds.ok(
+                f"注文番号ページを公開しました。\n\n"
+                f"{E.STORE} 待ち受け　`{host}:{port}`\n"
+                f"{E.CHARGE} 公開URL　{url}/<合い言葉>\n\n"
+                f"{E.INFO} 前段の nginx などから `{host}:{port}` へ回してください。\n"
+                f"動作確認: `{url}` 側で `/healthz` が `{{\"ok\":true}}` を返せばOKです。"
+            ),
+            ephemeral=True,
+        )
+
+    @web_group.command(name="disable", description="注文番号ページを止めます")
+    @admin_only()
+    async def web_disable(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await settings.set_value("web_enabled", False, updated_by=interaction.user.id)
+        from services import web as web_site
+
+        await web_site.stop()
+        await interaction.followup.send(
+            embed=embeds.ok(
+                "注文番号ページを止めました。\n"
+                "控えは今までどおり DM に届きます。"
+            ),
+            ephemeral=True,
+        )
+
+    @web_group.command(name="expire", description="ページを開ける時間を設定します")
+    @app_commands.describe(hours="注文から何時間で開けなくするか（0で期限なし）")
+    @admin_only()
+    async def web_expire(
+        self, interaction: discord.Interaction,
+        hours: app_commands.Range[int, 0, 720],
+    ) -> None:
+        await settings.set_value(
+            "receipt_page_hours", int(hours), updated_by=interaction.user.id
+        )
+        await interaction.response.send_message(
+            embed=embeds.ok(
+                f"注文から **{hours} 時間** で開けなくなります。"
+                if hours else "期限なしにしました。"
+            ),
+            ephemeral=True,
+        )
+
+    # -- 招待キャンペーン -------------------------------------
+
+    campaign = app_commands.Group(
+        name="campaign", description="招待キャンペーンの設定", parent=group
+    )
+
+    @campaign.command(name="start", description="招待キャンペーンを始めます")
+    @app_commands.describe(
+        reward="招待した人に渡す額（円）",
+        budget="全体で配る上限（円）。0で無制限",
+        max_per_user="1人が特典をもらえる招待の上限。0で無制限",
+        invitee_reward="招待された人にも渡す額（円）。0なら渡さない",
+        condition="特典を渡す条件",
+    )
+    @app_commands.choices(condition=[
+        app_commands.Choice(name="お友だちのはじめての注文（推奨）", value="first_order"),
+        app_commands.Choice(name="コードを入力した時点", value="join"),
+    ])
+    @admin_only()
+    async def campaign_start(
+        self, interaction: discord.Interaction,
+        reward: app_commands.Range[int, 1, 100000],
+        budget: app_commands.Range[int, 0, 10000000] = 10000,
+        max_per_user: app_commands.Range[int, 0, 1000] = 5,
+        invitee_reward: app_commands.Range[int, 0, 100000] = 0,
+        condition: app_commands.Choice[str] | None = None,
+    ) -> None:
+        cond = condition.value if condition else "first_order"
+        for key, value in (
+            ("invite_reward", int(reward)),
+            ("invite_budget", int(budget)),
+            ("invite_max_per_user", int(max_per_user)),
+            ("invite_reward_invitee", int(invitee_reward)),
+            ("invite_condition", cond),
+            ("invite_enabled", True),
+        ):
+            await settings.set_value(key, value, updated_by=interaction.user.id)
+
+        per = int(reward) + int(invitee_reward)
+        possible = (int(budget) // per) if (budget and per) else None
+        lines = [
+            f"{E.YEN} 招待した方へ　**{embeds.yen(int(reward))}**",
+        ]
+        if invitee_reward:
+            lines.append(f"{E.YEN} 招待された方へ　**{embeds.yen(int(invitee_reward))}**")
+        lines.append(
+            f"{E.CHART} 全体の上限　"
+            + (f"**{embeds.yen(int(budget))}**" if budget else "無制限")
+        )
+        if possible is not None:
+            lines.append(f"{E.INFO} この予算で成立するのは最大 **{possible} 件** です。")
+        lines.append(
+            f"{E.USER} お一人あたり　"
+            + (f"{max_per_user} 名まで" if max_per_user else "無制限")
+        )
+        lines.append(
+            f"{E.OK} 特典を渡す条件　"
+            + ("お友だちのはじめての注文" if cond == "first_order" else "コードの入力時")
+        )
+        lines.append("")
+        lines.append(f"`/panel invite #チャンネル` でパネルを設置してください。")
+
+        await interaction.response.send_message(
+            embed=embeds.ok("招待キャンペーンを開始しました。\n\n" + "\n".join(lines)),
+            ephemeral=True,
+        )
+
+    @campaign.command(name="stop", description="招待キャンペーンを終了します")
+    @admin_only()
+    async def campaign_stop(self, interaction: discord.Interaction) -> None:
+        from core import invite as inv
+
+        st = await inv.stats()
+        await settings.set_value("invite_enabled", False, updated_by=interaction.user.id)
+        await interaction.response.send_message(
+            embed=embeds.ok(
+                f"招待キャンペーンを終了しました。\n\n"
+                f"{E.OK} 成立した招待　**{st.rewarded} 件**\n"
+                f"{E.YEN} 配った合計　**{embeds.yen(st.spent)}**\n\n"
+                f"{E.INFO} すでに渡した特典はそのままです。"
+            ),
+            ephemeral=True,
+        )
+
+    @campaign.command(name="status", description="招待キャンペーンの状況を見ます")
+    @admin_only()
+    async def campaign_status(self, interaction: discord.Interaction) -> None:
+        from core import invite as inv
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        st = await inv.stats()
+        e = discord.Embed(title=f"{E.PARTY} 招待キャンペーン", color=embeds.BLUE)
+        e.add_field(
+            name="開催",
+            value="開催中" if inv.enabled() else "停止中",
+            inline=True,
+        )
+        e.add_field(name=f"{E.OK} 成立", value=f"{st.rewarded} 件", inline=True)
+        e.add_field(name=f"{E.LOADING} 条件待ち", value=f"{st.pending} 件", inline=True)
+        e.add_field(name=f"{E.YEN} 配った合計", value=embeds.yen(st.spent), inline=True)
+        left = st.budget_left
+        e.add_field(
+            name=f"{E.CHART} のこり",
+            value=embeds.yen(left) if left >= 0 else "無制限",
+            inline=True,
+        )
+        top = await inv.ranking(10)
+        if top:
+            lines = [f"<@{uid}>　{n} 名" for uid, n in top]
+            e.add_field(name="よく招待している方", value="\n".join(lines), inline=False)
+        e.set_footer(text="/config campaign start で条件を変更できます")
+        await interaction.followup.send(embed=e, ephemeral=True)
+
+    @campaign.command(name="channel", description="招待の成立を知らせるチャンネル")
+    @admin_only()
+    async def campaign_channel(
+        self, interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        await settings.set_value(
+            "channel_invite", channel.id if channel else None,
+            updated_by=interaction.user.id,
+        )
+        await interaction.response.send_message(
+            embed=embeds.ok(
+                f"招待の成立を {channel.mention} に投稿します。\n"
+                f"{E.INFO} 誰が誰を招待したかは出しません（成立件数だけ）。"
+                if channel else "招待の成立を投稿しないようにしました。"
+            ),
+            ephemeral=True,
+        )
+
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:

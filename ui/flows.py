@@ -734,6 +734,32 @@ async def run_order(
     await saga.mark_notified(result.order_id)
     await post_achievement(interaction, result)
     await post_balance_change(interaction, result)
+    await grant_invite_reward(interaction)
+
+
+async def grant_invite_reward(interaction: discord.Interaction) -> None:
+    """
+    招待の特典は「招待された人の初回注文」で確定することが多いので、
+    注文が成立したここで確かめる。
+
+    ⚠️ ここで何があっても注文は成立済み。例外を外へ出さない。
+    """
+    try:
+        from core import invite as inv
+        from ui import invite_flows
+
+        paid = await inv.grant_if_ready(interaction.user.id)
+        if not paid:
+            return
+        async with session_scope() as s:
+            row = await s.get(User, interaction.user.id)
+        inviter_id = row.invited_by if row else None
+        if inviter_id:
+            await invite_flows.announce(
+                interaction.client, interaction.user.id, int(inviter_id), paid
+            )
+    except Exception:
+        log.exception("招待の特典を渡せませんでした")
 
 
 async def send_completion_dm(interaction: discord.Interaction, result: saga.OrderResult) -> bool:
@@ -760,9 +786,13 @@ async def send_completion_dm(interaction: discord.Interaction, result: saga.Orde
     )
 
     view = discord.ui.View()
-    # 外部サイトへの飾りのリンク。設定で無効にされていたり、
-    # リンク先が落ちていたりするときは空文字が返るのでボタンを出さない。
-    link = receipt_svc.receipt_view_url(result.store_id, result.receipt_number)
+    # 受け取り画面のリンク。自前のサイトを立てているならそちらを優先する。
+    # どちらも無ければ空文字が返るのでボタンを出さない。
+    from services import web as web_site
+
+    link = web_site.page_url(result.view_token) or receipt_svc.receipt_view_url(
+        result.store_id, result.receipt_number
+    )
     if link:
         view.add_item(
             discord.ui.Button(

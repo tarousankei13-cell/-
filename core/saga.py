@@ -35,6 +35,7 @@ from services.mcd import accounts as mcd_accounts
 from services.mcd import stores as mcd_stores
 from services.mcd.client import McdError, McdNetworkError, McdOrderError
 from services.mcd.protocol import DecodedOrder, OrderItem, build_store_order_body
+from services.web import new_view_token
 
 log = logging.getLogger("bot.saga")
 
@@ -81,6 +82,7 @@ class OrderResult:
     user_amount: int = 0
     subsidy_rate: float = 0.0
     balance_after: int = 0
+    view_token: str = ""            # 注文番号ページのURLに使う
     total_orders: int = 0
     error: str = ""
     error_info: object = None   # services.mcd.errors.McdErrorInfo（分かれば）
@@ -325,6 +327,10 @@ async def execute(order_id: str, progress: ProgressCallback | None = None) -> Or
             async with session_scope() as s:
                 order = await s.get(Order, order_id)
                 order.receipt_number = receipt
+                # 注文番号ページのURLに入れる合い言葉。
+                # 一度作ったら変えない（渡したリンクが死ぬため）。
+                if receipt and not order.view_token:
+                    order.view_token = new_view_token()
             await _record(order_id, state, RECEIPT_FETCHED, {"receipt_number": receipt})
             state = RECEIPT_FETCHED
             await notify("receipt", f"注文番号を取得しました（{receipt or '取得中'}）")
@@ -509,6 +515,7 @@ async def _finalize(order_id: str, result: OrderResult) -> OrderResult:
         order = await s.get(Order, order_id)
         result.state = order.state
         result.receipt_number = order.receipt_number or ""
+        result.view_token = order.view_token or ""
         result.store_name = order.store_name or ""
         result.store_id = order.store_id or ""
         result.pickup_label = PICKUP_LABEL.get(order.pickup_method or "", "テイクアウト")

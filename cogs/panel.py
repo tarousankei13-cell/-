@@ -41,6 +41,7 @@ async def refresh_all(bot: commands.Bot) -> list[str]:
         "order": panels.build_order_panel(),
         "charge": (embeds.charge_panel(), panels.ChargePanel()),
         "admin": (embeds.admin_panel(stats), panels.AdminPanel()),
+        "invite": (embeds.invite_panel(), panels.InvitePanel()),
     }
 
     lines: list[str] = []
@@ -118,6 +119,24 @@ class PanelCog(commands.Cog):
             interaction, "charge", channel, embeds.charge_panel(), panels.ChargePanel()
         )
         await settings.set_value("channel_charge", channel.id, updated_by=interaction.user.id)
+
+    @group.command(name="invite", description="招待キャンペーンのパネルを設置します")
+    @app_commands.describe(channel="設置するチャンネル")
+    @admin_only()
+    async def invite(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
+        from core import invite as inv
+
+        await self._deploy(
+            interaction, "invite", channel, embeds.invite_panel(), panels.InvitePanel()
+        )
+        if not inv.enabled():
+            await interaction.followup.send(
+                embed=embeds.warn(
+                    "パネルは設置しましたが、キャンペーンはまだ始まっていません。\n"
+                    "`/config campaign start` で特典の額と上限を決めてください。"
+                ),
+                ephemeral=True,
+            )
 
     @group.command(name="admin", description="管理者パネルを設置します")
     @app_commands.describe(channel="設置するチャンネル")

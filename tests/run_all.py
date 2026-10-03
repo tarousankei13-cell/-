@@ -30,6 +30,7 @@ TESTS = [
     ("利用者カード", "test_user_card.py"),
     ("気になる動きの検知", "test_fraud.py"),
     ("一斉通知", "test_broadcast.py"),
+    ("招待キャンペーン", "test_invite.py"),
     ("バックアップと復元", "test_backup.py"),
     ("再送の方針（冪等性）", "test_retry.py"),
     ("サーキットブレーカー", "test_breaker.py"),
@@ -43,6 +44,7 @@ TESTS = [
     ("代理実績の同一性", "test_achievement.py"),
     ("残高の増減パネル", "test_balance_panel.py"),
     ("控えの届け方", "test_delivery.py"),
+    ("注文番号ページ", "test_web.py"),
     ("定期処理・バックアップ", "test_tasks.py"),
     ("安全性（認証情報・権限）", "test_security.py"),
 ]

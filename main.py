@@ -40,6 +40,14 @@ OWNER_IDS = [1324938326741876758]
 #   環境変数でも可: ADMIN_ROLE_IDS（カンマ区切り）
 ADMIN_ROLE_IDS = []
 
+# 招待キャンペーンで、Discordの招待リンクを自動で追いかけるか
+#   True にする前に、Developer Portal → Bot →
+#   「SERVER MEMBERS INTENT」を必ず有効にしてください。
+#   有効にせずに True のまま起動すると、BOTが立ち上がりません。
+#   False でも、招待コードを本人に入力してもらう方式は使えます。
+#   環境変数でも可: INVITE_AUTO_TRACK（true / false）
+INVITE_AUTO_TRACK = False
+
 # コマンドを反映させるサーバーID
 #   指定あり → そのサーバーだけに即座に反映（単一サーバー運用ならこちら）
 #   None     → 全サーバーに反映（反映まで最大1時間かかります）
@@ -107,6 +115,10 @@ DISCORD_TOKEN = _resolve_text(
     DISCORD_TOKEN, "DISCORD_TOKEN", "DISCORD_BOT_TOKEN", "TOKEN", "BOT_TOKEN"
 )
 ENCRYPTION_KEY = _resolve_text(ENCRYPTION_KEY, "ENCRYPTION_KEY")
+INVITE_AUTO_TRACK = (
+    os.getenv("INVITE_AUTO_TRACK", "").strip().lower() in ("1", "true", "yes")
+    or INVITE_AUTO_TRACK
+)
 OWNER_IDS = _resolve_ids(OWNER_IDS, "OWNER_IDS")
 ADMIN_ROLE_IDS = _resolve_ids(ADMIN_ROLE_IDS, "ADMIN_ROLE_IDS")
 DATABASE_URL = (
@@ -242,6 +254,12 @@ class McdBot(commands.Bot):
         # message_content は使わない（感想ゲート機能を使う場合のみ必要）。
         # 不要な特権インテントを要求しないことで、Discord側の申請も不要になる。
         intents = discord.Intents.default()
+        # 招待キャンペーンの自動追跡に要る。
+        # Developer Portal → Bot → SERVER MEMBERS INTENT を有効にすること。
+        # 有効にしていない状態で起動すると PrivilegedIntentsRequired で
+        # 止まるため、設定で切れるようにしてある。
+        if INVITE_AUTO_TRACK:
+            intents.members = True
 
         super().__init__(
             # ⚠️ command_prefix に "/" を使わない。
@@ -253,6 +271,8 @@ class McdBot(commands.Bot):
         )
         self._synced = False
         self.admin_role_ids = set(ADMIN_ROLE_IDS)
+        # サーバーごとの「招待リンク → 使われた回数」。入室時の比較に使う。
+        self._invite_uses: dict[int, dict[str, int]] = {}
         self.encryption_key = load_or_create_encryption_key()
         self.database_url = DATABASE_URL
 
@@ -335,6 +355,93 @@ class McdBot(commands.Bot):
             self._synced = True
 
         await self._refresh_panels()
+        await self._start_web()
+        await self._refresh_invite_cache()
+
+    # -- 招待の自動追跡 -----------------------------------------
+    #
+    # Discord は「誰の招待リンクで入ったか」を直接教えてくれない。
+    # 入室の前後で各リンクの使用回数を見比べて、増えたものを探す。
+    #
+    # ⚠️ 同時に2人入ると取り違えることがある。そのときは紐づけず、
+    #    本人にコードを入力してもらう（パネルの保険の方）に任せる。
+    #    間違った人に特典を渡すより、渡さないほうがまだよい。
+
+    async def _snapshot_invites(self, guild: discord.Guild) -> dict[str, int]:
+        try:
+            return {i.code: (i.uses or 0) for i in await guild.invites()}
+        except (discord.Forbidden, discord.HTTPException):
+            return {}
+
+    async def _refresh_invite_cache(self) -> None:
+        if not INVITE_AUTO_TRACK:
+            return
+        for guild in self.guilds:
+            self._invite_uses[guild.id] = await self._snapshot_invites(guild)
+
+    async def on_member_join(self, member: discord.Member) -> None:
+        if not INVITE_AUTO_TRACK or member.bot:
+            return
+        try:
+            await self._track_join(member)
+        except Exception:
+            log.exception("招待の自動追跡に失敗しました")
+
+    async def _track_join(self, member: discord.Member) -> None:
+        from core import invite as inv
+        from core import users as user_repo
+
+        before = self._invite_uses.get(member.guild.id, {})
+        after = await self._snapshot_invites(member.guild)
+        self._invite_uses[member.guild.id] = after
+
+        grown = [code for code, uses in after.items() if uses > before.get(code, 0)]
+        if len(grown) != 1:
+            # 0件＝権限が無い／リンク以外から参加
+            # 2件以上＝同時入室で見分けがつかない
+            log.info("招待元を特定できませんでした（候補 %d 件）", len(grown))
+            return
+
+        inviter = next(
+            (i.inviter for i in await member.guild.invites() if i.code == grown[0]),
+            None,
+        )
+        if inviter is None or inviter.bot or inviter.id == member.id:
+            return
+
+        await user_repo.get_or_create(member.id)
+        await user_repo.get_or_create(inviter.id)
+        try:
+            await inv.link(member.id, inviter.id, source="auto")
+        except inv.InviteError as e:
+            log.info("自動の紐づけを見送りました: %s", e)
+            return
+        await inv.grant_if_ready(member.id)
+
+    async def _start_web(self) -> None:
+        """
+        注文番号ページを立ち上げる（/config web で有効にしたときだけ）。
+
+        ⚠️ 失敗しても BOT は動かす。注文番号は DM の控えにも入っている。
+        """
+        try:
+            from services import web as web_site
+
+            url = await web_site.start()
+        except Exception:
+            log.exception("注文番号ページの起動に失敗しました")
+            return
+        if url:
+            log.info("注文番号ページ: %s", url)
+
+    async def close(self) -> None:
+        try:
+            from services import web as web_site
+
+            await web_site.stop()
+        except Exception:
+            log.exception("注文番号ページの停止に失敗しました")
+        await super().close()
 
     async def _refresh_panels(self) -> None:
         """

@@ -46,6 +46,18 @@ DEFAULTS: dict[str, Any] = {
     "balance_panel_fields": defaults.BALANCE_PANEL_FIELDS_DEFAULT,
     "backup_enabled": True,
     "backup_hour": 4,
+    "web_enabled": defaults.WEB_ENABLED,
+    "web_host": defaults.WEB_HOST,
+    "web_port": defaults.WEB_PORT,
+    "web_base_url": defaults.WEB_BASE_URL,
+    "receipt_page_hours": defaults.RECEIPT_PAGE_HOURS,
+    "invite_enabled": defaults.INVITE_ENABLED,
+    "invite_reward": defaults.INVITE_REWARD,
+    "invite_reward_invitee": defaults.INVITE_REWARD_INVITEE,
+    "invite_max_per_user": defaults.INVITE_MAX_PER_USER,
+    "invite_budget": defaults.INVITE_BUDGET,
+    "invite_condition": defaults.INVITE_CONDITION,
+    "channel_invite": None,
 }
 
 _cache: dict[str, Any] = {}

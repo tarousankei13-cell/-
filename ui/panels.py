@@ -244,8 +244,48 @@ class AdminPanel(discord.ui.View):
         await admin_flows.refresh_admin_panel(interaction)
 
 
+class InvitePanel(discord.ui.View):
+    """
+    招待キャンペーンの常設パネル。
+
+    ・自分の招待コードを見る（本人にだけ）
+    ・招待コードを入力して紐づける（新しく来た人）
+    ・いまの状況を見る（何人招待したか・あといくら配れるか）
+    """
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="自分の招待コードを見る", emoji=E.KEY,
+        style=discord.ButtonStyle.primary, custom_id="panel:invite:mycode", row=0,
+    )
+    async def mycode(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from ui import invite_flows
+
+        await invite_flows.show_my_code(interaction)
+
+    @discord.ui.button(
+        label="招待コードを入力する", emoji=E.PLUS,
+        style=discord.ButtonStyle.success, custom_id="panel:invite:enter", row=0,
+    )
+    async def enter(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from ui import invite_flows
+
+        await invite_flows.open_code_modal(interaction)
+
+    @discord.ui.button(
+        label="いまの状況", emoji=E.CHART,
+        style=discord.ButtonStyle.secondary, custom_id="panel:invite:status", row=1,
+    )
+    async def status(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from ui import invite_flows
+
+        await invite_flows.show_status(interaction)
+
+
 # main.py の setup_hook が、ここに並んだビューを add_view() で復元する
-PERSISTENT_VIEWS = [OrderPanel, ChargePanel, AdminPanel]
+PERSISTENT_VIEWS = [OrderPanel, ChargePanel, AdminPanel, InvitePanel]
 
 def build_order_panel() -> tuple[discord.Embed, discord.ui.View]:
     """設置・貼り直し用。現在の注文方式を反映したパネルを作る。"""
@@ -256,4 +296,5 @@ def build_order_panel() -> tuple[discord.Embed, discord.ui.View]:
 PANEL_BUILDERS = {
     "order": (embeds.order_panel, OrderPanel),
     "charge": (embeds.charge_panel, ChargePanel),
+    "invite": (embeds.invite_panel, InvitePanel),
 }

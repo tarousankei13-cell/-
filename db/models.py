@@ -100,6 +100,9 @@ class User(Base):
     last_store_id: Mapped[str | None] = mapped_column(String(8))
     last_store_name: Mapped[str | None] = mapped_column(String(128))
     last_pickup: Mapped[str | None] = mapped_column(String(24))
+    # 招待キャンペーン用。本人の招待コードと、誰に招待されたか。
+    invite_code: Mapped[str | None] = mapped_column(String(16), unique=True, index=True)
+    invited_by: Mapped[int | None] = mapped_column(BigInteger, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -330,6 +333,10 @@ class Order(Base):
     order_token: Mapped[str | None] = mapped_column(Text)
     order_code: Mapped[str | None] = mapped_column(String(64))
     receipt_number: Mapped[str | None] = mapped_column(String(16))  # 注文番号（例 7161）
+    # 注文番号ページのURLに入れる、推測できない合い言葉。
+    # ⚠️ 注文番号そのものをURLにしてはいけない。4桁しかないので、
+    #    順に試すだけで他人の注文が覗けてしまう。
+    view_token: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
 
     hold_tx_id: Mapped[str | None] = mapped_column(String(36))
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -408,6 +415,28 @@ class AuditLog(Base):
     after: Mapped[str | None] = mapped_column(Text)
     reason: Mapped[str | None] = mapped_column(String(255))
     detail: Mapped[str | None] = mapped_column(Text)
+
+
+class Invite(Base):
+    """
+    招待の記録。
+
+    ⚠️ 1人の招待は**1回だけ**成立する。discord_id を主キーにして、
+       何度押しても二重に特典が出ないようにする。
+       「同じ人が何回も招待された」はDBの形で起こらないようにしておく。
+    """
+    __tablename__ = "invites"
+
+    # 招待された人（この人は一度しか招待されない）
+    discord_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    inviter_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    # 紐づいた方法: code（本人がコードを入力） / auto（Discordの招待から自動）
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 特典を渡したか。条件（初回注文など）を満たすまでは False。
+    rewarded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    reward_amount: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    rewarded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class MenuProduct(Base):

@@ -415,6 +415,64 @@ def receipt_fallback(
     return e
 
 
+def invite_panel() -> discord.Embed:
+    """招待キャンペーンの常設パネル。"""
+    from core import invite as inv
+
+    reward = inv.reward_amount()
+    invitee = inv.invitee_amount()
+    cond = inv.condition()
+
+    if not inv.enabled():
+        return discord.Embed(
+            title=f"{E.PARTY} 招待キャンペーン",
+            description=(
+                "いまは開催していません。\n"
+                "次の開催までお待ちください。"
+            ),
+            color=GREY,
+        )
+
+    cond_text = {
+        "join": "お友だちがコードを入力した時点で",
+        "first_order": "お友だちが**はじめて注文された**時点で",
+    }.get(cond, "条件を満たした時点で")
+
+    lines = [f"{cond_text}、**{yen(reward)}** を差し上げます。"]
+    if invitee:
+        lines.append(f"招待されたご本人にも **{yen(invitee)}** 差し上げます。")
+
+    e = discord.Embed(
+        title=f"{E.PARTY} 招待キャンペーン",
+        description="\n".join(lines),
+        color=GREEN,
+    )
+    e.add_field(
+        name=f"{E.KEY} お友だちを誘う方",
+        value=(
+            "1. 下の「自分の招待コードを見る」を押す\n"
+            "2. 出てきた**6文字のコード**をお友だちに伝える\n"
+            "3. お友だちがこのサーバーに参加して、コードを入力する"
+        ),
+        inline=False,
+    )
+    e.add_field(
+        name=f"{E.PLUS} 招待された方",
+        value=(
+            "下の「招待コードを入力する」から、**6文字のコード**を入れてください。\n"
+            "入力は一度だけです。"
+        ),
+        inline=False,
+    )
+    limit = int(settings.get("invite_max_per_user", 0))
+    notes = ["押した先の画面は、あなたにしか見えません。"]
+    if limit:
+        notes.append(f"お一人が特典を受け取れるのは {limit} 名までです。")
+    notes.append("ご自身のコードは使えません。")
+    e.add_field(name=f"{E.INFO} ご注意", value="・" + "\n・".join(notes), inline=False)
+    return e
+
+
 def balance_change(
     *,
     display_name: str | None,
