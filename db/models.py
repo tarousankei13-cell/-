@@ -233,6 +233,9 @@ class StoreCache(Base):
     hit_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     # ETag を覚えておき、変更が無ければ 304 で済ませる（高頻度同期のため）
     store_etag: Mapped[str | None] = mapped_column(String(128))
+    # 選択肢専用の商品（ソース・ドレッシング・おもちゃ）。JSON配列。
+    # products に載らないため menu_products には入れられない。
+    menu_extras: Mapped[str | None] = mapped_column(Text)
     menu_etag: Mapped[str | None] = mapped_column(String(128))
     menu_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

@@ -1891,7 +1891,14 @@ class OptionView(discord.ui.View):
         いまは参照商品の属するカテゴリ全体から、
         **その時刻に取り扱いのあるものだけ**を出す。
         """
-        return self.cart.menu.choice_candidates(slot, now_minutes())
+        # ⚠️ 入れ子の枠（ナゲットのソース）は、親が構成品のほうになる。
+        #    親を間違えると候補を引けない。
+        owner = self.product
+        for comp_code, sl in self.nested:
+            if sl is slot:
+                owner = self.cart.menu.products.get(comp_code) or self.product
+                break
+        return self.cart.menu.choice_candidates(slot, now_minutes(), parent=owner)
 
     def _sizes(self, slot) -> list[Product]:
         """いま選んでいる商品のサイズ違い。無ければ空。"""

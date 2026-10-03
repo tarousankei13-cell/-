@@ -113,6 +113,41 @@ def harvest_display(menu: dict) -> dict[str, Display]:
     return out
 
 
+def harvest_extras(menu: dict, products: dict, ability: dict) -> dict[str, Extra]:
+    """
+    選択肢専用の商品を集める。
+
+    `groupMenu` にあって `products` に無く、値段が 0 のものが該当する。
+    実データでは 6xxx 番台（ソース・ドレッシング・おもちゃ）。
+    """
+    out: dict[str, Extra] = {}
+    gm = ((menu.get("groupMenu") or {}).get("products") or {})
+    if not isinstance(gm, dict):
+        return out
+    for code, raw in gm.items():
+        code = str(code)
+        if code in products or not isinstance(raw, dict):
+            continue
+        if str(raw.get("price", "")) not in ("0", ""):
+            continue            # 値段が付いているものは単品で買える商品
+        # ⚠️ 材料（99901032 ピクルス、99903001 氷など）は composition 側で
+        #    扱うもので、選択枠の候補ではない。混ぜるとソースの枠に
+        #    「氷」が並ぶ。
+        if code.startswith("999"):
+            continue
+        name = ((raw.get("tName") or {}).get("ja") or "").strip()
+        # ⚠️ 【CLR】で始まるものは社内向けの符号。利用者には出さない。
+        if not name or name.startswith("【"):
+            continue
+        out[code] = Extra(
+            code=code, name=name,
+            kind=str(raw.get("kind") or ""),
+            day_part=str(raw.get("dayPart") or ""),
+            time_windows=_windows_of(ability, code),
+        )
+    return out
+
+
 def build_size_names(menu: dict) -> dict[str, str]:
     """
     サイズ違いの商品名を「親の名前 + サイズ」に直す。
@@ -320,6 +355,53 @@ class Product:
 
 
 @dataclass
+class Extra:
+    """
+    選択肢専用の商品。
+
+    ⚠️ `products` には載らず、`groupMenu` と `limitedAbility` にだけ
+       現れる商品がある（6xxx番台）。ナゲットに付けるソース、
+       サイドサラダのドレッシング、ハッピーセットのおもちゃなど。
+
+       同じ名前で `products` にもある場合があるが**別物**。
+         5502 バーベキューソース price=50  … 単品で買うソース
+         6048 バーベキューソース price=0   … ナゲットに付ける無料のソース
+       取り違えると、無料のはずのソースを50円で注文することになる。
+    """
+    code: str
+    name: str
+    kind: str = ""              # KIND_SIDE / KIND_NONE など
+    day_part: str = ""
+    time_windows: list[dict] | None = None
+
+    @property
+    def group(self) -> tuple[str, str]:
+        """同じ枠に入る仲間かどうかの目印。"""
+        return (self.kind, self.day_part)
+
+    def is_orderable_at(self, minutes: int) -> bool:
+        if self.time_windows is None:
+            return True
+        if not self.time_windows:
+            return False
+        return any(w["start"] <= minutes < w["end"] for w in self.time_windows)
+
+    def to_dict(self) -> dict:
+        return {
+            "code": self.code, "name": self.name, "kind": self.kind,
+            "day_part": self.day_part, "time_windows": self.time_windows,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Extra":
+        return cls(
+            code=str(d.get("code", "")), name=str(d.get("name", "")),
+            kind=str(d.get("kind", "")), day_part=str(d.get("day_part", "")),
+            time_windows=d.get("time_windows"),
+        )
+
+
+@dataclass
 class Collection:
     id: str
     name: str
@@ -337,6 +419,8 @@ class ParsedMenu:
     # products に載っていない商品コード → 名前（groupMenu 由来）。
     # 選択枠の参照を名前で読み替えるのに使う。
     aliases: dict[str, str] = field(default_factory=dict)
+    # 選択肢専用の商品（ソース・ドレッシング・おもちゃ）
+    extras: dict[str, Extra] = field(default_factory=dict)
     _slot_ref_cache: dict[str, str] | None = field(default=None, repr=False)
 
     def collection_of(self, code: str) -> "Collection | None":
@@ -378,23 +462,20 @@ class ParsedMenu:
           2. **同じ枠コードを使う他の商品**の参照
              （ナゲット5ピースの枠7251には参照が無いが、
                15ピースの同じ枠には 6048 が入っている）
-          3. 参照が products に無ければ、**同じ名前の注文できる商品**
-             （6048「バーベキューソース」は products に無く、
-               注文できるのは同名の 5502）
+          3. 参照が選択肢専用の商品（6xxx）ならそのまま使う
+
+        ⚠️ 同じ名前で products にもある商品に読み替えてはいけない。
+             5502 バーベキューソース price=50 … 単品で買うソース
+             6048 バーベキューソース price=0  … ナゲットに付ける無料のソース
+           別物なので、取り違えると無料のソースを50円で注文してしまう。
         """
         base = slot.default_product or slot.reference_product
         if not base:
             base = self._slot_refs().get(slot.code, "")
         if not base:
             return ""
-        if base in self.products:
+        if base in self.products or base in self.extras:
             return base
-        # 名前で読み替える
-        want = self._display_name(base)
-        if want:
-            for code, q in self.products.items():
-                if q.name == want:
-                    return code
         return ""
 
     def _slot_refs(self) -> dict[str, str]:
@@ -431,8 +512,74 @@ class ParsedMenu:
                 return list(col.product_codes)
         return [q.code for q in self.size_variants(base)] or [base]
 
+    def _extra_candidates(
+        self, slot: Slot, base: str, parent: Product | None
+    ) -> list[Extra] | None:
+        """
+        選択肢専用の商品から候補を出す。該当しなければ None。
+
+        同じ (kind, dayPart) のものを「同じ枠の仲間」とみなす。
+        実データで、ソース3種・おもちゃ5種がそれぞれ1グループになる。
+        """
+        if base and base in self.extras:
+            g = self.extras[base].group
+            return sorted(
+                (e for e in self.extras.values() if e.group == g),
+                key=lambda e: e.code,
+            )
+        if base or parent is None:
+            return None
+
+        # ---- 参照がどこにも無い枠 ----
+        # ⚠️ 同じ商品の**他の枠**がすでに使っているグループは外す。
+        #    ハッピーセットにはおもちゃの枠とは別に参照の無い枠があり、
+        #    そのままだとおもちゃが両方の枠に出てしまう。
+        taken = set()
+        for other in parent.slots_of("choices"):
+            if other.code == slot.code:
+                continue
+            ref = self.slot_reference(other)
+            if ref and ref in self.extras:
+                taken.add(self.extras[ref].group)
+        # ⚠️ シャカチキの味、サイドサラダのドレッシングがこれ。
+        #    親商品との結び付きを順に探す。
+        claimed = {
+            e.code for e in self.extras.values()
+            for q in self.products.values()
+            if q.name and q.name in e.name and q.code != parent.code
+        }
+        free = [
+            e for e in self.extras.values()
+            if e.code not in claimed and e.group not in taken
+        ]
+
+        # ① 名前に親商品の名前が入っている（「シャカチキ チェダーチーズ味…」）
+        named = [
+            e for e in self.extras.values()
+            if parent.name and parent.name in e.name and e.group not in taken
+        ]
+        if named:
+            return sorted(named, key=lambda e: e.code)
+
+        # ② 親と同じ kind・dayPart
+        same = [
+            e for e in free
+            if e.kind == parent.display.kind and e.day_part == parent.display.set_type
+        ]
+        same = same or [
+            e for e in free
+            if e.kind == parent.display.kind and e.day_part == parent.day_part
+        ]
+        if same:
+            return sorted(same, key=lambda e: e.code)
+
+        # ③ 親と同じ kind のうち、他の商品に取られていないもの
+        rest = [e for e in free if e.kind == parent.display.kind]
+        return sorted(rest, key=lambda e: e.code) or None
+
     def choice_candidates(
-        self, slot: Slot, minutes: int | None = None
+        self, slot: Slot, minutes: int | None = None,
+        parent: Product | None = None,
     ) -> list[Product]:
         """
         セットの選択枠（ドリンク・サイド）に入れられる商品。
@@ -449,6 +596,15 @@ class ParsedMenu:
         弾かれてしまうため。
         """
         base = self.slot_reference(slot)
+
+        # ---- 選択肢専用の商品（ソース・ドレッシング・おもちゃ）----
+        picks = self._extra_candidates(slot, base, parent)
+        if picks is not None:
+            return [
+                e for e in picks
+                if minutes is None or e.is_orderable_at(minutes)
+            ]
+
         if not base:
             return []
 
@@ -536,7 +692,7 @@ class ParsedMenu:
                 continue                    # 入れなくてよい枠
             if slot.default_product:
                 continue                    # 既定があるので埋まる
-            if not self.choice_candidates(slot, minutes):
+            if not self.choice_candidates(slot, minutes, parent=product):
                 out.append(slot)
         return out
 
@@ -715,6 +871,7 @@ def parse_menu(store_id: str, menu: dict) -> ParsedMenu:
         size_groups=size_groups,
         # products に無い商品の名前も持っておく（枠の参照を引き直すため）
         aliases={c: n for c, n in names.items() if c not in products},
+        extras=harvest_extras(menu, products, ability),
     )
 
 

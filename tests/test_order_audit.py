@@ -182,12 +182,20 @@ async def main():
     check("枠に参照が書かれていない（前提）★", not sauce_slot.reference_product,
           sauce_slot.reference_product)
     check("他の商品の同じ枠から参照を引ける ★",
-          menu.slot_reference(sauce_slot) == "5502",
+          menu.slot_reference(sauce_slot) == "6048",
           menu.slot_reference(sauce_slot))
-    sauces = menu.choice_candidates(sauce_slot, 12*60)
+    # ⚠️ 同じ名前で products にもあるが**別物**。
+    #      5502 バーベキューソース price=50 … 単品で買うソース
+    #      6048 バーベキューソース price=0  … ナゲットに付ける無料のソース
+    #    読み替えると、無料のはずのソースを50円で注文してしまう。
+    check("単品のソース(5502)に読み替えない ★",
+          menu.slot_reference(sauce_slot) != "5502")
+    sauces = menu.choice_candidates(sauce_slot, 12*60, parent=nugget)
     check("ソース3種が候補に出る ★", len(sauces) == 3, [q.name for q in sauces])
     check("食べ物が混ざらない ★", all("ソース" in q.name for q in sauces),
           [q.name for q in sauces])
+    check("無料の選択肢専用の商品である ★",
+          all(q.code in menu.extras for q in sauces), [q.code for q in sauces])
     check("単品のナゲットが注文できる ★", menu.orderable(nugget, 12*60))
 
     print("\n[11] ポテナゲ（構成品がソース枠を持つ）★")
@@ -197,8 +205,11 @@ async def main():
             continue
         nested = menu.nested_choices(p11)
         check(f"{p11.name[:18]} の入れ子の枠を見つける ★", len(nested) == 1, nested)
-        picks = {f"{c}/{sl.code}": menu.choice_candidates(sl, 12*60)[0].code
-                 for c, sl in nested}
+        picks = {
+            f"{c}/{sl.code}": menu.choice_candidates(
+                sl, 12*60, parent=menu.products[c])[0].code
+            for c, sl in nested
+        }
         C11 = type("C", (), {"pickup": "takeOut", "menu": menu})
         item = build_order_item(C11, p11, picks)
         # セット → 構成品 → 枠 → ソース の4段になる
@@ -208,7 +219,7 @@ async def main():
         check(f"{p11.name[:18]} のソースが注文に入る ★", depth(d11) == 4, depth(d11))
         leaves = [x.product_code for x in d11.walk()]
         check(f"{p11.name[:18]} にソースの商品コードが入る ★",
-              any(c in ("5502", "5503", "5644") for c in leaves), leaves)
+              any(c in ("6048", "6049", "6059") for c in leaves), leaves)
 
     print("\n[12] ソースを選ばないと追加できない ★")
     c12 = cart()
@@ -221,6 +232,34 @@ async def main():
     await ov12._on_ok(itx12)
     check("選ばないとカートに入らない ★", len(c12.items) == 0, len(c12.items))
     check("理由を伝える ★", "選ばれていません" in itx12.text(), itx12.text()[:140])
+
+    print("\n[12.5] 選択肢専用の商品 ★")
+    # ⚠️ products に無く groupMenu にだけある商品（6xxx番台）。
+    #    同じ名前で products にもあるが**別物**。
+    #      5502 バーベキューソース price=50 … 単品で買うソース
+    #      6048 バーベキューソース price=0  … ナゲットに付ける無料のソース
+    check("選択肢専用の商品を拾っている ★", len(menu.extras) > 0, len(menu.extras))
+    check("材料（氷・ピクルス）が混ざらない ★",
+          not any(c.startswith("999") for c in menu.extras), 
+          [c for c in menu.extras if c.startswith("999")])
+    check("社内用の符号【CLR】が混ざらない ★",
+          not any(e.name.startswith("【") for e in menu.extras.values()),
+          [e.name for e in menu.extras.values() if e.name.startswith("【")])
+    check("単品で買える商品は入らない ★",
+          not (set(menu.extras) & set(menu.products)),
+          set(menu.extras) & set(menu.products))
+
+    for code, label, expect in (
+        ("2080", "シャカチキ", "シーズニング"),
+        ("2323", "サイドサラダ", "ドレッシング"),
+    ):
+        p125 = menu.products[code]
+        slots = p125.slots_of("choices")
+        cands = menu.choice_candidates(slots[0], 12*60, parent=p125)
+        check(f"{label}の枠が解ける ★", cands, [q.name for q in cands])
+        check(f"{label}に{expect}が出る ★",
+              any(expect in q.name for q in cands), [q.name for q in cands])
+        check(f"{label}が注文できる ★", menu.orderable(p125, 12*60))
 
     print("\n[13] 画面に枠コードを出さない ★")
     # スクリーンショットで「選択枠 9987009」と出ていた

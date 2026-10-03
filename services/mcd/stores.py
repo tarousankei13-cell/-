@@ -21,7 +21,7 @@ from db.session import session_scope
 from services.mcd.client import McdClient, McdError
 from services.mcd import availability
 from services.mcd.menu import (
-    Collection, Display, MenuDiff, ParsedMenu, Product, Slot,
+    Collection, Display, Extra, MenuDiff, ParsedMenu, Product, Slot,
     diff_menus, parse_dayparts, parse_menu, supported_pickup_methods,
 )
 
@@ -264,6 +264,9 @@ async def sync_menu(
         if row:
             row.menu_etag = new_etag or None
             row.menu_synced_at = now
+            row.menu_extras = json.dumps(
+                [e.to_dict() for e in parsed.extras.values()], ensure_ascii=False
+            )
 
     log.info(
         "メニューを同期しました: %s 商品%d件（新規%d / 終売%d / 価格変更%d）",
@@ -319,10 +322,25 @@ async def load_menu(store_id: str) -> ParsedMenu:
         )
         for r in crows
     ]
+    # 選択肢専用の商品（ソース・ドレッシングなど）
+    extras: dict[str, Extra] = {}
+    async with session_scope() as s:
+        cache = await s.get(StoreCache, store_id)
+        raw_extras = cache.menu_extras if cache else None
+    if raw_extras:
+        try:
+            for d in json.loads(raw_extras):
+                e = Extra.from_dict(d)
+                if e.code:
+                    extras[e.code] = e
+        except (ValueError, TypeError):
+            log.warning("選択肢専用の商品を読めませんでした: %s", store_id)
+
     # サイズ違いの対応表は、保存してある代表コードから組み直す
     size_groups = {c: p.size_group for c, p in products.items() if p.size_group}
     return ParsedMenu(
         store_id=store_id, products=products, collections=collections,
+        extras=extras,
         size_groups=size_groups,
     )
 
