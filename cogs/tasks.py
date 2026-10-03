@@ -139,8 +139,17 @@ class TasksCog(commands.Cog):
 
     # -- 通知 ---------------------------------------------------
 
-    async def notify_admin(self, embed: discord.Embed) -> None:
-        channel_id = settings.get("channel_admin")
+    async def notify_admin(
+        self, embed: discord.Embed, *, kind: str = "admin"
+    ) -> None:
+        """
+        お知らせを送る。
+
+        kind で宛先を分けられる。店舗やメニューの更新は件数が多いので、
+        管理者チャンネルに混ぜると本当に対応が要るものが埋もれる。
+        専用のチャンネルを決めていなければ管理者チャンネルへ送る。
+        """
+        channel_id = settings.get(f"channel_{kind}") or settings.get("channel_admin")
         if not channel_id:
             return
         channel = self.bot.get_channel(int(channel_id))
@@ -149,7 +158,7 @@ class TasksCog(commands.Cog):
         try:
             await channel.send(embed=embed)
         except discord.HTTPException:
-            log.exception("管理者通知の送信に失敗しました")
+            log.exception("お知らせの送信に失敗しました（%s）", kind)
 
     # -- メニュー同期 -------------------------------------------
 
@@ -199,7 +208,8 @@ class TasksCog(commands.Cog):
                     title=f"{E.CHART} メニューが更新されました",
                     description="\n\n".join(blocks)[:4000],
                     color=embeds.BLUE,
-                )
+                ),
+                kind="menu_updates",
             )
 
     @menu_sync.before_loop
@@ -243,7 +253,8 @@ class TasksCog(commands.Cog):
                     title=f"{E.STORE} 店舗一覧が更新されました",
                     description=text[:4000],
                     color=embeds.BLUE,
-                )
+                ),
+                kind="store_updates",
             )
 
     @store_index_sync.before_loop

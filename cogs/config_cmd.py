@@ -72,9 +72,12 @@ class ConfigCog(commands.Cog):
         e.add_field(
             name="チャンネル",
             value=(
-                f"実績　　{ch('channel_achievement')}\n"
-                f"管理通知　{ch('channel_admin')}\n"
-                f"チャージ　{ch('channel_charge')}"
+                f"実績　　　{ch('channel_achievement')}\n"
+                f"管理通知　　{ch('channel_admin')}\n"
+                f"チャージ　　{ch('channel_charge')}\n"
+                f"店舗の更新　{ch('channel_store_updates')}\n"
+                f"メニュー更新{ch('channel_menu_updates')}\n"
+                f"残高の増減　{ch('channel_balance') or '操作したチャンネル'}"
             ),
             inline=False,
         )
@@ -91,6 +94,15 @@ class ConfigCog(commands.Cog):
         )
         fields = v.get("achievement_fields", [])
         e.add_field(name="実績パネルの表示項目", value="`" + "`, `".join(fields) + "`" if fields else "（なし）", inline=False)
+        if v.get("balance_panel", True):
+            bf = v.get("balance_panel_fields", [])
+            e.add_field(
+                name="残高増減パネルの表示項目",
+                value="`" + "`, `".join(bf) + "`" if bf else "（なし）",
+                inline=False,
+            )
+        else:
+            e.add_field(name="残高増減パネル", value="OFF", inline=False)
         await interaction.followup.send(embed=e, ephemeral=True)
 
     # -- 負担率 -------------------------------------------------
@@ -219,6 +231,87 @@ class ConfigCog(commands.Cog):
         await settings.set_value("channel_achievement", channel.id, updated_by=interaction.user.id)
         await interaction.response.send_message(
             embed=embeds.ok(f"実績チャンネルを {channel.mention} に設定しました。"), ephemeral=True
+        )
+
+    @channel_group.command(
+        name="store_updates", description="店舗一覧の更新を送るチャンネルを設定します"
+    )
+    @app_commands.describe(channel="送り先（省略すると管理者チャンネルに戻します）")
+    @admin_only()
+    async def channel_store_updates(
+        self, interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        """
+        新店舗の開店・閉店・店名変更・モバイルオーダー対応の切り替えの送り先。
+
+        件数が多いので、管理者チャンネルに混ぜると本当に対応が要るものが
+        埋もれる。専用のチャンネルを決めておくとよい。
+        """
+        await settings.set_value(
+            "channel_store_updates", channel.id if channel else None,
+            updated_by=interaction.user.id, actor_name=str(interaction.user),
+        )
+        await interaction.response.send_message(
+            embed=embeds.ok(
+                f"店舗一覧の更新を {channel.mention} に送ります。"
+                if channel else
+                "店舗一覧の更新を管理者チャンネルに戻しました。"
+            ),
+            ephemeral=True,
+        )
+
+    @channel_group.command(
+        name="menu_updates", description="メニューの更新を送るチャンネルを設定します"
+    )
+    @app_commands.describe(channel="送り先（省略すると管理者チャンネルに戻します）")
+    @admin_only()
+    async def channel_menu_updates(
+        self, interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        """新商品・終売・値上げの送り先。"""
+        await settings.set_value(
+            "channel_menu_updates", channel.id if channel else None,
+            updated_by=interaction.user.id, actor_name=str(interaction.user),
+        )
+        await interaction.response.send_message(
+            embed=embeds.ok(
+                f"メニューの更新を {channel.mention} に送ります。"
+                if channel else
+                "メニューの更新を管理者チャンネルに戻しました。"
+            ),
+            ephemeral=True,
+        )
+
+    @channel_group.command(
+        name="balance", description="残高の増減を表示するチャンネルを設定します"
+    )
+    @app_commands.describe(channel="表示する場所（省略すると表示しません）")
+    @admin_only()
+    async def channel_balance(
+        self, interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        """
+        残高の増減を、誰でも見える形で出す場所。
+
+        ⚠️ 設定すると、チャージや注文のたびに**誰でも見える**投稿が出る。
+           表示する内容は /config balance_panel で選べる。
+        """
+        await settings.set_value(
+            "channel_balance", channel.id if channel else None,
+            updated_by=interaction.user.id, actor_name=str(interaction.user),
+        )
+        await interaction.response.send_message(
+            embed=embeds.ok(
+                f"残高の増減を {channel.mention} に表示します。\n"
+                f"{E.WARN} **誰でも見える投稿**になります。"
+                "表示する内容は `/config balance_panel` で選べます。"
+                if channel else
+                "残高の増減を表示しないようにしました。"
+            ),
+            ephemeral=True,
         )
 
     @channel_group.command(name="admin", description="管理者通知を送るチャンネルを設定します")
@@ -702,6 +795,58 @@ class ConfigCog(commands.Cog):
         await interaction.response.send_message(
             embed=embeds.ok("実績パネルの表示項目を更新しました。\n`" + "`, `".join(chosen) + "`"),
             ephemeral=True,
+        )
+
+    @group.command(
+        name="balance_panel",
+        description="残高の増減パネルの表示項目を設定します",
+    )
+    @app_commands.describe(
+        enabled="パネルを出すかどうか",
+        name="ご利用者名（off にすると匿名コードになります）",
+        amount="増減額",
+        balance="変動後の残高（⚠️ いくら持っているかが分かります）",
+        reason="内容（チャージ／注文した店舗など）",
+        orders="通算のご利用回数",
+    )
+    @admin_only()
+    async def balance_panel_fields(
+        self, interaction: discord.Interaction,
+        enabled: bool = True,
+        name: bool = True, amount: bool = True,
+        balance: bool = False, reason: bool = True, orders: bool = False,
+    ) -> None:
+        chosen = [
+            k for k, v in {
+                "name": name, "amount": amount, "balance": balance,
+                "reason": reason, "orders": orders,
+            }.items() if v
+        ]
+        await settings.set_value("balance_panel", enabled, updated_by=interaction.user.id)
+        await settings.set_value(
+            "balance_panel_fields", chosen, updated_by=interaction.user.id
+        )
+        if not enabled:
+            await interaction.response.send_message(
+                embed=embeds.ok("残高の増減パネルを**出さない**設定にしました。"),
+                ephemeral=True,
+            )
+            return
+
+        where = settings.get("channel_balance")
+        dest = f"<#{where}>" if where else "操作したチャンネル"
+        lines = [
+            f"残高の増減パネルを更新しました。",
+            f"{E.PIN} 送り先: {dest}",
+            "表示項目: " + ("`" + "`, `".join(chosen) + "`" if chosen else "なし"),
+        ]
+        if balance:
+            lines.append(
+                f"{E.WARN} 残高を表示する設定です。"
+                "いくら持っているかが誰にでも見えます。"
+            )
+        await interaction.response.send_message(
+            embed=embeds.ok("\n".join(lines)), ephemeral=True
         )
 
     async def cog_app_command_error(

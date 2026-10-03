@@ -415,6 +415,50 @@ def receipt_fallback(
     return e
 
 
+def balance_change(
+    *,
+    display_name: str | None,
+    anon_code: str,
+    amount: int,
+    balance: int,
+    reason: str,
+    fields: list[str],
+    total_orders: int = 0,
+) -> discord.Embed:
+    """
+    残高の増減を、誰でも見える形で出す。
+
+    ⚠️ 何を出すかは管理者が選ぶ（/config balance_panel）。
+       既定では残高を出さない。いくら持っているかは
+       知られたくない人が多いため。
+    """
+    plus = amount >= 0
+    who = (
+        display_name if ("name" in fields and display_name) else f"`{anon_code}`"
+    )
+    e = discord.Embed(
+        title=f"{E.CHARGE if plus else E.BURGER} {'チャージ' if plus else 'ご注文'}",
+        color=GREEN if plus else BLUE,
+        timestamp=datetime.now(timezone.utc),
+    )
+    e.add_field(name=f"{E.USER} ご利用者", value=who, inline=True)
+    if "amount" in fields:
+        # 符号は ¥ の外に出す。「¥-480」は読みにくい。
+        e.add_field(
+            name=f"{E.YEN} 増減",
+            value=f"**{'+' if plus else '-'}{yen(abs(amount))}**",
+            inline=True,
+        )
+    if "balance" in fields:
+        e.add_field(name=f"{E.WALLET} 残高", value=f"**{yen(balance)}**", inline=True)
+    if "reason" in fields and reason:
+        e.add_field(name=f"{E.NOTE} 内容", value=reason, inline=False)
+    if "orders" in fields and total_orders:
+        e.add_field(name=f"{E.FRIES} ご利用回数",
+                    value=f"通算 **{total_orders}** 回目", inline=True)
+    return e
+
+
 # ============================================================
 #  実績パネル（プライバシー重視 / docs/05 §5）
 # ============================================================

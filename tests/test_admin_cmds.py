@@ -3,6 +3,7 @@ import asyncio, sys, os, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import config
 import discord
 from _fake_discord import FakeInteraction, FakeUser, FakeClient
 from core.crypto import init_cipher
@@ -108,12 +109,23 @@ async def main():
         ("/config menu store_refresh",
          lambda i: config_cog.store_refresh.callback(config_cog, i, 20),
          lambda: settings.get("store_refresh_minutes") == 20),
+        ("/config balance_panel",
+         lambda i: config_cog.balance_panel_fields.callback(
+             config_cog, i, True, True, True, True, True, False),
+         lambda: settings.get("balance_panel") is True
+                 and settings.get("balance_panel_fields")
+                     == ["name", "amount", "balance", "reason"]),
+        ("/config balance_panel（OFF）",
+         lambda i: config_cog.balance_panel_fields.callback(config_cog, i, False),
+         lambda: settings.get("balance_panel") is False),
     ]:
         itx = FakeInteraction(owner, client)
         if await run(label, fn(itx)):
             check(f"{label} が反映される", verify(), label)
     await settings.set_value("order_mode", "both")
     await settings.set_value("maintenance", False)
+    await settings.set_value("balance_panel", True)
+    await settings.set_value("balance_panel_fields", config.BALANCE_PANEL_FIELDS_DEFAULT)
 
     print("\n[3] 利用者の管理")
     target = FakeUser(5001, "利用者A")
@@ -122,6 +134,13 @@ async def main():
         async with session_scope() as s:
             check("残高が増える（5000→6500）", await L.user_balance(s, 5001) == 6500,
                   await L.user_balance(s, 5001))
+        pub = itx.public_embeds
+        check("残高の増減パネルが公開で出る", len(pub) == 1, f"{len(pub)}件")
+        if pub:
+            body = (pub[0].title or "") + "".join(
+                f"{f.name}{f.value}" for f in pub[0].fields)
+            check("対象の利用者名で出る（操作した管理者ではない）",
+                  "利用者A" in body and "テスト付与" in body, body[:160])
     itx = FakeInteraction(owner, client)
     if await run("/admin grant（減算）", admin_cog.grant.callback(admin_cog, itx, target, -500, "テスト減算")):
         async with session_scope() as s:

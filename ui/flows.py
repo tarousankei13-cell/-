@@ -32,7 +32,7 @@ from services.mcd.client import McdError
 from services.mcd.protocol import (
     PICKUP_LABEL, DecodedOrder, ProtocolError, decode_hex,
 )
-from ui import embeds
+from ui import balance_panel, embeds
 
 log = logging.getLogger("bot.flows")
 
@@ -147,6 +147,14 @@ class ChargeModal(discord.ui.Modal, title="残高チャージ"):
         if result.sender_name:
             e.add_field(name=f"{E.USER} 送金者", value=result.sender_name, inline=True)
         await interaction.followup.send(embed=e, ephemeral=True)
+
+        # 残高が増えたことを、使ったチャンネルに誰でも見える形で出す
+        await balance_panel.post(
+            interaction,
+            amount=result.amount,
+            balance=result.balance,
+            reason=balance_panel.REASON_CHARGE,
+        )
 
 
 async def open_charge_modal(interaction: discord.Interaction) -> None:
@@ -725,6 +733,7 @@ async def run_order(
 
     await saga.mark_notified(result.order_id)
     await post_achievement(interaction, result)
+    await post_balance_change(interaction, result)
 
 
 async def send_completion_dm(interaction: discord.Interaction, result: saga.OrderResult) -> bool:
@@ -909,6 +918,21 @@ async def post_achievement(interaction: discord.Interaction, result: saga.OrderR
         store_name=result.store_name,
         receipt_number=result.receipt_number,
         pickup_label=result.pickup_label,
+    )
+
+
+async def post_balance_change(
+    interaction: discord.Interaction, result: saga.OrderResult
+) -> None:
+    """注文で残高が減ったことを、使ったチャンネルへ公開パネルで出す。"""
+    store = result.store_name or result.store_id or ""
+    reason = f"{balance_panel.REASON_ORDER}{f'（{store}）' if store else ''}"
+    await balance_panel.post(
+        interaction,
+        amount=-abs(result.user_amount),
+        balance=result.balance_after,
+        reason=reason,
+        total_orders=result.total_orders,
     )
 
 

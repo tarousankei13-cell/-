@@ -72,6 +72,14 @@ ORDER_CONCURRENCY = 3             # 同時に処理する注文の数
 ORDER_MAX_WAIT_SECONDS = 120      # 順番を待つ上限（0で無制限）
 ORDER_MAX_QUEUE = 20              # 待機列の上限。これ以上は断る
 ORDER_OUTAGE_WAIT_SECONDS = 60    # マクドナルドが落ちているときに復帰を待つ上限
+
+# 残高の増減を公開するパネルで、何を出すか
+#   name    誰の分か（表示名）。off にすると匿名コードになる
+#   amount  増減額
+#   balance 変動後の残高
+#   reason  理由（チャージ／注文）
+# ⚠️ 既定では残高を出さない。いくら持っているかは知られたくない人が多い。
+BALANCE_PANEL_FIELDS_DEFAULT = ["name", "amount", "reason"]
 MENU_ACTIVE_STORE_DAYS = 30       # 「直近で使われた店舗」とみなす日数
 MENU_NOTIFY_DIFF = True           # 新商品・値上げを管理者へ通知するか
 # 提供時間帯（limitedAbility / daypart）は日付ごとに定義されるため、

@@ -172,6 +172,31 @@ async def main():
         check(f"{len(num)}桁の番号が正しく届く",
               got is not None and num in str([f.value for f in got.fields]), num)
 
+    print("\n[4.5] 残高の増減パネルが、使ったチャンネルに公開で出る")
+    user45 = FakeUser(5045)
+    await give(user45.id, "r-" + str(user45.id))
+    itx45 = await place(user45, bot, number="4545", price=800)
+    pub = itx45.public_embeds
+    check("操作したチャンネルにパネルが出る", len(pub) >= 1, f"{len(pub)}件")
+    if pub:
+        pe = pub[-1]
+        body = (pe.title or "") + "".join(f"{f.name}{f.value}" for f in pe.fields)
+        check("減った額が入っている", f"-¥{quote().user_amount:,}" in body, body[:160])
+        check("注文だと分かる", "注文" in body, body[:160])
+        check("残高は既定では出さない", "¥5,000" not in body and "残高" not in body, body[:160])
+    check("パネルは本人限定ではない（誰にでも見える）",
+          all(kw.get("ephemeral") is not True for kw in itx45.channel.sent),
+          str(itx45.channel.sent)[:120])
+
+    print("\n[4.6] パネルを切ってもDMと実績は届く")
+    await settings.set_value("balance_panel", False)
+    user46 = FakeUser(5046)
+    await give(user46.id, "r-" + str(user46.id))
+    itx46 = await place(user46, bot, number="4646")
+    check("パネルは出ない", len(itx46.public_embeds) == 0, str(itx46.public_embeds)[:80])
+    check("DMは届く", len(user46.dms) == 1, f"{len(user46.dms)}通")
+    await settings.set_value("balance_panel", True)
+
     print("\n[5] DMが閉じていても実績は出る")
     await settings.set_value("channel_achievement", "9999")
     bot.sent[9999] = []

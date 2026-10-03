@@ -20,7 +20,7 @@ from core import settings
 from core import users as user_repo
 from db.session import session_scope, user_scope
 from cogs._checks import admin_only, handle_check_failure, owner_only
-from ui import admin_flows, embeds
+from ui import admin_flows, balance_panel, embeds
 
 log = logging.getLogger("bot.cogs.admin")
 
@@ -311,6 +311,15 @@ class AdminCog(commands.Cog):
                 f"現在の残高: **{embeds.yen(balance)}**"
             ),
             ephemeral=True,
+        )
+        # 誰の残高をどう動かしたかを公開パネルにも残す（記録が人目に触れる形で残る）
+        await balance_panel.post(
+            interaction,
+            amount=amount,
+            balance=balance,
+            reason=f"{balance_panel.REASON_GRANT}：{reason}",
+            display_name=user.display_name,
+            discord_id=user.id,
         )
 
     @admin.command(name="ban", description="利用者の利用を停止します")

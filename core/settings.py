@@ -39,6 +39,11 @@ DEFAULTS: dict[str, Any] = {
     "channel_achievement": None,
     "channel_admin": None,
     "channel_charge": None,
+    "channel_store_updates": None,
+    "channel_menu_updates": None,
+    "channel_balance": None,
+    "balance_panel": True,
+    "balance_panel_fields": defaults.BALANCE_PANEL_FIELDS_DEFAULT,
     "backup_enabled": True,
     "backup_hour": 4,
 }

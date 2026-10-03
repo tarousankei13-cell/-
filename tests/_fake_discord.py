@@ -96,20 +96,52 @@ class FakeClient:
 
 
 class FakeChannel:
-    def __init__(self, cid, client): self.id = cid; self.client = client
+    """
+    チャンネル。2つの使い方を兼ねる。
+
+      - client 付き … client.sent[cid] に溜める（通知先の検証用）
+      - client 無し … self.sent に溜める（操作したチャンネルの検証用）
+    """
+
+    def __init__(self, cid: int = 1000, client=None, name: str = "general") -> None:
+        self.id = cid
+        self.client = client
+        self.name = name
+        self.sent: list[dict] = []
+
+    def permissions_for(self, _member):
+        return None   # 判定できないときは送れる扱い（ui/balance_panel 参照）
+
     async def send(self, **kw):
-        self.client.sent.setdefault(self.id, []).append(kw)
+        self.sent.append(kw)
+        if self.client is not None:
+            self.client.sent.setdefault(self.id, []).append(kw)
+
+
+class FakeGuild:
+    def __init__(self, gid: int = 1) -> None:
+        self.id = gid
+        self.me = None
 
 
 class FakeInteraction:
-    def __init__(self, user: FakeUser, client: FakeClient | None = None) -> None:
+    def __init__(
+        self, user: FakeUser, client: FakeClient | None = None,
+        *, channel: "FakeChannel | None" = None, guild: "FakeGuild | None" = None,
+    ) -> None:
         self.user = user
         self.client = client or FakeClient()
         self.response = FakeResponse(self)
         self.followup = FakeFollowup(self)
         self.actions: list[tuple[str, dict]] = []
-        self.guild = None
+        self.channel = channel if channel is not None else FakeChannel()
+        self.guild = guild if guild is not None else FakeGuild()
         self.message = None
+
+    @property
+    def public_embeds(self) -> list:
+        """チャンネルへ公開で出した埋め込み（本人だけに見えるものは含まない）"""
+        return [kw["embed"] for kw in getattr(self.channel, "sent", []) if kw.get("embed")]
 
     async def edit_original_response(self, *, content=None, embed=None, view=None, **kw):
         self.actions.append(("edit_original", {"content": content, "embed": embed, "view": view}))
