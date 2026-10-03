@@ -11,12 +11,10 @@ BOT から注文番号を受け取り、店頭で見せるためのページを�
   仮にこのサーバーを覗かれても、漏れるのは
   「注文番号・店舗名・受取方法・時刻」だけ。
 
-必要な環境変数:
-  PORT           待ち受けるポート（ホスティングが決める）
-  HOST           待ち受けるアドレス（未指定なら 0.0.0.0）
-  PUSH_SECRET    BOT と共有する合い言葉。**必須**
-  DATA_DIR       保存先（既定 ./data）
-  EXPIRE_HOURS   何時間で消すか（既定 12）
+設定のしかたは2通りあります。どちらでも構いません。
+  ・下の「設定ブロック」に直接書く（BOT本体の main.py と同じ形）
+  ・環境変数で渡す（ホスティングサービスの設定画面から）
+両方に値があるときは、**直接書いたほうが優先**されます。
 """
 
 from __future__ import annotations
@@ -42,7 +40,76 @@ logging.basicConfig(
 )
 log = logging.getLogger("receipt")
 
-PUSH_SECRET = os.environ.get("PUSH_SECRET", "").strip()
+# ============================================================
+#  設定ブロック — ここだけ書き換えてください
+#
+#  ★ 貼り付けるときは、前後のダブルクォート " を消さないこと ★
+#
+#      PUSH_SECRET = "ここに貼る"
+#                    ↑        ↑  この2つは残す
+#
+#  片方でも消すと SyntaxError: unterminated string literal になります。
+# ============================================================
+
+# BOT と共有する合い言葉（必須）
+#   BOT 側の `/config web remote` で入れるものと**同じ文字列**にすること。
+#   長めにしてください。日本語でも使えます。
+#   環境変数でも可: PUSH_SECRET
+PUSH_SECRET = ""
+
+# 注文から何時間でページを開けなくするか（空のままなら 12 時間）
+#   注文番号は当日しか使わないので、長く残さない。0 と書けば期限なし。
+#   環境変数でも可: EXPIRE_HOURS
+EXPIRE_HOURS = None
+
+# 保存先のフォルダ（空のままなら ./data）
+#   環境変数でも可: DATA_DIR
+DATA_DIR = ""
+
+# 待ち受け先
+#   ふつうは空のままにしてください。ホスティングサービスが
+#   環境変数 PORT / HOST で指定してきます。
+#   ⚠️ 127.0.0.1 や localhost にすると外から届きません。
+#   環境変数でも可: PORT / HOST
+PORT = None
+HOST = ""
+
+# ============================================================
+#  ここから下は、ふつう触りません
+# ============================================================
+
+
+def _text(written: str, name: str, fallback: str = "") -> str:
+    """
+    直接書いた値を優先し、無ければ環境変数、それも無ければ既定値。
+
+    ⚠️ 既定値をここに書くこと。設定ブロック側に書くと、
+       環境変数を入れても打ち消されてしまう。
+    """
+    if (written or "").strip():
+        return written.strip()
+    return os.environ.get(name, "").strip() or fallback
+
+
+def _number(written: int | None, name: str, fallback: int) -> int:
+    """
+    ⚠️ 「書いていない」は None で表す。
+       0 を「書いていない」扱いにすると、`EXPIRE_HOURS = 0`（期限なし）
+       と書いたのに既定の12時間に戻ってしまう。
+    """
+    if written is not None:
+        return written
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return fallback
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("環境変数 %s の値が数字ではありません: %r", name, raw)
+        return fallback
+
+
+PUSH_SECRET = _text(PUSH_SECRET, "PUSH_SECRET")
 
 
 def secret_digest(secret: str) -> str:
@@ -60,8 +127,8 @@ def secret_digest(secret: str) -> str:
 
 
 PUSH_DIGEST = secret_digest(PUSH_SECRET) if PUSH_SECRET else ""
-DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
-EXPIRE_HOURS = int(os.environ.get("EXPIRE_HOURS", "12") or 12)
+DATA_DIR = Path(_text(DATA_DIR, "DATA_DIR", "./data"))
+EXPIRE_HOURS = _number(EXPIRE_HOURS, "EXPIRE_HOURS", 12)
 MAX_BODY = 8 * 1024          # 注文1件はせいぜい数百バイト
 TOKEN_MAX = 64
 
@@ -268,12 +335,8 @@ def main() -> None:
             "環境変数 PUSH_SECRET が設定されていません。\n"
             "BOT と同じ合い言葉を入れてください。設定するまで登録を受け付けません。"
         )
-    host = os.environ.get("HOST", "").strip() or "0.0.0.0"
-    try:
-        port = int(os.environ.get("PORT", "8080"))
-    except ValueError:
-        log.error("環境変数 PORT の値が数字ではありません")
-        sys.exit(1)
+    host = _text(HOST, "HOST", "0.0.0.0")
+    port = _number(PORT, "PORT", 8080)
 
     log.info("注文番号ページを開始します（%s:%s / 期限 %d時間）",
              host, port, EXPIRE_HOURS)

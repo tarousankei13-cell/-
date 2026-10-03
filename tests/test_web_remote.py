@@ -188,6 +188,20 @@ async def main():
     check("送らない", await web_push.send(token="a", receipt_number="1") is False)
     check("リンクも出さない", web_push.page_link("a") == "")
 
+    print("\n[11.5] ページ側の設定の読み方 ★")
+    # 直接書く / 環境変数 のどちらでも設定できる（BOT本体と同じ形）
+    check("直接書いたほうが優先 ★", site._text("書いた", "PUSH_SECRET") == "書いた")
+    check("空なら環境変数を見る ★", site._text("", "PUSH_SECRET") == SECRET, SECRET)
+    check("どちらも無ければ既定値",
+          site._text("", "存在しない変数", "きてい") == "きてい")
+    # ⚠️ 既定値を設定ブロックに書くと、環境変数を入れても打ち消される
+    check("書いていない（None）は環境変数を見る ★",
+          site._number(None, "EXPIRE_HOURS", 12) == 12)
+    check("0 と書いたら 0 のまま（期限なし）★",
+          site._number(0, "EXPIRE_HOURS", 12) == 0)
+    check("数字でない環境変数は既定値に戻す",
+          site._number(None, "PATH", 12) == 12)
+
     print("\n[12] BOT とページの見た目が同じ ★")
     # ⚠️ 2か所に書くとずれる。receipt_page.py を共有している。
     from services import receipt_page as bot_side
