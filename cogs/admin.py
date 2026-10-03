@@ -343,6 +343,18 @@ class AdminCog(commands.Cog):
             embed=embeds.ok(f"{user.mention} の利用停止を解除しました。"), ephemeral=True
         )
 
+    @admin.command(name="user", description="利用者の情報をまとめて表示します")
+    @app_commands.describe(user="対象の利用者")
+    @admin_only()
+    async def admin_user(
+        self, interaction: discord.Interaction, user: discord.User
+    ) -> None:
+        """
+        残高・利用状況・適用中の負担率とその根拠・直近の注文・
+        チャージ履歴を1画面にまとめる。
+        """
+        await admin_flows.show_user(interaction, user)
+
     @admin.command(name="audit", description="管理操作の記録を表示します")
     @app_commands.describe(
         user="この人の操作だけ表示（任意）",

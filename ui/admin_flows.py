@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
+import config
 import discord
 from sqlalchemy import func, select
 
@@ -194,6 +195,228 @@ async def show_accounts(interaction: discord.Interaction) -> None:
     await interaction.followup.send(
         embed=e, view=AccountHealthView(mcd_rows), ephemeral=True
     )
+
+
+# ============================================================
+#  利用者カード（管理5）
+# ============================================================
+
+async def show_user(interaction: discord.Interaction, user: discord.User) -> None:
+    """
+    1人分の情報を1画面にまとめる。
+
+    残高・利用状況・適用中の負担率とその理由・直近の注文・チャージ履歴。
+    複数のコマンドを行き来しないと全体像がつかめない状態を解消する。
+    """
+    from datetime import datetime, timezone
+
+    from core import ledger as L, saga, subsidy
+    from db.models import as_utc, Ledger, Order, User
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    discord_id = user.id
+
+    role_ids = [r.id for r in getattr(user, "roles", [])] if hasattr(user, "roles") else []
+    month_start = config.now_jst().replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+
+    async with session_scope() as s:
+        row = await s.get(User, discord_id)
+        balance = await L.user_balance(s, discord_id)
+        quote = await subsidy.resolve(s, discord_id, role_ids, 1000)
+
+        orders = (
+            await s.execute(
+                select(Order)
+                .where(Order.discord_id == discord_id)
+                .order_by(Order.created_at.desc())
+                .limit(5)
+            )
+        ).scalars().all()
+        recent = [
+            (as_utc(o.created_at), o.state, o.store_name or o.store_id or "",
+             o.user_amount, o.list_price, o.receipt_number or "")
+            for o in orders
+        ]
+
+        charges = (
+            await s.execute(
+                select(Ledger)
+                .where(
+                    Ledger.account == f"user:{discord_id}",
+                    Ledger.amount > 0,
+                )
+                .order_by(Ledger.created_at.desc())
+                .limit(3)
+            )
+        ).scalars().all()
+        charge_rows = [(as_utc(c.created_at), c.amount, c.memo or "") for c in charges]
+
+        month_spent = int(
+            await s.scalar(
+                select(func.coalesce(func.sum(Order.user_amount), 0)).where(
+                    Order.discord_id == discord_id,
+                    Order.created_at >= month_start,
+                    Order.state.in_([saga.COMPLETED, saga.NOTIFIED, saga.CAPTURED]),
+                )
+            ) or 0
+        )
+        month_subsidy = int(
+            await s.scalar(
+                select(
+                    func.coalesce(func.sum(Order.list_price - Order.user_amount), 0)
+                ).where(
+                    Order.discord_id == discord_id,
+                    Order.created_at >= month_start,
+                    Order.state.in_([saga.COMPLETED, saga.NOTIFIED, saga.CAPTURED]),
+                )
+            ) or 0
+        )
+
+    banned = bool(row and row.is_banned)
+    e = discord.Embed(
+        title=f"{E.USER} {user}",
+        description=(
+            f"{E.BAN} **利用停止中**" + (f"\n理由: {row.note}" if row and row.note else "")
+            if banned else f"`{discord_id}`"
+        ),
+        color=embeds.RED if banned else embeds.BLUE,
+        timestamp=datetime.now(timezone.utc),
+    )
+    e.add_field(name=f"{E.WALLET} 残高", value=f"**{embeds.yen(balance)}**", inline=True)
+    e.add_field(
+        name=f"{E.FRIES} 通算注文",
+        value=f"**{(row.total_orders if row else 0):,}** 回",
+        inline=True,
+    )
+    e.add_field(
+        name=f"{E.CHART} 今月",
+        value=f"支払 {embeds.yen(month_spent)}\n負担 {embeds.yen(month_subsidy)}",
+        inline=True,
+    )
+
+    user_rate = 100 - quote.subsidy_rate
+    e.add_field(
+        name=f"{E.YEN} 適用中の負担率",
+        value=(
+            f"管理者負担 **{quote.subsidy_rate:g}%**（利用者 {user_rate:g}%）\n"
+            f"{E.INFO} 根拠: **{quote.source}**"
+        ),
+        inline=False,
+    )
+
+    if recent:
+        lines = []
+        for when, state, store, amount, price, receipt in recent:
+            mark = {
+                saga.COMPLETED: E.OK, saga.NOTIFIED: E.OK, saga.CAPTURED: E.OK,
+                saga.REFUNDED: E.NG, saga.MANUAL_REVIEW: E.WARN,
+            }.get(state, E.LOADING)
+            stamp = f"<t:{int(when.timestamp())}:R>" if when else "—"
+            num = f"　`{receipt}`" if receipt else ""
+            lines.append(
+                f"{mark} {stamp}　{store or '—'}　{embeds.yen(amount)}"
+                f"（定価 {embeds.yen(price)}）{num}"
+            )
+        e.add_field(name=f"{E.HISTORY} 直近の注文", value="\n".join(lines)[:1024],
+                    inline=False)
+    else:
+        e.add_field(name=f"{E.HISTORY} 直近の注文", value="まだありません", inline=False)
+
+    if charge_rows:
+        lines = [
+            f"<t:{int(w.timestamp())}:R>　**+{embeds.yen(a)}**"
+            + (f"　{m[:40]}" if m else "")
+            for w, a, m in charge_rows
+        ]
+        e.add_field(name=f"{E.CHARGE} 直近のチャージ", value="\n".join(lines)[:1024],
+                    inline=False)
+
+    await interaction.followup.send(
+        embed=e, view=UserCardView(discord_id, banned), ephemeral=True
+    )
+
+
+class UserCardView(discord.ui.View):
+    """利用者カードから、そのまま手当てできるようにする。"""
+
+    def __init__(self, discord_id: int, banned: bool) -> None:
+        super().__init__(timeout=300)
+        self.discord_id = discord_id
+
+        hist = discord.ui.Button(
+            label="注文履歴をすべて見る", emoji=E.HISTORY,
+            style=discord.ButtonStyle.secondary,
+        )
+        hist.callback = self._on_history
+        self.add_item(hist)
+
+        audit_btn = discord.ui.Button(
+            label="この人への操作記録", emoji=E.NOTE,
+            style=discord.ButtonStyle.secondary,
+        )
+        audit_btn.callback = self._on_audit
+        self.add_item(audit_btn)
+
+    async def _on_history(self, interaction: discord.Interaction) -> None:
+        from core import saga
+        from db.models import as_utc, Order
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with session_scope() as s:
+            rows = (
+                await s.execute(
+                    select(Order)
+                    .where(Order.discord_id == self.discord_id)
+                    .order_by(Order.created_at.desc())
+                    .limit(25)
+                )
+            ).scalars().all()
+            items = [
+                (as_utc(o.created_at), o.state, o.store_name or "",
+                 o.user_amount, o.receipt_number or "")
+                for o in rows
+            ]
+        if not items:
+            await interaction.followup.send(
+                embed=embeds.info("注文はまだありません。"), ephemeral=True
+            )
+            return
+        lines = [
+            f"{'✅' if st in (saga.COMPLETED, saga.NOTIFIED, saga.CAPTURED) else '⚠️'}"
+            f" <t:{int(w.timestamp())}:f>　{store or '—'}　{embeds.yen(amt)}"
+            + (f"　`{num}`" if num else "")
+            for w, st, store, amt, num in items
+        ]
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title=f"{E.HISTORY} 注文履歴（最新{len(items)}件）",
+                description="\n".join(lines)[:4000],
+                color=embeds.BLUE,
+            ),
+            ephemeral=True,
+        )
+
+    async def _on_audit(self, interaction: discord.Interaction) -> None:
+        from core import audit
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        rows = await audit.search(target=str(self.discord_id), limit=20)
+        if not rows:
+            await interaction.followup.send(
+                embed=embeds.info("この利用者への操作は記録されていません。"),
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title=f"{E.NOTE} この利用者への操作記録",
+                description="\n\n".join(r.line() for r in rows)[:4000],
+                color=embeds.BLUE,
+            ),
+            ephemeral=True,
+        )
 
 
 # ============================================================

@@ -24,6 +24,7 @@ TESTS = [
     ("管理者コマンド", "test_admin_cmds.py"),
     ("管理操作の記録", "test_audit.py"),
     ("アカウント健全性パネル", "test_admin_panel.py"),
+    ("利用者カード", "test_user_card.py"),
     ("再送の方針（冪等性）", "test_retry.py"),
     ("サーキットブレーカー", "test_breaker.py"),
     ("名前解決の控え", "test_dns.py"),
