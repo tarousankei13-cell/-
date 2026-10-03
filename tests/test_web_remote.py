@@ -14,6 +14,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SITE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "receipt_site")
 sys.path.insert(0, SITE)
 
+if not os.path.isdir(SITE):
+    # ページ側を同梱していない配り方もありうる。その場合は飛ばす。
+    print("  （receipt_site/ が無いため、この検証は飛ばします）")
+    sys.exit(0)
+
 ok = fail = 0
 def check(name, cond, extra=""):
     global ok, fail
@@ -143,6 +148,21 @@ async def main():
         )
         async with cs.get(f"{base}/order/{old_token}") as r:
             check("13時間前の注文は開けない ★", r.status == 404, r.status)
+
+        print("\n[7.5] 注文時刻が無くても開ける ★")
+        # ⚠️ 無いことを理由に期限切れ扱いにすると、登録はできるのに
+        #    ページが開けない（必ず404）。実際にこれで踏んだ。
+        bare = web_site.new_view_token()
+        async with cs.post(
+            f"{base}/api/receipts",
+            json={"token": bare, "receipt_number": "8888", "store_name": "時刻なし店"},
+            headers={"X-Push-Secret": DIGEST},
+        ) as r:
+            check("登録できる", r.status == 200, r.status)
+        async with cs.get(f"{base}/order/{bare}") as r:
+            b = await r.text()
+        check("ページも開ける ★", r.status == 200, r.status)
+        check("注文番号が出る ★", "8888" in b, b[:200])
 
         print("\n[8] 死活確認")
         async with cs.get(f"{base}/healthz") as r:

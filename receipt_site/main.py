@@ -109,7 +109,7 @@ def save(conn: sqlite3.Connection, data: dict) -> None:
 
 def load(conn: sqlite3.Connection, token: str) -> dict | None:
     row = conn.execute(
-        "SELECT receipt_number, store_name, store_id, pickup_label, created_at "
+        "SELECT receipt_number, store_name, store_id, pickup_label, created_at, saved_at "
         "FROM receipts WHERE token = ?",
         (token,),
     ).fetchone()
@@ -118,7 +118,7 @@ def load(conn: sqlite3.Connection, token: str) -> dict | None:
     return {
         "receipt_number": row[0], "store_name": row[1] or "",
         "store_id": row[2] or "", "pickup_label": row[3] or "",
-        "created_at": row[4] or "",
+        "created_at": row[4] or "", "saved_at": row[5] or "",
     }
 
 
@@ -173,7 +173,11 @@ async def handle_page(request: web.Request) -> web.Response:
         return not_found()
 
     created = parse_time(data["created_at"])
-    if expired(created):
+    # 期限は注文時刻で測る。
+    # ⚠️ 注文時刻が入っていないときは、受け取った時刻で代える。
+    #    無いことを理由に期限切れ扱いにすると、登録はできるのに
+    #    ページが開けない（必ず404になる）。
+    if expired(created or parse_time(data["saved_at"])):
         return not_found()
 
     return html_response(
