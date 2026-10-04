@@ -138,6 +138,35 @@ class PanelCog(commands.Cog):
                 ephemeral=True,
             )
 
+    @group.command(name="ticket", description="お問い合わせパネルを設置します")
+    @app_commands.describe(channel="設置するチャンネル")
+    @admin_only()
+    async def ticket(
+        self, interaction: discord.Interaction, channel: discord.TextChannel,
+    ) -> None:
+        from services.server import tickets
+
+        await self._deploy(
+            interaction, "ticket", channel,
+            embeds.ticket_panel(), panels.TicketPanel(),
+        )
+        # スレッド方式のときは、このチャンネルの中にスレッドを作る
+        if tickets.mode() == "thread":
+            await settings.set_value(
+                "ticket_channel", channel.id, updated_by=interaction.user.id,
+            )
+
+    @group.command(name="verify", description="認証パネルを設置します")
+    @app_commands.describe(channel="設置するチャンネル")
+    @admin_only()
+    async def verify(
+        self, interaction: discord.Interaction, channel: discord.TextChannel,
+    ) -> None:
+        await self._deploy(
+            interaction, "verify", channel,
+            embeds.verify_panel(), panels.VerifyPanel(),
+        )
+
     @group.command(name="admin", description="管理者パネルを設置します")
     @app_commands.describe(channel="設置するチャンネル")
     @admin_only()

@@ -555,6 +555,108 @@ class TasksCog(commands.Cog):
     async def before_hourly(self) -> None:
         await self._wait_ready()
 
+    # ------------------------------------------------------------
+    #  サーバー管理の定期処理
+    # ------------------------------------------------------------
+
+    @tasks.loop(minutes=config.GUARD_COUNTER_MINUTES)
+    async def server_upkeep(self) -> None:
+        """
+        チケット・認証・監視の、時間でやることをまとめて行う。
+
+        ⚠️ 1つが失敗しても残りを続けること。
+           まとめてあるぶん、1つの例外で全部止まると影響が大きい。
+        """
+        if not self._started:
+            return
+
+        # ① 放置されたチケットを閉じる
+        try:
+            from services.server import tickets
+
+            await tickets.close_stale(self.bot)
+        except Exception:
+            log.warning("チケットの自動終了に失敗しました", exc_info=True)
+
+        # ② 未認証のまま時間がたった方を退出させる
+        try:
+            await self._kick_unverified()
+        except Exception:
+            log.warning("未認証の方の整理に失敗しました", exc_info=True)
+
+        # ③ メンバー数の表示を更新する
+        #    ⚠️ チャンネル名は10分に2回までしか変えられない。
+        #       このループの間隔（既定10分）がその制限に合わせてある。
+        try:
+            cog = self.bot.get_cog("GuardCog")
+            if cog is not None and settings.get("guard_counter_channel"):
+                await cog.update_counter()
+        except Exception:
+            log.warning("メンバー数の表示を更新できませんでした", exc_info=True)
+
+        # ④ 検知のために覚えている分を捨てる（放っておくと増え続ける）
+        try:
+            from services.server import guard
+
+            guard.detector.prune()
+        except Exception:
+            log.debug("検知の後片づけに失敗", exc_info=True)
+
+    async def _kick_unverified(self) -> int:
+        """
+        認証しないまま時間がたった方を退出させる。
+
+        ⚠️ **認証パネルが無いまま動かすと、入った人を順に追い出す。**
+           そのため、ロールが設定されていないときは何もしない。
+        """
+        from services.server import verify
+
+        hours = int(settings.get("verify_kick_hours", 0) or 0)
+        if hours <= 0 or not verify.enabled() or verify.role_id() is None:
+            return 0
+
+        from datetime import datetime, timedelta, timezone
+
+        cut = datetime.now(timezone.utc) - timedelta(hours=hours)
+        done = 0
+        for guild in self.bot.guilds:
+            role = guild.get_role(verify.role_id())
+            if role is None:
+                continue
+            for member in list(guild.members):
+                if member.bot or role in member.roles:
+                    continue
+                joined = member.joined_at
+                if joined is None or joined > cut:
+                    continue
+                if await verify.already(guild.id, member.id):
+                    continue
+                try:
+                    from services.server import mod as modsvc
+
+                    await modsvc.notify(
+                        member, guild_name=guild.name,
+                        action="自動退出",
+                        reason=f"{hours}時間以内に認証が行われなかったため",
+                        extra="もう一度ご参加のうえ、認証をお願いいたします。",
+                    )
+                    await member.kick(reason=f"未認証（{hours}時間経過）")
+                    done += 1
+                except discord.Forbidden:
+                    log.warning(
+                        "未認証の方を退出させられません（権限不足）: %s", guild.name,
+                    )
+                    break        # 権限が無いなら、このサーバーでは続けても同じ
+                except discord.HTTPException:
+                    continue
+        if done:
+            log.info("未認証のまま時間がたった %d 人を退出させました", done)
+        return done
+
+    @server_upkeep.before_loop
+    async def before_server_upkeep(self) -> None:
+        await self._wait_ready()
+
     async def _send_backup(self) -> None:
         """
         控えを保存する。

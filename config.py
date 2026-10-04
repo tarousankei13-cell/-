@@ -352,3 +352,114 @@ def utcnow_naive() -> datetime:
     """いまのUTC（タイムゾーン無し）。DBの比較に使う。"""
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
+
+
+# ------------------------------------------------------------
+#  サーバー管理：チケット
+# ------------------------------------------------------------
+TICKET_ENABLED = False
+# channel（専用チャンネル） / thread（プライベートスレッド）
+#
+#   ⚠️ 既定をチャンネルにしてある。理由は**担当者から見えるかどうか**。
+#      チャンネルなら、ロールに閲覧権限を与えるだけで担当者全員に見える。
+#      プライベートスレッドは、ロールを @メンション しても
+#      **そのロールの人がスレッドに入らない**（Discordの仕様）。
+#      担当者に見せるには、親チャンネルで「スレッドの管理」権限を
+#      与えておく必要がある。
+#
+#   チャンネルの上限
+#      サーバー全体で500個、1カテゴリに50個まで。
+#      自動クローズ（TICKET_AUTO_CLOSE_HOURS）を入れてあるので
+#      普通の使い方では埋まらないが、残りが少なくなったら知らせる。
+TICKET_MODE = "channel"
+TICKET_CATEGORY_LIMIT = 50    # 1カテゴリに作れるチャンネル数（Discordの制限）
+TICKET_CATEGORY_WARN = 5      # 残りこの数で管理者に知らせる
+TICKET_MAX_OPEN = 2           # 1人が同時に開けるチケット数
+TICKET_AUTO_CLOSE_HOURS = 72  # 放置で自動クローズ（0で無効）
+TICKET_PING_STAFF = True      # 作成時に担当ロールへ声をかける
+
+# 問い合わせの種別。/ticket kinds で変更できる。
+TICKET_KINDS_DEFAULT = [
+    {"key": "order", "label": "注文のトラブル", "emoji": "🍔",
+     "desc": "注文できない・間違って届いた など"},
+    {"key": "charge", "label": "チャージ・残高", "emoji": "💴",
+     "desc": "チャージが反映されない など"},
+    {"key": "refund", "label": "返金の相談", "emoji": "🔙",
+     "desc": "返金してほしい場合"},
+    {"key": "other", "label": "その他", "emoji": "💬",
+     "desc": "上にあてはまらないこと"},
+]
+
+# ------------------------------------------------------------
+#  サーバー管理：認証
+# ------------------------------------------------------------
+VERIFY_ENABLED = False
+# button（ボタンを押すだけ） / captcha（画像の文字を入力）
+VERIFY_MODE = "button"
+VERIFY_MIN_ACCOUNT_DAYS = 0   # アカウント作成からの日数条件（0で無し）
+VERIFY_KICK_HOURS = 0         # 未認証のまま何時間でキック（0で無効）
+VERIFY_CAPTCHA_LENGTH = 5     # 画像認証の文字数
+VERIFY_MAX_ATTEMPTS = 5       # 画像認証の失敗上限
+
+# 画像認証で使う文字。
+#   ⚠️ 0とO、1とI、2とZ など**見間違える文字を入れない**。
+#      入れると、正しく読めたのに弾かれる人が出る。
+VERIFY_CAPTCHA_CHARS = "34679ACDEFHJKLMNPQRTUVWXY"
+
+# ------------------------------------------------------------
+#  サーバー管理：監視
+# ------------------------------------------------------------
+# 記録する出来事。/guard events で切り替える。
+GUARD_EVENTS_DEFAULT = ["join", "leave", "ban", "role", "nick", "timeout"]
+GUARD_EVENTS_ALL = [
+    "join", "leave", "ban", "role", "nick", "timeout",
+    "msgdelete", "msgedit", "channel", "voice",
+]
+# ⚠️ msgdelete / msgedit は **MESSAGE CONTENT INTENT が必要**。
+#    無い場合、内容が空のまま記録される（誰がいつ消したかだけ分かる）。
+GUARD_EVENTS_NEED_CONTENT = ["msgdelete", "msgedit"]
+
+# 短時間の大量入室（レイド）
+GUARD_RAID_ENABLED = False
+GUARD_RAID_JOINS = 5          # 何人で
+GUARD_RAID_SECONDS = 10       # 何秒以内なら
+GUARD_RAID_ACTION = "notify"  # notify（知らせるだけ） / lockdown（入室を止める）
+
+# 連投（スパム）
+#   ⚠️ 同じ文の繰り返しの判定は MESSAGE CONTENT INTENT が必要。
+#      無い場合は「速さ」だけで見る（これは内容がなくても数えられる）。
+GUARD_SPAM_ENABLED = False
+GUARD_SPAM_MESSAGES = 6       # 何件を
+GUARD_SPAM_SECONDS = 5        # 何秒以内に出したら
+GUARD_SPAM_ACTION = "timeout"  # delete（消す） / timeout（発言停止）
+GUARD_TIMEOUT_MINUTES = 10    # 自動の発言停止の長さ
+
+# メンション爆撃。1通に入れられるメンションの上限（0で無効）
+#   ⚠️ これは内容を読まなくても数えられる（Discord が別の項目で送ってくる）。
+GUARD_MENTION_LIMIT = 6
+
+# 招待リンク・NGワード（どちらも MESSAGE CONTENT INTENT が必要）
+GUARD_INVITE_BLOCK = False
+GUARD_WORDS_DEFAULT: list[str] = []
+
+# 作りたてのアカウントが入ってきたら知らせる（0で無効）
+GUARD_NEW_ACCOUNT_DAYS = 0
+
+# メンバー数をチャンネル名に出す
+#   ⚠️ チャンネル名の変更は **10分に2回** までしか通らない（Discordの制限）。
+#      そのため更新は10分間隔にしてある。
+GUARD_COUNTER_FORMAT = "👥 メンバー: {count}"
+GUARD_COUNTER_MINUTES = 10
+
+# ------------------------------------------------------------
+#  サーバー管理：モデレーション
+# ------------------------------------------------------------
+MOD_WARN_TIMEOUT_AT = 3       # 警告が何回たまったら発言停止（0で無し）
+MOD_WARN_KICK_AT = 0          # 何回でキック（0で無し）
+MOD_WARN_BAN_AT = 0           # 何回でBAN（0で無し）
+MOD_WARN_TIMEOUT_MINUTES = 60
+MOD_DM_ON_ACTION = True       # 処分の理由を本人にDMする
+MOD_PURGE_MAX = 200           # /mod purge で一度に消せる上限
+
+# ⚠️ Discord のタイムアウトは **28日**までしか設定できない。
+MOD_TIMEOUT_MAX_DAYS = 28

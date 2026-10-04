@@ -85,6 +85,57 @@ DEFAULTS: dict[str, Any] = {
     "proxy_paypay": "",
     "proxy_discord": "",
     "proxy_web": "",
+
+    # ---- サーバー管理：チケット ----
+    "ticket_enabled": defaults.TICKET_ENABLED,
+    "ticket_mode": defaults.TICKET_MODE,
+    "ticket_channel": None,        # パネルを置く／スレッドの親チャンネル
+    "ticket_category": None,       # channel モードのときの置き場所
+    "ticket_staff_roles": [],
+    "ticket_log_channel": None,
+    "ticket_kinds": defaults.TICKET_KINDS_DEFAULT,
+    "ticket_max_open": defaults.TICKET_MAX_OPEN,
+    "ticket_auto_close_hours": defaults.TICKET_AUTO_CLOSE_HOURS,
+    "ticket_ping_staff": defaults.TICKET_PING_STAFF,
+
+    # ---- サーバー管理：認証 ----
+    "verify_enabled": defaults.VERIFY_ENABLED,
+    "verify_mode": defaults.VERIFY_MODE,
+    "verify_role": None,           # 認証した人に付けるロール
+    "verify_pending_role": None,   # 未認証の人に付いているロール（外す）
+    "verify_min_account_days": defaults.VERIFY_MIN_ACCOUNT_DAYS,
+    "verify_kick_hours": defaults.VERIFY_KICK_HOURS,
+    "verify_log_channel": None,
+    "verify_captcha_length": defaults.VERIFY_CAPTCHA_LENGTH,
+    "verify_max_attempts": defaults.VERIFY_MAX_ATTEMPTS,
+
+    # ---- サーバー管理：監視 ----
+    "guard_log_channel": None,
+    "guard_events": defaults.GUARD_EVENTS_DEFAULT,
+    "guard_exempt_roles": [],
+    "guard_raid_enabled": defaults.GUARD_RAID_ENABLED,
+    "guard_raid_joins": defaults.GUARD_RAID_JOINS,
+    "guard_raid_seconds": defaults.GUARD_RAID_SECONDS,
+    "guard_raid_action": defaults.GUARD_RAID_ACTION,
+    "guard_spam_enabled": defaults.GUARD_SPAM_ENABLED,
+    "guard_spam_messages": defaults.GUARD_SPAM_MESSAGES,
+    "guard_spam_seconds": defaults.GUARD_SPAM_SECONDS,
+    "guard_spam_action": defaults.GUARD_SPAM_ACTION,
+    "guard_timeout_minutes": defaults.GUARD_TIMEOUT_MINUTES,
+    "guard_mention_limit": defaults.GUARD_MENTION_LIMIT,
+    "guard_invite_block": defaults.GUARD_INVITE_BLOCK,
+    "guard_words": defaults.GUARD_WORDS_DEFAULT,
+    "guard_new_account_days": defaults.GUARD_NEW_ACCOUNT_DAYS,
+    "guard_counter_channel": None,
+    "guard_counter_format": defaults.GUARD_COUNTER_FORMAT,
+
+    # ---- サーバー管理：モデレーション ----
+    "mod_log_channel": None,       # 未設定なら guard_log_channel を使う
+    "mod_warn_timeout_at": defaults.MOD_WARN_TIMEOUT_AT,
+    "mod_warn_kick_at": defaults.MOD_WARN_KICK_AT,
+    "mod_warn_ban_at": defaults.MOD_WARN_BAN_AT,
+    "mod_warn_timeout_minutes": defaults.MOD_WARN_TIMEOUT_MINUTES,
+    "mod_dm_on_action": defaults.MOD_DM_ON_ACTION,
 }
 
 _cache: dict[str, Any] = {}

@@ -34,7 +34,10 @@ for p in (ROOT / "cogs").glob("*.py"):
         if "command(" not in deco:
             continue
         total += 1
-        if "admin_only()" not in deco and "owner_only()" not in deco:
+        # self_checked() は「中で相手を見て判断する」ことを明示した印。
+        # 付け忘れと見分けるために、印があるものだけを許す。
+        if not any(d in deco for d in
+                   ("admin_only()", "owner_only()", "self_checked()")):
             missing.append(f"      {p.name}: {fn}")
 check(f"全{total}コマンドに権限チェックがある", not missing, "\n".join(missing))
 check("コマンドが十分に定義されている", total >= 40, total)

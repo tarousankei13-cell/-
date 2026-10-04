@@ -57,6 +57,22 @@ UNLOCK = "🔓"      # 利用条件
 PLUS = "➕"
 MINUS = "➖"
 
+# サーバー管理
+SHIELD = "🛡️"      # 監視・守り
+LOG = "📋"         # 記録・ログ
+HAMMER = "🔨"      # 処分（キック・BAN）
+MUTE = "🔇"        # 発言停止（タイムアウト）
+LOCK = "🔒"        # 封鎖・低速モード
+BROOM = "🧹"       # 一括削除
+SIREN = "🚨"       # 荒らし検知
+IN = "📥"          # 入室
+OUT = "📤"         # 退室
+SPEAK = "🔊"       # ボイスチャンネル
+PENCIL = "✏️"      # 編集
+TRASH = "🗑️"       # 削除
+ROBOT = "🤖"       # 自動の処理
+PEOPLE = "👥"      # メンバー数
+
 # アカウント健全性
 GREEN = "🟢"       # ACTIVE
 YELLOW = "🟡"      # DEGRADED

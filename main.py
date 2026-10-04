@@ -48,6 +48,28 @@ ADMIN_ROLE_IDS = []
 #   環境変数でも可: INVITE_AUTO_TRACK（true / false）
 INVITE_AUTO_TRACK = False
 
+# サーバー管理機能（チケット・認証・監視・モデレーション）を使うか
+#   True にする前に、Developer Portal → Bot →
+#   「SERVER MEMBERS INTENT」を必ず有効にしてください。
+#   入退室の記録・認証・レイド検知は、これが無いと動きません。
+#   （チケットとモデレーションは False でも使えます）
+#   環境変数でも可: SERVER_MANAGEMENT（true / false）
+SERVER_MANAGEMENT = False
+
+# メッセージの内容を読む機能を使うか
+#   ・消されたメッセージ／編集されたメッセージの**内容**の記録
+#   ・NGワード、招待リンクの検知
+#   ・同じ文の連投の検知
+#   ・感想ゲート
+#   これらを使う場合だけ True にしてください。
+#
+#   ⚠️ Developer Portal → Bot → 「MESSAGE CONTENT INTENT」を
+#      有効にする必要があります。有効にせず True にすると起動しません。
+#   ⚠️ False でも、入退室・ロール変更・メンション爆撃・連投の速さの
+#      検知は動きます（内容を読まずに数えられるため）。
+#   環境変数でも可: MESSAGE_CONTENT（true / false）
+MESSAGE_CONTENT = False
+
 # コマンドを反映させるサーバーID
 #   指定あり → そのサーバーだけに即座に反映（単一サーバー運用ならこちら）
 #   None     → 全サーバーに反映（反映まで最大1時間かかります）
@@ -134,6 +156,14 @@ ENCRYPTION_KEY = _resolve_text(ENCRYPTION_KEY, "ENCRYPTION_KEY")
 INVITE_AUTO_TRACK = (
     os.getenv("INVITE_AUTO_TRACK", "").strip().lower() in ("1", "true", "yes")
     or INVITE_AUTO_TRACK
+)
+SERVER_MANAGEMENT = (
+    os.getenv("SERVER_MANAGEMENT", "").strip().lower() in ("1", "true", "yes")
+    or SERVER_MANAGEMENT
+)
+MESSAGE_CONTENT = (
+    os.getenv("MESSAGE_CONTENT", "").strip().lower() in ("1", "true", "yes")
+    or MESSAGE_CONTENT
 )
 OWNER_IDS = _resolve_ids(OWNER_IDS, "OWNER_IDS")
 ADMIN_ROLE_IDS = _resolve_ids(ADMIN_ROLE_IDS, "ADMIN_ROLE_IDS")
@@ -282,15 +312,27 @@ def acquire_pid_lock() -> None:
 
 class McdBot(commands.Bot):
     def __init__(self) -> None:
-        # message_content は使わない（感想ゲート機能を使う場合のみ必要）。
-        # 不要な特権インテントを要求しないことで、Discord側の申請も不要になる。
+        # 既定では特権インテントを一切要求しない。
+        # 要求しなければ Discord側の申請も不要で、そのまま動かせる。
         intents = discord.Intents.default()
-        # 招待キャンペーンの自動追跡に要る。
+
+        # SERVER MEMBERS INTENT が要るもの
+        #   ・招待キャンペーンの自動追跡
+        #   ・入退室の記録、認証、レイド検知、メンバー数カウンター
         # Developer Portal → Bot → SERVER MEMBERS INTENT を有効にすること。
         # 有効にしていない状態で起動すると PrivilegedIntentsRequired で
         # 止まるため、設定で切れるようにしてある。
-        if INVITE_AUTO_TRACK:
+        if INVITE_AUTO_TRACK or SERVER_MANAGEMENT:
             intents.members = True
+
+        # MESSAGE CONTENT INTENT が要るもの
+        #   ・消された／編集されたメッセージの内容の記録
+        #   ・NGワード、招待リンク、同じ文の連投の検知
+        #   ・感想ゲート
+        # ⚠️ 無くても、入退室の記録・メンション爆撃・連投の速さは数えられる。
+        #    内容を読まずに判定できるものは、こちらを要求せずに動かす。
+        if MESSAGE_CONTENT:
+            intents.message_content = True
 
         # Discord 自身への接続（API・ゲートウェイ）に通すプロキシ。
         #   ⚠️ Discord は認証情報をURLに入れた形を受け取らない。
@@ -359,6 +401,18 @@ class McdBot(commands.Bot):
         from core import settings
 
         await settings.load_all()
+
+        # 開いているチケットを覚え直す。
+        # ⚠️ これをしないと、再起動後に「発言があった」ことを拾えず、
+        #    対応中のチケットが放置と見なされて自動で閉じてしまう。
+        try:
+            from services.server import tickets
+
+            n = await tickets.reload_cache()
+            if n:
+                log.info("対応中のお問い合わせ %d 件を読み込みました", n)
+        except Exception:
+            log.warning("お問い合わせの読み込みに失敗しました", exc_info=True)
 
         # 相手の名前を先に引いておく。最初の注文で待たずに済むほか、
         # DNSが引けなくなっても前回の結果で動き続けられる。

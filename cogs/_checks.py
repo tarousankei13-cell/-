@@ -32,6 +32,25 @@ def owner_only():
     return app_commands.check(predicate)
 
 
+def self_checked():
+    """
+    「このコマンドは、自分の中で相手を見て判断する」ことを表す印。
+
+    管理者以外も使うコマンド（例：お問い合わせを閉じる）に付ける。
+    ⚠️ **判定そのものは関数の中で必ず行うこと。** これは印であって、
+       これだけでは誰でも実行できてしまう。
+    ⚠️ 権限の確認を忘れたコマンドと見分けるために要る。
+       付いていないコマンドは、安全性の検査（tests/test_security.py）で
+       「権限チェックが無い」として落ちる。
+
+    最低限、サーバーの中であることだけはここで確かめる
+    （DMから呼ばれると、ロールを見る処理が成り立たないため）。
+    """
+    async def predicate(interaction: discord.Interaction) -> bool:
+        return interaction.guild is not None
+    return app_commands.check(predicate)
+
+
 async def handle_check_failure(interaction: discord.Interaction, error: Exception) -> bool:
     """権限エラーなら案内を返す。処理したら True。"""
     if isinstance(error, app_commands.CheckFailure):

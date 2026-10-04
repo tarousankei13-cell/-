@@ -80,6 +80,8 @@ OWNER_IDS = [あなたのDiscordユーザーID]    # ← 必須
 | `ENCRYPTION_KEY` | `""` | **空でOK。初回起動時に自動生成します** |
 | `DATABASE_URL` | SQLite | そのままで動きます |
 | `PROXY_URL` | `""` | 通信の出口を変えたいときだけ（下記） |
+| `SERVER_MANAGEMENT` | `False` | チケット・認証・監視を使うなら `True`（下記） |
+| `MESSAGE_CONTENT` | `False` | メッセージの内容を読む機能を使うなら `True`（下記） |
 
 #### 環境変数でも設定できます
 
@@ -92,6 +94,7 @@ OWNER_IDS = [あなたのDiscordユーザーID]    # ← 必須
 | `OWNER_IDS` | オーナーID（カンマ区切り 例 `123,456`） |
 | `ADMIN_ROLE_IDS` / `GUILD_ID` / `DATABASE_URL` | 同名の設定 |
 | `BOT_PROXY` | `PROXY_URL`（プロキシ） |
+| `SERVER_MANAGEMENT` / `MESSAGE_CONTENT` | 同名の設定（`true` / `false`） |
 
 > ### ⚠️ `main.py` に直接書いた場合
 > トークンが平文で入ります。**公開リポジトリへ push しないでください。**
@@ -127,6 +130,31 @@ PROXY_URL = "http://利用者名:パスワード@ホスト:ポート"   # 認証
 - 設定したら `/proxy test` で、**外から見えるIP**を必ず確認してください
   （「日本から出ているつもりで海外から出ていた」はこれでしか気付けません）
 - `socks5://` を使う場合は `pip install "httpx[socks]"` が必要です
+
+#### サーバー管理機能を使う場合
+
+チケット・認証・サーバー監視・警告と処分は、**既定ではOFF**です。
+使う場合だけ、次を `True` にしてください。
+
+```python
+SERVER_MANAGEMENT = True   # チケット・認証・監視・処分
+MESSAGE_CONTENT   = True   # メッセージの内容を読む機能だけに必要
+```
+
+> ### ⚠️ Developer Portal でも有効にしてください
+> `SERVER_MANAGEMENT = True` → **SERVER MEMBERS INTENT**
+> `MESSAGE_CONTENT = True` → **MESSAGE CONTENT INTENT**
+>
+> 有効にせず `True` にすると、BOTが起動しません。
+
+`MESSAGE_CONTENT` が要るのは次の3つだけです。
+
+- 消された／編集されたメッセージの**内容**の記録
+- NGワード・招待リンクの検知
+- 同じ文の繰り返しの検知
+
+**入退室の記録・メンション爆撃・連投の速さ・チケット・認証・処分は、
+`False` のままでも動きます。** 必要ないものは有効にしないのが安全です。
 
 ### 1-4. Discord 側の設定
 
@@ -337,7 +365,7 @@ location /order/ {
 ## 4. 管理者コマンド
 
 <details>
-<summary>一覧（全50コマンド）</summary>
+<summary>一覧（全135コマンド）</summary>
 
 ### パネル
 | コマンド | 説明 |
@@ -415,6 +443,45 @@ location /order/ {
 | `/stats breaker` | 一時的に止めている経路 |
 | `/debug hex <コード>` | 注文コードの中身を表示 |
 | `/sync` / `/restart` | コマンド同期・再起動 |
+
+### お問い合わせチケット
+| コマンド | 説明 |
+|---|---|
+| `/panel ticket <ch>` | 問い合わせパネルを設置 |
+| `/ticket setup` | 受け付け・方式・置き場所・担当ロールをまとめて設定 |
+| `/ticket status` | 設定と件数、足りない権限を確認 |
+| `/ticket staff` / `rules` / `kinds` | 担当ロール / 上限と自動終了 / 相談の種別 |
+| `/ticket close` / `add` / `remove` | 閉じる / 人を呼ぶ / 人を外す |
+
+### 認証
+| コマンド | 説明 |
+|---|---|
+| `/panel verify <ch>` | 認証パネルを設置 |
+| `/verify setup` | ON/OFF・付けるロール・やり方を設定 |
+| `/verify rules` | アカウント年齢の条件・未認証の自動退出 |
+| `/verify status` / `user` / `reset` | 状況 / 手動で認証 / 失敗回数の取消 |
+| `/verify bulk` | **すでにロールを持つ方を認証済みにする**（途中から入れる場合） |
+
+### サーバー監視
+| コマンド | 説明 |
+|---|---|
+| `/guard setup` | 記録先のチャンネルを設定 |
+| `/guard status` | 設定・足りないインテントと権限を確認 |
+| `/guard events` | 記録する出来事の切り替え（10種類） |
+| `/guard raid` / `unlock` | 短時間の大量入室への備え / 解除 |
+| `/guard spam` / `words` | 連投・メンション爆撃 / NGワード・招待リンク |
+| `/guard exempt` | 検知の対象から外すロール |
+| `/guard counter` | メンバー数をチャンネル名に表示 |
+| `/guard recent` | 最近の検知を確認 |
+
+### 警告と処分
+| コマンド | 説明 |
+|---|---|
+| `/mod warn` / `warnings` / `unwarn` | 警告 / 履歴 / 取り消し |
+| `/mod warn_rules` | 警告がたまったときの自動処分 |
+| `/mod timeout` / `untimeout` | 発言停止 / 解除 |
+| `/mod kick` / `ban` / `unban` | 退出 / BAN / 解除 |
+| `/mod purge` / `slowmode` / `lock` | 一括削除 / 低速モード / 封鎖 |
 
 ### プロキシ（通信の出口）
 | コマンド | 説明 |
@@ -535,6 +602,32 @@ location /order/ {
 
 > ⚠️ Discord への接続だけは、`/proxy set` の内容が**次の起動から**反映されます。
 > すぐ反映したい場合は `main.py` の `PROXY_URL` に書いてください。
+
+### チケットを作っても担当者に見えない
+
+**プライベートスレッド方式**をお使いの場合、ロールを@メンションしても
+**そのロールの方はスレッドに入りません**（Discordの仕様です）。
+
+- 親チャンネルで、担当ロールに「**スレッドの管理**」権限を与える
+- または `/ticket setup place:専用チャンネル` に切り替える（おすすめ）
+
+`/ticket status` で、足りない権限をまとめて確認できます。
+
+### 認証を押しても何も起きない
+
+`/verify status` をご確認ください。よくある原因は2つです。
+
+- **付けるロールが未設定** → `/verify setup role:<ロール>`
+- **ロールがBOTより上にある** → サーバー設定 → ロール で、
+  BOTのロールを認証ロールより**上**に移動してください
+
+### 消されたメッセージの内容が記録されない
+
+`MESSAGE_CONTENT = True` にして、Developer Portal → Bot でも
+**MESSAGE CONTENT INTENT** を有効にしてください。
+無い場合、「誰がいつ消したか」だけが残ります。
+
+`/guard status` が、いまのインテントで効く機能・効かない機能を表示します。
 
 ### 注文方法を1つに絞りたい
 

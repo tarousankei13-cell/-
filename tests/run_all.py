@@ -58,6 +58,7 @@ TESTS = [
     ("通信を使う新しい機能", "test_new_features.py"),
     ("PayPayでのチャージ", "test_paypay.py"),
     ("プロキシ（通信の出口）", "test_proxy.py"),
+    ("サーバー管理（チケット・認証・監視・処分）", "test_server.py"),
     ("安全性（認証情報・権限）", "test_security.py"),
 ]
 

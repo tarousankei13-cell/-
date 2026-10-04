@@ -662,3 +662,150 @@ def balance_card(*, balance: int, held: int, rate: float, total_orders: int) -> 
     e.add_field(name=f"{E.CHART} あなたの支払い率", value=f"**{rate:g}%**", inline=True)
     e.add_field(name=f"{E.FRIES} ご利用回数", value=f"{total_orders} 回", inline=True)
     return e
+
+
+# ============================================================
+#  サーバー管理
+# ============================================================
+
+def ticket_panel() -> discord.Embed:
+    """問い合わせの常設パネル。"""
+    from services.server import tickets
+
+    if not tickets.enabled():
+        return discord.Embed(
+            title=f"{E.TICKET} お問い合わせ",
+            description=(
+                "ただいま受け付けを停止しております。\n"
+                "恐れ入りますが、しばらくお待ちください。"
+            ),
+            color=GREY,
+        )
+
+    lines = [
+        f"{k.get('emoji', '💬')} **{k['label']}**"
+        + (f"\n　{k['desc']}" if k.get("desc") else "")
+        for k in tickets.kinds()
+    ]
+    e = discord.Embed(
+        title=f"{E.TICKET} お問い合わせ",
+        description=(
+            "下のボタンから、担当者とご相談いただけます。\n"
+            "**やり取りはあなたと担当者だけに見えます。**"
+        ),
+        color=BLUE,
+    )
+    e.add_field(name="ご相談いただける内容", value="\n".join(lines), inline=False)
+
+    hours = int(settings.get("ticket_auto_close_hours", 0) or 0)
+    note = []
+    if hours:
+        note.append(f"{hours}時間お返事がないと自動で終了します")
+    cap = int(settings.get("ticket_max_open", 0) or 0)
+    if cap:
+        note.append(f"同時に開けるのは {cap} 件までです")
+    if note:
+        e.set_footer(text="　/　".join(note))
+    return e
+
+
+def ticket_opened(ticket, opener_id: int, kind_label: str) -> discord.Embed:
+    """チケットを開いたときの最初の案内。"""
+    e = discord.Embed(
+        title=f"{E.TICKET} お問い合わせ {ticket.number}",
+        description=(
+            f"<@{opener_id}> さん、お待たせいたしました。\n"
+            "こちらにご用件をお書きください。担当者がご対応いたします。"
+        ),
+        color=BLUE,
+    )
+    e.add_field(name="種別", value=kind_label, inline=True)
+    if ticket.subject:
+        e.add_field(name="件名", value=ticket.subject, inline=True)
+    e.set_footer(text="終わりましたら「この問い合わせを閉じる」を押してください")
+    return e
+
+
+def ticket_closed(ticket) -> discord.Embed:
+    """閉じたチケットの記録。"""
+    from services.server import tickets
+
+    e = discord.Embed(
+        title=f"{E.TICKET} お問い合わせ {ticket.number} を終了しました",
+        color=GREY,
+    )
+    e.add_field(name="種別", value=tickets.kind_of(ticket.kind)["label"], inline=True)
+    e.add_field(name="開いた方", value=f"<@{ticket.opener_id}>", inline=True)
+    if ticket.claimed_by:
+        e.add_field(name="担当", value=f"<@{ticket.claimed_by}>", inline=True)
+    if ticket.subject:
+        e.add_field(name="件名", value=ticket.subject, inline=False)
+    if ticket.close_reason:
+        e.add_field(name="終了の理由", value=ticket.close_reason, inline=False)
+    if ticket.closed_by:
+        e.add_field(name="終了した人", value=f"<@{ticket.closed_by}>", inline=True)
+    elif ticket.closed_by == 0:
+        e.add_field(name="終了した人", value=f"{E.ROBOT} 自動", inline=True)
+    e.set_footer(text="やり取りは添付のファイルに残しています")
+    return e
+
+
+def verify_panel() -> discord.Embed:
+    """認証の常設パネル。"""
+    from services.server import verify
+
+    if not verify.enabled():
+        return discord.Embed(
+            title=f"{E.KEY} 認証",
+            description="ただいま認証を受け付けておりません。",
+            color=GREY,
+        )
+
+    if verify.mode() == "captcha":
+        how = (
+            "下のボタンを押すと画像が出ます。\n"
+            "**画像に書かれた文字**を入力してください。"
+        )
+    else:
+        how = "下のボタンを押してください。それだけで完了します。"
+
+    e = discord.Embed(
+        title=f"{E.KEY} 認証のお願い",
+        description=(
+            "サーバーをご利用いただくために、認証をお願いしております。\n\n"
+            + how
+        ),
+        color=GREEN,
+    )
+    days = verify.min_account_days()
+    if days > 0:
+        e.add_field(
+            name=f"{E.WARN} ご注意",
+            value=(
+                f"Discordアカウントを作成されてから **{days}日** 以上"
+                "経っている必要があります。"
+            ),
+            inline=False,
+        )
+    return e
+
+
+def guard_log(
+    *, title: str, color: int, lines: list[tuple[str, str]],
+    footer: str | None = None,
+) -> discord.Embed:
+    """
+    監視の記録に使う共通の形。
+
+    ⚠️ 1フィールド1024文字、全体6000文字が上限。
+       超えると送信そのものが失敗するので、呼ぶ側で切っておくこと。
+    """
+    from datetime import datetime, timezone
+
+    e = discord.Embed(title=title, color=color,
+                      timestamp=datetime.now(timezone.utc))
+    for name, value in lines:
+        e.add_field(name=name, value=value or "（なし）", inline=False)
+    if footer:
+        e.set_footer(text=footer)
+    return e

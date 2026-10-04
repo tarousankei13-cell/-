@@ -640,3 +640,113 @@ __all__ = [
     "Order", "OrderEvent", "Cart",
     "MenuProduct", "MenuCollection", "StoreDaypart",
 ]
+
+
+# ============================================================
+#  サーバー管理（チケット・認証・監視・モデレーション）
+# ============================================================
+
+class Ticket(Base):
+    """
+    問い合わせチケット。
+
+    ⚠️ `channel_id` にはスレッドIDも入る。どちらかは `is_thread` で見る。
+       Discord の API ではスレッドもチャンネルとして扱えるため、
+       取得は `bot.get_channel()` / `fetch_channel()` で共通にできる。
+    """
+    __tablename__ = "tickets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    is_thread: Mapped[bool] = mapped_column(Boolean, default=True)
+    opener_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(32), default="other")
+    subject: Mapped[str | None] = mapped_column(String(200))
+
+    # OPEN（未対応） / CLAIMED（担当者あり） / CLOSED（終了）
+    status: Mapped[str] = mapped_column(String(16), default="OPEN", index=True)
+    claimed_by: Mapped[int | None] = mapped_column(BigInteger)
+
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # 放置の自動クローズに使う。発言があるたび更新する。
+    last_activity_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow,
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    closed_by: Mapped[int | None] = mapped_column(BigInteger)
+    close_reason: Mapped[str | None] = mapped_column(String(400))
+
+    STATUS_OPEN = "OPEN"
+    STATUS_CLAIMED = "CLAIMED"
+    STATUS_CLOSED = "CLOSED"
+
+    @property
+    def number(self) -> str:
+        """表示用の番号。#0001 の形。"""
+        return f"#{self.id:04d}"
+
+
+class Verification(Base):
+    """
+    認証が済んだ人。
+
+    ⚠️ サーバーごとに持つ。同じ人が複数のサーバーにいることがあるため、
+       `discord_id` だけを主キーにしてはいけない。
+    """
+    __tablename__ = "verifications"
+
+    guild_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    discord_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    verified_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow,
+    )
+    # button（ボタンのみ） / captcha（画像認証） / manual（管理者が手で） /
+    # bulk（既存メンバーの一括認証）
+    method: Mapped[str] = mapped_column(String(16), default="button")
+    # 失敗した回数。多すぎる人を見つけるために残す。
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class ModWarning(Base):
+    """
+    警告の記録。
+
+    ⚠️ 取り消しても行は消さない（`cleared_at` を入れる）。
+       「何回警告されたか」を後から数え直せるようにしておくため。
+    """
+    __tablename__ = "mod_warnings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    moderator_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    reason: Mapped[str] = mapped_column(String(400), default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow,
+    )
+    cleared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cleared_by: Mapped[int | None] = mapped_column(BigInteger)
+
+
+class GuardHit(Base):
+    """
+    荒らし・スパムとして自動で対処した記録。
+
+    自動で動く機能なので、**何にどう反応したか**を必ず残す。
+    残していないと「なぜ消されたのか」に答えられない。
+    """
+    __tablename__ = "guard_hits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    # spam（連投） / mention（メンション爆撃） / invite（招待リンク） /
+    # word（NGワード） / raid（短時間の大量入室） / newaccount（作りたて）
+    kind: Mapped[str] = mapped_column(String(24), nullable=False, index=True)
+    detail: Mapped[str] = mapped_column(Text, default="")
+    # deleted（消した） / timeout（発言停止） / kick / ban / none（記録だけ）
+    action: Mapped[str] = mapped_column(String(24), default="none")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True,
+    )

@@ -309,7 +309,15 @@ class InvitePanel(discord.ui.View):
 #    ここに並べて add_view() で復元する。
 from ui.invite_flows import ClaimView  # noqa: E402
 
-PERSISTENT_VIEWS = [OrderPanel, ChargePanel, AdminPanel, InvitePanel, ClaimView]
+# サーバー管理（チケット・認証）のボタンも同じ仕組みで復元する
+from ui.server_views import (  # noqa: E402
+    PERSISTENT_VIEWS as _SERVER_VIEWS, TicketPanel, VerifyPanel,
+)
+
+PERSISTENT_VIEWS = [
+    OrderPanel, ChargePanel, AdminPanel, InvitePanel, ClaimView,
+    *_SERVER_VIEWS,
+]
 
 def build_order_panel() -> tuple[discord.Embed, discord.ui.View]:
     """設置・貼り直し用。現在の注文方式を反映したパネルを作る。"""
@@ -321,4 +329,6 @@ PANEL_BUILDERS = {
     "order": (embeds.order_panel, OrderPanel),
     "charge": (embeds.charge_panel, ChargePanel),
     "invite": (embeds.invite_panel, InvitePanel),
+    "ticket": (embeds.ticket_panel, TicketPanel),
+    "verify": (embeds.verify_panel, VerifyPanel),
 }
