@@ -32,6 +32,14 @@ def text_of(embed) -> str:
 
 
 async def main():
+    # ⚠️ 時刻を固定する。実データの商品には販売時間帯があり
+    #    （ハンバーガーは 10:20〜23:50）、朝に回すとカートが正しく
+    #    止めてしまう。固定しないと「毎朝だけ落ちるテスト」になる。
+    import config as _cfg
+    from datetime import datetime as _dt
+
+    _cfg.now_jst = lambda: _dt(2026, 10, 3, 12, 0, tzinfo=_cfg.JST)
+
     tmp = tempfile.mkdtemp()
     init_cipher("dGVzdC1rZXktMzJieXRlcy1mb3ItdGVzdGluZy0xMjM0")
     await init_db(f"sqlite+aiosqlite:///{tmp}/pd.db")

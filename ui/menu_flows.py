@@ -2399,7 +2399,9 @@ def build_order_item(
             OrderItem(product_code=code, quantity=n)
             for code, n in spread_quantity(chosen, slot.need)
         ]
-        bridge = slot_bridge.bridge_for(slot.code)
+        # ⚠️ 枠コードだけで引かない。朝マックのドリンク枠（9997925）は
+        #    通常セット（9997918）と別コードだが、同じ中間ノードが要る。
+        bridge = menu.bridge_for(slot)
         if bridge:
             leaves = [
                 OrderItem(product_code=bridge, quantity=leaf.quantity,

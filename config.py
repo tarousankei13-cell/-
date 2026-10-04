@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timedelta, timezone
 
 """
@@ -269,7 +270,20 @@ JST = timezone(timedelta(hours=9))
 
 
 def now_jst() -> datetime:
-    """いまの日本時間。"""
+    """
+    いまの日本時間。
+
+    ⚠️ 環境変数 BOT_FAKE_JST（"YYYY-MM-DD HH:MM"）があれば、その時刻を
+       返す。**テスト専用**。提供時間帯の判定は時刻で変わるため、
+       これが無いと「朝だけ落ちるテスト」を書いてしまう。
+       本番では設定しないこと。
+    """
+    fake = os.getenv("BOT_FAKE_JST", "").strip()
+    if fake:
+        try:
+            return datetime.strptime(fake, "%Y-%m-%d %H:%M").replace(tzinfo=JST)
+        except ValueError:
+            pass
     return datetime.now(JST)
 
 

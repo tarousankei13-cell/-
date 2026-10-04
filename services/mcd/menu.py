@@ -526,6 +526,43 @@ class ParsedMenu:
         """products に無い商品の名前（groupMenu 由来）。"""
         return self.aliases.get(str(code), "")
 
+    def bridge_for(self, slot: Slot) -> str:
+        """
+        枠と商品の間に入る中間ノード。無ければ空文字。
+
+        ⚠️ 実物の注文コードから分かっているのは
+               ドリンク枠 9997918 → 9997914
+           の1本だけ。ところが枠は27種類あり、**同じドリンクでも
+           朝マックのセットは別の枠コード（9997925）** を使う。
+           中間ノードを付けずに送ると、マクドナルドから
+           「お取り扱いがありません」で断られる。
+
+        ⚠️ そこで「**同じカテゴリを指している枠は、同じ中間ノードを
+           使う**」とみなす。9997918 も 9997925 も参照はコカ・コーラM
+           （ドリンク）なので、同じ中間ノードになる。
+           推測を含むが、付けずに送れば確実に断られる以上、
+           付けて試すほうが通る見込みがある。
+        """
+        from services.mcd import slot_bridge
+
+        known = slot_bridge.bridge_for(slot.code)
+        if known:
+            return known
+
+        ref = self.slot_reference(slot)
+        col = self.collection_of(ref) if ref else None
+        if col is None:
+            return ""
+        refs = self._slot_refs()
+        for other_code, bridge in slot_bridge.all_known().items():
+            if other_code == slot.code:
+                continue
+            other_ref = refs.get(str(other_code), "")
+            other_col = self.collection_of(other_ref) if other_ref else None
+            if other_col is not None and other_col.id == col.id:
+                return bridge
+        return ""
+
     def _pool_for(self, base: str) -> list[str]:
         """
         候補の母集団。

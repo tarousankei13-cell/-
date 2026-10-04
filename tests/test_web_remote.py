@@ -67,9 +67,15 @@ async def main():
     token = web_site.new_view_token()
 
     print("\n[1] BOT からページへ登録できる ★")
+    # ⚠️ 登録時刻は **実時計** で渡すこと。別置きのページは BOT とは
+    #    別のプロセスなので、こちらの偽の時計（BOT_FAKE_JST）が効かない。
+    #    省略すると、時刻をずらして回したときだけ期限切れで404になる。
+    from datetime import datetime, timezone
+
     sent = await web_push.send(
         token=token, receipt_number="7161", store_name="南砂町店",
         store_id="13934", pickup_label="店内でお召し上がり",
+        created=datetime.now(timezone.utc),
     )
     check("送れた ★", sent is True, sent)
 
@@ -129,6 +135,7 @@ async def main():
         await web_push.send(
             token=bad_token, receipt_number="1234",
             store_name="<script>alert(1)</script>", store_id="1",
+            created=datetime.now(timezone.utc),
         )
         async with cs.get(f"{base}/order/{bad_token}") as r:
             b = await r.text()

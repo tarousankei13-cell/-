@@ -28,7 +28,7 @@ OrderItem:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import config
@@ -369,6 +369,32 @@ def build_item(item: OrderItem, *, top_level: bool = False) -> bytes:
     return b
 
 
+def merge_items(items: list[OrderItem]) -> list[OrderItem]:
+    """
+    まったく同じ商品をまとめて、数量にする。
+
+    ⚠️ 同じ商品を**並べて送ってはいけない**。マクドナルドは同じ商品が
+       並んでいると1つにまとめてしまい、1個ぶんしか注文されない。
+       実機で確認した（¥300の商品を3つ並べて送ったら、相手の金額は
+       ¥300だった）。数量は field 3 に入れること。
+
+    ⚠️ まとめてよいのは **中身まで完全に同じもの** だけ。
+       「ピクルス抜き」と「ふつう」は別の品なので、まとめない。
+    """
+    out: list[OrderItem] = []
+    keys: list[bytes] = []
+    for item in items:
+        # 数量だけが違うものも同じ品として扱いたいので、数量を1に揃えて比べる
+        key = build_item(replace(item, quantity=1), top_level=True)
+        if key in keys:
+            at = keys.index(key)
+            out[at] = replace(out[at], quantity=out[at].quantity + item.quantity)
+            continue
+        keys.append(key)
+        out.append(item)
+    return out
+
+
 def build_hex(
     store_id: str,
     items: list[OrderItem],
@@ -391,7 +417,9 @@ def build_hex(
     if redirect_url:
         body += pb_msg(3, pb_msg(8, pb_str(1, redirect_url) + pb_str(3, redirect_url)))
     body += pb_msg(7, build_pickup_payload(pickup_method, number=pickup_number))
-    order = b"".join(pb_msg(2, build_item(i, top_level=True)) for i in items)
+    order = b"".join(
+        pb_msg(2, build_item(i, top_level=True)) for i in merge_items(items)
+    )
     body += pb_msg(8, order)
     return body.hex()
 
@@ -423,7 +451,11 @@ def build_store_order_body(
     # field 7: createDeliveryMethod ★ここが本命
     b += pb_msg(7, build_pickup_payload(method, number=pickup_number))
     # field 8: 商品（複数対応）
-    order = b"".join(pb_msg(2, build_item(i, top_level=True)) for i in decoded.items)
+    # ⚠️ ここでも必ずまとめる。利用者が貼った注文コードに同じ商品が
+    #    並んでいることがあり、そのまま送ると1個ぶんしか注文されない。
+    order = b"".join(
+        pb_msg(2, build_item(i, top_level=True)) for i in merge_items(decoded.items)
+    )
     b += pb_msg(8, order)
     if pos_paseto:
         b += pb_str(12, pos_paseto)

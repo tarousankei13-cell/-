@@ -730,13 +730,25 @@ async def run_order(
             # ⚠️ マクドナルドは組み合わせが悪いときも「時間外」と言ってくる。
             #    そのまま伝えると、待てば直ると誤解させてしまう。
             message = (
-                "セットの中身の組み合わせが、この店舗では選べませんでした。\n"
+                "セットの中身が、この店舗では選べませんでした。\n"
                 + "・" + "\n・".join(learned) + "\n\n"
-                "この組み合わせは次から出さないようにしました。\n"
+                "次からは出さないようにしました。\n"
                 "お手数ですが、別のものを選んでもう一度お試しください。\n"
                 "残高は元に戻っています。"
             )
             title = f"{E.NG} この組み合わせは選べません"
+        elif _looks_like_choice_problem(result):
+            # ⚠️ **断定しない。** マクドナルドはどれが駄目かを教えてくれない。
+            #    疑わしいものが複数あるときに名前を並べると、何も悪くない
+            #    商品を「選べない」と伝えてしまう。
+            message = (
+                "セットの中身のどれかが、この店舗では選べませんでした。\n"
+                "**どれが原因かは、お店からは分かりませんでした。**\n\n"
+                "お手数ですが、サイドやドリンクを別のものに変えて"
+                "もう一度お試しください。\n"
+                "残高は元に戻っています。"
+            )
+            title = f"{E.NG} セットの中身を変えてお試しください"
         await interaction.edit_original_response(
             embed=embeds.error(message, title=title)
         )
@@ -1073,6 +1085,15 @@ async def notify_admin_fraud(
         log.exception("不正検知の通知を送れませんでした")
 
 
+def _looks_like_choice_problem(result) -> bool:
+    """セットの中身が原因で断られた可能性が高いか。"""
+    from services.mcd import errors as mcd_errors
+
+    info = getattr(result, "error_info", None)
+    kind = getattr(info, "kind", "") if info else ""
+    return kind in (mcd_errors.PRODUCT_TIME, mcd_errors.PRODUCT_GONE)
+
+
 async def learn_rejected_choices(decoded, result) -> list[str]:
     """
     セットの中身が原因で断られたなら覚える。覚えた商品名を返す。
@@ -1105,7 +1126,14 @@ async def learn_rejected_choices(decoded, result) -> list[str]:
         return []
 
     minutes = minutes_of(config.now_jst())
-    learned: list[str] = []
+
+    # ⚠️ マクドナルドは「どれが駄目か」を教えてくれない。返ってくるのは
+    #    注文全体への「お取り扱いがありません」だけ。
+    #    疑わしいものが複数あるときに全部覚えてしまうと、**何も悪くない
+    #    商品まで二度と出せなくなる**。実際、朝マックのセットで
+    #    サイドサラダが巻き添えになっていた。
+    #    疑いが1つに絞れたときだけ覚える。
+    suspects: list[tuple[str, str, str]] = []   # (枠, 商品, 名前)
     for item in getattr(decoded, "items", None) or []:
         for slot_code, product_code in slot_rules.choices_of(item):
             product = menu.products.get(product_code)
@@ -1114,9 +1142,21 @@ async def learn_rejected_choices(decoded, result) -> list[str]:
             # こちらが「時間外」と分かっていたものは、組み合わせのせいにしない
             if not product.is_orderable_at(minutes):
                 continue
-            if slot_rules.reject(store_id, slot_code, product_code):
-                learned.append(product.name)
-    return learned
+            if slot_rules.known_bad(store_id, slot_code, product_code):
+                continue
+            suspects.append((slot_code, product_code, product.name))
+
+    if len(suspects) != 1:
+        if suspects:
+            log.info(
+                "断られた原因を1つに絞れませんでした（候補 %d 件）。"
+                "巻き添えを避けるため、何も覚えません: %s",
+                len(suspects), [n for _, _, n in suspects],
+            )
+        return []
+
+    slot_code, product_code, name = suspects[0]
+    return [name] if slot_rules.reject(store_id, slot_code, product_code) else []
 
 
 async def notify_admin_failure(

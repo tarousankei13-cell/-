@@ -107,6 +107,15 @@ def reject(store_id: str, slot_code: str, product_code: str) -> bool:
     return True
 
 
+def known_bad(store_id: str, slot_code: str, product_code: str) -> bool:
+    """すでに「入れられない」と覚えている組み合わせか。"""
+    if not _loaded:
+        load()
+    k = _key(str(store_id), str(slot_code), str(product_code))
+    with _lock:
+        return k in _rejected
+
+
 def confirm(store_id: str, slot_code: str, product_code: str) -> None:
     """通った組み合わせとして覚える。以後は断られた記録より優先する。"""
     if not _loaded:
