@@ -195,10 +195,10 @@ class PayPayClient:
             raise PayPayLoginError("PayPayにログインしていません")
 
     async def _request(self, method: str, url: str, **kw) -> dict:
+        # portal 側はヘッダがまったく別なので、差し替えられるようにする
+        headers = kw.pop("headers_override", None) or self._headers()
         try:
-            r = await self._client.request(
-                method, url, headers=self._headers(), **kw
-            )
+            r = await self._client.request(method, url, headers=headers, **kw)
         except httpx.HTTPError as e:
             raise PayPayError(f"PayPayに接続できませんでした: {e}") from e
         try:
@@ -234,38 +234,166 @@ class PayPayClient:
 
     # -- ログイン ---------------------------------------------
 
-    async def start_login(self, phone: str, password: str) -> str:
+    def _portal_headers(self, *, json_api: bool = True) -> dict[str, str]:
         """
-        ログインを始める。SMSで **URL** が届くので、それを
-        login_confirm に渡すこと（数字のOTPではない）。
+        portal（www.paypay.ne.jp）側のヘッダ。
+
+        ⚠️ app4 側とは別物。あちらはアプリとして、こちらは
+           **アプリ内ブラウザ** として振る舞う必要がある。
+        """
+        ua = (
+            "Mozilla/5.0 (Linux; Android 10; SCV38 Build/QP1A.190711.020; wv) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 "
+            f"Chrome/132.0.6834.163 Mobile Safari/537.36 jp.pay2.app.android/{APP_VERSION}"
+        )
+        h = {
+            "Accept-Language": "ja-JP,ja;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Host": "www.paypay.ne.jp",
+            "User-Agent": ua,
+            "X-Requested-With": "jp.ne.paypay.android.app",
+            "sec-ch-ua-mobile": "?1",
+            "sec-ch-ua-platform": '"Android"',
+        }
+        if json_api:
+            h |= {
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/json",
+                "Client-Id": CLIENT_ID,
+                "Client-OS-Type": "ANDROID",
+                "Client-OS-Version": "29.0.0",
+                "Client-Type": "PAYPAYAPP",
+                "Client-Version": APP_VERSION,
+                "Origin": PORTAL,
+                "Referer": (
+                    f"{PORTAL}/portal/oauth2/sign-in"
+                    f"?client_id={CLIENT_ID}&mode=landing"
+                ),
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+            }
+        else:
+            h |= {
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "image/avif,image/webp,image/apng,*/*;q=0.8"
+                ),
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Upgrade-Insecure-Requests": "1",
+                "is-emulator": "false",
+            }
+        return h
+
+    async def start_login(self, phone: str, password: str) -> dict:
+        """
+        ログインを始める。
+
+        ⚠️ **手順を飛ばせない。** 相手は www.paypay.ne.jp 側で
+           Cookie を積み上げながら進める作りになっている。
+
+             ① app4  /bff/v2/oauth2/par            … 要求を登録し requestUri をもらう
+             ② portal /portal/api/v2/oauth2/authorize
+             ③ portal /portal/oauth2/sign-in
+             ④ portal /portal/api/v2/oauth2/par/check
+             ⑤ portal /portal/api/v2/oauth2/sign-in/password … ここで資格情報
+
+           いきなり ⑤ や ① に資格情報を送っても通らない。
+
+        返り値:
+          {"done": True, "session": ...}  端末が登録済みで、SMSなしで入れた
+          {"done": False}                 SMSでURLが届くので login_confirm へ
         """
         phone = (phone or "").replace("-", "").strip()
         if not phone or not password:
             raise PayPayLoginError("電話番号とパスワードを入力してください")
 
         self._verifier, challenge = _pkce()
-        payload = {
-            "clientId": CLIENT_ID,
-            "clientAppVersion": APP_VERSION,
-            "clientOsVersion": "29.0.0",
-            "clientOsType": "ANDROID",
-            "redirectUri": REDIRECT_URI,
-            "responseType": "code",
-            "state": base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode(),
-            "codeChallenge": challenge,
-            "codeChallengeMethod": "S256",
-            "scope": "REGULAR",
-            "tokenVersion": "v2",
-            "prompt": "",
-            "uiLocales": "ja",
-            "username": phone,
-            "password": password,
-        }
-        data = await self._request(
+        state = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
+
+        # ① 要求の登録（アプリとして）
+        par = await self._request(
             "POST", f"{APP}/bff/v2/oauth2/par",
-            data=payload, params={"payPayLang": "ja"},
+            data={
+                "clientId": CLIENT_ID,
+                "clientAppVersion": APP_VERSION,
+                "clientOsVersion": "29.0.0",
+                "clientOsType": "ANDROID",
+                "redirectUri": REDIRECT_URI,
+                "responseType": "code",
+                "state": state,
+                "codeChallenge": challenge,
+                "codeChallengeMethod": "S256",
+                "scope": "REGULAR",
+                "tokenVersion": "v2",
+                "prompt": "",
+                "uiLocales": "ja",
+            },
+            params={"payPayLang": "ja"},
         )
-        return str((data.get("payload") or {}).get("requestUri") or "")
+        request_uri = str((par.get("payload") or {}).get("requestUri") or "")
+        if not request_uri:
+            raise PayPayLoginError("ログインの準備に失敗しました")
+
+        # ②〜④ ブラウザとして画面をたどる（Cookie を積む）
+        browser = self._portal_headers(json_api=False)
+        try:
+            await self._client.get(
+                f"{PORTAL}/portal/api/v2/oauth2/authorize",
+                headers=browser,
+                params={"client_id": CLIENT_ID, "request_uri": request_uri},
+                follow_redirects=False,
+            )
+            r = await self._client.get(
+                f"{PORTAL}/portal/oauth2/sign-in", headers=browser,
+                params={"client_id": CLIENT_ID, "mode": "landing"},
+            )
+            if r.status_code >= 400:
+                raise PayPayLoginError("サインイン画面を開けませんでした")
+            await self._request(
+                "GET", f"{PORTAL}/portal/api/v2/oauth2/par/check",
+                headers_override=self._portal_headers(),
+            )
+        except httpx.HTTPError as e:
+            raise PayPayError(f"PayPayに接続できませんでした: {e}") from e
+
+        # ⑤ 資格情報
+        signin = await self._request(
+            "POST", f"{PORTAL}/portal/api/v2/oauth2/sign-in/password",
+            json={"username": phone, "password": password},
+            headers_override=self._portal_headers(),
+        )
+
+        # 端末が登録済みなら、ここで認可コードがそのまま返る（SMSなし）
+        redirect = str((signin.get("payload") or {}).get("redirectUrl") or "")
+        m = re.search(r"code=([^&\s]+)", redirect)
+        if m:
+            session = await self._exchange(m.group(1))
+            return {"done": True, "session": session}
+        return {"done": False}
+
+    async def _exchange(self, code: str) -> PayPaySession:
+        """認可コードをトークンに換える。"""
+        data = await self._request(
+            "POST", f"{APP}/bff/v2/oauth2/token",
+            data={
+                "clientId": CLIENT_ID,
+                "redirectUri": REDIRECT_URI,
+                "code": code,
+                "codeVerifier": self._verifier,
+            },
+            params={"payPayLang": "ja"},
+        )
+        got = data.get("payload") or {}
+        self.session.access_token = str(got.get("accessToken") or "")
+        self.session.refresh_token = str(got.get("refreshToken") or "")
+        if not self.session.access_token:
+            raise PayPayLoginError("トークンを受け取れませんでした")
+        return self.session
 
     async def login_confirm(self, url_or_code: str) -> PayPaySession:
         """SMSで届いたURLを渡してトークンを受け取る。"""
@@ -281,6 +409,7 @@ class PayPayClient:
             "POST",
             f"{PORTAL}/portal/api/v2/oauth2/extension/sign-in/2fa/otl/verify",
             json={"code": code},
+            headers_override=self._portal_headers(),
         )
         redirect = ""
         payload = verify.get("payload") or {}
@@ -293,23 +422,7 @@ class PayPayClient:
             raise PayPayLoginError(
                 "ログインの確認に失敗しました。URLをもう一度ご確認ください。"
             )
-
-        data = await self._request(
-            "POST", f"{APP}/bff/v2/oauth2/token",
-            data={
-                "clientId": CLIENT_ID,
-                "redirectUri": REDIRECT_URI,
-                "code": m.group(1),
-                "codeVerifier": self._verifier,
-            },
-            params={"payPayLang": "ja"},
-        )
-        got = data.get("payload") or {}
-        self.session.access_token = str(got.get("accessToken") or "")
-        self.session.refresh_token = str(got.get("refreshToken") or "")
-        if not self.session.access_token:
-            raise PayPayLoginError("トークンを受け取れませんでした")
-        return self.session
+        return await self._exchange(m.group(1))
 
     # -- 残高・履歴 -------------------------------------------
 

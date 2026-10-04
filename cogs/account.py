@@ -541,7 +541,7 @@ class AccountCog(commands.Cog):
         cipher = get_cipher()
         client = PayPayClient(proxy=proxy or pp_accounts.config_proxy())
         try:
-            await client.start_login(phone, password)
+            started = await client.start_login(phone, password)
         except PayPayError as e:
             await client.aclose()
             await interaction.followup.send(
@@ -564,8 +564,30 @@ class AccountCog(commands.Cog):
             await s.flush()
             account_id = acc.id
 
-        # ⚠️ 確認の手順で同じ検証子（PKCE）が要る。
-        #    使い回せるようにここで預かっておく。
+        # 端末が登録済みなら、SMSなしでそのまま入れている
+        if started.get("done"):
+            await pp_accounts.save_session(account_id, started["session"])
+            note = ""
+            try:
+                bal = await client.get_balance()
+                note = f"\n{E.WALLET} いまの残高 **{embeds.yen(bal.all_balance)}**"
+            except PayPayError:
+                pass
+            finally:
+                await client.aclose()
+            await interaction.followup.send(
+                embed=embeds.ok(
+                    f"**#{account_id} {label}** を登録し、ログインまで完了しました。"
+                    f"{note}\n\n"
+                    f"{E.INFO} SMSの確認は不要でした。\n"
+                    f"{E.INFO} トークンは約90日もちます。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        # ⚠️ 確認の手順で同じ検証子（PKCE）と Cookie が要る。
+        #    クライアントごと預かっておく（作り直すと通らない）。
         _PENDING_PAYPAY[account_id] = client
 
         await interaction.followup.send(

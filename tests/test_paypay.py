@@ -253,7 +253,75 @@ async def main():
     check("Kyashだけにもできる", charge_methods() == ["kyash"])
     await settings.set_value("charge_methods", "both")
 
-    print("\n── ⑬ 期限の通知は両方を見る ──")
+    print("\n── ⑬ ログインの手順を飛ばしていないか ★ ──")
+    # ⚠️ 相手は www.paypay.ne.jp 側で Cookie を積み上げながら進む。
+    #    いきなり資格情報を送っても通らない。順番を固定する。
+    calls = []
+
+    class RecordingClient(C.PayPayClient):
+        async def _request(self, method, url, **kw):
+            calls.append((method, url.split("?")[0]))
+            if url.endswith("/par") or "oauth2/par" in url and "check" not in url:
+                return {"header": {"resultCode": "S0000"},
+                        "payload": {"requestUri": "urn:req:1"}}
+            if "par/check" in url:
+                return {"header": {"resultCode": "S0000"}}
+            if "sign-in/password" in url:
+                return {"header": {"resultCode": "S0000"}, "payload": {}}
+            return {"header": {"resultCode": "S0000"}, "payload": {}}
+
+    class FakeHTTP:
+        def __init__(self): self.gets = []
+        async def get(self, url, **kw):
+            self.gets.append(url)
+            class R: status_code = 200
+            return R()
+        async def request(self, *a, **kw): raise AssertionError("使わない")
+        async def aclose(self): pass
+
+    cl = RecordingClient()
+    cl._client = FakeHTTP()
+    got = await cl.start_login("090-1234-5678", "pw")
+    paths = [u for _, u in calls]
+    check("① まず par で要求を登録する ★",
+          paths and paths[0].endswith("/bff/v2/oauth2/par"), paths)
+    check("② authorize と sign-in 画面をたどる ★",
+          any("oauth2/authorize" in u for u in cl._client.gets)
+          and any("portal/oauth2/sign-in" in u for u in cl._client.gets),
+          cl._client.gets)
+    check("③ par/check を通す ★",
+          any("par/check" in u for u in paths), paths)
+    check("④ 最後に資格情報を送る ★",
+          paths[-1].endswith("/sign-in/password"), paths)
+    check("資格情報を par へ送っていない ★（順番の取り違え）",
+          not any(u.endswith("/bff/v2/oauth2/par") for u in paths[1:]), paths)
+    check("端末が未登録ならSMS待ちになる ★", got == {"done": False}, got)
+
+    class RegisteredClient(RecordingClient):
+        async def _request(self, method, url, **kw):
+            if "sign-in/password" in url:
+                calls.append((method, url.split("?")[0]))
+                return {"header": {"resultCode": "S0000"},
+                        "payload": {"redirectUrl":
+                                    "paypay://oauth2/callback?code=AUTHCODE&state=x"}}
+            if "oauth2/token" in url:
+                calls.append((method, url.split("?")[0]))
+                return {"header": {"resultCode": "S0000"},
+                        "payload": {"accessToken": "AT", "refreshToken": "RT"}}
+            return await super()._request(method, url, **kw)
+
+    calls.clear()
+    cl2 = RegisteredClient()
+    cl2._client = FakeHTTP()
+    got = await cl2.start_login("09012345678", "pw")
+    check("登録済み端末ならSMSなしで入れる ★", got.get("done") is True, got)
+    check("そのままトークンを受け取る ★",
+          got["session"].access_token == "AT"
+          and got["session"].refresh_token == "RT",
+          got.get("session"))
+    check("トークン交換まで進む ★",
+          any("oauth2/token" in u for _, u in calls), [u for _, u in calls])
+
     from services import tasks as jobs
     async with session_scope() as s:
         from datetime import timedelta
