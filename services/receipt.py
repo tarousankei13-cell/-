@@ -133,7 +133,7 @@ async def check_link_alive(force: bool = False) -> bool:
 
     url = template.format(store_id="13934", receipt_number="0000")
     try:
-        async with build_async_client(timeout=10.0) as client:
+        async with build_async_client(timeout=10.0, service="web") as client:
             r = await client.head(url)
             if r.status_code >= 400:
                 r = await client.get(url)

@@ -67,6 +67,21 @@ ENCRYPTION_KEY = ""
 #   環境変数でも可: DATABASE_URL
 DATABASE_URL = "sqlite+aiosqlite:///./data/bot.db"
 
+# BOT全体が外へ出るときに通すプロキシ（任意・空ならそのまま出ます）
+#   書き方  "http://ホスト:ポート"
+#           "http://利用者名:パスワード@ホスト:ポート"（認証あり）
+#           "socks5://ホスト:ポート"（socks を使う場合は pip install httpx[socks]）
+#
+#   ここに入れると、Discord・マクドナルド・Kyash・PayPay・画像取得の
+#   すべてがこのプロキシを通ります。
+#   サービスごとに分けたいときは、起動後に /proxy set で設定できます
+#   （そちらの設定が、ここに書いた値より優先されます）。
+#
+#   ⚠️ PayPay と マクドナルド は日本国内からしか使えません。
+#      海外のサーバーで動かす場合は、日本のプロキシを必ず入れてください。
+#   環境変数でも可: BOT_PROXY
+PROXY_URL = ""
+
 # ログの詳しさ  "INFO"（通常） / "DEBUG"（不具合調査時）
 LOG_LEVEL = "INFO"
 
@@ -82,6 +97,7 @@ import os
 import sys
 from pathlib import Path
 
+import aiohttp
 import discord
 from discord.ext import commands
 
@@ -127,6 +143,12 @@ DATABASE_URL = (
 if GUILD_ID is None:
     _guild = _from_env("GUILD_ID")
     GUILD_ID = int(_guild) if _guild.isdigit() else None
+_PROXY_WRITTEN = bool((PROXY_URL or "").strip())
+PROXY_URL = _resolve_text(PROXY_URL, "BOT_PROXY", "HTTPS_PROXY", "ALL_PROXY")
+PROXY_SOURCE = (
+    "main.py の PROXY_URL" if _PROXY_WRITTEN
+    else ("環境変数" if PROXY_URL else "")
+)
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
@@ -154,6 +176,15 @@ for _noisy in ("httpx", "httpcore"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 log = logging.getLogger("bot")
+
+# プロキシの既定値を登録する。
+#   ⚠️ import より前には置けないが、通信が始まる前でなければならない。
+#      ここは logging の設定直後で、まだ何も通信していない。
+from core import proxy  # noqa: E402
+
+proxy.set_bootstrap(PROXY_URL, source=PROXY_SOURCE or "main.py")
+if PROXY_URL:
+    log.info("プロキシを使います（%s）: %s", PROXY_SOURCE, proxy.mask(PROXY_URL))
 
 
 # ------------------------------------------------------------
@@ -261,6 +292,37 @@ class McdBot(commands.Bot):
         if INVITE_AUTO_TRACK:
             intents.members = True
 
+        # Discord 自身への接続（API・ゲートウェイ）に通すプロキシ。
+        #   ⚠️ Discord は認証情報をURLに入れた形を受け取らない。
+        #      URL と 利用者名/パスワード に分けて渡す必要がある。
+        #   ⚠️ ここは /proxy set の Discord 設定を**使えない**。
+        #      ログインはDBを読む前に始まるため、設定欄か環境変数だけが効く。
+        #      設定で変えた場合は、次の起動から反映される。
+        d_proxy, d_auth = proxy.split_auth(
+            proxy.for_service("discord") or PROXY_URL
+        )
+        extra: dict = {}
+        if d_proxy and d_proxy.lower().startswith("socks"):
+            # ⚠️ Discord（aiohttp）は socks に対応していない。
+            #    黙って直接出ると気付けないので、必ず警告を出す。
+            rest = ("他の通信はこの socks を通ります"
+                    if proxy.socks_ready()
+                    else 'socksio が入っていないため、他の通信も'
+                         '直接つなぎます（pip install "httpx[socks]"）')
+            log.warning(
+                "Discord への接続は socks プロキシに対応していません。"
+                "Discord は直接つなぎます（%s）。"
+                "`/proxy set service:Discord` で http のプロキシを指定すると、"
+                "Discord もプロキシを通せます。",
+                rest,
+            )
+        elif d_proxy:
+            extra["proxy"] = d_proxy
+            if d_auth:
+                extra["proxy_auth"] = aiohttp.BasicAuth(d_auth[0], d_auth[1])
+            log.info("Discord への接続にプロキシを使います: %s",
+                     proxy.mask(d_proxy))
+
         super().__init__(
             # ⚠️ command_prefix に "/" を使わない。
             #    スラッシュコマンドと衝突し、コマンドが二重に見える原因になる。
@@ -268,6 +330,7 @@ class McdBot(commands.Bot):
             intents=intents,
             owner_ids=set(OWNER_IDS),
             help_command=None,
+            **extra,
         )
         self._synced = False
         self.admin_role_ids = set(ADMIN_ROLE_IDS)

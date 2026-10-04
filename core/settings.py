@@ -78,9 +78,45 @@ DEFAULTS: dict[str, Any] = {
     "invite_link_channel": defaults.INVITE_LINK_CHANNEL,
     "invite_link_days": defaults.INVITE_LINK_DAYS,
     "channel_invite": None,
+    # プロキシ（空なら上位の設定に従う。優先順位は core/proxy.py を見ること）
+    "proxy_all": "",
+    "proxy_mcd": "",
+    "proxy_kyash": "",
+    "proxy_paypay": "",
+    "proxy_discord": "",
+    "proxy_web": "",
 }
 
 _cache: dict[str, Any] = {}
+
+# 値そのものを残してはいけない設定。
+#   ログにも監査ログにも、中身を伏せた形でしか書かない。
+#   ⚠️ 秘密を持つ設定を増やしたら、必ずここに足すこと。
+#      呼び出し側で audit=False を書く方式だと、書き忘れた1箇所から漏れる。
+SECRET_KEYS: frozenset[str] = frozenset({
+    "web_push_secret",
+    "proxy_all", "proxy_mcd", "proxy_kyash", "proxy_paypay",
+    "proxy_discord", "proxy_web", "paypay_proxy",
+})
+
+
+def safe_value(key: str, value: Any) -> Any:
+    """
+    ログや監査ログに書いてよい形。秘密を持つ設定は中身を伏せる。
+
+    プロキシのURLはホストまでは出す（どこを通しているかは分かった方が
+    調べ物に役立つ）。パスワードだけを隠す。
+    """
+    if key not in SECRET_KEYS:
+        return value
+    text = str(value or "")
+    if not text:
+        return "（解除）"
+    if key.startswith("proxy_") or key.endswith("_proxy"):
+        from core.proxy import mask
+
+        return mask(text)
+    return "（設定あり・非表示）"
 
 
 async def load_all() -> dict[str, Any]:
@@ -130,7 +166,7 @@ async def set_value(
             row.value = payload
             row.updated_by = updated_by
     _cache[key] = value
-    log.info("設定を更新しました: %s = %s", key, value)
+    log.info("設定を更新しました: %s = %s", key, safe_value(key, value))
 
     if audit and updated_by:
         # 循環参照を避けるため、ここで取り込む
@@ -138,7 +174,10 @@ async def set_value(
 
         await audit_log.record(
             actor_id=updated_by, actor_name=actor_name, action="config.set",
-            target=key, before=previous, after=value, reason=reason,
+            target=key,
+            before=safe_value(key, previous),
+            after=safe_value(key, value),
+            reason=reason,
         )
 
 

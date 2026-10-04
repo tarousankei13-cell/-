@@ -101,7 +101,9 @@ class KyashClient:
             installation_uuid=s.installation_uuid or str(uuid.uuid4()).upper(),
         )
         self._email = ""
-        self._client = build_async_client(timeout=timeout, proxy=proxy)
+        self._client = build_async_client(
+            timeout=timeout, proxy=proxy, service="kyash",
+        )
 
     async def aclose(self) -> None:
         await self._client.aclose()

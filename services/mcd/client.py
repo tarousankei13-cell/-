@@ -205,7 +205,7 @@ class McdClient:
         self.tokens = tokens or TokenSet()
         self._on_tokens_updated = on_tokens_updated
         self._client = build_async_client(
-            timeout=timeout, proxy=proxy,
+            timeout=timeout, proxy=proxy, service="mcd",
             max_connections=8, max_keepalive=4,
         )
 

@@ -50,6 +50,7 @@ def build_async_client(
     *,
     timeout: httpx.Timeout | float | None = None,
     proxy: str | None = None,
+    service: str | None = None,
     max_connections: int = 16,
     max_keepalive: int = 8,
     follow_redirects: bool = True,
@@ -61,7 +62,17 @@ def build_async_client(
     計測付きの AsyncClient を作る。
 
     measured=False にすると計測を外せる（計測そのものの検証用）。
+
+    ⚠️ **外へ出る通信は必ず service を渡すこと。**
+       proxy を省いたとき、service に応じた設定（/proxy set）を
+       自動で引く。渡し忘れると、その通信だけプロキシを通らず
+       素のIPで出てしまう。
+       proxy を明示したときは、そちらが優先される（口座ごとの指定）。
     """
+    if not proxy and service:
+        from core import proxy as proxy_mod
+
+        proxy = proxy_mod.resolve(service)
     if timeout is None:
         timeout = DEFAULT_TIMEOUT
     elif isinstance(timeout, (int, float)):
@@ -107,14 +118,37 @@ def build_async_client(
 # 1本を使い回して接続を温かいまま保つ。
 _catalog: httpx.AsyncClient | None = None
 
+# どのプロキシで作ったか。設定が変わったら作り直すために覚えておく。
+#   ⚠️ 使い回しているので、設定し直しても勝手には切り替わらない。
+#      ここで見張らないと「変えたのに前の出口から出続ける」ことになる。
+_catalog_proxy: str | None = None
+
 
 def catalog_client() -> httpx.AsyncClient:
     """店舗・メニューの取得に使う共用クライアント。"""
-    global _catalog
+    global _catalog, _catalog_proxy
+    from core import proxy as proxy_mod
+
+    want = proxy_mod.resolve("mcd")
+    if _catalog is not None and not _catalog.is_closed and want != _catalog_proxy:
+        # 設定が変わった。古い接続は捨てる。
+        old, _catalog = _catalog, None
+        import asyncio
+
+        try:
+            asyncio.get_running_loop().create_task(old.aclose())
+        except RuntimeError:          # ループ外から呼ばれたとき
+            pass
+        log.info("プロキシの設定が変わったため、カタログ用の接続を作り直します")
+
     if _catalog is None or _catalog.is_closed:
-        _catalog = build_async_client(max_connections=32, max_keepalive=16)
-        log.info("カタログ用の接続を用意しました（HTTP/2 %s）",
-                 "あり" if HTTP2_AVAILABLE else "なし")
+        _catalog = build_async_client(
+            max_connections=32, max_keepalive=16, proxy=want,
+        )
+        _catalog_proxy = want
+        log.info("カタログ用の接続を用意しました（HTTP/2 %s・プロキシ %s）",
+                 "あり" if HTTP2_AVAILABLE else "なし",
+                 proxy_mod.mask(want))
     return _catalog
 
 
@@ -131,7 +165,8 @@ async def catalog_session():
 
 async def close_shared() -> None:
     """終了時に共用の接続を閉じる。"""
-    global _catalog
+    global _catalog, _catalog_proxy
     if _catalog is not None and not _catalog.is_closed:
         await _catalog.aclose()
     _catalog = None
+    _catalog_proxy = None

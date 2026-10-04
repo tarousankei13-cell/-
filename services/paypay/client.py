@@ -141,7 +141,9 @@ class PayPayClient:
             client_uuid=s.client_uuid or str(uuid.uuid4()),
         )
         self._verifier = ""
-        self._client = build_async_client(timeout=timeout, proxy=proxy)
+        self._client = build_async_client(
+            timeout=timeout, proxy=proxy, service="paypay",
+        )
 
     async def aclose(self) -> None:
         await self._client.aclose()

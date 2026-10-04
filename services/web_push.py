@@ -85,7 +85,7 @@ async def send(
         "created_at": (created or config.now_jst()).isoformat(),
     }
     try:
-        client = build_async_client(timeout=TIMEOUT)
+        client = build_async_client(timeout=TIMEOUT, service="web")
         try:
             r = await client.post(
                 push_url(),
@@ -124,7 +124,7 @@ async def check() -> tuple[bool, str]:
 
     health = url.rsplit("/api/", 1)[0].rstrip("/") + "/healthz"
     try:
-        client = build_async_client(timeout=TIMEOUT)
+        client = build_async_client(timeout=TIMEOUT, service="web")
         try:
             r = await client.get(health)
         finally:

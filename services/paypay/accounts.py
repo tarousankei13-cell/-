@@ -67,10 +67,14 @@ def build_client(acc: PayPayAccount) -> PayPayClient:
 
 
 def config_proxy() -> str | None:
-    """全体に設定されたプロキシ（口座ごとの指定が無いときに使う）。"""
-    from core import settings
+    """
+    全体に設定されたプロキシ（口座ごとの指定が無いときに使う）。
 
-    return str(settings.get("paypay_proxy", "") or "") or None
+    中身は core.proxy に移した。設定の優先順位はそちらに書いてある。
+    """
+    from core import proxy
+
+    return proxy.resolve("paypay")
 
 
 def token_days_left(acc: PayPayAccount) -> float | None:

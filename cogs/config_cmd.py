@@ -32,6 +32,11 @@ class ConfigCog(commands.Cog):
     channel_group = app_commands.Group(name="channel", description="チャンネルの設定", parent=group)
     menu_group = app_commands.Group(name="menu", description="メニュー同期の設定", parent=group)
     store_group = app_commands.Group(name="store", description="店舗一覧の設定", parent=group)
+    # ⚠️ /config の下には入れられない（サブコマンドの上限25に達しているため）。
+    #    独立したコマンドとして出す。
+    proxy_group = app_commands.Group(
+        name="proxy", description="プロキシ（通信の出口）の設定（管理者用）",
+    )
 
     # -- 一覧 ---------------------------------------------------
 
@@ -128,6 +133,21 @@ class ConfigCog(commands.Cog):
             )
         else:
             e.add_field(name="残高増減パネル", value="OFF", inline=False)
+
+        # プロキシ（中身は伏せて表示する）
+        from core import proxy
+
+        picked = [
+            f"{name}　{url}" for name, url in proxy.describe()
+            if url not in ("（全体に従う）",)
+        ]
+        e.add_field(
+            name="プロキシ（通信の出口）",
+            value=("\n".join(picked) + f"\n{E.INFO} 詳しくは `/proxy show`")
+            if any(u != "（なし）" for _, u in proxy.describe())
+            else "設定なし（そのまま通信します）",
+            inline=False,
+        )
         await interaction.followup.send(embed=e, ephemeral=True)
 
     # -- 負担率 -------------------------------------------------
@@ -1515,6 +1535,189 @@ class ConfigCog(commands.Cog):
                 "`/config slot_rules forget_store:<店舗ID>` で消せます。"
             ),
             ephemeral=True,
+        )
+
+    # -- プロキシ ----------------------------------------------
+    #
+    #  ⚠️ プロキシのURLには認証情報が入る。
+    #     画面に出すときは必ず proxy.mask() を通すこと。
+    #     応答は全て ephemeral=True にしておくこと。
+
+    _SERVICE_CHOICES = [
+        app_commands.Choice(name="全体（既定）", value=""),
+        app_commands.Choice(name="マクドナルド", value="mcd"),
+        app_commands.Choice(name="Kyash", value="kyash"),
+        app_commands.Choice(name="PayPay", value="paypay"),
+        app_commands.Choice(name="Discord", value="discord"),
+        app_commands.Choice(name="注文番号ページ・画像取得", value="web"),
+    ]
+
+    @proxy_group.command(name="show", description="いまのプロキシ設定を表示します")
+    @admin_only()
+    async def proxy_show(self, interaction: discord.Interaction) -> None:
+        from core import proxy
+
+        lines = [f"**{name}**　{url}" for name, url in proxy.describe()]
+        body = "\n".join(lines)
+        body += (
+            f"\n\n{E.INFO} 出どころ　{proxy.source_of()}\n"
+            f"{E.INFO} 優先順位は **口座ごとの指定 → サービスごと → 全体** です。\n"
+            f"{E.INFO} `/proxy test` で、実際に外から見えるIPを確認できます。"
+        )
+        if proxy.for_service("discord"):
+            body += (
+                f"\n{E.WARN} Discord への接続は、ここでの設定が"
+                "**次の起動から**反映されます"
+                "（ログインはDBを読む前に始まるため）。\n"
+                "すぐ反映したい場合は main.py の `PROXY_URL` に書いてください。"
+            )
+        await interaction.response.send_message(
+            embed=embeds.info(body, title="プロキシの設定"), ephemeral=True
+        )
+
+    @proxy_group.command(name="set", description="プロキシを設定します")
+    @app_commands.describe(
+        url="http://host:port / http://user:pass@host:port / socks5://host:port",
+        service="指定しなければ全体の既定になります",
+    )
+    @app_commands.choices(service=_SERVICE_CHOICES)
+    @admin_only()
+    async def proxy_set(
+        self,
+        interaction: discord.Interaction,
+        url: str,
+        service: app_commands.Choice[str] | None = None,
+    ) -> None:
+        from core import proxy
+
+        url = (url or "").strip()
+        why = proxy.problem(url)
+        if why:
+            await interaction.response.send_message(
+                embed=embeds.error(f"この値では設定できません。\n{why}"),
+                ephemeral=True,
+            )
+            return
+
+        key = f"proxy_{service.value}" if (service and service.value) else "proxy_all"
+        where = service.name if (service and service.value) else "全体"
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await settings.set_value(key, url, updated_by=interaction.user.id)
+
+        # ⚠️ 設定しただけでは通るか分からない。その場で確かめて見せる。
+        ok, detail = await proxy.check(url)
+        body = (
+            f"{where}のプロキシを設定しました。\n"
+            f"{E.INFO} 設定　{proxy.mask(url)}\n"
+        )
+        if ok:
+            body += f"{E.OK} 通りました。外から見えるIPは **{detail}** です。"
+        else:
+            body += (
+                f"{E.NG} 通りませんでした（{detail}）。\n"
+                "設定は保存しましたが、このままでは通信できません。"
+                "URLと、プロキシ側の許可設定をご確認ください。"
+            )
+        if service and service.value == "discord":
+            body += (
+                f"\n{E.WARN} Discord への接続は**次の起動から**反映されます。"
+            )
+        elif not service or not service.value:
+            body += (
+                f"\n{E.WARN} Discord への接続だけは、main.py の `PROXY_URL` か"
+                "環境変数 `BOT_PROXY` でなければ反映されません。"
+            )
+        await interaction.followup.send(
+            embed=(embeds.ok(body) if ok else embeds.warn(body)), ephemeral=True
+        )
+
+    @proxy_group.command(name="clear", description="プロキシの設定を解除します")
+    @app_commands.describe(service="指定しなければ全体の既定を解除します")
+    @app_commands.choices(service=_SERVICE_CHOICES)
+    @admin_only()
+    async def proxy_clear(
+        self,
+        interaction: discord.Interaction,
+        service: app_commands.Choice[str] | None = None,
+    ) -> None:
+        from core import proxy
+
+        picked = service.value if service else ""
+        key = f"proxy_{picked}" if picked else "proxy_all"
+        where = service.name if picked else "全体"
+        await settings.set_value(key, "", updated_by=interaction.user.id)
+        if picked == "paypay":
+            # 古い名前で入っている分も消す（残っていると効き続ける）
+            await settings.set_value(
+                "paypay_proxy", "", updated_by=interaction.user.id
+            )
+
+        after = proxy.for_service(picked) if picked else proxy.global_proxy()
+        body = f"{where}のプロキシ設定を解除しました。\n"
+        if after:
+            body += (
+                f"{E.INFO} 解除後は **{proxy.mask(after)}** が使われます"
+                f"（{proxy.source_of(picked)}）。"
+            )
+        else:
+            body += f"{E.INFO} これでプロキシを通さず、そのまま通信します。"
+        await interaction.response.send_message(
+            embed=embeds.ok(body), ephemeral=True
+        )
+
+    @proxy_group.command(
+        name="test", description="実際に通信して、外から見えるIPを確認します"
+    )
+    @admin_only()
+    async def proxy_test(self, interaction: discord.Interaction) -> None:
+        """
+        ⚠️ 「設定したつもりで素のIPから出ていた」を見つけるための機能。
+           サービスごとに別々に試すこと（設定が分かれていることがある）。
+        """
+        import asyncio
+
+        from core import proxy
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        targets = [("直接（プロキシなし）", "")]
+        seen: set[str] = {""}
+        for key, name in proxy.SERVICES.items():
+            url = proxy.for_service(key) or ""
+            if url in seen:
+                continue
+            seen.add(url)
+            targets.append((f"{name}（{proxy.mask(url)}）", url))
+
+        results = await asyncio.gather(
+            *(proxy.check(url) for _, url in targets),
+            return_exceptions=True,
+        )
+
+        lines = []
+        for (label, _), res in zip(targets, results):
+            if isinstance(res, BaseException):
+                lines.append(f"{E.NG} **{label}**　{type(res).__name__}")
+                continue
+            ok, detail = res
+            lines.append(
+                f"{E.OK} **{label}**　{detail}" if ok
+                else f"{E.NG} **{label}**　{detail}"
+            )
+
+        body = "\n".join(lines)
+        body += (
+            f"\n\n{E.INFO} 表示しているのは、相手側から見えるIPです。\n"
+            f"{E.WARN} マクドナルドと PayPay は**日本国内から**でないと"
+            "使えません。日本のIPになっているかをご確認ください。"
+        )
+        if len(targets) == 1:
+            body += (
+                f"\n{E.INFO} プロキシは設定されていません"
+                "（`/proxy set` で設定できます）。"
+            )
+        await interaction.followup.send(
+            embed=embeds.info(body, title="プロキシの確認"), ephemeral=True
         )
 
     async def cog_app_command_error(
