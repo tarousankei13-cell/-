@@ -76,7 +76,8 @@ def main():
     print("\n── ② 選択枠の中間ノード ──")
     menu = parse_menu("13934", json.load(open(f"{HERE}/m13934.json")))
     known = slot_bridge.all_known()
-    check("実データで分かっているのは1本だけ", list(known) == ["9997918"], known)
+    check("実データで分かっているのは2本", sorted(known) == ["9997918", "9997925"],
+          known)
 
     def slot_of(code, slot_code):
         p = menu.products[code]
@@ -86,8 +87,11 @@ def main():
     check("通常セットのドリンク枠（実データ）", menu.bridge_for(drink) == "9997914")
 
     p2, drink2 = slot_of("9030", "9997925")
-    check("朝マックのドリンク枠にも付く ★", menu.bridge_for(drink2) == "9997914",
+    check("朝マックのドリンク枠（実データ）★", menu.bridge_for(drink2) == "9997922",
           menu.bridge_for(drink2))
+    check("値に規則は無い（推測で埋めない）★",
+          menu.bridge_for(drink) != menu.bridge_for(drink2),
+          (menu.bridge_for(drink), menu.bridge_for(drink2)))
     p3, side = slot_of("9030", "9987010")
     check("サイド枠には付けない ★（中間ノードの要らない形）",
           menu.bridge_for(side) == "", menu.bridge_for(side))
@@ -108,7 +112,7 @@ def main():
         if drinks:
             inner = drinks[0].components
             check(f"{name}: 中間ノードが入っている ★",
-                  len(inner) == 1 and inner[0].product_code == "9997914",
+                  len(inner) == 1 and inner[0].product_code == "9997922",
                   shape(drinks[0]))
             check(f"{name}: その下に商品がある ★",
                   bool(inner and inner[0].components), shape(drinks[0]))
@@ -125,6 +129,61 @@ def main():
     drink = next(c for c in item.components if c.product_code == "9997918")
     check("通常セットのドリンクはこれまでどおり",
           shape(drink)[2][0][0] == "9997914", shape(drink))
+
+    print("\n── ③ 実物の注文コードと突き合わせる ★ ──")
+    # mcdon.asia で公式画面から取った本物。これと1バイトでも違えば、
+    # こちらの組み立て方が間違っている。
+    from services.mcd.protocol import (
+        build_item, decode_hex, pb_msg, proto_parse,
+    )
+
+    REAL_SET = (
+        "0a0531333933341a6b2a690a2168747470733a2f2f6d63646f6e2e617369612f6d6f70"
+        "2f31333933342f61757468122168747470733a2f2f6d63646f6e2e617369612f6d6f70"
+        "2f31333933342f617574681a2168747470733a2f2f6d63646f6e2e617369612f6d6f70"
+        "2f31333933342f617574683a020a00424e124c120439303330180120a8052a17080112"
+        "073939383730313018012a0812043530313018012a260801120739393937393235180"
+        "12a17080112073939393739323218012a081204333137301801"
+    )
+    REAL_X3 = (
+        "0a0531333933341a6b2a690a2168747470733a2f2f6d63646f6e2e617369612f6d6f70"
+        "2f31333933342f61757468122168747470733a2f2f6d63646f6e2e617369612f6d6f70"
+        "2f31333933342f617574681a2168747470733a2f2f6d63646f6e2e617369612f6d6f70"
+        "2f31333933342f617574683a020a00420d120b120432303831180320b602"
+    )
+
+    def items_hex(h):
+        raw = bytes.fromhex(h)
+        return next(v for v in proto_parse(raw).get(8, []) if isinstance(v, bytes)).hex()
+
+    for label, h in (("朝マックのセット", REAL_SET), ("同じ商品×3", REAL_X3)):
+        dec = decode_hex(h)
+        mine = b"".join(
+            pb_msg(2, build_item(i, top_level=True)) for i in dec.items
+        ).hex()
+        check(f"{label}: 読んで組み直すと1バイトも変わらない ★",
+              mine == items_hex(h), (mine[:80], items_hex(h)[:80]))
+
+    real_set = decode_hex(REAL_SET).items[0]
+    check("実物の構造: セット → 枠 → 中間 → 商品 ★",
+          shape(real_set) == ("9030", 1, [
+              ("9987010", 1, [("5010", 1, [])]),
+              ("9997925", 1, [("9997922", 1, [("3170", 1, [])])]),
+          ]), shape(real_set))
+
+    prod = menu.products["9030"]
+    mine = build_order_item(cart, prod, {"9987010": "5010", "9997925": "3170"})
+    check("カートから組み立てた形が実物と同じ ★", shape(mine) == shape(real_set),
+          (shape(mine), shape(real_set)))
+    check("金額も同じ（¥680）★", mine.amount == real_set.amount == 680,
+          (mine.amount, real_set.amount))
+
+    real_x3 = decode_hex(REAL_X3).items[0]
+    check("実物も数量で表す（×3）★", shape(real_x3) == ("2081", 3, []),
+          shape(real_x3))
+    check("金額欄は **単価** ★（合計ではない）",
+          real_x3.amount == menu.products["2081"].price_for("takeOut") == 310,
+          (real_x3.amount, menu.products["2081"].price_for("takeOut")))
 
     print(f"\n{'='*52}\n  成功 {ok} / 失敗 {fail}\n{'='*52}")
     return 1 if fail else 0
