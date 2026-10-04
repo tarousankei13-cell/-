@@ -176,7 +176,14 @@ async def fetch_store(
 
 
 def _entry(data: dict, group: str, etag: str) -> dict:
-    return {
+    """
+    索引に残す1店舗ぶん。
+
+    ⚠️ 緯度経度は **すでに取ってきている** データ。残すだけなので
+       通信は1回も増えない。近くの店舗を探すのに使う。
+       （以前は捨てていたため、非対応店に当たると行き止まりだった）
+    """
+    out = {
         "n": data.get("name", ""),
         "a": data.get("address", ""),
         "g": group,
@@ -184,6 +191,12 @@ def _entry(data: dict, group: str, etag: str) -> dict:
         "e": etag,
         "c": _now(),
     }
+    lat, lon = data.get("latitude"), data.get("longitude")
+    if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+        # 小数4桁あれば約11m。それ以上は索引を太らせるだけ。
+        out["lat"] = round(float(lat), 4)
+        out["lon"] = round(float(lon), 4)
+    return out
 
 
 async def sync(

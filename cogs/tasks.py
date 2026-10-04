@@ -221,6 +221,33 @@ class TasksCog(commands.Cog):
                 kind="menu_updates",
             )
 
+        # ⚠️ 利用者向けは別物。店舗ごとではなく全店まとめて、
+        #    「何が増えた・値段が変わった・終わった」だけを伝える。
+        await self._tell_menu_news(diffs)
+
+    async def _tell_menu_news(self, diffs: dict) -> None:
+        """価格改定や新商品を、利用者チャンネルへお知らせする。"""
+        channel_id = settings.get("channel_menu_news")
+        if not channel_id:
+            return
+        text = jobs.format_menu_news(diffs)
+        if not text:
+            return
+        channel = self.bot.get_channel(int(channel_id))
+        if channel is None:
+            return
+        try:
+            await channel.send(
+                embed=discord.Embed(
+                    title=f"{E.BURGER} メニューが変わりました",
+                    description=text[:4000],
+                    color=embeds.GREEN,
+                    timestamp=config.now_jst(),
+                )
+            )
+        except discord.HTTPException:
+            log.exception("メニューのお知らせを投稿できませんでした")
+
     @menu_sync.before_loop
     async def before_menu_sync(self) -> None:
         await self._wait_ready()
@@ -352,6 +379,64 @@ class TasksCog(commands.Cog):
     async def before_token_warm(self) -> None:
         await self._wait_ready()
 
+    # -- できあがり通知 -----------------------------------------
+
+    @tasks.loop(seconds=config.READY_POLL_SECONDS)
+    async def ready_watch(self) -> None:
+        """
+        注文のできあがりを見張る。
+
+        ⚠️ 既定では無効。有効にすると、見張っている注文の数だけ
+           マクドナルドへの問い合わせが増える。
+        """
+        if not self._started:
+            return
+        from services import order_watch
+
+        if not order_watch.enabled():
+            return
+        interval = order_watch.poll_seconds()
+        if self.ready_watch.seconds != interval:
+            self.ready_watch.change_interval(seconds=interval)
+        try:
+            done = await order_watch.sweep()
+        except Exception:
+            log.exception("できあがりの確認に失敗しました")
+            return
+        for ready in done:
+            await self._tell_ready(ready)
+
+    async def _tell_ready(self, ready) -> None:
+        """できあがりを本人へDMで知らせる。届かなくても構わない。"""
+        try:
+            user = self.bot.get_user(ready.discord_id) or await self.bot.fetch_user(
+                ready.discord_id
+            )
+            e = discord.Embed(
+                title=f"{E.BELL} ご注文の品ができあがりました",
+                color=embeds.GREEN,
+            )
+            if ready.receipt_number:
+                e.add_field(
+                    name=f"{E.RECEIPT} 注文番号",
+                    value=f"**{ready.receipt_number}**", inline=True,
+                )
+            if ready.buzzer_number:
+                e.add_field(
+                    name=f"{E.BELL} 呼び出し番号",
+                    value=f"**{ready.buzzer_number}**", inline=True,
+                )
+            if ready.store_name:
+                e.add_field(name=f"{E.STORE} 店舗", value=ready.store_name, inline=True)
+            e.set_footer(text="カウンターでお受け取りください")
+            await user.send(embed=e)
+        except (discord.HTTPException, AttributeError):
+            log.info("できあがりをDMできませんでした（%s）", ready.discord_id)
+
+    @ready_watch.before_loop
+    async def before_ready_watch(self) -> None:
+        await self._wait_ready()
+
     # -- 毎時の点検 ---------------------------------------------
 
     @tasks.loop(hours=1)
@@ -372,6 +457,45 @@ class TasksCog(commands.Cog):
                     color=embeds.RED,
                 )
             )
+
+        # 入金の照合（Kyash側の履歴と、こちらの記録を突き合わせる）
+        # ⚠️ 読むだけ。見つけても自動では直さない。
+        #    お金の帳尻を機械が勝手に合わせるのが一番危ない。
+        if now.hour == 9:
+            try:
+                from services.kyash import reconcile
+
+                rep = await reconcile.check(days=1)
+            except Exception:
+                log.exception("入金の照合に失敗しました")
+            else:
+                if not rep.clean or rep.errors:
+                    lines = [rep.summary()]
+                    for label, rows in (
+                        ("記帳もれ（受け取ったのに残高に入っていない）", rep.missing_here),
+                        ("入金が見つからない（記帳したのに履歴に無い）", rep.missing_there),
+                        ("途中で止まっている", rep.stuck),
+                    ):
+                        if not rows:
+                            continue
+                        detail = "\n".join(
+                            f"　口座#{r.get('account_id')} "
+                            f"{embeds.yen(int(r.get('amount') or 0))}"
+                            + (f"（{r.get('status')}）" if r.get("status") else "")
+                            for r in rows[:5]
+                        )
+                        more = f"\n　ほか {len(rows) - 5} 件" if len(rows) > 5 else ""
+                        lines.append(f"**{label}**\n{detail}{more}")
+                    if rep.errors:
+                        lines.append("**照合できなかった口座**\n　" + "\n　".join(rep.errors[:3]))
+                    await self.notify_admin(
+                        discord.Embed(
+                            title=f"{E.WARN} 入金の照合で食い違いがありました",
+                            description="\n\n".join(lines)[:4000],
+                            color=embeds.ORANGE,
+                        ),
+                        kind="reconcile",
+                    )
 
         # Kyash トークンの期限
         warnings = await jobs.kyash_token_warnings()

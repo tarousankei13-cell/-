@@ -322,6 +322,80 @@ class AdminCog(commands.Cog):
             discord_id=user.id,
         )
 
+    @admin.command(
+        name="refund", description="実際にお金をお返しします（送金リンクを作ります）"
+    )
+    @app_commands.describe(
+        user="お返しする相手", amount="返金額（円）", reason="理由（記録に残ります）",
+    )
+    @admin_only()
+    async def refund(
+        self, interaction: discord.Interaction, user: discord.User,
+        amount: app_commands.Range[int, 1, 1000000], reason: str = "",
+    ) -> None:
+        """
+        ⚠️ 残高を戻すだけの `/admin grant` とは別物。
+           ここは **実際に Kyash からお金が出ていく**。
+        """
+        from services.kyash import refund as refund_svc
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            made = await refund_svc.send(
+                user.id, int(amount), reason=reason,
+                requested_by=interaction.user.id,
+            )
+        except refund_svc.RefundError as e:
+            await interaction.followup.send(embed=embeds.warn(str(e)), ephemeral=True)
+            return
+        except Exception:
+            log.exception("返金に失敗しました")
+            await interaction.followup.send(
+                embed=embeds.error(
+                    "返金に失敗しました。残高は元に戻しています。\n"
+                    "ログをご確認ください。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await audit.record(
+            actor_id=interaction.user.id, actor_name=str(interaction.user),
+            action="refund.send", target=str(user.id),
+            reason=reason or None,
+            detail={"金額": amount, "返金ID": made.id},
+        )
+
+        # ⚠️ リンクは本人にだけ渡す。公開の場に出すと誰でも受け取れてしまう。
+        sent = False
+        try:
+            await user.send(
+                embed=embeds.ok(
+                    f"**{embeds.yen(int(amount))}** をお返しします。\n"
+                    f"下のリンクを開いてお受け取りください。\n\n{made.link_url}"
+                    + (f"\n\n理由: {reason}" if reason else ""),
+                    title=f"{E.YEN} 返金のご案内",
+                )
+            )
+            sent = True
+        except (discord.HTTPException, AttributeError):
+            log.info("返金リンクをDMできませんでした（%s）", user.id)
+
+        await interaction.followup.send(
+            embed=embeds.ok(
+                f"{user.mention} へ **{embeds.yen(int(amount))}** の返金リンクを作りました。\n"
+                + (
+                    f"{E.OK} 本人へDMでお送りしました。"
+                    if sent else
+                    f"{E.WARN} DMを送れませんでした。下のリンクをご本人へお渡しください。\n"
+                    f"{made.link_url}"
+                )
+                + f"\n\n{E.INFO} 残高からは引き済みです。"
+                "リンクを開くまで受け取りは完了しません。"
+            ),
+            ephemeral=True,
+        )
+
     @admin.command(name="ban", description="利用者の利用を停止します")
     @admin_only()
     async def ban(self, interaction: discord.Interaction, user: discord.User, reason: str = "") -> None:

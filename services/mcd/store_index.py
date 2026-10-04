@@ -46,6 +46,12 @@ class StoreEntry:
     address: str
     group: str = ""
     mop_enabled: bool = True
+    lat: float | None = None
+    lon: float | None = None
+
+    @property
+    def located(self) -> bool:
+        return self.lat is not None and self.lon is not None
 
     @property
     def label(self) -> str:
@@ -142,6 +148,8 @@ class StoreIndex:
                 address=d.get("a") or d.get("address") or "",
                 group=d.get("g") or d.get("group") or "",
                 mop_enabled=bool(d.get("mop", True)),
+                lat=d.get("lat"),
+                lon=d.get("lon"),
             )
             if not entry.name:
                 continue
@@ -154,6 +162,10 @@ class StoreIndex:
         self._norm_name, self._norm_addr = norm_name, norm_addr
         log.info("店舗インデックスを読み込みました: %d 店舗", len(self._entries))
         return len(self._entries)
+
+    def entries(self) -> list[StoreEntry]:
+        """読み込んである全店舗。"""
+        return self._entries
 
     def get(self, store_id: str) -> StoreEntry | None:
         """
@@ -223,6 +235,54 @@ def load_index(path: Path | None = None) -> int:
 
 def get_index() -> StoreIndex:
     return _index
+
+
+def distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    2地点の距離（km）。
+
+    地球を半径6371kmの球とみなす（ヒュベニの簡易版）。
+    数十km程度までの「近い順」を出すには十分で、
+    外部の地図サービスに問い合わせる必要がない。
+    """
+    import math
+
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dp / 2) ** 2
+        + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    )
+    return 2 * r * math.asin(min(1.0, math.sqrt(a)))
+
+
+def nearby(
+    store_id: str, limit: int = 5, *, mop_only: bool = True,
+    max_km: float = 30.0,
+) -> list[tuple[StoreEntry, float]]:
+    """
+    その店舗の近くにある店舗を、近い順に (店舗, 距離km) で返す。
+
+    ⚠️ 位置を持っていない店舗は飛ばす。索引が古いと位置が無いので、
+       その場合は空になる（間違った距離を出すよりよい）。
+    """
+    idx = get_index()
+    me = idx.get(str(store_id))
+    if me is None or not me.located:
+        return []
+    out = []
+    for entry in idx.entries():
+        if entry.store_id == me.store_id or not entry.located:
+            continue
+        if mop_only and not entry.mop_enabled:
+            continue
+        km = distance_km(me.lat, me.lon, entry.lat, entry.lon)
+        if km <= max_km:
+            out.append((entry, km))
+    out.sort(key=lambda x: x[1])
+    return out[:limit]
 
 
 def search(query: str, limit: int = 25) -> list[StoreEntry]:

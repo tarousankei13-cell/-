@@ -504,8 +504,19 @@ async def open_menu(
     # 選び終えてから断られるのが一番つらいので、理由まで説明する。
     av = await availability.check_store(store_id)
     if not av.orderable:
+        # ⚠️ 行き止まりにしない。近くの注文できる店舗まで出す。
+        #    「別の店舗をお選びください」とだけ言われても、
+        #    利用者はどこを選べばよいか分からない。
+        e = embeds.store_unavailable(info.name, store_id, av)
+        near = nearby_lines(store_id)
+        if near:
+            e.add_field(
+                name=f"{E.PIN} 近くでご注文いただける店舗",
+                value="\n".join(near),
+                inline=False,
+            )
         await interaction.followup.send(
-            embed=embeds.store_unavailable(info.name, store_id, av),
+            embed=e,
             view=StoreSelectView(interaction.user.id, purpose),
             ephemeral=True,
         )
@@ -2264,6 +2275,27 @@ def cart_lines(
         lines.append(f"**{idx}.** {name}{note}{qty}　{money}")
         lines += cart_item_lines(menu, g.item, pickup)
     return lines
+
+
+def nearby_lines(store_id: str, limit: int = 3) -> list[str]:
+    """
+    近くの注文できる店舗を、画面に出せる形で返す。
+
+    ⚠️ 索引に位置が入っていなければ空を返す（古い索引のとき）。
+       間違った距離を出すより、何も出さないほうがよい。
+    """
+    from services.mcd import store_index
+
+    try:
+        found = store_index.nearby(store_id, limit=limit)
+    except Exception:
+        log.exception("近くの店舗を探せませんでした")
+        return []
+    out = []
+    for entry, km in found:
+        far = f"{km:.1f}km" if km >= 1 else f"{int(km * 1000)}m"
+        out.append(f"・**{entry.name}**（`{entry.store_id}`）　約 {far}")
+    return out
 
 
 async def _add_to_cart(

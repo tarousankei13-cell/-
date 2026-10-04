@@ -483,6 +483,97 @@ class ConfigCog(commands.Cog):
             embed=embeds.ok(body), ephemeral=True
         )
 
+    @group.command(
+        name="ready_notify", description="できあがりをDMで知らせるかを設定します"
+    )
+    @app_commands.describe(
+        enabled="知らせるか",
+        minutes="注文後、何分まで見張るか",
+        seconds="問い合わせの間隔（秒）",
+    )
+    @admin_only()
+    async def ready_notify_cmd(
+        self, interaction: discord.Interaction, enabled: bool,
+        minutes: app_commands.Range[int, 1, 180] | None = None,
+        seconds: app_commands.Range[int, 15, 600] | None = None,
+    ) -> None:
+        """
+        ⚠️ 有効にすると、見張っている注文の数だけマクドナルドへの
+           問い合わせが増える。アカウントの負担になるので間隔に注意。
+        """
+        from services import order_watch
+
+        if minutes is not None:
+            await settings.set_value("ready_watch_minutes", int(minutes),
+                                     updated_by=interaction.user.id)
+        if seconds is not None:
+            await settings.set_value("ready_poll_seconds", int(seconds),
+                                     updated_by=interaction.user.id)
+        await settings.set_value("ready_notify", bool(enabled),
+                                 updated_by=interaction.user.id)
+        m, sec = order_watch.watch_minutes(), order_watch.poll_seconds()
+        if enabled:
+            per = (m * 60) // sec
+            body = (
+                f"できあがりをDMでお知らせします。\n\n"
+                f"{E.LOADING} 注文後 **{m}分** まで、**{sec}秒** ごとに確認\n"
+                f"{E.WARN} 1件の注文につき最大 **{per}回** の問い合わせが増えます。\n"
+                f"{E.INFO} 同時に見張るのは {config.READY_MAX_WATCHED} 件までです。\n"
+                f"{E.INFO} 呼び出し番号が出たらそれを、出なければ相手の状態が"
+                "変わった時点でお知らせします。"
+            )
+        else:
+            body = "できあがりのお知らせを止めました。"
+        await interaction.response.send_message(embed=embeds.ok(body), ephemeral=True)
+
+    @group.command(
+        name="menu_news", description="新商品・価格改定を知らせるチャンネル"
+    )
+    @admin_only()
+    async def menu_news_cmd(
+        self, interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        await settings.set_value(
+            "channel_menu_news", channel.id if channel else None,
+            updated_by=interaction.user.id,
+        )
+        await interaction.response.send_message(
+            embed=embeds.ok(
+                f"新商品・価格改定を {channel.mention} にお知らせします。\n"
+                f"{E.INFO} 店舗ごとではなく、全店まとめた内容を出します。"
+                if channel else "メニューのお知らせを止めました。"
+            ),
+            ephemeral=True,
+        )
+
+    @group.command(name="refund", description="返金（実際に送金）の設定")
+    @app_commands.describe(enabled="返金を使えるようにするか", maximum="1回の上限(円)")
+    @admin_only()
+    async def refund_cmd(
+        self, interaction: discord.Interaction, enabled: bool,
+        maximum: app_commands.Range[int, 1, 1000000] | None = None,
+    ) -> None:
+        """⚠️ 有効にすると、実際に Kyash からお金が出ていくようになる。"""
+        from services.kyash import refund as refund_svc
+
+        if maximum is not None:
+            await settings.set_value("refund_max", int(maximum),
+                                     updated_by=interaction.user.id)
+        await settings.set_value("refund_enabled", bool(enabled),
+                                 updated_by=interaction.user.id)
+        if enabled:
+            body = (
+                f"{E.WARN} **返金を有効にしました。実際にお金が出ていきます。**\n\n"
+                f"{E.YEN} 1回の上限　**{embeds.yen(refund_svc.max_amount())}**\n"
+                f"{E.INFO} `/admin refund` で返金できます。\n"
+                f"{E.INFO} 先に残高を引いてから送金リンクを作ります。"
+                "作れなかったときは残高を戻します。"
+            )
+        else:
+            body = "返金を無効にしました。"
+        await interaction.response.send_message(embed=embeds.ok(body), ephemeral=True)
+
     @group.command(name="order_limit", description="1注文あたりの上限金額を設定します")
     @app_commands.describe(maximum="上限(円)。0で無制限")
     @admin_only()

@@ -342,6 +342,14 @@ class Order(Base):
     # ⚠️ 注文番号そのものをURLにしてはいけない。4桁しかないので、
     #    順に試すだけで他人の注文が覗けてしまう。
     view_token: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    # ---- できあがり通知 ----
+    # ⚠️ 相手の状態値（status）の意味は分かっていない。注文が済んだ時点の
+    #    値を控えておき、**変わったら**できあがりとみなす。
+    #    ブザー番号が出たら、そちらのほうが確かな合図。
+    last_status: Mapped[int | None] = mapped_column(Integer)
+    buzzer_number: Mapped[int | None] = mapped_column(Integer)
+    ready_notified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     hold_tx_id: Mapped[str | None] = mapped_column(String(36))
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -488,6 +496,36 @@ class InvitePayout(Base):
     # この発火を満たした時点の達成人数（あとから検算できるように）
     reached: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Refund(Base):
+    """
+    実際にお金をお返しした記録。
+
+    ⚠️ 残高を戻すだけの「取り消し」とは別物。ここに載るのは
+       **Kyash で現金が出ていった** ものだけ。
+       同じ申請で二度送らないよう、申請IDを主キーにする。
+    """
+    __tablename__ = "refunds"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    discord_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    # 作った送金リンク（利用者がこれを開いて受け取る）
+    link_url: Mapped[str | None] = mapped_column(String(255))
+    link_uuid: Mapped[str | None] = mapped_column(String(64), unique=True)
+    kyash_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("kyash_accounts.id")
+    )
+    # PENDING（作成済み・未受取）/ DONE（受取済み）/ CANCELLED / FAILED
+    status: Mapped[str] = mapped_column(String(16), default="PENDING", nullable=False)
+    requested_by: Mapped[int | None] = mapped_column(BigInteger)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
 
 
 class MenuProduct(Base):

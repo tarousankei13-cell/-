@@ -34,6 +34,9 @@ COVERAGE = {
     "元帳の整合性":                "hourly_checks",
     "日次・月次リセット":          "hourly_checks",
     "不正利用の見張り":            "hourly_checks",
+    "できあがり通知":              "ready_watch",
+    "入金の照合（Kyash）":         "hourly_checks",
+    "新商品・価格改定のお知らせ":  "menu_sync",
 }
 
 
@@ -76,11 +79,15 @@ async def main():
     check("全部止まる ★", not left, sorted(left))
 
     print("\n── 間隔が妥当か ──")
+    # ⚠️ できあがり通知だけは1分より短くてよい。注文直後の数十分しか
+    #    動かず、機能が無効なら毎回すぐ戻る（通信もしない）。
+    FAST_OK = {"ready_watch"}
     for loop in cog._loops():
         name = loop.coro.__name__
         secs = (loop.seconds or 0) + (loop.minutes or 0) * 60 + (loop.hours or 0) * 3600
-        reasonable = 60 <= secs <= 24 * 3600
-        check(f"{name} は {secs/60:.0f}分ごと", reasonable, secs)
+        low = 15 if name in FAST_OK else 60
+        reasonable = low <= secs <= 24 * 3600
+        check(f"{name} は {secs:.0f}秒ごと", reasonable, secs)
 
     print("\n── 準備完了を待つか（待たないと静かに死ぬ）──")
     for loop in cog._loops():
@@ -105,6 +112,15 @@ async def main():
           callable(getattr(kyash_accounts, "report_success_healthcheck", None)))
     check("Kyashの期限通知がある",
           callable(getattr(jobs, "kyash_token_warnings", None)))
+    from services import order_watch
+    from services.kyash import reconcile, refund
+    check("できあがりの確認がある ★", callable(getattr(order_watch, "sweep", None)))
+    check("入金の照合がある ★", callable(getattr(reconcile, "check", None)))
+    check("返金がある ★", callable(getattr(refund, "send", None)))
+    check("利用者向けのメニュー告知がある ★",
+          callable(getattr(jobs, "format_menu_news", None)))
+    check("できあがり通知は既定で無効 ★", not order_watch.enabled())
+    check("返金は既定で無効 ★", not refund.enabled())
 
     print("\n── 名前解決の控えが対象を網羅しているか ──")
     from core import dns

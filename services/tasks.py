@@ -93,6 +93,56 @@ def format_menu_diff(store_id: str, store_name: str, diff: MenuDiff) -> str | No
     return "\n".join(lines)
 
 
+def format_menu_news(diffs: dict, *, min_stores: int = 1) -> str | None:
+    """
+    利用者向けのお知らせ。変更がなければ None。
+
+    ⚠️ 管理者向け（format_menu_diff）とは作りが違う。
+       あちらは店舗ごとに出すが、利用者には **全店まとめて**
+       「何が増えた・終わった・いくらになった」だけを伝える。
+       同じ新商品が300店舗ぶん並んでも読めないため、商品名で束ねる。
+
+    ⚠️ 1店舗だけの変更は出さないようにもできる（min_stores）。
+       改装中の1店だけ品切れ、といったものを全体のお知らせにしない。
+    """
+    added: dict[str, set] = {}
+    removed: dict[str, set] = {}
+    priced: dict[tuple[str, int, int], set] = {}
+
+    for store_id, diff in (diffs or {}).items():
+        for _code, name in getattr(diff, "added", []) or []:
+            added.setdefault(name, set()).add(store_id)
+        for _code, name in getattr(diff, "removed", []) or []:
+            removed.setdefault(name, set()).add(store_id)
+        for _code, name, old_p, new_p in getattr(diff, "price_changed", []) or []:
+            priced.setdefault((name, int(old_p), int(new_p)), set()).add(store_id)
+
+    def keep(d):
+        return {k: v for k, v in d.items() if len(v) >= min_stores}
+
+    added, removed, priced = keep(added), keep(removed), keep(priced)
+    if not (added or removed or priced):
+        return None
+
+    lines = []
+    if added:
+        names = "\n".join(f"・{n}" for n in sorted(added)[:10])
+        more = f"\n　ほか {len(added) - 10} 品" if len(added) > 10 else ""
+        lines.append(f"**新しく登場しました**\n{names}{more}")
+    if priced:
+        rows = []
+        for (name, old_p, new_p) in sorted(priced)[:10]:
+            arrow = "↑" if new_p > old_p else "↓"
+            rows.append(f"・{name}　¥{old_p:,} → **¥{new_p:,}** {arrow}")
+        more = f"\n　ほか {len(priced) - 10} 品" if len(priced) > 10 else ""
+        lines.append("**お値段が変わりました**\n" + "\n".join(rows) + more)
+    if removed:
+        names = "\n".join(f"・{n}" for n in sorted(removed)[:10])
+        more = f"\n　ほか {len(removed) - 10} 品" if len(removed) > 10 else ""
+        lines.append(f"**販売を終了しました**\n{names}{more}")
+    return "\n\n".join(lines)
+
+
 # ============================================================
 #  トークンの事前更新
 # ============================================================
