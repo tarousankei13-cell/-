@@ -615,7 +615,7 @@ class TasksCog(commands.Cog):
         if hours <= 0 or not verify.enabled() or verify.role_id() is None:
             return 0
 
-        from datetime import datetime, timedelta, timezone
+        from datetime import timedelta
 
         cut = datetime.now(timezone.utc) - timedelta(hours=hours)
         done = 0

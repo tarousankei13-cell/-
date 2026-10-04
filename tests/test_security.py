@@ -1,5 +1,5 @@
 """安全性の検証 — 認証情報の扱いと権限チェックが崩れていないか"""
-import re, sys, os, pathlib
+import os, pathlib, re, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 ok = fail = 0
@@ -104,6 +104,65 @@ tok = re.search(r'^DISCORD_TOKEN = "(.*)"', main, re.M)
 key = re.search(r'^ENCRYPTION_KEY = "(.*)"', main, re.M)
 check("DISCORD_TOKEN が空", tok and tok.group(1) == "", tok.group(1)[:12] if tok else "?")
 check("ENCRYPTION_KEY が空", key and key.group(1) == "", key.group(1)[:12] if key else "?")
+
+print("\n[8] コマンドの入力と、Discord の上限")
+# ⚠️ 自由入力に上限が無いと、長文を入れられたときに埋め込みの
+#    題名（256）・説明（4096）・フィールド（1024）を超え、
+#    送信が400で失敗する。入口で止めるのが一番確実。
+import asyncio, glob
+
+import discord
+
+os.environ.setdefault("DISCORD_TOKEN", "x" * 59)
+sys.path.insert(0, str(ROOT))
+import main as _main
+
+_bot = _main.McdBot()
+no_cap, no_desc, long_desc, too_many = [], [], [], []
+
+
+def _walk(cmd, path=""):
+    full = f"{path}/{cmd.name}"
+    if len(getattr(cmd, "description", "") or "") > 100:
+        long_desc.append(full)
+    kids = getattr(cmd, "commands", None)
+    if kids:
+        if len(kids) > 25:
+            too_many.append(f"{full}（{len(kids)}）")
+        for k in kids:
+            _walk(k, full)
+        return
+    for prm in (getattr(cmd, "parameters", []) or []):
+        d = prm.description or ""
+        # discord.py は説明が無いと "…" を自動で入れる。利用者には
+        # 何の引数か分からないので、これも「無い」として扱う。
+        if not d or d == "…":
+            no_desc.append(f"{full}.{prm.name}")
+        if len(d) > 100:
+            long_desc.append(f"{full}.{prm.name}")
+        if (prm.type is discord.AppCommandOptionType.string
+                and not prm.choices and not prm.max_value):
+            no_cap.append(f"{full}.{prm.name}")
+
+
+async def _load():
+    for f in sorted(glob.glob(str(ROOT / "cogs" / "*.py"))):
+        n = os.path.basename(f)[:-3]
+        if not n.startswith("_"):
+            await _bot.load_extension(f"cogs.{n}")
+    for c in _bot.tree.get_commands():
+        _walk(c)
+
+
+asyncio.run(_load())
+check("自由入力の文字列すべてに長さの上限がある", not no_cap,
+      "\n".join(f"      {x}" for x in no_cap))
+check("すべての引数に説明がある", not no_desc,
+      "\n".join(f"      {x}" for x in no_desc))
+check("説明が100文字を超えていない", not long_desc,
+      "\n".join(f"      {x}" for x in long_desc))
+check("サブコマンドが25個を超えていない", not too_many,
+      "\n".join(f"      {x}" for x in too_many))
 
 print(f"\n{'='*46}\n  成功 {ok} / 失敗 {fail}\n{'='*46}")
 sys.exit(1 if fail else 0)

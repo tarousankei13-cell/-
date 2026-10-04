@@ -84,13 +84,19 @@ async def notify(
         return False
     from ui import embeds
 
+    # ⚠️ 理由はコマンドの自由入力。Discord の説明欄は4096文字までなので、
+    #    そのまま入れると送信が400で失敗し、「DMが届かない人」と
+    #    区別できなくなる（本当はこちらの作りの問題なのに）。
+    reason = str(reason or "")
+    if len(reason) > 1500:
+        reason = reason[:1497] + "…"
     body = (
-        f"**{guild_name}** での対応をお知らせします。\n\n"
-        f"**内容**　{action}\n"
+        f"**{guild_name[:100]}** での対応をお知らせします。\n\n"
+        f"**内容**　{str(action)[:200]}\n"
         f"**理由**　{reason or '（記載なし）'}"
     )
     if extra:
-        body += f"\n\n{extra}"
+        body += f"\n\n{extra[:500]}"
     try:
         await user.send(embed=embeds.warn(body, title="サーバーからのお知らせ"))
         return True
@@ -292,23 +298,54 @@ async def purge(
     if count > cap:
         raise ModError(f"一度に消せるのは {cap} 件までです。")
 
-    def pick(m: discord.Message) -> bool:
-        return user is None or m.author.id == user.id
-
+    # ⚠️ channel.purge() を使わない。理由が2つある。
+    #
+    #   ① purge に after= を渡すと、履歴の読み出しが**古い順**になる
+    #      （discord.py は after が指定されると oldest_first を True にする）。
+    #      「直近10件を消す」つもりが「14日前の10件」を消してしまう。
+    #
+    #   ② purge(limit=N, check=f) は「N件見て、当てはまる全部」を消す。
+    #      相手を絞ったときに、指定した件数より多く消えてしまう。
+    #
+    #   そのため、新しい順に見て、消す分を**数えながら**自分で集める。
     cut = datetime.now(timezone.utc) - timedelta(days=14)
+    # 相手を絞ったときは、その人の発言を探すために多めに見る
+    scan = count if user is None else min(max(count * 10, count), 1000)
+
+    targets: list[discord.Message] = []
     try:
-        deleted = await channel.purge(
-            limit=count if user is None else max(count * 5, count),
-            check=pick, after=cut, reason=f"一括削除（{by}）",
-        )
+        async for m in channel.history(limit=scan):      # 新しい順
+            if m.created_at <= cut:
+                break           # ここから先は古すぎてまとめて消せない
+            if user is not None and m.author.id != user.id:
+                continue
+            targets.append(m)
+            if len(targets) >= count:
+                break
+    except discord.Forbidden as e:
+        raise ModError(
+            "読めませんでした。BOTに「メッセージ履歴を読む」権限が必要です。"
+        ) from e
+
+    n = 0
+    try:
+        # まとめて消せるのは1回100件まで
+        for i in range(0, len(targets), 100):
+            chunk = targets[i:i + 100]
+            if len(chunk) == 1:
+                await chunk[0].delete()
+            else:
+                await channel.delete_messages(chunk, reason=f"一括削除（{by}）")
+            n += len(chunk)
     except discord.Forbidden as e:
         raise ModError(
             "消せませんでした。BOTに「メッセージの管理」権限が必要です。"
         ) from e
     except discord.HTTPException as e:
-        raise ModError(f"消せませんでした: {e}") from e
+        if n == 0:
+            raise ModError(f"消せませんでした: {e}") from e
+        log.warning("一括削除の途中で失敗しました（%d件は消えています）: %s", n, e)
 
-    n = len(deleted)
     await audit.record(
         actor_id=by, action="mod.purge", target=str(channel.id),
         detail={"count": n, "user": user.id if user else None},

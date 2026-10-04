@@ -62,7 +62,7 @@ class ModCog(commands.Cog):
     @admin_only()
     async def warn(
         self, interaction: discord.Interaction,
-        member: discord.Member, reason: str,
+        member: discord.Member, reason: app_commands.Range[str, 1, 400],
     ) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         why = mod.can_act(interaction.user, member)
@@ -242,7 +242,8 @@ class ModCog(commands.Cog):
     @admin_only()
     async def timeout_cmd(
         self, interaction: discord.Interaction, member: discord.Member,
-        minutes: app_commands.Range[int, 1, 40320], reason: str = "",
+        minutes: app_commands.Range[int, 1, 40320],
+        reason: app_commands.Range[str, 0, 400] = "",
     ) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         why = mod.can_act(interaction.user, member)
@@ -295,7 +296,8 @@ class ModCog(commands.Cog):
     @admin_only()
     async def kick_cmd(
         self, interaction: discord.Interaction,
-        member: discord.Member, reason: str = "",
+        member: discord.Member,
+        reason: app_commands.Range[str, 0, 400] = "",
     ) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         why = mod.can_act(interaction.user, member)
@@ -333,7 +335,8 @@ class ModCog(commands.Cog):
     @admin_only()
     async def ban_cmd(
         self, interaction: discord.Interaction, member: discord.Member,
-        reason: str = "", delete_days: app_commands.Range[int, 0, 7] = 0,
+        reason: app_commands.Range[str, 0, 400] = "",
+        delete_days: app_commands.Range[int, 0, 7] = 0,
     ) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         why = mod.can_act(interaction.user, member)
@@ -369,7 +372,8 @@ class ModCog(commands.Cog):
     @app_commands.describe(user_id="解除する方のユーザーID")
     @admin_only()
     async def unban_cmd(
-        self, interaction: discord.Interaction, user_id: str,
+        self, interaction: discord.Interaction,
+        user_id: app_commands.Range[str, 1, 25],
     ) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         if not user_id.strip().isdigit():

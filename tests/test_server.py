@@ -579,6 +579,41 @@ async def main():
     check("種別が空でも既定へ落ちる ★", len(tickets.kinds()) == 4)
     await put(ticket_kinds=list(C2.TICKET_KINDS_DEFAULT))
 
+    print("\n[ 記録が Discord の上限を超えないこと ]")
+    # ⚠️ 超えると送信が400で失敗し、記録が丸ごと消える。
+    from ui import embeds as E2
+    big = E2.guard_log(
+        title="あ" * 500, color=0x3498DB,
+        lines=[(f"な{i}", "x" * 3000) for i in range(12)],
+        footer="f" * 3000,
+    )
+    d = big.to_dict()
+    total = (len(d.get("title", ""))
+             + sum(len(f["name"]) + len(f["value"]) for f in d.get("fields", []))
+             + len(d.get("footer", {}).get("text", "")))
+    check("題名は256文字まで ★", len(d["title"]) <= 256, len(d["title"]))
+    check("1つの値は1024文字まで ★",
+          max(len(f["value"]) for f in d["fields"]) <= 1024)
+    check("フィールドは25個まで ★", len(d["fields"]) <= 25, len(d["fields"]))
+    check("全体で6000文字まで ★", total <= 6000, total)
+    check("切ったことが分かる ★",
+          any("省略" in f["value"] for f in d["fields"]), d["fields"][-1])
+
+    print("\n[ 処分の連絡が長文で壊れないこと ]")
+    import discord as _d
+
+    class DMCatcher:
+        def __init__(self): self.got = []
+        async def send(self, **kw): self.got.append(kw)
+    await settings.set_value("mod_dm_on_action", True)
+    who = DMCatcher()
+    sent = await mod.notify(who, guild_name="テ" * 300,
+                            action="あ" * 300, reason="い" * 6000,
+                            extra="う" * 2000)
+    check("長文でも送れる ★", sent is True)
+    desc = str(who.got[0]["embed"].description)
+    check("説明が4096文字を超えない ★", len(desc) <= 4096, len(desc))
+
     print("\n[ 設定 ]")
     for key in ("ticket_enabled", "verify_enabled", "guard_log_channel",
                 "guard_events", "mod_warn_timeout_at", "guard_exempt_roles"):

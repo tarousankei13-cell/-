@@ -520,8 +520,12 @@ async def close_stale(bot: discord.Client) -> int:
                 f"⏰ {hours}時間お返事がなかったため、この問い合わせを"
                 "終了します。続きがあれば、またパネルからお知らせください。"
             )
-        except Exception:
-            pass
+        except Exception as e:
+            # 知らせられなくても閉じる処理は止めない。
+            # ⚠️ ただし黙って消さない。ずっと失敗していることに
+            #    気付けなくなる。
+            log.warning("チケット %s に終了のお知らせを出せませんでした: %s",
+                        t.number, e)
         try:
             await close(bot, channel, closed_by=0,
                         reason="お返事がないため自動で終了")

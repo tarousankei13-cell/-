@@ -60,6 +60,8 @@ async def main():
 
     # ── 受け付ける形 ────────────────────────────────────
     print("\n[ 設定できる形かを見る ]")
+    check("使える種類は http と https だけ ★",
+          proxy.SCHEMES == ("http", "https"), proxy.SCHEMES)
     check("http は通る", proxy.valid("http://h:8080"))
     check("https も通る", proxy.valid("https://h:8080"))
     check("空（解除）は通る", proxy.valid(""))
@@ -68,14 +70,12 @@ async def main():
     check("ただの文字列は断る", not proxy.valid("こわれています"))
     check("断る理由が日本語で返る", "ホスト名" in proxy.problem("http://"),
           proxy.problem("http://"))
-    if proxy.socks_ready():
-        check("socksio があれば socks は通る", proxy.valid("socks5://h:1080"))
-    else:
-        check("socksio が無ければ socks は断る",
-              not proxy.valid("socks5://h:1080"))
-        check("理由に入れ方が書いてある",
-              "httpx[socks]" in proxy.problem("socks5://h:1080"),
-              proxy.problem("socks5://h:1080"))
+    # ⚠️ socks は追加の部品が要るうえ Discord では使えないので、受け付けない
+    check("socks5 は断る ★", not proxy.valid("socks5://h:1080"))
+    check("socks5h も断る ★", not proxy.valid("socks5h://h:1080"))
+    check("断る理由に socks と書いてある ★",
+          "socks" in proxy.problem("socks5://h:1080"),
+          proxy.problem("socks5://h:1080"))
 
     # ── 優先順位 ────────────────────────────────────────
     print("\n[ どの設定が勝つか ]")
@@ -122,6 +122,23 @@ async def main():
     await settings.set_value("paypay_proxy", "")
     await settings.set_value("proxy_paypay", "")
 
+    # 「設定されているか」の判定（画面の出し分けに使う）
+    proxy.set_bootstrap("")
+    await settings.set_value("proxy_all", "")
+    await settings.set_value("proxy_mcd", "")
+    await settings.set_value("paypay_proxy", "")
+    await settings.set_value("proxy_paypay", "")
+    check("どこにも無ければ False ★", proxy.configured() is False)
+    await settings.set_value("proxy_kyash", "http://only:1")
+    check("どれか1つでもあれば True ★", proxy.configured() is True)
+    check("文面では判定していない ★",
+          "（全体に従う）" in [u for _, u in proxy.describe()]
+          and proxy.configured() is True)
+    await settings.set_value("proxy_kyash", "")
+    check("消せば False に戻る ★", proxy.configured() is False)
+    await settings.set_value("proxy_mcd", "http://mcd:1")
+    await settings.set_value("proxy_all", "http://all:1")
+
     # 一覧表示にパスワードが出ないこと
     await settings.set_value("proxy_all", "http://u:pw@h:1")
     shown = proxy.describe()
@@ -158,19 +175,22 @@ async def main():
     check("監査ログにパスワードは残らない", "leaked" not in blob, blob)
     await settings.set_value("proxy_kyash", "")
 
-    # ── socks を設定しても通信が死なないこと ───────────
-    print("\n[ socks を設定しても止まらない ]")
-    await settings.set_value("proxy_all", "socks5://h:1080")
-    await settings.set_value("proxy_mcd", "")
-    if proxy.socks_ready():
-        check("socksio があればそのまま使う",
-              proxy.resolve("mcd") == "socks5://h:1080")
-    else:
-        check("使えない socks は外して直接つなぐ",
+    # ── 使えない形を書かれても通信が死なないこと ───────
+    print("\n[ 使えない形を書かれても止まらない ]")
+    # ⚠️ main.py の PROXY_URL と環境変数は problem() を通らないため、
+    #    ここで弾けないと「クライアントを作る時点で落ちる」ことになる。
+    for bad in ("socks5://h:1080", "ftp://h:1", "でたらめ"):
+        await settings.set_value("proxy_all", bad)
+        await settings.set_value("proxy_mcd", "")
+        check(f"使えない形（{bad[:14]}）は外して直接つなぐ ★",
               proxy.resolve("mcd") is None, proxy.resolve("mcd"))
         c = build_async_client(timeout=1.0, service="mcd")
-        check("クライアントが作れる（通信が死なない）", c is not None)
+        check("クライアントは作れる（通信が死なない）★", c is not None)
         await c.aclose()
+    proxy.set_bootstrap("socks5://h:1080")
+    await settings.set_value("proxy_all", "")
+    check("設定欄に書かれても外す ★", proxy.resolve("mcd") is None)
+    proxy.set_bootstrap("")
 
     # ── 各通信がプロキシを引くこと ─────────────────────
     print("\n[ すべての通信が設定を見るか ]")

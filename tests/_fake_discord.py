@@ -28,8 +28,12 @@ class FakeResponse:
         self._done = True
         self.parent.actions.append((kind, kw))
 
-    async def send_message(self, content=None, *, embed=None, view=None, ephemeral=False, **kw):
-        self._mark("send_message", content=content, embed=embed, view=view, ephemeral=ephemeral)
+    async def send_message(self, content=None, *, embed=None, view=None,
+                           ephemeral=False, file=None, files=None, **kw):
+        # ⚠️ file も残すこと。画像認証のように「画像が出たか」を
+        #    確かめたい場面があり、捨てると検証できない。
+        self._mark("send_message", content=content, embed=embed, view=view,
+                   ephemeral=ephemeral, file=file, files=files)
 
     async def edit_message(self, *, content=None, embed=None, view=None, **kw):
         self._mark("edit_message", content=content, embed=embed, view=view)
@@ -133,7 +137,12 @@ class FakeChannel:
             self.guild.invite_list.append(inv)
         return inv
 
-    async def send(self, **kw):
+    async def send(self, content=None, **kw):
+        # ⚠️ 本物は content を位置引数で受け取れる（channel.send("文字列")）。
+        #    ここで受け取れないと TypeError になり、送った側が
+        #    例外を握りつぶしていると「送っていない」ように見えてしまう。
+        if content is not None:
+            kw["content"] = content
         self.sent.append(kw)
         if self.client is not None:
             self.client.sent.setdefault(self.id, []).append(kw)

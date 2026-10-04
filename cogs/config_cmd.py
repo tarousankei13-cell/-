@@ -137,17 +137,15 @@ class ConfigCog(commands.Cog):
         # プロキシ（中身は伏せて表示する）
         from core import proxy
 
-        picked = [
-            f"{name}　{url}" for name, url in proxy.describe()
-            if url not in ("（全体に従う）",)
-        ]
-        e.add_field(
-            name="プロキシ（通信の出口）",
-            value=("\n".join(picked) + f"\n{E.INFO} 詳しくは `/proxy show`")
-            if any(u != "（なし）" for _, u in proxy.describe())
-            else "設定なし（そのまま通信します）",
-            inline=False,
-        )
+        if proxy.configured():
+            picked = [
+                f"{name}　{url}" for name, url in proxy.describe()
+                if url not in ("（なし）", "（全体に従う）")
+            ]
+            value = "\n".join(picked) + f"\n{E.INFO} 詳しくは `/proxy show`"
+        else:
+            value = "設定なし（そのまま通信します）"
+        e.add_field(name="プロキシ（通信の出口）", value=value, inline=False)
         await interaction.followup.send(embed=e, ephemeral=True)
 
     # -- 負担率 -------------------------------------------------
@@ -271,6 +269,7 @@ class ConfigCog(commands.Cog):
     # -- チャンネル ---------------------------------------------
 
     @channel_group.command(name="achievement", description="実績を送るチャンネルを設定します")
+    @app_commands.describe(channel="実績を送るチャンネル")
     @admin_only()
     async def ch_achievement(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
         await settings.set_value("channel_achievement", channel.id, updated_by=interaction.user.id)
@@ -360,6 +359,7 @@ class ConfigCog(commands.Cog):
         )
 
     @channel_group.command(name="admin", description="管理者通知を送るチャンネルを設定します")
+    @app_commands.describe(channel="管理者への通知を送るチャンネル")
     @admin_only()
     async def ch_admin(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
         await settings.set_value("channel_admin", channel.id, updated_by=interaction.user.id)
@@ -549,6 +549,7 @@ class ConfigCog(commands.Cog):
     @group.command(
         name="menu_news", description="新商品・価格改定を知らせるチャンネル"
     )
+    @app_commands.describe(channel="お知らせを送るチャンネル（省略すると送りません）")
     @admin_only()
     async def menu_news_cmd(
         self, interaction: discord.Interaction,
@@ -775,7 +776,10 @@ class ConfigCog(commands.Cog):
         url="リンク先のURL。off と入れるとボタンを出しません（既定に戻すなら default）"
     )
     @admin_only()
-    async def receipt_url(self, interaction: discord.Interaction, url: str) -> None:
+    async def receipt_url(
+        self, interaction: discord.Interaction,
+        url: app_commands.Range[str, 1, 500],
+    ) -> None:
         """
         完了DMに出る「受け取り画面を開く」ボタンのリンク先。
 
@@ -1116,9 +1120,9 @@ class ConfigCog(commands.Cog):
     @admin_only()
     async def web_enable(
         self, interaction: discord.Interaction,
-        base_url: str,
+        base_url: app_commands.Range[str, 1, 300],
         port: app_commands.Range[int, 1, 65535] = 8080,
-        host: str = "127.0.0.1",
+        host: app_commands.Range[str, 1, 100] = "127.0.0.1",
     ) -> None:
         url = base_url.strip().rstrip("/")
         if not url.startswith(("http://", "https://")):
@@ -1175,7 +1179,9 @@ class ConfigCog(commands.Cog):
     @admin_only()
     async def web_remote(
         self, interaction: discord.Interaction,
-        api_url: str, secret: str, page_url: str | None = None,
+        api_url: app_commands.Range[str, 1, 300],
+        secret: app_commands.Range[str, 1, 200],
+        page_url: app_commands.Range[str, 1, 300] | None = None,
     ) -> None:
         url = api_url.strip()
         if not url.startswith("https://"):
@@ -1443,6 +1449,7 @@ class ConfigCog(commands.Cog):
         await interaction.followup.send(embed=e, ephemeral=True)
 
     @campaign.command(name="channel", description="招待の成立を知らせるチャンネル")
+    @app_commands.describe(channel="招待の成立を知らせるチャンネル")
     @admin_only()
     async def campaign_channel(
         self, interaction: discord.Interaction,
@@ -1465,6 +1472,7 @@ class ConfigCog(commands.Cog):
         name="link_channel",
         description="招待リンクの発行先チャンネル（指定するまで発行できません）",
     )
+    @app_commands.describe(channel="招待された方が入ってくるチャンネル")
     @admin_only()
     async def campaign_link_channel(
         self, interaction: discord.Interaction, channel: discord.TextChannel,
@@ -1507,7 +1515,8 @@ class ConfigCog(commands.Cog):
     )
     @admin_only()
     async def slot_rules_cmd(
-        self, interaction: discord.Interaction, forget_store: str | None = None
+        self, interaction: discord.Interaction,
+        forget_store: app_commands.Range[str, 1, 20] | None = None,
     ) -> None:
         from services.mcd import slot_rules
 
@@ -1577,7 +1586,7 @@ class ConfigCog(commands.Cog):
 
     @proxy_group.command(name="set", description="プロキシを設定します")
     @app_commands.describe(
-        url="http://host:port / http://user:pass@host:port / socks5://host:port",
+        url="http://ホスト:ポート　または http://利用者名:パスワード@ホスト:ポート",
         service="指定しなければ全体の既定になります",
     )
     @app_commands.choices(service=_SERVICE_CHOICES)
@@ -1585,7 +1594,7 @@ class ConfigCog(commands.Cog):
     async def proxy_set(
         self,
         interaction: discord.Interaction,
-        url: str,
+        url: app_commands.Range[str, 0, 300],
         service: app_commands.Choice[str] | None = None,
     ) -> None:
         from core import proxy

@@ -440,6 +440,7 @@ class AccountCog(commands.Cog):
         )
 
     @mcd.command(name="enable", description="アカウントを再び使えるようにします")
+    @app_commands.describe(account_id="対象のアカウントID（/mcd list で確認）")
     @admin_only()
     async def mcd_enable(self, interaction: discord.Interaction, account_id: int) -> None:
         async with session_scope() as s:
@@ -457,6 +458,7 @@ class AccountCog(commands.Cog):
         )
 
     @mcd.command(name="disable", description="アカウントを一時的に使わないようにします")
+    @app_commands.describe(account_id="対象のアカウントID（/mcd list で確認）")
     @admin_only()
     async def mcd_disable(self, interaction: discord.Interaction, account_id: int) -> None:
         async with session_scope() as s:
@@ -473,6 +475,7 @@ class AccountCog(commands.Cog):
         )
 
     @mcd.command(name="remove", description="アカウントを削除します")
+    @app_commands.describe(account_id="削除するアカウントID（/mcd list で確認）")
     @admin_only()
     async def mcd_remove(self, interaction: discord.Interaction, account_id: int) -> None:
         async with session_scope() as s:
@@ -525,8 +528,11 @@ class AccountCog(commands.Cog):
     )
     @admin_only()
     async def paypay_add(
-        self, interaction: discord.Interaction, label: str, phone: str,
-        password: str, proxy: str | None = None,
+        self, interaction: discord.Interaction,
+        label: app_commands.Range[str, 1, 50],
+        phone: app_commands.Range[str, 1, 20],
+        password: app_commands.Range[str, 1, 200],
+        proxy: app_commands.Range[str, 1, 300] | None = None,
     ) -> None:
         """
         ⚠️ ログインは2段階。ここを実行すると SMS で **URL** が届くので、
@@ -605,7 +611,8 @@ class AccountCog(commands.Cog):
     @app_commands.describe(account_id="アカウントID", url="SMSで届いたURL")
     @admin_only()
     async def paypay_confirm(
-        self, interaction: discord.Interaction, account_id: int, url: str
+        self, interaction: discord.Interaction, account_id: int,
+        url: app_commands.Range[str, 1, 1000],
     ) -> None:
         from services.paypay import accounts as pp_accounts
         from services.paypay.client import PayPayError
@@ -652,6 +659,7 @@ class AccountCog(commands.Cog):
         )
 
     @paypay.command(name="methods", description="チャージに使える決済を選びます")
+    @app_commands.describe(mode="利用者が使えるチャージ方法")
     @app_commands.choices(mode=[
         app_commands.Choice(name="Kyash と PayPay の両方（推奨）", value="both"),
         app_commands.Choice(name="Kyash のみ", value="kyash"),
@@ -680,13 +688,25 @@ class AccountCog(commands.Cog):
     @app_commands.describe(url="http://user:pass@host:port 形式。空で解除")
     @admin_only()
     async def paypay_proxy(
-        self, interaction: discord.Interaction, url: str = ""
+        self, interaction: discord.Interaction,
+        url: app_commands.Range[str, 0, 300] = "",
     ) -> None:
         """
         ⚠️ 口座ごとに指定があれば、そちらが優先される。
            ここは「指定が無い口座の既定」。
         """
+        from core import proxy as proxy_mod
         from core import settings
+
+        # ⚠️ ここでも形を確かめる。確かめないと、使えない値が入ったまま
+        #    「設定できた」と見えてしまい、実際には素のIPで出ていく。
+        why = proxy_mod.problem(url.strip())
+        if why:
+            await interaction.response.send_message(
+                embed=embeds.error(f"この値では設定できません。\n{why}"),
+                ephemeral=True,
+            )
+            return
 
         await settings.set_value(
             "paypay_proxy", url.strip(), updated_by=interaction.user.id
@@ -819,6 +839,7 @@ class AccountCog(commands.Cog):
         )
 
     @kyash.command(name="remove", description="Kyashアカウントを削除します")
+    @app_commands.describe(account_id="削除するアカウントID（/kyash list で確認）")
     @admin_only()
     async def kyash_remove(self, interaction: discord.Interaction, account_id: int) -> None:
         async with session_scope() as s:

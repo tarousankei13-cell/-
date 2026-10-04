@@ -339,7 +339,8 @@ class GuardCog(commands.Cog):
     @admin_only()
     async def words(
         self, interaction: discord.Interaction,
-        words: str | None = None, block_invites: bool | None = None,
+        words: app_commands.Range[str, 0, 4000] | None = None,
+        block_invites: bool | None = None,
     ) -> None:
         by = interaction.user.id
         if words is not None:
@@ -398,7 +399,7 @@ class GuardCog(commands.Cog):
         self,
         interaction: discord.Interaction,
         channel: discord.VoiceChannel | discord.TextChannel | None = None,
-        text: str | None = None,
+        text: app_commands.Range[str, 1, 90] | None = None,
     ) -> None:
         by = interaction.user.id
         if channel is not None:
@@ -475,8 +476,21 @@ class GuardCog(commands.Cog):
         channel = self.bot.get_channel(int(cid))
         if channel is None:
             return False, "チャンネルが見つかりません"
-        guild = channel.guild
-        count = guild.member_count or len(guild.members)
+        guild = getattr(channel, "guild", None)
+        if guild is None:
+            return False, "サーバー内のチャンネルではありません"
+
+        # ⚠️ member_count は SERVER MEMBERS INTENT が無いと None になる。
+        #    その場合 len(guild.members) はBOT自身だけの「1」になり、
+        #    **間違った人数を堂々と表示してしまう**。
+        #    黙って嘘を出すより、理由を返して何もしない方がよい。
+        count = guild.member_count
+        if count is None:
+            if not self.bot.intents.members:
+                return False, (
+                    "人数を取得できません（SERVER MEMBERS INTENT が必要です）"
+                )
+            return False, "人数を取得できません"
         fmt = str(settings.get("guard_counter_format") or config.GUARD_COUNTER_FORMAT)
         try:
             name = fmt.format(count=count)[:100]

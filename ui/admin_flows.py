@@ -230,8 +230,6 @@ async def start_broadcast(interaction: discord.Interaction, target: str) -> None
 
 
 def _broadcast_embed(heading: str, body: str) -> discord.Embed:
-    from datetime import datetime, timezone
-
     e = discord.Embed(
         title=f"{E.BELL} {heading}",
         description=body,
@@ -396,8 +394,6 @@ async def show_user(interaction: discord.Interaction, user: discord.User) -> Non
     残高・利用状況・適用中の負担率とその理由・直近の注文・チャージ履歴。
     複数のコマンドを行き来しないと全体像がつかめない状態を解消する。
     """
-    from datetime import datetime, timezone
-
     from core import ledger as L, saga, subsidy
     from db.models import as_utc, Ledger, Order, User
 

@@ -341,7 +341,8 @@ def dm_complete(
     total_orders: int,
     feedback_required: bool = False,
 ) -> discord.Embed:
-    user_rate = 100 - subsidy_rate
+    # ⚠️ 負担率は利用者に見せない。引数で受け取ってはいるが、
+    #    ここで表示に使わないことが仕様（docs/05 参照）。
     e = discord.Embed(
         title=f"{E.OK} ご注文が確定しました",
         description=(
@@ -797,15 +798,28 @@ def guard_log(
     """
     監視の記録に使う共通の形。
 
-    ⚠️ 1フィールド1024文字、全体6000文字が上限。
-       超えると送信そのものが失敗するので、呼ぶ側で切っておくこと。
+    ⚠️ Discord の上限（1フィールド1024文字・全体6000文字・25個）を
+       **ここで守る**。呼ぶ側でも切っているが、1箇所でも忘れると
+       送信が400で失敗し、記録が丸ごと消える。
+       記録は「落ちないこと」が何より大事なので、二重に守る。
     """
     from datetime import datetime, timezone
 
-    e = discord.Embed(title=title, color=color,
+    e = discord.Embed(title=str(title)[:256], color=color,
                       timestamp=datetime.now(timezone.utc))
-    for name, value in lines:
-        e.add_field(name=name, value=value or "（なし）", inline=False)
+    budget = 6000 - len(str(title)[:256]) - (len(footer) if footer else 0)
+    for name, value in list(lines)[:25]:
+        name = str(name)[:256]
+        value = (str(value) if value else "") or "（なし）"
+        if len(value) > 1024:
+            value = value[:1021] + "…"
+        # 全体の上限に当たりそうなら、そこで打ち切る
+        if budget - len(name) - len(value) < 0:
+            e.add_field(name="…", value="（長いため以降は省略しました）",
+                        inline=False)
+            break
+        budget -= len(name) + len(value)
+        e.add_field(name=name, value=value, inline=False)
     if footer:
-        e.set_footer(text=footer)
+        e.set_footer(text=str(footer)[:2048])
     return e

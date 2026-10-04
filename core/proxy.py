@@ -181,20 +181,20 @@ def split_auth(url: str | None) -> tuple[str | None, tuple[str, str] | None]:
         return None, None
 
 
-def socks_ready() -> bool:
-    """
-    socks プロキシが使える環境か。
-
-    ⚠️ httpx は socks を使うのに socksio が必要で、無いまま socks の
-       URLを渡すと **クライアントを作る時点で ImportError** になる。
-       つまり設定を1つ間違えるだけで、BOTの通信が全部止まる。
-       必ずここで確かめてから渡すこと。
-    """
-    try:
-        import socksio  # noqa: F401
-    except ImportError:
-        return False
-    return True
+# 使えるプロキシの種類。
+#
+#   ⚠️ **http と https だけ**にしてある。socks は使わない。
+#      理由は2つ。
+#        ① httpx で socks を使うには socksio を追加で入れる必要があり、
+#           入れずに socks のURLを渡すと **クライアントを作る時点で
+#           ImportError** になる。設定を1つ間違えるだけで、
+#           BOTの通信が全部止まる。
+#        ② Discord への接続（aiohttp）は、そもそも socks に対応していない。
+#           socks を許すと「他は通るのに Discord だけ通らない」という
+#           分かりにくい状態になる。
+#
+#      追加の部品を入れずに、どこでも同じように動く形だけを残す。
+SCHEMES = ("http", "https")
 
 
 def problem(url: str) -> str:
@@ -207,19 +207,17 @@ def problem(url: str) -> str:
         parts = urlsplit(url)
     except Exception:
         return "URLとして読めません。"
-    if parts.scheme not in ("http", "https", "socks5", "socks5h"):
+    if parts.scheme.lower().startswith("socks"):
         return (
-            "先頭を `http://`、`https://`、`socks5://` のいずれかに"
-            "してください。"
+            "socks のプロキシには対応していません。\n"
+            "`http://ホスト:ポート` の形でご指定ください"
+            "（socks は追加の部品が必要になるうえ、"
+            "Discord への接続では使えないためです）。"
         )
+    if parts.scheme not in SCHEMES:
+        return "先頭を `http://` か `https://` にしてください。"
     if not parts.hostname:
         return "ホスト名が入っていません。`http://ホスト:ポート` の形です。"
-    if parts.scheme.startswith("socks") and not socks_ready():
-        return (
-            "socks を使うには追加の部品が必要です。\n"
-            "`pip install \"httpx[socks]\"` を実行してから設定してください"
-            "（入れずに設定すると、BOTの通信が全て止まります）。"
-        )
     return ""
 
 
@@ -228,31 +226,46 @@ def valid(url: str) -> bool:
     return not problem(url)
 
 
-# socks を使えないのに設定されている、と気付いた回数（警告は1度だけ出す）
-_warned_socks = False
+# 使えない形だと気付いた分（警告は1度だけ出す）
+_warned: set[str] = set()
 
 
 def _usable(url: str) -> str | None:
     """
     実際に渡してよい値にする。渡せないものは None にして警告する。
 
-    ⚠️ ここで弾かないと、設定を間違えた瞬間に全ての通信が
-       ImportError で落ちる。落とすよりは、警告して直接つなぐ。
+    ⚠️ コマンドからの設定は problem() で断っているが、
+       **main.py の PROXY_URL と環境変数はそこを通らない**。
+       そこに socks を書かれると、ここで弾かない限り
+       クライアントを作る時点で落ち、全ての通信が止まる。
+       落とすよりは、警告して直接つなぐ。
     """
-    global _warned_socks
     if not url:
         return None
-    if url.lower().startswith("socks") and not socks_ready():
-        if not _warned_socks:
-            _warned_socks = True
+    why = problem(url)
+    if why:
+        if url not in _warned:
+            _warned.add(url)
             log.error(
-                "socks プロキシ（%s）が設定されていますが、socksio が入って"
-                "いないため使えません。プロキシを通さず直接つなぎます。"
-                '`pip install "httpx[socks]"` を実行してください。',
-                mask(url),
+                "プロキシの設定（%s）は使えません。%s "
+                "プロキシを通さず直接つなぎます。",
+                mask(url), why.replace("\n", " "),
             )
         return None
     return url
+
+
+def configured() -> bool:
+    """
+    どこかにプロキシが設定されているか。
+
+    ⚠️ describe() の文面で判定しないこと。
+       「（全体に従う）」も文字列なので、設定が無いのに
+       「あり」と判定してしまう。
+    """
+    if global_proxy():
+        return True
+    return any(for_service(k) for k in SERVICES)
 
 
 def describe() -> list[tuple[str, str]]:

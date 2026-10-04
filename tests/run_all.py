@@ -59,6 +59,7 @@ TESTS = [
     ("PayPayでのチャージ", "test_paypay.py"),
     ("プロキシ（通信の出口）", "test_proxy.py"),
     ("サーバー管理（チケット・認証・監視・処分）", "test_server.py"),
+    ("サーバー管理：コマンドとイベント", "test_server_cmds.py"),
     ("安全性（認証情報・権限）", "test_security.py"),
 ]
 

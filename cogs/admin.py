@@ -288,7 +288,8 @@ class AdminCog(commands.Cog):
     @app_commands.describe(user="対象", amount="増減額（マイナスで減算）", reason="理由（元帳に残ります）")
     @admin_only()
     async def grant(
-        self, interaction: discord.Interaction, user: discord.User, amount: int, reason: str
+        self, interaction: discord.Interaction, user: discord.User,
+        amount: int, reason: app_commands.Range[str, 1, 400],
     ) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         await user_repo.get_or_create(user.id)
@@ -331,7 +332,8 @@ class AdminCog(commands.Cog):
     @admin_only()
     async def refund(
         self, interaction: discord.Interaction, user: discord.User,
-        amount: app_commands.Range[int, 1, 1000000], reason: str = "",
+        amount: app_commands.Range[int, 1, 1000000],
+        reason: app_commands.Range[str, 0, 400] = "",
     ) -> None:
         """
         ⚠️ 残高を戻すだけの `/admin grant` とは別物。
@@ -397,8 +399,12 @@ class AdminCog(commands.Cog):
         )
 
     @admin.command(name="ban", description="利用者の利用を停止します")
+    @app_commands.describe(user="対象の利用者", reason="停止の理由（記録に残ります）")
     @admin_only()
-    async def ban(self, interaction: discord.Interaction, user: discord.User, reason: str = "") -> None:
+    async def ban(
+        self, interaction: discord.Interaction, user: discord.User,
+        reason: app_commands.Range[str, 0, 400] = "",
+    ) -> None:
         async with session_scope() as s:
             u = await user_repo.ensure_user(s, user.id)
             u.is_banned = True
@@ -413,6 +419,7 @@ class AdminCog(commands.Cog):
         )
 
     @admin.command(name="unban", description="利用停止を解除します")
+    @app_commands.describe(user="解除する利用者")
     @admin_only()
     async def unban(self, interaction: discord.Interaction, user: discord.User) -> None:
         async with session_scope() as s:
@@ -527,7 +534,7 @@ class AdminCog(commands.Cog):
         self,
         interaction: discord.Interaction,
         user: discord.User | None = None,
-        action: str | None = None,
+        action: app_commands.Range[str, 1, 50] | None = None,
         limit: app_commands.Range[int, 1, 50] = 20,
     ) -> None:
         """
@@ -600,8 +607,8 @@ class AdminCog(commands.Cog):
         list_price: int,
         subsidy_rate: app_commands.Range[float, 0.0, 100.0] | None = None,
         user_amount: int | None = None,
-        store_name: str | None = None,
-        receipt_number: str | None = None,
+        store_name: app_commands.Range[str, 1, 100] | None = None,
+        receipt_number: app_commands.Range[str, 1, 20] | None = None,
         pickup: app_commands.Choice[str] | None = None,
         daily_count: int | None = None,
     ) -> None:
@@ -715,7 +722,10 @@ class AdminCog(commands.Cog):
     @menu_group.command(name="sync", description="メニューを同期します")
     @app_commands.describe(store_id="店舗ID。省略すると使用中の全店舗")
     @admin_only()
-    async def menu_sync(self, interaction: discord.Interaction, store_id: str | None = None) -> None:
+    async def menu_sync(
+        self, interaction: discord.Interaction,
+        store_id: app_commands.Range[str, 1, 20] | None = None,
+    ) -> None:
         from services.mcd import accounts as mcd_accounts
         from services.mcd import stores as mcd_stores
         from services.mcd.client import McdError
@@ -756,7 +766,10 @@ class AdminCog(commands.Cog):
     @store_group.command(name="search", description="店名の検索を試します")
     @app_commands.describe(query="店名の一部、または店舗ID")
     @admin_only()
-    async def store_search(self, interaction: discord.Interaction, query: str) -> None:
+    async def store_search(
+        self, interaction: discord.Interaction,
+        query: app_commands.Range[str, 1, 100],
+    ) -> None:
         from services.mcd import store_index
 
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -900,7 +913,11 @@ class AdminCog(commands.Cog):
     @debug_group.command(name="hex", description="注文コードの中身を表示します")
     @app_commands.describe(code="注文コード（HEX）")
     @admin_only()
-    async def debug_hex(self, interaction: discord.Interaction, code: str) -> None:
+    # ⚠️ 注文コードは長い。Discord の文字列引数の上限いっぱいまで許す。
+    async def debug_hex(
+        self, interaction: discord.Interaction,
+        code: app_commands.Range[str, 1, 6000],
+    ) -> None:
         from services.mcd.protocol import PICKUP_LABEL, ProtocolError, decode_hex
 
         await interaction.response.defer(ephemeral=True, thinking=True)

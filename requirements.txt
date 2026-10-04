@@ -9,7 +9,7 @@ aiosqlite>=0.20.0        # SQLite を非同期で使うためのドライバ
 # asyncpg>=0.29.0
 
 # マクドナルド / Kyash との通信
-httpx[http2,socks]>=0.27.0   # http2 は同時接続が多い同期で効く / socks はプロキシに socks5 を使う場合に必要
+httpx[http2]>=0.27.0   # http2 は同時接続が多い同期で効く
 beautifulsoup4>=4.12.0   # Kyash の送金リンクの読み取りに使用
 
 # 認証情報の暗号化

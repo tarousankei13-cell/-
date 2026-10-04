@@ -92,7 +92,9 @@ DATABASE_URL = "sqlite+aiosqlite:///./data/bot.db"
 # BOT全体が外へ出るときに通すプロキシ（任意・空ならそのまま出ます）
 #   書き方  "http://ホスト:ポート"
 #           "http://利用者名:パスワード@ホスト:ポート"（認証あり）
-#           "socks5://ホスト:ポート"（socks を使う場合は pip install httpx[socks]）
+#
+#   ⚠️ 使えるのは http と https だけです。socks には対応していません
+#      （追加の部品が必要になるうえ、Discord への接続では使えないため）。
 #
 #   ここに入れると、Discord・マクドナルド・Kyash・PayPay・画像取得の
 #   すべてがこのプロキシを通ります。
@@ -340,25 +342,9 @@ class McdBot(commands.Bot):
         #   ⚠️ ここは /proxy set の Discord 設定を**使えない**。
         #      ログインはDBを読む前に始まるため、設定欄か環境変数だけが効く。
         #      設定で変えた場合は、次の起動から反映される。
-        d_proxy, d_auth = proxy.split_auth(
-            proxy.for_service("discord") or PROXY_URL
-        )
+        d_proxy, d_auth = proxy.split_auth(proxy.resolve("discord"))
         extra: dict = {}
-        if d_proxy and d_proxy.lower().startswith("socks"):
-            # ⚠️ Discord（aiohttp）は socks に対応していない。
-            #    黙って直接出ると気付けないので、必ず警告を出す。
-            rest = ("他の通信はこの socks を通ります"
-                    if proxy.socks_ready()
-                    else 'socksio が入っていないため、他の通信も'
-                         '直接つなぎます（pip install "httpx[socks]"）')
-            log.warning(
-                "Discord への接続は socks プロキシに対応していません。"
-                "Discord は直接つなぎます（%s）。"
-                "`/proxy set service:Discord` で http のプロキシを指定すると、"
-                "Discord もプロキシを通せます。",
-                rest,
-            )
-        elif d_proxy:
+        if d_proxy:
             extra["proxy"] = d_proxy
             if d_auth:
                 extra["proxy_auth"] = aiohttp.BasicAuth(d_auth[0], d_auth[1])

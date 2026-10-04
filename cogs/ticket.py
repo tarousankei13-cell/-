@@ -225,7 +225,8 @@ class TicketCog(commands.Cog):
     )
     @admin_only()
     async def kinds_cmd(
-        self, interaction: discord.Interaction, labels: str = "",
+        self, interaction: discord.Interaction,
+        labels: app_commands.Range[str, 0, 2000] = "",
     ) -> None:
         import config
 
@@ -273,7 +274,8 @@ class TicketCog(commands.Cog):
     @app_commands.describe(reason="終了の理由（記録に残ります）")
     @self_checked()
     async def close(
-        self, interaction: discord.Interaction, reason: str = "",
+        self, interaction: discord.Interaction,
+        reason: app_commands.Range[str, 0, 300] = "",
     ) -> None:
         ticket = await tickets.by_channel(interaction.channel_id)
         if ticket is None:
