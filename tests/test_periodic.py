@@ -28,6 +28,7 @@ COVERAGE = {
     "マクドナルドのトークン":      "token_warm",
     "マクドナルドの口座の生存":    "health_check",
     "Kyashの口座の生存":           "health_check",
+    "PayPayの口座の生存":          "health_check",
     "Kyashのトークン期限の通知":   "hourly_checks",
     "外形監視（障害検知）":        "outage_watch",
     "バックアップの外部保存":      "hourly_checks",
@@ -121,6 +122,13 @@ async def main():
           callable(getattr(jobs, "format_menu_news", None)))
     check("できあがり通知は既定で無効 ★", not order_watch.enabled())
     check("返金は既定で無効 ★", not refund.enabled())
+    from services.paypay import accounts as pp_accounts, charge as pp_charge
+    check("PayPayの生存確認がある ★",
+          callable(getattr(pp_accounts, "healthcheck_all", None)))
+    check("PayPayのチャージがある ★",
+          callable(getattr(pp_charge, "charge_from_link", None)))
+    check("PayPayの期限通知もある ★",
+          callable(getattr(pp_accounts, "expiring_accounts", None)))
 
     print("\n── 名前解決の控えが対象を網羅しているか ──")
     from core import dns

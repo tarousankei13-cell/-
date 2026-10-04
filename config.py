@@ -220,6 +220,14 @@ REFUND_ENABLED = False
 REFUND_MAX = 10000            # 1回に返せる上限（円）
 REFUND_LINK_HOURS = 72        # 作った送金リンクの有効時間（案内に使う）
 
+# ------------------------------------------------------------
+#  PayPay
+# ------------------------------------------------------------
+# ⚠️ アプリ側のAPIを使うのでトークンは90日もつ。
+#    Web側（2時間で切れ、更新手段なし）とは別物。
+PAYPAY_TOKEN_LIFETIME_DAYS = 90
+PAYPAY_TOKEN_WARN_DAYS = 14        # 残りこの日数で管理者へ警告
+
 # 感想ゲート（既定OFF。ONにする場合は message_content インテントが必要）
 FEEDBACK_GATE_ENABLED = False
 

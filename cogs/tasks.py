@@ -345,12 +345,18 @@ class TasksCog(commands.Cog):
         #    チャージしようとした利用者が最初に気付く形になっていた。
         results = await jobs.mcd_accounts.healthcheck_all()
         dead = [(f"#{i}", l, "マクドナルド") for i, l, alive in results if not alive]
-        try:
-            kyash = await jobs.kyash_accounts.healthcheck_all()
-        except Exception as e:          # Kyash 側で落ちても点検は続ける
-            log.warning("Kyash口座の生存確認に失敗しました: %s", e)
-        else:
-            dead += [(f"#{i}", l, "Kyash") for i, l, alive in kyash if not alive]
+        for kind, mod in (("Kyash", "kyash"), ("PayPay", "paypay")):
+            try:
+                if kind == "Kyash":
+                    got = await jobs.kyash_accounts.healthcheck_all()
+                else:
+                    from services.paypay import accounts as pp_accounts
+
+                    got = await pp_accounts.healthcheck_all()
+            except Exception as e:      # 片方で落ちても点検は続ける
+                log.warning("%s口座の生存確認に失敗しました: %s", kind, e)
+            else:
+                dead += [(f"#{i}", l, kind) for i, l, alive in got if not alive]
         if dead:
             await self.notify_admin(
                 discord.Embed(

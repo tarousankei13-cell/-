@@ -498,6 +498,67 @@ class InvitePayout(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class PayPayAccount(Base):
+    """
+    チャージを受ける PayPay 口座。
+
+    ⚠️ アプリ側のAPIを使うので、トークンは **90日** もつ
+       （Web側は2時間で切れる）。device_uuid を残しておけば、
+       切れてもSMSなしで入り直せることがある。
+    """
+    __tablename__ = "paypay_accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    label: Mapped[str] = mapped_column(String(64), nullable=False)
+    phone_enc: Mapped[bytes] = mapped_column(nullable=False)
+    password_enc: Mapped[bytes | None] = mapped_column()
+    access_token_enc: Mapped[bytes | None] = mapped_column()
+    refresh_token_enc: Mapped[bytes | None] = mapped_column()
+    # ⚠️ これを変えると「別の端末」とみなされ、SMSからやり直しになる
+    device_uuid: Mapped[str | None] = mapped_column(String(36))
+    client_uuid: Mapped[str | None] = mapped_column(String(36))
+    token_obtained_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    monthly_cap: Mapped[int | None] = mapped_column(BigInteger)
+    received_this_month: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    last_balance: Mapped[int | None] = mapped_column(BigInteger)
+    # ⚠️ PayPayは日本からしかアクセスできない。国外で動かすなら必須。
+    proxy_url: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(16), default="ACTIVE", nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class PayPayReceipt(Base):
+    """
+    PayPay の受け取り1件。
+
+    ⚠️ 同じリンクを2回使わせないために link_uuid を一意にする。
+       Kyash と同じ考え方（DBの形で二重受け取りを防ぐ）。
+    """
+    __tablename__ = "paypay_receipts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    link_uuid: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    paypay_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("paypay_accounts.id")
+    )
+    discord_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sender_name: Mapped[str | None] = mapped_column(String(128))
+    wallet_before: Mapped[int | None] = mapped_column(BigInteger)
+    wallet_after: Mapped[int | None] = mapped_column(BigInteger)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    raw_link: Mapped[str | None] = mapped_column(String(255))
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class Refund(Base):
     """
     実際にお金をお返しした記録。

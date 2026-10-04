@@ -217,6 +217,10 @@ async def monthly_reset_if_needed(last_month: int | None) -> int:
     now = datetime.now(timezone.utc)
     if last_month != now.month:
         await kyash_accounts.reset_monthly_counters()
+        # ⚠️ PayPay も忘れずに。片方だけ戻すと上限の判定がずれる。
+        from services.paypay import accounts as paypay_accounts
+
+        await paypay_accounts.reset_monthly_counters()
         log.info("Kyash口座の月間受取額をリセットしました")
     return now.month
 
@@ -273,10 +277,24 @@ async def make_backup() -> tuple[str, bytes]:
 # ============================================================
 
 async def kyash_token_warnings() -> list[str]:
+    """
+    トークンの期限が近い口座。Kyash と PayPay の両方を見る。
+
+    ⚠️ どちらも取り直しに本人の操作が要る（Kyashはメール/SMSのOTP、
+       PayPayはSMSのURL）。切れてから気付くと、その間チャージが
+       受けられない。
+    """
     out = []
+    from services.paypay import accounts as paypay_accounts
+
+    for account_id, label, days in await paypay_accounts.expiring_accounts():
+        if days <= 0:
+            out.append(f"🔴 PayPay `#{account_id}` **{label}** のトークンは**失効しています**")
+        else:
+            out.append(f"🟡 PayPay `#{account_id}` **{label}** のトークンは残り **{int(days)}日** です")
     for account_id, label, days in await kyash_accounts.expiring_accounts():
         if days <= 0:
-            out.append(f"🔴 `#{account_id}` **{label}** のトークンは**失効しています**")
+            out.append(f"🔴 Kyash `#{account_id}` **{label}** のトークンは**失効しています**")
         else:
-            out.append(f"🟡 `#{account_id}` **{label}** のトークンは残り **{int(days)}日** です")
+            out.append(f"🟡 Kyash `#{account_id}` **{label}** のトークンは残り **{int(days)}日** です")
     return out

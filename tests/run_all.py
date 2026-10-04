@@ -56,6 +56,7 @@ TESTS = [
     ("定期処理・バックアップ", "test_tasks.py"),
     ("定期更新の総点検", "test_periodic.py"),
     ("通信を使う新しい機能", "test_new_features.py"),
+    ("PayPayでのチャージ", "test_paypay.py"),
     ("安全性（認証情報・権限）", "test_security.py"),
 ]
 

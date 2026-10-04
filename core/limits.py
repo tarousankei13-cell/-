@@ -80,18 +80,25 @@ async def charged_total(discord_id: int) -> int:
        上乗せしたあとの額が入っているので、率を上げるほど条件が
        緩くなってしまう。
     """
+    # ⚠️ Kyash と PayPay の **両方** を数えること。片方しか見ないと、
+    #    そちらで入れた人がいつまでも条件を満たせない。
+    from db.models import PayPayReceipt
+
+    total = 0
     async with session_scope() as s:
-        return int(
-            (
-                await s.execute(
-                    select(func.coalesce(func.sum(KyashReceipt.amount), 0))
-                    .where(
-                        KyashReceipt.discord_id == discord_id,
-                        KyashReceipt.status == CREDITED,
+        for model in (KyashReceipt, PayPayReceipt):
+            total += int(
+                (
+                    await s.execute(
+                        select(func.coalesce(func.sum(model.amount), 0))
+                        .where(
+                            model.discord_id == discord_id,
+                            model.status == CREDITED,
+                        )
                     )
-                )
-            ).scalar() or 0
-        )
+                ).scalar() or 0
+            )
+    return total
 
 
 async def check_order(discord_id: int, list_price: int) -> None:

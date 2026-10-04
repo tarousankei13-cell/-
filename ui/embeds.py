@@ -129,7 +129,13 @@ def charge_panel() -> discord.Embed:
     from core import limits
 
     rate = limits.charge_rate()
-    desc = "Kyash の送金リンクで残高をチャージできます。"
+    from ui.flows import charge_methods as _ways
+
+    _names = {"kyash": "Kyash", "paypay": "PayPay"}
+    desc = (
+        " / ".join(_names[w] for w in _ways())
+        + " の送金リンクで残高をチャージできます。"
+    )
     if rate > 100:
         example = limits.credited_for(1000)
         desc += (
@@ -137,12 +143,27 @@ def charge_panel() -> discord.Embed:
             f"　例）{yen(1000)} の送金で **{yen(example)}** ぶんの残高になります"
         )
     e = discord.Embed(title=f"{E.YEN} 残高チャージ", description=desc, color=BLUE)
+    from ui.flows import charge_methods
+
+    ways = charge_methods()
+    names = {"kyash": "Kyash", "paypay": "PayPay"}
+    apps = " / ".join(names[w] for w in ways)
     e.add_field(
         name="手順",
         value=(
-            "**1.** Kyash アプリで「送金リンク」を作成\n"
+            f"**1.** {apps} のアプリで「送金リンク」を作成\n"
             "**2.** 下の「チャージする」からリンクを貼り付け\n"
             "**3.** 受け取りが完了すると即座に残高へ反映されます"
+            + (
+                f"\n\n{E.INFO} どちらのリンクでも、同じ欄に貼っていただければ"
+                "自動で見分けます。"
+                if len(ways) > 1 else ""
+            )
+            + (
+                f"\n{E.INFO} PayPay のリンクにパスコードを設定された方は、"
+                "一緒に入力してください。"
+                if "paypay" in ways else ""
+            )
         ),
         inline=False,
     )

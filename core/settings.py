@@ -36,6 +36,8 @@ DEFAULTS: dict[str, Any] = {
     "refund_enabled": defaults.REFUND_ENABLED,
     "refund_max": defaults.REFUND_MAX,
     "channel_menu_news": None,
+    "paypay_proxy": "",
+    "charge_methods": "both",   # kyash / paypay / both
     "order_max_amount": defaults.ORDER_MAX_AMOUNT,
     "order_daily_limit": defaults.ORDER_DAILY_LIMIT,
     "menu_sync_interval_minutes": defaults.MENU_SYNC_INTERVAL_MINUTES,

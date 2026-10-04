@@ -113,22 +113,87 @@ async def show_history(interaction: discord.Interaction) -> None:
 #  チャージ
 # ============================================================
 
+def charge_methods() -> list[str]:
+    """使えるチャージ方法。設定で片方だけにもできる。"""
+    mode = str(settings.get("charge_methods", "both") or "both")
+    if mode == "kyash":
+        return ["kyash"]
+    if mode == "paypay":
+        return ["paypay"]
+    return ["kyash", "paypay"]
+
+
+def detect_method(url: str) -> str:
+    """
+    貼られたリンクがどちらのものか見分ける。
+
+    ⚠️ 見分けられないものは Kyash 扱いにしない。間違った相手に
+       問い合わせると、使えるはずのリンクが「無効」と言われる。
+    """
+    u = (url or "").strip().lower()
+    if "paypay.ne.jp" in u:
+        return "paypay"
+    if "kyash.me" in u:
+        return "kyash"
+    return ""
+
+
 class ChargeModal(discord.ui.Modal, title="残高チャージ"):
+    def __init__(self, method: str = "") -> None:
+        super().__init__()
+        self.method = method
+
     link = discord.ui.TextInput(
-        label="Kyash 送金リンク",
-        placeholder="https://kyash.me/payments/xxxxxxxx",
+        label="送金リンク",
+        placeholder="https://kyash.me/payments/xxxx または https://pay.paypay.ne.jp/xxxx",
         required=True,
         max_length=255,
+    )
+    passcode = discord.ui.TextInput(
+        label="パスコード（PayPayで設定した方のみ・4桁）",
+        placeholder="設定していなければ空のままで大丈夫です",
+        required=False,
+        max_length=4,
     )
 
     @traced("チャージ")
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        from services.kyash.charge import ChargeError, charge_from_link
+        url = str(self.link.value)
+        code = str(self.passcode.value or "").strip()
+        method = self.method or detect_method(url)
+        if not method:
+            await interaction.response.send_message(
+                embed=embeds.error(
+                    "リンクの形が分かりませんでした。\n"
+                    "Kyash か PayPay の **送金リンク** を貼り付けてください。"
+                ),
+                ephemeral=True,
+            )
+            return
+        if method not in charge_methods():
+            await interaction.response.send_message(
+                embed=embeds.error(
+                    f"いまは {'Kyash' if method == 'paypay' else 'PayPay'} の"
+                    "リンクのみ受け付けています。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if method == "paypay":
+            from services.paypay.charge import ChargeError, charge_from_link
+        else:
+            from services.kyash.charge import ChargeError, charge_from_link
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         await user_repo.get_or_create(interaction.user.id)
         try:
-            result = await charge_from_link(interaction.user.id, str(self.link.value))
+            if method == "paypay":
+                result = await charge_from_link(
+                    interaction.user.id, url, passcode=code or None
+                )
+            else:
+                result = await charge_from_link(interaction.user.id, url)
         except ChargeError as e:
             await interaction.followup.send(embed=embeds.error(str(e)), ephemeral=True)
             return

@@ -381,6 +381,12 @@ async def _save_kyash(client: KyashClient, email: str, password: str, label: str
 #  コマンド
 # ============================================================
 
+# ⚠️ PayPay の登録はSMSのURLを挟むので、途中の状態を持っておく必要がある。
+#    BOTを再起動すると消えるが、やり直せばよいだけなので保存はしない
+#    （パスワードをディスクに残さないほうが安全）。
+_PENDING_PAYPAY: dict[int, object] = {}
+
+
 class AccountCog(commands.Cog):
     """マクドナルド／Kyash アカウントの管理"""
 
@@ -389,6 +395,7 @@ class AccountCog(commands.Cog):
 
     mcd = app_commands.Group(name="mcd", description="マクドナルドアカウント（管理者用）")
     kyash = app_commands.Group(name="kyash", description="Kyashアカウント（管理者用）")
+    paypay = app_commands.Group(name="paypay", description="PayPayアカウント（管理者用）")
 
     # -- マクドナルド -------------------------------------------
 
@@ -505,6 +512,209 @@ class AccountCog(commands.Cog):
         await interaction.followup.send(
             embed=discord.Embed(
                 title=f"{E.KEY} アカウントの状態", description="\n".join(lines), color=embeds.BLUE
+            ),
+            ephemeral=True,
+        )
+
+    # -- PayPay --------------------------------------------------
+
+    @paypay.command(name="add", description="PayPayアカウントを追加します")
+    @app_commands.describe(
+        label="見分けるための名前", phone="電話番号", password="パスワード",
+        proxy="このアカウント専用のプロキシ（省略可）",
+    )
+    @admin_only()
+    async def paypay_add(
+        self, interaction: discord.Interaction, label: str, phone: str,
+        password: str, proxy: str | None = None,
+    ) -> None:
+        """
+        ⚠️ ログインは2段階。ここを実行すると SMS で **URL** が届くので、
+           `/paypay confirm` にそのURLを貼ること（数字のOTPではない）。
+        """
+        from core.crypto import get_cipher
+        from db.models import PayPayAccount
+        from services.paypay import accounts as pp_accounts
+        from services.paypay.client import PayPayClient, PayPayError
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        cipher = get_cipher()
+        client = PayPayClient(proxy=proxy or pp_accounts.config_proxy())
+        try:
+            await client.start_login(phone, password)
+        except PayPayError as e:
+            await client.aclose()
+            await interaction.followup.send(
+                embed=embeds.error(f"ログインを始められませんでした。\n{e}"),
+                ephemeral=True,
+            )
+            return
+
+        async with session_scope() as s:
+            acc = PayPayAccount(
+                label=label,
+                phone_enc=cipher.encrypt(phone),
+                password_enc=cipher.encrypt(password),
+                device_uuid=client.session.device_uuid,
+                client_uuid=client.session.client_uuid,
+                proxy_url=proxy,
+                status=pp_accounts.STATUS_DEGRADED,   # 確認が済むまでは使わせない
+            )
+            s.add(acc)
+            await s.flush()
+            account_id = acc.id
+
+        # ⚠️ 確認の手順で同じ検証子（PKCE）が要る。
+        #    使い回せるようにここで預かっておく。
+        _PENDING_PAYPAY[account_id] = client
+
+        await interaction.followup.send(
+            embed=embeds.ok(
+                f"**#{account_id} {label}** を登録しました。\n\n"
+                f"{E.INFO} SMS に **URL** が届きます（数字ではありません）。\n"
+                f"`/paypay confirm account_id:{account_id} url:<届いたURL>` "
+                "を実行してください。\n\n"
+                f"{E.WARN} ログインに3回失敗するとアカウントが一時ロックされます。"
+            ),
+            ephemeral=True,
+        )
+
+    @paypay.command(name="confirm", description="SMSで届いたURLを貼って確定します")
+    @app_commands.describe(account_id="アカウントID", url="SMSで届いたURL")
+    @admin_only()
+    async def paypay_confirm(
+        self, interaction: discord.Interaction, account_id: int, url: str
+    ) -> None:
+        from services.paypay import accounts as pp_accounts
+        from services.paypay.client import PayPayError
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        client = _PENDING_PAYPAY.get(account_id)
+        if client is None:
+            await interaction.followup.send(
+                embed=embeds.error(
+                    "この登録の続きが見つかりませんでした。\n"
+                    "`/paypay add` からやり直してください。\n"
+                    f"{E.INFO} BOTを再起動すると、やりかけの登録は消えます。"
+                ),
+                ephemeral=True,
+            )
+            return
+        try:
+            session = await client.login_confirm(url)
+        except PayPayError as e:
+            await interaction.followup.send(
+                embed=embeds.error(f"確認できませんでした。\n{e}"), ephemeral=True
+            )
+            return
+        finally:
+            pass
+
+        await pp_accounts.save_session(account_id, session)
+        _PENDING_PAYPAY.pop(account_id, None)
+        try:
+            balance = await client.get_balance()
+            note = f"\n{E.WALLET} いまの残高 **{embeds.yen(balance.all_balance)}**"
+        except PayPayError:
+            note = ""
+        finally:
+            await client.aclose()
+
+        await interaction.followup.send(
+            embed=embeds.ok(
+                f"**#{account_id}** のログインが完了しました。{note}\n\n"
+                f"{E.INFO} トークンは約90日もちます。"
+                "期限が近づくと管理者へお知らせします。"
+            ),
+            ephemeral=True,
+        )
+
+    @paypay.command(name="methods", description="チャージに使える決済を選びます")
+    @app_commands.choices(mode=[
+        app_commands.Choice(name="Kyash と PayPay の両方（推奨）", value="both"),
+        app_commands.Choice(name="Kyash のみ", value="kyash"),
+        app_commands.Choice(name="PayPay のみ", value="paypay"),
+    ])
+    @admin_only()
+    async def paypay_methods(
+        self, interaction: discord.Interaction, mode: app_commands.Choice[str]
+    ) -> None:
+        from core import settings
+
+        await settings.set_value(
+            "charge_methods", mode.value, updated_by=interaction.user.id
+        )
+        body = f"チャージに使える決済を **{mode.name}** にしました。\n"
+        if mode.value in ("both", "paypay"):
+            body += (
+                f"\n{E.WARN} PayPay は **日本からしかアクセスできません**。"
+                "国外で動かす場合は `/paypay proxy` でプロキシをご指定ください。\n"
+                f"{E.INFO} `/paypay add` で口座を登録してください。"
+            )
+        body += f"\n{E.INFO} チャージパネルの文面も変わります（`/panel refresh`）。"
+        await interaction.response.send_message(embed=embeds.ok(body), ephemeral=True)
+
+    @paypay.command(name="proxy", description="PayPay用のプロキシ（全口座の既定）")
+    @app_commands.describe(url="http://user:pass@host:port 形式。空で解除")
+    @admin_only()
+    async def paypay_proxy(
+        self, interaction: discord.Interaction, url: str = ""
+    ) -> None:
+        """
+        ⚠️ 口座ごとに指定があれば、そちらが優先される。
+           ここは「指定が無い口座の既定」。
+        """
+        from core import settings
+
+        await settings.set_value(
+            "paypay_proxy", url.strip(), updated_by=interaction.user.id
+        )
+        await interaction.response.send_message(
+            embed=embeds.ok(
+                "PayPay用のプロキシを設定しました。\n"
+                f"{E.INFO} 口座ごとに指定がある場合は、そちらが優先されます。"
+                if url.strip() else "PayPay用のプロキシを解除しました。"
+            ),
+            ephemeral=True,
+        )
+
+    @paypay.command(name="list", description="登録済みPayPayアカウントの一覧")
+    @admin_only()
+    async def paypay_list(self, interaction: discord.Interaction) -> None:
+        from sqlalchemy import select
+        from db.models import PayPayAccount
+        from services.paypay import accounts as pp_accounts
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with session_scope() as s:
+            rows = (await s.execute(select(PayPayAccount))).scalars().all()
+            items = [
+                (a.id, a.label, a.status, pp_accounts.token_days_left(a),
+                 a.last_balance, a.proxy_url, a.last_error)
+                for a in rows
+            ]
+        if not items:
+            await interaction.followup.send(
+                embed=embeds.info(
+                    "まだ登録がありません。`/paypay add` から追加してください。"
+                ),
+                ephemeral=True,
+            )
+            return
+        lines = []
+        for aid, label, status, left, bal, proxy, err in items:
+            mark = {"ACTIVE": E.GREEN, "DEGRADED": E.YELLOW}.get(status, E.RED)
+            days = f"残り{int(left)}日" if left is not None else "未ログイン"
+            lines.append(
+                f"{mark} `#{aid}` **{label}**　{days}"
+                + (f"　残高 {embeds.yen(int(bal))}" if bal is not None else "")
+                + (f"　{E.INFO}プロキシ有" if proxy else "")
+                + (f"\n　　{E.WARN} {err[:60]}" if err else "")
+            )
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title=f"{E.YEN} PayPayアカウント",
+                description="\n".join(lines), color=embeds.BLUE,
             ),
             ephemeral=True,
         )
