@@ -178,6 +178,63 @@ def main():
     check("金額も同じ（¥680）★", mine.amount == real_set.amount == 680,
           (mine.amount, real_set.amount))
 
+    REAL_HAPPY = (
+        "0a0531333933341a6b4a690a2168747470733a2f2f6d63646f6e2e617369612f6d6f70"
+        "2f31333933342f61757468122168747470733a2f2f6d63646f6e2e617369612f6d6f70"
+        "2f31333933342f617574681a2168747470733a2f2f6d63646f6e2e617369612f6d6f70"
+        "2f31333933342f617574683a020a0042781276120439303035180120ba042a1e120431"
+        "3631301801 2a14080112043732353118012a0812043630343818012a1708011207393"
+        "939373032381801 2a0812043530313018012a170801120739393937303038180"
+        "12a0812043636363318012a17080112073939383730313718012a0812043333313"
+        "51801".replace(" ", "")
+    )
+    happy = decode_hex(REAL_HAPPY).items[0]
+    check("ハッピーセットも1バイトも変わらない ★",
+          b"".join(pb_msg(2, build_item(i, top_level=True))
+                   for i in decode_hex(REAL_HAPPY).items).hex()
+          == items_hex(REAL_HAPPY))
+    check("ハッピーセットのドリンク枠に中間ノードは無い ★",
+          shape(happy)[2][3] == ("9987017", 1, [("3315", 1, [])]),
+          shape(happy)[2][3])
+    check("ナゲットの中にソースの枠が入る ★",
+          shape(happy)[2][0] == ("1610", 1, [("7251", 1, [("6048", 1, [])])]),
+          shape(happy)[2][0])
+
+    print("\n── ④ field 1 のフラグ ★ ──")
+    # ⚠️ ここが「ポテナゲが通らない」原因だった。
+    #    商品（ナゲット）が選択枠を抱えていると子を持つので、
+    #    「子を持つ節に付ける」という規則だとフラグが付いてしまう。
+    #    実物は付けていない。
+    def flags(raw, out, top=True):
+        f = proto_parse(raw)
+        code = next((v.decode() for v in f.get(2, []) if isinstance(v, bytes)), "")
+        if not top:
+            out[code] = 1 in f
+        for k in f.get(5, []):
+            if isinstance(k, bytes):
+                flags(k, out, top=False)
+        return out
+
+    got = flags(bytes.fromhex(items_hex(REAL_HAPPY))[2:], {})
+    check("ナゲット（商品）にフラグは付かない ★", got.get("1610") is False, got)
+    check("ソースの枠には付く ★", got.get("7251") is True, got)
+    check("ドリンクの枠には付く ★", got.get("9987017") is True, got)
+    check("選んだ商品には付かない ★", got.get("3315") is False, got)
+
+    mine_happy = build_order_item(cart, menu.products["9005"], {
+        "1610/7251": "6048", "9997028": "5010",
+        "9997008": "6663", "9987017": "3315",
+    })
+    check("カートから組み立てても実物と同じバイト列 ★",
+          pb_msg(2, build_item(mine_happy, top_level=True)).hex() == items_hex(REAL_HAPPY),
+          pb_msg(2, build_item(mine_happy, top_level=True)).hex()[:90])
+
+    mine_set = build_order_item(cart, menu.products["9030"],
+                                {"9987010": "5010", "9997925": "3170"})
+    check("朝マックのセットも実物と同じバイト列 ★",
+          pb_msg(2, build_item(mine_set, top_level=True)).hex() == items_hex(REAL_SET),
+          pb_msg(2, build_item(mine_set, top_level=True)).hex()[:90])
+
     real_x3 = decode_hex(REAL_X3).items[0]
     check("実物も数量で表す（×3）★", shape(real_x3) == ("2081", 3, []),
           shape(real_x3))

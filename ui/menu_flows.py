@@ -2364,7 +2364,7 @@ def build_order_item(
         if inner:
             picked = [
                 OrderItem(
-                    product_code=sl.code, quantity=sl.need,
+                    product_code=sl.code, quantity=sl.need, has_flag=True,
                     components=[
                         OrderItem(product_code=code, quantity=n)
                         for code, n in spread_quantity(chosen, sl.need)
@@ -2373,6 +2373,8 @@ def build_order_item(
                 for sl, chosen in inner
             ]
             components.append(
+                # ⚠️ 構成品（ナゲットなど）は **商品** なのでフラグを付けない。
+                #    中にソースの枠を抱えていても付けない（実物で確認）。
                 OrderItem(product_code=slot.code, quantity=qty, components=picked)
             )
             continue
@@ -2405,12 +2407,13 @@ def build_order_item(
         if bridge:
             leaves = [
                 OrderItem(product_code=bridge, quantity=leaf.quantity,
-                          components=[leaf])
+                          has_flag=True, components=[leaf])
                 for leaf in leaves
             ]
         components.append(
             OrderItem(
-                product_code=slot.code, quantity=slot.need, components=leaves
+                product_code=slot.code, quantity=slot.need, has_flag=True,
+                components=leaves,
             )
         )
 
