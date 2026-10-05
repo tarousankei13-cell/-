@@ -13,6 +13,7 @@ TESTS = [
     ("カート組み立て", "test_cart.py"),
     ("カートの編集と再開", "test_cart_edit.py"),
     ("セットの選択枠・時間帯", "test_menu_choices.py"),
+    ("画面が作れること（全商品・全画面）", "test_views.py"),
     ("選択枠の学習", "test_slot_rules.py"),
     ("複数個必須の選択枠", "test_slot_quantity.py"),
     ("数量のまとめ方と中間ノード", "test_quantity_and_bridge.py"),

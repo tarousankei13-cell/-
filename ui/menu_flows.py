@@ -1893,10 +1893,28 @@ class OptionView(discord.ui.View):
         return "お選びください"
 
     def _build(self) -> None:
+        """
+        選択枠の数だけ Select を並べ、最後にボタンを置く。
+
+        ⚠️ **Discord の行の決まり**
+              ・1画面は5行（row 0〜4）
+              ・Select は1つで**1行を丸ごと**使う（幅5）
+              ・Button は幅1。1行に5個まで並べられる
+
+           つまり「Select がある行には Button を置けない」。
+           置こうとすると ValueError（6 > 5 width）で**ビューを作る処理ごと
+           落ちる**。落ちると応答を返せないので、利用者には
+           「BOTは時間内に応答しませんでした」としか見えない。
+
+        ⚠️ ボタンの行を決め打ちしないこと。
+           かつて row=3 固定にしていたため、枠が4つある商品
+           （ハッピーセット＝サイド・おもちゃ・ドリンク＋ソース）や、
+           サイズ選択が増えて4行目まで埋まったセットで必ず落ちていた。
+           実データで42商品が該当した。**空いている次の行に置く。**
+        """
         self.clear_items()
         row = 0
-        # ⚠️ 入れ子の枠（ナゲットのソース）を含めると3つ以上になることがある。
-        #    Discord は1画面5行まで。確定ボタン用に1行空けて4行まで使う。
+        # 最後の1行はボタン用に空けておく（Select は 0〜3 の4行まで）
         for c in self.choices:
             if row >= 4:
                 break
@@ -1945,17 +1963,25 @@ class OptionView(discord.ui.View):
                 self.add_item(ssel)
                 row += 1
 
-        ok = discord.ui.Button(label="カートに追加", emoji=E.PLUS, style=discord.ButtonStyle.success, row=3)
+        # ⚠️ ここが肝心。Select を置いた**次の行**にボタンを並べる。
+        #    row を使い切っていれば4行目（最後の行）に置く。
+        btn_row = min(row, 4)
+        ok = discord.ui.Button(
+            label="カートに追加", emoji=E.PLUS,
+            style=discord.ButtonStyle.success, row=btn_row,
+        )
         ok.callback = self._on_ok
         self.add_item(ok)
         if self.product.customizations():
             cz = discord.ui.Button(
                 label="具材を変える", emoji=E.NOTE,
-                style=discord.ButtonStyle.secondary, row=3,
+                style=discord.ButtonStyle.secondary, row=btn_row,
             )
             cz.callback = self._on_customize
             self.add_item(cz)
-        back = discord.ui.Button(label="戻る", style=discord.ButtonStyle.secondary, row=3)
+        back = discord.ui.Button(
+            label="戻る", style=discord.ButtonStyle.secondary, row=btn_row,
+        )
         back.callback = self._on_back
         self.add_item(back)
 
