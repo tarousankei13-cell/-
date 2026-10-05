@@ -123,6 +123,39 @@ async def user_balance(session: AsyncSession, discord_id: int) -> int:
     return await balance(session, user_account(discord_id))
 
 
+async def user_balances(
+    session: AsyncSession, discord_ids: list[int] | set[int],
+) -> dict[int, int]:
+    """
+    まとめて残高を求める。{利用者ID: 残高}。元帳に無い人は 0。
+
+    ⚠️ **1人ずつ user_balance() を呼ばないため**にある。
+       人数ぶんクエリが飛ぶと、定期処理が人数に比例して重くなる。
+
+    ⚠️ 勘定名の作り方（user_account）はここでも必ず使うこと。
+       同じ規則を2か所に書くと、片方を直し忘れたときに
+       残高が0に見えるという、最悪の形で食い違う。
+    """
+    ids = [int(i) for i in discord_ids]
+    if not ids:
+        return {}
+    want = {user_account(i): i for i in ids}
+    out = {i: 0 for i in ids}
+    # ⚠️ IN 句には上限がある（SQLite は既定999）。小分けにして投げる。
+    CHUNK = 500
+    keys = list(want)
+    for i in range(0, len(keys), CHUNK):
+        part = keys[i:i + CHUNK]
+        rows = (await session.execute(
+            select(Ledger.account, func.coalesce(func.sum(Ledger.amount), 0))
+            .where(Ledger.account.in_(part))
+            .group_by(Ledger.account)
+        )).all()
+        for account, total in rows:
+            out[want[str(account)]] = int(total or 0)
+    return out
+
+
 async def held_balance(session: AsyncSession, discord_id: int) -> int:
     """注文処理中でホールドされている額。"""
     return await balance(session, hold_account(discord_id))

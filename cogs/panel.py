@@ -37,26 +37,44 @@ async def refresh_all(bot: commands.Bot) -> list[str]:
         return []
 
     stats = await admin_flows.collect_stats()
+    # ⚠️ ここに**全種類**を並べること。並べ忘れたパネルは黙って
+    #    古いまま残り、`/panel refresh` でも直らない。
+    #    種類を増やしたら、下の「取りこぼし」の確認で気付けるようにしてある。
     builders = {
         "order": panels.build_order_panel(),
         "charge": (embeds.charge_panel(), panels.ChargePanel()),
         "admin": (embeds.admin_panel(stats), panels.AdminPanel()),
         "invite": (embeds.invite_panel(), panels.InvitePanel()),
+        "ticket": (embeds.ticket_panel(), panels.TicketPanel()),
+        "verify": (embeds.verify_panel(), panels.VerifyPanel()),
     }
+    # 中身を作るのにDBを読むパネルは、ここで作る
+    for kind, build in panels.ASYNC_PANEL_BUILDERS.items():
+        builders[kind] = (await build(), None)
 
     lines: list[str] = []
     for kind, channel_id, message_id in targets:
+        if kind not in builders:
+            # ⚠️ 「チャンネルが見つかりません」と出してはいけない。
+            #    原因が違うので、直し方も違う。
+            lines.append(f"{E.NG} {kind}: このBOTが知らない種類のパネルです")
+            continue
         channel = bot.get_channel(channel_id)
-        if channel is None or kind not in builders:
+        if channel is None:
             lines.append(f"{E.NG} {kind}: チャンネルが見つかりません")
             continue
         embed, view = builders[kind]
         try:
             message = await channel.fetch_message(message_id)
-            await message.edit(embed=embed, view=view)
+            if view is None:
+                await message.edit(embed=embed)
+            else:
+                await message.edit(embed=embed, view=view)
             lines.append(f"{E.OK} {kind}: 更新しました")
         except discord.NotFound:
             lines.append(f"{E.NG} {kind}: メッセージが見つかりません（再設置してください）")
+        except discord.Forbidden:
+            lines.append(f"{E.NG} {kind}: 書き込む権限がありません")
         except discord.HTTPException as e:
             lines.append(f"{E.NG} {kind}: {e}")
     return lines
@@ -166,6 +184,30 @@ class PanelCog(commands.Cog):
             interaction, "verify", channel,
             embeds.verify_panel(), panels.VerifyPanel(),
         )
+
+    @group.command(name="ranking", description="紹介ランキングのパネルを設置します")
+    @app_commands.describe(channel="設置するチャンネル")
+    @admin_only()
+    async def ranking(
+        self, interaction: discord.Interaction, channel: discord.TextChannel,
+    ) -> None:
+        """
+        ⚠️ ボタンの無いパネル。中身はDBから作るので、定期処理で貼り直す。
+        """
+        from core import invite as inv
+
+        await self._deploy(
+            interaction, "ranking", channel, await embeds.ranking_panel(), None,
+        )
+        if not inv.enabled():
+            await interaction.followup.send(
+                embed=embeds.warn(
+                    f"{E.INFO} 紹介プログラムがまだ開催されていません。\n"
+                    "`/config campaign start` で開始すると、"
+                    "ランキングが出るようになります。"
+                ),
+                ephemeral=True,
+            )
 
     @group.command(name="admin", description="管理者パネルを設置します")
     @app_commands.describe(channel="設置するチャンネル")

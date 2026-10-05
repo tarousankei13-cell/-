@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from sqlalchemy import (
     BigInteger, Boolean, DateTime, ForeignKey, Index, Integer,
     Numeric, String, Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -105,6 +106,10 @@ class User(Base):
     invited_by: Mapped[int | None] = mapped_column(BigInteger, index=True)
     # 紹介プログラムのお知らせを受け取るか（通知設定ボタンで切り替える）
     invite_notify: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # 声かけ（ようこそ・カートの残り・残高のお知らせ）を受け取るか
+    #   ⚠️ **止められるようにしておくこと。** 止められないDMは迷惑でしかなく、
+    #      サーバーごと抜けられる。既定はONだが、1タップで切れる。
+    nudge_notify: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -749,4 +754,37 @@ class GuardHit(Base):
     action: Mapped[str] = mapped_column(String(24), default="none")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True,
+    )
+
+
+class Nudge(Base):
+    """
+    送った声かけの記録。
+
+    ⚠️ **同じことを二度言わないため**だけに存在する。
+       「カートが残っています」を10分おきに言われたら、人は去る。
+       送る前に必ずここを見て、同じ (discord_id, kind, key) があれば送らない。
+
+    key は「どの出来事に対する声かけか」を表す。
+       welcome        … "once"（一生に1回）
+       cart_left      … カートの更新時刻（カートごとに1回）
+       charged_unused … 入金の記録ID（チャージごとに1回）
+       idle_balance   … 送った日付（同じ日に二度言わない）
+    """
+    __tablename__ = "nudges"
+
+    id: Mapped[int] = mapped_column(AutoBigInt, primary_key=True, autoincrement=True)
+    discord_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    key: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    # 届いたか。DMを閉じている人を何度も試さないために残す。
+    delivered: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    sent_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True,
+    )
+
+    __table_args__ = (
+        # ⚠️ ここで重ならないことを保証する。
+        #    判定だけに任せると、処理が重なったときに二重で送ってしまう。
+        UniqueConstraint("discord_id", "kind", "key", name="uq_nudge_once"),
     )

@@ -136,6 +136,18 @@ DEFAULTS: dict[str, Any] = {
     "mod_warn_ban_at": defaults.MOD_WARN_BAN_AT,
     "mod_warn_timeout_minutes": defaults.MOD_WARN_TIMEOUT_MINUTES,
     "mod_dm_on_action": defaults.MOD_DM_ON_ACTION,
+
+    # ---- 声かけ ----
+    "nudge_enabled": defaults.NUDGE_ENABLED,
+    "nudge_welcome": defaults.NUDGE_WELCOME,
+    "nudge_cart_minutes": defaults.NUDGE_CART_MINUTES,
+    "nudge_charged_hours": defaults.NUDGE_CHARGED_HOURS,
+    "nudge_idle_days": defaults.NUDGE_IDLE_DAYS,
+    "nudge_idle_min_balance": defaults.NUDGE_IDLE_MIN_BALANCE,
+
+    # ---- 紹介ランキング ----
+    "ranking_top": defaults.RANKING_TOP,
+    "ranking_show_names": defaults.RANKING_SHOW_NAMES,
 }
 
 _cache: dict[str, Any] = {}

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -31,7 +32,7 @@ from services.mcd.menu import minutes_of
 from services.mcd import stores as mcd_stores
 from services.mcd.client import McdError
 from services.mcd.protocol import (
-    PICKUP_LABEL, DecodedOrder, ProtocolError, decode_hex,
+    PICKUP_LABEL, DecodedOrder, OrderItem, ProtocolError, decode_hex,
 )
 from ui import embeds
 
@@ -106,7 +107,131 @@ async def show_history(interaction: discord.Interaction) -> None:
             inline=False,
         )
     e.set_footer(text=f"現在の残高 {embeds.yen(balance)}")
-    await interaction.followup.send(embed=e, ephemeral=True)
+
+    # ---- 同じ内容でもう一度頼めるようにする ----
+    # ⚠️ 成立した注文だけを出す。失敗した注文を「もう一度」と誘うのは、
+    #    同じ失敗を繰り返させることになる。
+    repeatable = [
+        o for o in rows
+        if o.state in (saga.COMPLETED, saga.NOTIFIED, saga.CAPTURED)
+        and (o.items_json or "").strip("[] \n")
+    ][: config.REORDER_HISTORY]
+    view = ReorderView(interaction.user.id, repeatable) if repeatable else None
+    if view is not None:
+        e.add_field(
+            name=f"{E.REPEAT} 同じ内容でもう一度",
+            value="下から選ぶと、同じ商品でカートを組み直します。",
+            inline=False,
+        )
+    await interaction.followup.send(embed=e, view=view, ephemeral=True)
+
+
+class ReorderSelect(discord.ui.Select):
+    """履歴から1つ選んで、同じ内容を組み直す。"""
+
+    def __init__(self, orders: list[Order]) -> None:
+        options = []
+        for o in orders:
+            created = as_utc(o.created_at)
+            when = (created.astimezone(config.JST).strftime("%m/%d %H:%M")
+                    if created else "—")
+            try:
+                n = len(json.loads(o.items_json or "[]"))
+            except ValueError:
+                n = 0
+            options.append(discord.SelectOption(
+                label=f"{when}　{(o.store_name or o.store_id or '—')[:40]}"[:100],
+                value=o.id,
+                description=f"{n}点　{embeds.yen(o.user_amount)}"[:100],
+                emoji=E.REPEAT,
+            ))
+        super().__init__(
+            placeholder="もう一度頼む注文をお選びください",
+            options=options[:25], min_values=1, max_values=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await reorder(interaction, self.values[0])
+
+
+class ReorderView(discord.ui.View):
+    def __init__(self, owner_id: int, orders: list[Order]) -> None:
+        super().__init__(timeout=config.VIEW_TIMEOUT)
+        self.owner_id = owner_id
+        self.add_item(ReorderSelect(orders))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                embed=embeds.error("この操作は開いた本人のみ行えます。"),
+                ephemeral=True,
+            )
+            return False
+        return True
+
+
+async def reorder(interaction: discord.Interaction, order_id: str) -> None:
+    """
+    過去の注文と同じ内容でカートを組み直す。
+
+    ⚠️ 中身をそのまま信じない。前の注文から時間が経っていると
+         ・商品が終売になっている
+         ・時間帯が変わって注文できない
+         ・値段が変わっている
+       が起こる。**取り直したメニューで作り直す**必要がある。
+       この面倒は open_menu(resume=...) がすでに見てくれるので、
+       そこへ渡す形にして、判断を1箇所にまとめる。
+
+    ⚠️ 他人の注文を開けないよう、必ず本人のものか確かめる。
+    """
+    from ui import menu_flows
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    async with session_scope() as s:
+        order = await s.get(Order, order_id)
+        if order is None or order.discord_id != interaction.user.id:
+            await interaction.followup.send(
+                embed=embeds.error("その注文は見つかりませんでした。"),
+                ephemeral=True,
+            )
+            return
+        store_id = order.store_id or ""
+        pickup = order.pickup_method
+        raw = order.items_json or "[]"
+
+    if not store_id:
+        await interaction.followup.send(
+            embed=embeds.warn(
+                "この注文には店舗の記録がないため、同じ内容を組み直せません。\n"
+                "お手数ですが、注文パネルからお選びください。"
+            ),
+            ephemeral=True,
+        )
+        return
+
+    try:
+        items = [OrderItem.from_dict(d) for d in json.loads(raw)]
+    except (ValueError, KeyError, TypeError):
+        log.warning("再注文の内容を読めませんでした（order_id=%s）", order_id)
+        await interaction.followup.send(
+            embed=embeds.error("この注文の内容を読み取れませんでした。"),
+            ephemeral=True,
+        )
+        return
+    if not items:
+        await interaction.followup.send(
+            embed=embeds.warn("この注文には商品の記録がありません。"), ephemeral=True,
+        )
+        return
+
+    saved = menu_flows.SavedCart(
+        purpose="order", store_id=store_id, pickup=pickup,
+        items=items, age_minutes=0.0,
+    )
+    await menu_flows.open_menu(
+        interaction, store_id, "order", resume=saved, reorder=True,
+    )
 
 
 # ============================================================

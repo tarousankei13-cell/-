@@ -310,13 +310,14 @@ class InvitePanel(discord.ui.View):
 from ui.invite_flows import ClaimView  # noqa: E402
 
 # サーバー管理（チケット・認証）のボタンも同じ仕組みで復元する
+from ui.nudge_views import PERSISTENT_VIEWS as _NUDGE_VIEWS  # noqa: E402
 from ui.server_views import (  # noqa: E402
     PERSISTENT_VIEWS as _SERVER_VIEWS, TicketPanel, VerifyPanel,
 )
 
 PERSISTENT_VIEWS = [
     OrderPanel, ChargePanel, AdminPanel, InvitePanel, ClaimView,
-    *_SERVER_VIEWS,
+    *_SERVER_VIEWS, *_NUDGE_VIEWS,
 ]
 
 def build_order_panel() -> tuple[discord.Embed, discord.ui.View]:
@@ -331,4 +332,10 @@ PANEL_BUILDERS = {
     "invite": (embeds.invite_panel, InvitePanel),
     "ticket": (embeds.ticket_panel, TicketPanel),
     "verify": (embeds.verify_panel, VerifyPanel),
+}
+
+# ⚠️ 中身を作るのに DB を読むパネル。PANEL_BUILDERS（同期）には置けない。
+#    /panel refresh と定期更新は、こちらを使う。
+ASYNC_PANEL_BUILDERS = {
+    "ranking": embeds.ranking_panel,
 }

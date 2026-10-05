@@ -109,6 +109,8 @@ class TasksCog(commands.Cog):
         self._last_menu_force_date = None
         self._last_backup_day: int | None = None
         self._started = False
+        # 紹介ランキングを何回に1回貼り直すかを数える
+        self._ranking_tick = 0
 
     def _loops(self) -> list[tasks.Loop]:
         """
@@ -601,6 +603,57 @@ class TasksCog(commands.Cog):
             guard.detector.prune()
         except Exception:
             log.debug("検知の後片づけに失敗", exc_info=True)
+
+        # ⑤ 声かけ（ようこそ・カートの残り・残高のお知らせ）
+        #    ⚠️ カートの声かけは分単位なので、このループ（既定10分）で回す。
+        #       1時間ごとだと、カートが消えてから声をかけることになる。
+        try:
+            from services import outreach
+
+            await outreach.run(self.bot)
+        except Exception:
+            log.warning("声かけに失敗しました", exc_info=True)
+
+        # ⑥ 紹介ランキングのパネルを最新にする
+        try:
+            await self._refresh_ranking()
+        except Exception:
+            log.warning("紹介ランキングを更新できませんでした", exc_info=True)
+
+    async def _refresh_ranking(self) -> None:
+        """
+        設置済みの紹介ランキングを貼り直す。
+
+        ⚠️ 設置されていなければ何もしない。毎回パネルを探しに行くが、
+           DBを1回引くだけなので軽い。
+        """
+        from sqlalchemy import select
+
+        from db.models import Panel
+        from db.session import session_scope
+
+        self._ranking_tick += 1
+        every = max(1, config.RANKING_REFRESH_MINUTES
+                    // max(1, config.GUARD_COUNTER_MINUTES))
+        if self._ranking_tick % every:
+            return
+
+        async with session_scope() as s:
+            row = await s.get(Panel, "ranking")
+        if row is None:
+            return
+        channel = self.bot.get_channel(row.channel_id)
+        if channel is None:
+            return
+        from ui import embeds as E2
+
+        try:
+            msg = await channel.fetch_message(row.message_id)
+            await msg.edit(embed=await E2.ranking_panel())
+        except (discord.NotFound, discord.Forbidden):
+            log.debug("紹介ランキングのパネルが見つかりません")
+        except discord.HTTPException as e:
+            log.warning("紹介ランキングの更新に失敗: %s", e)
 
     async def _kick_unverified(self) -> int:
         """

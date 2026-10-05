@@ -44,13 +44,17 @@ class InviteError(Exception):
     """利用者にそのまま見せてよい、招待の失敗理由。"""
 
 
-def code_for(discord_id: int) -> str:
+def code_for(discord_id: int, *, salt: int = 0) -> str:
     """
     その人の招待コード。discord_id から導き、いつでも同じ値になる。
 
     ⚠️ discord_id を復元できてはいけないので、ハッシュから作る。
+
+    salt は**他の人とぶつかったときだけ**使う。0 のときは今までと
+    同じ値になるので、すでに配ったコードは変わらない。
     """
-    digest = hashlib.sha256(f"invite:{discord_id}".encode()).digest()
+    seed = f"invite:{discord_id}" if not salt else f"invite:{discord_id}#{salt}"
+    digest = hashlib.sha256(seed.encode()).digest()
     n = int.from_bytes(digest[:8], "big")
     out = []
     for _ in range(CODE_LENGTH):
@@ -228,6 +232,53 @@ async def ranking(limit: int = 10) -> list[tuple[int, int]]:
     return [(int(r[0]), int(r[1])) for r in rows]
 
 
+async def monthly_ranking(
+    limit: int = 5, *, month_start: datetime | None = None,
+) -> list[tuple[int, int]]:
+    """
+    今月に成立した紹介の数で並べる。(招待した人のID, 件数)。
+
+    ⚠️ 基準は `qualified_at`（条件を満たした時刻）。
+       招待した時刻ではない。先月に招待して今月に成立した分は
+       **今月**として数える。特典が出たのが今月だから。
+
+    ⚠️ 月の区切りは日本時間。UTCで切ると、毎月1日の朝9時までが
+       前月に入ってしまう。
+    """
+    start = month_start or config.jst_month_start_utc()
+    async with session_scope() as s:
+        rows = (
+            await s.execute(
+                select(Invite.inviter_id, func.count().label("n"))
+                .where(
+                    Invite.claimed.is_(True),
+                    Invite.qualified.is_(True),
+                    Invite.qualified_at.is_not(None),
+                    Invite.qualified_at >= start,
+                )
+                .group_by(Invite.inviter_id)
+                .order_by(func.count().desc(), Invite.inviter_id)
+                .limit(limit)
+            )
+        ).all()
+    return [(int(r[0]), int(r[1])) for r in rows]
+
+
+async def monthly_total() -> int:
+    """今月に成立した紹介の合計。"""
+    start = config.jst_month_start_utc()
+    async with session_scope() as s:
+        got = (await s.execute(
+            select(func.count()).select_from(Invite).where(
+                Invite.claimed.is_(True),
+                Invite.qualified.is_(True),
+                Invite.qualified_at.is_not(None),
+                Invite.qualified_at >= start,
+            )
+        )).scalar()
+    return int(got or 0)
+
+
 # ============================================================
 #  紐づけ
 # ============================================================
@@ -239,13 +290,37 @@ async def ensure_code(discord_id: int) -> str:
     code_for() は discord_id から決まるので毎回同じだが、
     **コードから人を引く**ために列にも入れておく。
     全員ぶんハッシュを計算して突き合わせるのは、人が増えると重い。
+
+    ⚠️ **他の人と同じコードになりうる**（8.9億通りだが、
+       5,000人で約1.4%、2万人で約20%）。ぶつかったまま保存しようとすると
+       一意制約で失敗し、その人は招待コードを受け取れなくなる。
+       ぶつかったら塩を足して別の値にする。
+
+    ⚠️ 返すのは**実際に保存した値**。導いた値をそのまま返すと、
+       画面に出すコードとDBの中身が食い違い、貼っても誰も引けなくなる。
+
+    ⚠️ すでに自分のコードを持っている人は、そのまま使う。
+       配ったあとに変えると、出回っているリンクが死ぬ。
     """
-    code = code_for(discord_id)
     async with session_scope() as s:
         row = await s.get(User, discord_id)
-        if row is not None and row.invite_code != code:
-            row.invite_code = code
-    return code
+        if row is None:
+            return code_for(discord_id)
+        if row.invite_code:
+            return row.invite_code
+
+        for salt in range(8):
+            code = code_for(discord_id, salt=salt)
+            taken = (await s.execute(
+                select(User.discord_id).where(User.invite_code == code)
+            )).scalar()
+            if taken is None or taken == discord_id:
+                row.invite_code = code
+                return code
+
+        # ここまで全部ぶつかることは現実には起こらない
+        log.error("招待コードを決められませんでした（discord_id=%s）", discord_id)
+        return code_for(discord_id)
 
 
 async def find_inviter(code: str) -> int | None:

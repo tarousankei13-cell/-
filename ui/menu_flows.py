@@ -472,13 +472,18 @@ async def start_store_select(interaction: discord.Interaction, purpose: str) -> 
 
 async def open_menu(
     interaction: discord.Interaction, store_id: str, purpose: str,
-    resume: "SavedCart | None" = None,
+    resume: "SavedCart | None" = None, *, reorder: bool = False,
 ) -> None:
     """
     お店のメニューを開く。
 
     resume を渡すと、保存してあったカートの中身を引き継ぐ。
     渡さなければ空のカートから始める（既存のカートは捨てる）。
+
+    reorder=True は「過去の注文と同じ内容を組み直す」場合。
+    やることは resume と同じ（取り直したメニューで作り直す）ので、
+    **文面だけ**変える。処理を分けると、終売や時間帯の確認を
+    片方だけ直し忘れる。
     """
     if not store_id.isdigit():
         await interaction.followup.send(
@@ -573,11 +578,28 @@ async def open_menu(
     )
     embed = await view.build_embed()
     if resume is not None:
-        note = f"{E.REPEAT} 続きから始めます。"
-        if dropped:
-            note += (
-                f"\n{E.WARN} お取り扱いが終わった商品を {dropped} 点だけ外しました。"
-            )
+        if reorder:
+            note = f"{E.REPEAT} 前回と同じ内容をご用意しました。"
+            if not items:
+                # ⚠️ 全部外れたときに「ご用意しました」と出してはいけない。
+                #    カートは空なので、そう伝える。
+                note = (
+                    f"{E.WARN} 前回の商品は、いまお取り扱いがありませんでした。\n"
+                    "お手数ですが、あらためてお選びください。"
+                )
+            elif dropped:
+                note += (
+                    f"\n{E.WARN} いまお取り扱いの無い商品を "
+                    f"{dropped} 点だけ外しました。"
+                )
+            else:
+                note += "\n内容をご確認のうえ、お進みください。"
+        else:
+            note = f"{E.REPEAT} 続きから始めます。"
+            if dropped:
+                note += (
+                    f"\n{E.WARN} お取り扱いが終わった商品を {dropped} 点だけ外しました。"
+                )
         embed.description = note
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
@@ -639,6 +661,17 @@ class CartView(discord.ui.View):
             value=f"{self.store_name or '—'}\n`{self.store_id}`",
             inline=True,
         )
+        # いまだけ頼めるもの（朝マック・夜マックなど）を伝える。
+        #   ⚠️ 「レギュラー」は一日の大半なので出さない。
+        #      いつでも頼めるものを知らせても、選ぶ助けにならない。
+        notable = availability.notable_labels(self.active_dayparts)
+        if notable:
+            e.add_field(
+                name=f"{E.LOADING} いまの時間帯",
+                value="／".join(f"**{n}**" for n in notable) + "\n"
+                      "この時間だけのメニューがございます",
+                inline=True,
+            )
         e.add_field(
             name=f"{E.CART} 商品数",
             value=f"{len(self.items)} 点",
@@ -1298,7 +1331,14 @@ class CategoryView(discord.ui.View):
         # 時間帯が終わったカテゴリは出さない。
         # 夜に「朝マック」を出しても、中身はほとんど注文できない。
         active = cart.active_dayparts
-        options = []
+        # ⚠️ 「いまだけのメニュー」を先頭に出す。
+        #    朝マックの時間に朝マックが一覧の下の方にあると、
+        #    その時間しか頼めないものに気づかないまま終わる。
+        notable_now = {
+            name for name, part in availability.COLLECTION_DAYPART.items()
+            if part in availability.NOTABLE_DAYPARTS and part in (active or set())
+        }
+        options, featured = [], []
         for c in cart.menu.collections[:25]:
             if not availability.collection_available(c.name, active):
                 continue
@@ -1310,9 +1350,15 @@ class CategoryView(discord.ui.View):
             )
             if count == 0:
                 continue
-            options.append(
-                discord.SelectOption(label=c.name[:100], value=c.id, description=f"{count} 品")
+            now_only = (c.name or "").strip() in notable_now
+            opt = discord.SelectOption(
+                label=c.name[:100], value=c.id,
+                description=(f"いまの時間だけ・{count} 品" if now_only
+                             else f"{count} 品")[:100],
+                emoji="⏰" if now_only else None,
             )
+            (featured if now_only else options).append(opt)
+        options = featured + options
         if not options:
             options = [discord.SelectOption(label="（今は選べる商品がありません）", value="_none")]
         # よく頼まれる商品は、カテゴリを選ばずにここから直接選べるようにする。

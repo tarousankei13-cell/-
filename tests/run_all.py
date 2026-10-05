@@ -60,6 +60,8 @@ TESTS = [
     ("プロキシ（通信の出口）", "test_proxy.py"),
     ("サーバー管理（チケット・認証・監視・処分）", "test_server.py"),
     ("サーバー管理：コマンドとイベント", "test_server_cmds.py"),
+    ("利用を広げる機能（声かけ・再注文・ランキング）", "test_growth.py"),
+    ("人数が増えたときの挙動", "test_scale.py"),
     ("安全性（認証情報・権限）", "test_security.py"),
 ]
 

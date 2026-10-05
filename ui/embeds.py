@@ -823,3 +823,81 @@ def guard_log(
     if footer:
         e.set_footer(text=str(footer)[:2048])
     return e
+
+
+async def ranking_panel() -> discord.Embed:
+    """
+    紹介ランキングの常設パネル。
+
+    ⚠️ 名前を出すかどうかは設定で切り替えられる。
+       出さない設定のときは、実績パネルと同じ匿名コードを使う
+       （同じ人が同じコードで出るので、本人は自分だと分かる）。
+
+    ⚠️ 1位が0件のときは順位を出さない。誰も居ないランキングは、
+       かえって「誰もやっていない」ように見える。
+    """
+    import config
+    from core import invite as inv
+
+    if not inv.enabled():
+        return discord.Embed(
+            title=f"{E.CHART} 紹介ランキング",
+            description=(
+                "紹介プログラムはただいま開催しておりません。\n"
+                "次回の開催までお待ちください。"
+            ),
+            color=GREY,
+        )
+
+    top = int(settings.get("ranking_top", config.RANKING_TOP) or 5)
+    rows = await inv.monthly_ranking(top)
+    total = await inv.monthly_total()
+    # ⚠️ %-m は Linux でしか使えない。自分で組み立てる。
+    month = f"{config.now_jst().month}月"
+
+    e = discord.Embed(
+        title=f"{E.CHART} 今月の紹介ランキング",
+        description=(
+            f"{month}にご紹介いただいた方のランキングです。\n"
+            f"ご紹介が成立すると、紹介者さまに **{yen(inv.reward_amount())}** が入ります。"
+        ),
+        color=GREEN,
+    )
+
+    if not rows:
+        e.add_field(
+            name="今月の1人目を目指しませんか",
+            value=(
+                "まだご紹介の成立がありません。\n"
+                f"{E.GIFT} 招待パネルの「リンクを受け取る」から始められます。"
+            ),
+            inline=False,
+        )
+        return e
+
+    show_names = bool(settings.get("ranking_show_names", True))
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    codes: dict[int, str] = {}
+    if not show_names:
+        from db.models import User
+        from db.session import session_scope
+
+        async with session_scope() as s:
+            for uid, _ in rows:
+                row = await s.get(User, uid)
+                codes[uid] = row.anon_code if row else "—"
+
+    for i, (uid, n) in enumerate(rows):
+        mark = medals[i] if i < len(medals) else f"**{i + 1}.**"
+        who = f"<@{uid}>" if show_names else f"`{codes.get(uid, '—')}`"
+        lines.append(f"{mark}　{who}　**{n} 名**")
+
+    e.add_field(name="順位", value="\n".join(lines), inline=False)
+    e.add_field(
+        name=f"{E.PARTY} 今月の成立数",
+        value=f"**{total} 名**",
+        inline=True,
+    )
+    e.set_footer(text="毎月1日に区切ります（日本時間）")
+    return e

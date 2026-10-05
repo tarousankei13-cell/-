@@ -477,6 +477,82 @@ async def check_store(
     return check(raw, minutes=minutes, date_key=date_key, pickup_method=pickup_method)
 
 
+# 時間帯のコード → 利用者に見せる呼び名
+#   ⚠️ 実データで確認した5種類（docs/08）。知らない値はそのまま出す。
+DAYPART_LABEL = {
+    "DAYPART_BREAKFAST": "朝マック",
+    "DAYPART_BREAKFAST_REGULAR": "朝マック・レギュラー",
+    "DAYPART_HIRU_MAC": "ヒルマック",
+    "DAYPART_REGULAR": "レギュラー",
+    "DAYPART_YORU_MAC": "夜マック",
+}
+
+# 利用者に伝える価値がある時間帯だけ。
+#   ⚠️ 「レギュラー」は一日の大半なので伝えても意味がない。
+#      朝マック・ヒルマック・夜マックのように**限られた時間だけ**の
+#      ものを伝える。
+NOTABLE_DAYPARTS = ("DAYPART_BREAKFAST", "DAYPART_HIRU_MAC", "DAYPART_YORU_MAC")
+
+
+def daypart_label(name: str) -> str:
+    """時間帯の呼び名。知らない値はそのまま返す。"""
+    return DAYPART_LABEL.get(str(name), str(name))
+
+
+def notable_labels(active: set[str] | None) -> list[str]:
+    """
+    いまの時間帯のうち、利用者に伝える価値があるものの呼び名。
+
+    ⚠️ 伝える価値が無いもの（レギュラー）を混ぜないこと。
+       「いまはレギュラーの時間です」と言われても何の助けにもならず、
+       本当に伝えたい朝マック・夜マックが埋もれる。
+    """
+    if not active:
+        return []
+    return [daypart_label(n) for n in NOTABLE_DAYPARTS if n in active]
+
+
+async def common_dayparts(*, minutes: int | None = None) -> set[str]:
+    """
+    いま多くの店舗で受け付けている時間帯。
+
+    ⚠️ 店舗を選ぶ**前**の案内に使う。店舗ごとに違うので、
+       「お店によって異なります」と添えて出すこと。
+    ⚠️ 推測で時刻を決め打ちしない（朝マックは5:00〜、など）。
+       保存してある実際の営業データから数える。
+    """
+    from collections import Counter
+
+    from db.models import StoreDaypart
+    from db.session import session_scope
+    from sqlalchemy import select
+
+    now = config.now_jst()
+    if minutes is None:
+        minutes = now.hour * 60 + now.minute
+    date_key = now.strftime("%Y-%m-%d")
+
+    async with session_scope() as s:
+        rows = (await s.execute(
+            select(StoreDaypart).where(StoreDaypart.date == date_key)
+        )).scalars().all()
+
+    if not rows:
+        return set()
+
+    stores: set[str] = set()
+    hit: Counter[str] = Counter()
+    for d in rows:
+        stores.add(str(d.store_id))
+        merged = _merge(json.loads(d.checkoutable or "[]"))
+        if merged and _contains(minutes, merged):
+            hit[str(d.daypart)] += 1
+
+    # 半数以上の店舗で受け付けているものだけを「いまの時間帯」とする
+    need = max(1, len(stores) // 2)
+    return {name for name, n in hit.items() if n >= need}
+
+
 async def active_dayparts_for(
     store_id: str, *, minutes: int | None = None, date_key: str | None = None
 ) -> set[str]:

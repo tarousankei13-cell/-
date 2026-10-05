@@ -342,6 +342,16 @@ async def _finish_verify(interaction: discord.Interaction, *, method: str) -> No
         ephemeral=True,
     )
 
+    # ようこそ案内を1回だけ送る（設定が切れていれば何もしない）
+    #   ⚠️ 認証が済んだこの瞬間が、一番届く。
+    #      入室直後だと、まだ中が見えていないので読まれない。
+    try:
+        from services import outreach
+
+        await outreach.welcome(interaction.client, interaction.user)
+    except Exception:
+        log.warning("ようこそ案内を送れませんでした", exc_info=True)
+
     # 認証したことを記録先へ流す（設定されていなければ何もしない）
     from core import settings
     from services.server import logs
