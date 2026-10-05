@@ -170,6 +170,43 @@ def main():
           SB.bridge_for("9180") == "", SB.bridge_for("9180"))
     check("同じものを2度は学ばない", SB.learn_from_order(decode_hex(REAL).items) == 0)
 
+    # ------------------------------------------------------------
+    print("\n[ 実物で確かめていない選択枠の洗い出し ]")
+    # ------------------------------------------------------------
+    # ⚠️ 中間ノードはカタログに載っておらず、**実物の注文コードからしか
+    #    分からない**。分からない枠は「中間なし」として送っているので、
+    #    本当は中間が要る枠だと注文が通らない。
+    #    どの枠が未検証かを、いつでも数えられるようにしておく。
+    import json as _json
+    from collections import defaultdict
+
+    from services.mcd.menu import parse_menu as _parse
+
+    _pm = _parse("13934", _json.load(open(os.path.join(HERE, "m13934.json"))))
+    # 実物の注文コードから確認できている枠
+    VERIFIED = {
+        "9987009", "9987010", "9987017", "9997008", "9997028",  # 中間なし
+        "9997918", "9997925",                                   # 中間あり
+    }
+    users = defaultdict(set)
+    for _mins in (8 * 60, 13 * 60, 20 * 60):
+        for _c, _p in _pm.products.items():
+            if _p.product_class != "VALUE_MEAL" or not _pm.orderable(_p, _mins):
+                continue
+            for _s in _p.slots_of("choices"):
+                users[_s.code].add(_c)
+    unknown = sorted(c for c in users if c not in VERIFIED)
+    risky = sorted({c for u in unknown for c in users[u]})
+    print(f"      未検証の枠 {len(unknown)} 種類 / 影響する商品 {len(risky)} 件")
+    for u in unknown:
+        print(f"        枠{u} … {len(users[u])} 商品")
+    check("検証済みの枠は実在する ★",
+          all(v in users or v in SB.KNOWN for v in VERIFIED),
+          [v for v in VERIFIED if v not in users and v not in SB.KNOWN])
+    # ⚠️ ここは「0件であるべき」ではない。実物をいただくまでは残る。
+    #    数が**増えていないこと**を見るための記録。
+    check("未検証の枠が想定どおり（増えていない）★", len(unknown) <= 6, unknown)
+
     print("\n[9] 中間を知らない枠でも注文を止めない ★")
     SB.forget_all(); SB.KNOWN.clear()
     fallback = build_order_item(cart, menu.products["9180"], {"9997918": "3120"})

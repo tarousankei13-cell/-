@@ -910,6 +910,104 @@ class AdminCog(commands.Cog):
 
     # -- 調査 ---------------------------------------------------
 
+    @debug_group.command(
+        name="fails", description="失敗した注文の中身とエラーを表示します"
+    )
+    @app_commands.describe(
+        count="見る件数", product="この商品コードを含むものだけ（省略可）",
+    )
+    @admin_only()
+    async def debug_fails(
+        self, interaction: discord.Interaction,
+        count: app_commands.Range[int, 1, 10] = 3,
+        product: app_commands.Range[str, 1, 16] | None = None,
+    ) -> None:
+        """
+        注文が通らない原因を突き止めるための窓口。
+
+        ⚠️ **送った中身そのもの**と、マクドナルドが返した文言を並べて出す。
+           どちらか片方だけでは原因が分からない。
+           「何を送って、何と言われたか」が揃って初めて切り分けられる。
+        """
+        from sqlalchemy import select
+
+        from db.models import Order, as_utc
+        from services.mcd.protocol import ProtocolError, decode_hex
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with session_scope() as s:
+            q = (
+                select(Order)
+                .where(Order.error.is_not(None))
+                .order_by(Order.created_at.desc())
+                .limit(50)
+            )
+            rows = list((await s.execute(q)).scalars().all())
+
+        if product:
+            want = str(product).strip()
+            rows = [o for o in rows if want in (o.items_json or "")
+                    or want in (o.hex_payload or "")]
+        rows = rows[:count]
+
+        if not rows:
+            await interaction.followup.send(
+                embed=embeds.info(
+                    "失敗した注文は見つかりませんでした。" if not product
+                    else f"`{product}` を含む失敗した注文は見つかりませんでした。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        from services.mcd import stores as mcd_stores
+
+        blocks = []
+        for o in rows:
+            created = as_utc(o.created_at)
+            when = (created.astimezone(config.JST).strftime("%m/%d %H:%M")
+                    if created else "—")
+            lines = [
+                f"**{when}　{o.store_name or o.store_id or '—'}**",
+                f"状態 `{o.state}`　定価 {embeds.yen(o.list_price)}",
+            ]
+            # 送った中身を木の形で出す
+            try:
+                dec = decode_hex(o.hex_payload)
+                menu = None
+                try:
+                    menu = await mcd_stores.load_menu(str(o.store_id))
+                except Exception:
+                    pass
+
+                def nm(code: str) -> str:
+                    if menu is None:
+                        return ""
+                    p = menu.products.get(str(code))
+                    return f" {p.name}" if p else " （枠・中間）"
+
+                def tree(it, d=0):
+                    out = ["　" * d + f"`{it.product_code}`×{it.quantity}"
+                           + ("[枠]" if it.has_flag else "") + nm(it.product_code)]
+                    for c in it.components:
+                        out += tree(c, d + 1)
+                    return out
+
+                for it in dec.items:
+                    lines += tree(it)
+            except ProtocolError as e:
+                lines.append(f"（送った中身を読めませんでした: {e}）")
+
+            lines.append(f"{E.NG} **マクドナルドの応答**")
+            lines.append(f"```\n{(o.error or '（記録なし）')[:700]}\n```")
+            blocks.append("\n".join(lines))
+
+        body = "\n\n".join(blocks)
+        await interaction.followup.send(
+            embed=embeds.info(body[:4000], title=f"{E.WARN} 通らなかった注文"),
+            ephemeral=True,
+        )
+
     @debug_group.command(name="hex", description="注文コードの中身を表示します")
     @app_commands.describe(code="注文コード（HEX）")
     @admin_only()
