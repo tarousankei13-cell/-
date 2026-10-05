@@ -1315,10 +1315,42 @@ async def learn_rejected_choices(decoded, result) -> list[str]:
         log.exception("メニューを読めず、組み合わせを学習できませんでした")
         return []
 
+    # ---- ① 相手が「どれが駄目か」を教えてくれている場合 ----
+    #
+    # ⚠️ **これが本命。** 応答には
+    #        9030 > 9997925 > 3120 product not found
+    #    のように、セット > 枠 > 商品 の経路が入っている。
+    #    推測する必要はまったく無い。
+    #
+    # ⚠️ 以前はここを読まず、注文全体から疑わしいものを絞り込んでいた。
+    #    疑いが2つ以上あると「巻き添えを避ける」ために何も覚えず、
+    #    同じ組み合わせで何度も失敗し続けていた。
+    told = list(getattr(info, "rejected", None) or [])
+    if told:
+        learned: list[str] = []
+        for slot_code, product_code in told:
+            # 枠として実在するものだけを覚える。
+            # 経路の末尾2つが「セット > 商品」のこともあり、
+            # それを枠として覚えると意味の無い記録になる。
+            if product_code not in menu.products:
+                continue
+            if slot_rules.known_bad(store_id, slot_code, product_code):
+                continue
+            if slot_rules.reject(store_id, slot_code, product_code):
+                learned.append(menu.products[product_code].name)
+        if learned:
+            log.info(
+                "断られた組み合わせを相手の応答から覚えました: %s", learned,
+            )
+            return learned
+        # 教えてもらったが覚えるものが無かった場合は、下の絞り込みへ進む
+
     minutes = minutes_of(config.now_jst())
 
-    # ⚠️ マクドナルドは「どれが駄目か」を教えてくれない。返ってくるのは
-    #    注文全体への「お取り扱いがありません」だけ。
+    # ---- ② 経路が入っていなかった場合の絞り込み ----
+    #
+    # ⚠️ 古い応答や、経路を返さないエラーのための保険。
+    #    ここは推測なので、疑いが1つに絞れたときだけ覚える。
     #    疑わしいものが複数あるときに全部覚えてしまうと、**何も悪くない
     #    商品まで二度と出せなくなる**。実際、朝マックのセットで
     #    サイドサラダが巻き添えになっていた。

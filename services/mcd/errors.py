@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 log = logging.getLogger("bot.mcd.errors")
 
@@ -129,6 +129,36 @@ _JA = re.compile(
 _ERRCODE = re.compile(r"ErrorCode_\w+")
 
 
+# 断られた商品の経路。
+#
+#   9030 > 9997925 > 3120 product not found
+#   └セット  └選択枠   └商品
+#
+# ⚠️ **マクドナルドは「どれが駄目か」をここで正確に教えてくれている。**
+#    かつては注文全体から疑わしいものを絞り込んで推測していたが、
+#    2つ以上疑わしいと何も学習できず、同じ失敗を繰り返していた。
+#    推測せず、ここを読むこと。
+_PATH = re.compile(r"\b\d{3,8}(?:\s*>\s*\d{3,8})+")
+
+
+def rejected_pairs(body: bytes | str) -> list[tuple[str, str]]:
+    """
+    断られた (枠のコード, 商品のコード) を取り出す。
+
+    経路の**末尾2つ**が「どの枠に、どの商品を入れたのが駄目だったか」。
+    経路が1段しかない（商品だけ）場合は、枠が分からないので返さない。
+    """
+    text = body.decode("utf-8", "replace") if isinstance(body, bytes) else (body or "")
+    out: list[tuple[str, str]] = []
+    for m in _PATH.finditer(text):
+        parts = [p.strip() for p in m.group(0).split(">") if p.strip()]
+        if len(parts) >= 2:
+            pair = (parts[-2], parts[-1])
+            if pair not in out:
+                out.append(pair)
+    return out
+
+
 @dataclass
 class McdErrorInfo:
     """解析したエラー。"""
@@ -137,6 +167,8 @@ class McdErrorInfo:
     message: str = ""           # マクドナルドの日本語の文言
     status: int = 0             # HTTPの状態
     raw: str = ""               # 元の本文（管理者向け）
+    # 断られた (枠, 商品) の組。相手が教えてくれたものだけが入る。
+    rejected: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def account_fault(self) -> bool:
@@ -229,7 +261,10 @@ def parse(status: int, body: bytes | str) -> McdErrorInfo:
     message = max(messages, key=len) if messages else ""
 
     info = McdErrorInfo(
-        kind=kind, code=code, message=message, status=status, raw=raw[:1000]
+        kind=kind, code=code, message=message, status=status, raw=raw[:1000],
+        rejected=rejected_pairs(body),
     )
+    if info.rejected:
+        log.info("断られた組み合わせを相手が教えてくれました: %s", info.rejected)
     log.info("注文のエラーを解析しました: %s (HTTP %s)", info.summary(), status)
     return info

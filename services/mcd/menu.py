@@ -696,29 +696,71 @@ class ParsedMenu:
                 continue
             out.append(p)
 
-        # 代表の商品は、時間帯の判定に関わらず必ず残す
-        # （マクドナルド側が代表として指定しているものなので）
-        if base not in [p.code for p in out]:
-            base_p = self.products.get(str(base))
-            if base_p is not None and (
-                minutes is None or base_p.is_orderable_at(minutes)
-            ):
+        # 代表の商品（referenceProduct）の扱い。
+        #
+        # ⚠️ **断られた記録があるなら戻さない。**
+        #    代表だからといって必ず選べるとは限らない。実際、朝マックの
+        #    セット（9030）のドリンク枠 9997925 は代表が「コカ・コーラ M」
+        #    だが、マクドナルドは
+        #        9030 > 9997925 > 3120 product not found
+        #    と断ってくる。以前はここで無条件に押し戻していたため、
+        #    学習しても候補の**先頭**に出続け、選んだ人が必ず失敗していた。
+        #
+        # ⚠️ ただし**候補が空になるのはもっと悪い**。
+        #    0件だと枠を埋められず、その商品を一切注文できなくなる。
+        #    全部断られてしまった場合だけは、代表を戻して望みをつなぐ。
+        base_p = self.products.get(str(base))
+        if base_p is not None and base not in [p.code for p in out]:
+            time_ok = minutes is None or base_p.is_orderable_at(minutes)
+            if time_ok and slot_rules.allowed(self.store_id, slot.code, base):
+                out.insert(0, base_p)
+            elif not out and time_ok:
+                # 最後の手段。断られた記録があっても、空よりはまし。
+                log.info(
+                    "枠 %s は候補が全部断られています。"
+                    "代表商品（%s）だけ残します。", slot.code, base,
+                )
                 out.insert(0, base_p)
 
         # 確かなものを先に並べる。
         # ⚠️ カタログに候補一覧が無い以上、確実に選べると分かっているのは
         #    参照商品とそのサイズ違いだけ。利用者が上から選ぶほど
         #    通りやすくなるようにしておく。
-        safe = {str(base)} | {q.code for q in self.size_variants(base)}
+        # ⚠️ 断られた記録があるものを「確実」に入れない。
+        #    入れると、通らないと分かっているものが先頭に並ぶ。
+        safe = {
+            c for c in ({str(base)} | {q.code for q in self.size_variants(base)})
+            if slot_rules.allowed(self.store_id, slot.code, c)
+        }
         # 手がかりの表で「確実に選べる」と分かっているものは、さらに先へ。
         # ハッピーセットのドリンクは枠の中身がカタログに無いため、
         # 上から選ぶほど通りやすい並びにしておく。
         from services.mcd import slot_hints
         prefer = slot_hints.preferred(slot.code)
         rank = {code: i for i, code in enumerate(prefer)}
-        out.sort(
-            key=lambda q: (rank.get(q.code, len(rank)), q.code not in safe, q.name)
-        )
+
+        # ⚠️ ドリンクの枠は20種類を超えることがある。名前順に並べると
+        #    コーラ・スプライト・ファンタが離れ、選ぶのに何度も
+        #    上下に動かすことになる（一度に5〜6件しか見えない）。
+        #    同じ仲間が隣り合うように、種類でまとめてから並べる。
+        from services.mcd import drinks
+
+        grouped = drinks.is_drink_slot(out)
+
+        def sort_key(q):
+            # ⚠️ 並べる順の優先度を間違えないこと。
+            #    ① 手がかりの表（実物で通ると分かっているもの）
+            #    ② 種類（炭酸・ジュース…）でまとめる
+            #    ③ 代表商品とそのサイズ違い
+            #    ④ 名前
+            #    ①を②より後ろにすると、ハッピーセットのように
+            #    カタログに候補が載っていない枠で、通らないものが
+            #    先頭に来てしまう。**通りやすさが見やすさより先**。
+            hint = rank.get(q.code, len(rank))
+            group = drinks.group_of(q.name)[0] if grouped else 0
+            return (hint, group, q.code not in safe, q.name)
+
+        out.sort(key=sort_key)
         return out
 
     def nested_choices(self, product: Product) -> list[tuple[str, Slot]]:

@@ -1924,12 +1924,22 @@ class OptionView(discord.ui.View):
             key = self._key_of(c)
             label = self._slot_label(c, candidates)
             now = picked_codes(self.picks.get(key))
-            options = [
-                discord.SelectOption(
+            # ⚠️ ドリンクのように種類が多い枠は、絵文字を付けて
+            #    一目で仲間が分かるようにする。
+            #    並び順は choice_candidates が種類ごとにまとめている。
+            from services.mcd import drinks
+
+            grouped = drinks.is_drink_slot(candidates)
+            options = []
+            for p in candidates[:25]:
+                opt = discord.SelectOption(
                     label=p.name[:100], value=p.code, default=(p.code in now),
                 )
-                for p in candidates[:25]
-            ]
+                if grouped:
+                    order, emoji, group_name = drinks.group_of(p.name)
+                    opt.emoji = emoji
+                    opt.description = group_name
+                options.append(opt)
             # ⚠️ ナゲット15ピースのソースのように3個必須の枠は、
             #    実際のアプリと同じく **種類を分けて選べる** ようにする。
             #    足りない分は選んだものを増やして埋めるので、

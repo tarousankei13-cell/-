@@ -998,6 +998,21 @@ class AdminCog(commands.Cog):
             except ProtocolError as e:
                 lines.append(f"（送った中身を読めませんでした: {e}）")
 
+            # ⚠️ 応答には「どれが駄目か」の経路が入っていることがある。
+            #    そこを読んで、分かりやすく出す。
+            from services.mcd import errors as mcd_errors
+
+            pairs = mcd_errors.rejected_pairs(o.error or "")
+            if pairs:
+                told = []
+                for slot_code, product_code in pairs:
+                    told.append(
+                        f"枠 `{slot_code}` に `{product_code}`"
+                        + nm(product_code) + " を入れたのが断られました"
+                    )
+                lines.append(f"{E.WARN} **相手が指した原因**")
+                lines += [f"・{t}" for t in told]
+
             lines.append(f"{E.NG} **マクドナルドの応答**")
             lines.append(f"```\n{(o.error or '（記録なし）')[:700]}\n```")
             blocks.append("\n".join(lines))
