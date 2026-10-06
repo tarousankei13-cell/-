@@ -546,6 +546,42 @@ class ParsedMenu:
 
         return slot_bridge.bridge_for(slot.code)
 
+    def bridge_gaps(self) -> list[tuple[str, list["Product"]]]:
+        """中間ノードが分かっていない枠と、それが止めている商品。
+
+        ⚠️ カタログは「参照しているが定義していないコード」を持つ。
+           枠コードは choices に出てくるが products には載っておらず、
+           その枠に必要な中間ノードはカタログのどこにも書かれていない。
+           書かれていないので**計算では出せない**。実際に通った注文
+           コードを貼ってもらう以外に手が無い（docs/04）。
+
+        ⚠️ 「中間が要る枠」と「中間が要らない枠」は見分けられない。
+           サイド枠は中間なしで実際に通っている。だからここに出るのは
+           「中間が要るかどうかも分からない枠」であって、全部が
+           壊れているとは限らない。**疑わしい枠の一覧**として読む。
+
+        返すのは (枠のコード, その枠を持つ商品) の一覧。多い順。
+        """
+        from services.mcd import slot_bridge
+
+        gaps: dict[str, list[Product]] = {}
+        for product in self.products.values():
+            for slot in product.slots_of("choices"):
+                # 中間あり／中間不要と分かっている枠は、調べる必要が無い
+                if slot_bridge.status_of(slot.code) != "unknown":
+                    continue
+                gaps.setdefault(slot.code, []).append(product)
+        return sorted(gaps.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+
+    def products_using_slots(self, slot_codes: Iterable[str]) -> list["Product"]:
+        """その枠を持つ商品。覚えた直後に「何が直ったか」を見せるため。"""
+        want = {str(c) for c in slot_codes}
+        out = []
+        for product in self.products.values():
+            if any(s.code in want for s in product.slots_of("choices")):
+                out.append(product)
+        return sorted(out, key=lambda p: p.code)
+
     def _pool_for(self, base: str) -> list[str]:
         """
         候補の母集団。

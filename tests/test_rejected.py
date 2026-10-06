@@ -157,6 +157,13 @@ async def main():
     # ========================================================
     print("\n[ 画面に出せる形になっているか ]")
     # ========================================================
+    # ⚠️ 9030 は朝マックのセット。時間帯の外だと候補が全部消えて
+    #    選択肢が1つも作られず、このテストは**実行した時刻によって
+    #    落ちる**。実際に 05:25 に落ちた。時計を固定する。
+    #    時刻で結果が変わるテストは、無いほうがましなので必ず固定する。
+    #    config.now_jst() は毎回この環境変数を読むので、置くだけで効く。
+    os.environ["BOT_FAKE_JST"] = "2026-10-06 08:00"
+
     import discord
     from ui import menu_flows as mf
 
@@ -180,6 +187,8 @@ async def main():
 
     test_debug_fails_scrub()
     await test_debug_fails_cmd()
+    await test_bridge_commands()
+    test_bridge_gaps()
 
     await close_db()
     print(f"\n{'='*52}\n  成功 {ok} / 失敗 {fail}\n{'='*52}")
@@ -268,6 +277,124 @@ async def test_debug_fails_cmd():
         check("添付にトークンが残らない ★", "abcdef1234567890SECRET" not in raw)
         check("伏せたことが分かる", "伏せました" in raw)
         check("両方の注文が入っている", raw.count("=== ") >= 2)
+
+
+
+
+# ============================================================
+# [9] 選択枠の構造を教える窓口（/debug learn / bridges / forget）
+# ============================================================
+
+async def test_bridge_commands():
+    """⚠️ これが無いと、構造を教える手段が存在しない。
+
+    学習は注文の流れの中だけで動いていた。そこを通るには金額・残高・
+    店舗の確認をすべて越える必要があり、**構造だけ教えたい場合に
+    使えなかった**。カタログにも公式アプリにも無い値なので
+    （docs/04）、通った注文コードを貼る以外に入手経路が無い。
+    """
+    print("\n[ 構造を教える窓口 ]")
+    import cogs.admin as admin
+    from _fake_discord import FakeClient, FakeInteraction, FakeUser
+    from services.mcd import slot_bridge
+    from services.mcd.protocol import OrderItem, build_hex
+
+    slot_bridge.forget_all()
+    cog = admin.AdminCog(FakeClient())
+
+    def hexfor(slot, bridge, leaf="3604", top="9052"):
+        return build_hex("13934", [OrderItem(product_code=top, quantity=1, amount=500,
+            components=[OrderItem(product_code=slot, quantity=1, has_flag=True,
+                components=[OrderItem(product_code=bridge, quantity=1, has_flag=True,
+                    components=[OrderItem(product_code=leaf, quantity=1)])])])], "takeOut")
+
+    # ① 知らない枠をおぼえる
+    it = FakeInteraction(FakeUser(1))
+    await admin.AdminCog.debug_learn.callback(cog, it, code=hexfor("9997929", "9997926"))
+    check("落ちずに応答する", bool(it.actions))
+    check("おぼえたと言う ★", "おぼえました" in it.text())
+    check("実際に覚えている ★", slot_bridge.bridge_for("9997929") == "9997926")
+
+    # ② 同じものをもう一度 → 既知として扱う
+    it = FakeInteraction(FakeUser(1))
+    await admin.AdminCog.debug_learn.callback(cog, it, code=hexfor("9997929", "9997926"))
+    check("2回目は既知と言う", "既に知っています" in it.text())
+
+    # ③ ⚠️ 違う値が来たら「書き換えた」と必ず知らせる。
+    #    黙って上書きすると、通っていたものが通らなくなった理由が追えない。
+    it = FakeInteraction(FakeUser(1))
+    await admin.AdminCog.debug_learn.callback(cog, it, code=hexfor("9997929", "9997999"))
+    check("書き換えを知らせる ★", "書き換えました" in it.text())
+    check("前の値も見せる ★", "9997926" in it.text())
+
+    # ④ 中間ノードが無いコードでは、何も学ばず、そう言う
+    flat = build_hex("13934", [OrderItem(product_code="1010", quantity=1, amount=200)],
+                     "takeOut")
+    it = FakeInteraction(FakeUser(1))
+    await admin.AdminCog.debug_learn.callback(cog, it, code=flat)
+    check("学ぶものが無いと言う", "ありませんでした" in it.text())
+
+    # ⑤ 壊れたコードで落ちない
+    it = FakeInteraction(FakeUser(1))
+    await admin.AdminCog.debug_learn.callback(cog, it, code="ZZ-読めない")
+    check("壊れたコードでも落ちない ★", bool(it.actions))
+    check("読めないと言う", "読み取れませんでした" in it.text())
+
+    # ⑥ 一覧
+    it = FakeInteraction(FakeUser(1))
+    await admin.AdminCog.debug_bridges.callback(cog, it, store="13934")
+    txt = it.text()
+    check("一覧が出る", bool(it.actions))
+    check("中間ありを出す", "9997918" in txt)
+    check("中間不要と確認済みを別に出す ★", "直結" in txt)
+    check("まだ分からない枠を出す", "まだ分からない枠" in txt)
+    # ⚠️ 「不明」と「不要と確認済み」を混ぜない
+    check("確認済みの枠を不明側に出さない ★",
+          "9987009" not in txt.split("まだ分からない枠")[-1])
+    check("全部壊れていると誤解させない ★", "全部が壊れているわけではありません" in txt)
+
+    # ⑦ おぼえた分は消せる
+    it = FakeInteraction(FakeUser(1))
+    await admin.AdminCog.debug_forget.callback(cog, it, slot="9997929")
+    check("消せる", "消しました" in it.text())
+    check("実際に消えている ★", slot_bridge.bridge_for("9997929") == "")
+
+    # ⑧ ⚠️ 実物で確認済みのものは消せない（事故で動かなくなるため）
+    it = FakeInteraction(FakeUser(1))
+    await admin.AdminCog.debug_forget.callback(cog, it, slot="9997918")
+    check("確認済みは消せない ★", "消せません" in it.text())
+    check("消されていない ★", slot_bridge.bridge_for("9997918") == "9997914")
+
+    # ⑨ 知らない枠を消そうとしても落ちない
+    it = FakeInteraction(FakeUser(1))
+    await admin.AdminCog.debug_forget.callback(cog, it, slot="0000")
+    check("知らない枠でも落ちない", bool(it.actions))
+
+    slot_bridge.forget_all()
+
+
+def test_bridge_gaps():
+    """⚠️ 一覧は「不明」だけを出す。確認済みを混ぜてはいけない。"""
+    print("\n[ 分からない枠の数え方 ★ ]")
+    import json
+    from services.mcd import slot_bridge
+    from services.mcd.menu import parse_menu
+
+    slot_bridge.forget_all()
+    m = parse_menu("13934", json.load(open(os.path.join(HERE, "m13934.json"))))
+    codes = [c for c, _ in m.bridge_gaps()]
+
+    for c in slot_bridge.KNOWN:
+        check(f"中間ありの {c} は不明に出ない", c not in codes)
+    # 9987009 は37商品が使う枠。中間不要と実物で確認済み。
+    for c in slot_bridge.NO_BRIDGE:
+        check(f"中間不要と確認済みの {c} は不明に出ない ★", c not in codes)
+
+    check("それでも不明は残る（0件にはならない）", len(codes) > 0, codes[:3])
+    check("状況を3つに分けられる ★",
+          slot_bridge.status_of("9997918") == "bridge"
+          and slot_bridge.status_of("9987009") == "direct"
+          and slot_bridge.status_of("0000") == "unknown")
 
 
 if __name__ == "__main__":

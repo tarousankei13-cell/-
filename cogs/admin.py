@@ -1101,8 +1101,281 @@ class AdminCog(commands.Cog):
         e.add_field(name=f"商品（{len(d.items)} 点）", value="\n".join(lines)[:1024] or "—", inline=False)
         if d.redirect_urls:
             e.add_field(name="リダイレクトURL", value="\n".join(d.redirect_urls[:3])[:1024], inline=False)
+
+        # ⚠️ ここでは覚えない。読むだけの窓口が勝手に設定を書き換えると、
+        #    「見ただけ」のつもりが挙動を変えてしまう。覚えるのは
+        #    /debug learn の仕事。見つけたことだけ知らせる。
+        from services.mcd import slot_bridge
+
+        pairs = slot_bridge.pairs_in_order(d.items)
+        new_pairs = [
+            (sc, bc) for sc, bc in pairs if slot_bridge.bridge_for(sc) != bc
+        ]
+        if new_pairs:
+            e.add_field(
+                name=f"{E.WARN} まだ知らない枠の構造が入っています",
+                value=(
+                    "\n".join(f"`{sc}` → `{bc}`" for sc, bc in new_pairs[:8])
+                    + f"\n\n{E.INFO} `/debug learn` に同じコードを貼ると覚えます。"
+                )[:1024],
+                inline=False,
+            )
         e.set_footer(text=f"{len(d.raw_hex) // 2} バイト")
         await interaction.followup.send(embed=e, ephemeral=True)
+
+
+    # -- 選択枠の中間ノード -------------------------------------
+
+    async def _recent_store(self) -> str:
+        """直近の注文の店舗。店舗を省略されたときの既定にする。"""
+        from sqlalchemy import select
+
+        from db.models import Order
+
+        async with session_scope() as s:
+            q = (
+                select(Order.store_id)
+                .where(Order.store_id.is_not(None))
+                .order_by(Order.created_at.desc())
+                .limit(1)
+            )
+            return (await s.execute(q)).scalars().first() or ""
+
+    @debug_group.command(
+        name="learn", description="注文コードから選択枠の構造をおぼえます"
+    )
+    @app_commands.describe(code="通った注文コード（HEX）")
+    @admin_only()
+    async def debug_learn(
+        self, interaction: discord.Interaction,
+        code: app_commands.Range[str, 1, 6000],
+    ) -> None:
+        """
+        通った注文コードを貼って、選択枠の中間ノードをおぼえる窓口。
+
+        ⚠️ これが無いと、構造を教える手段が無い。学習は注文の流れの
+           中だけで動いており、そこを通るには金額・残高・店舗の確認を
+           すべて越える必要があった。**構造だけ教えたい場合に使えない。**
+
+        ⚠️ 中間ノードはカタログにもマクドナルド公式アプリにも載っていない
+           （docs/04）。通った注文コードが唯一の手がかり。
+        """
+        from services.mcd import slot_bridge, stores as mcd_stores
+        from services.mcd.protocol import ProtocolError, decode_hex
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            d = decode_hex(code)
+        except ProtocolError as e:
+            await interaction.followup.send(
+                embed=embeds.error(
+                    f"注文コードを読み取れませんでした。\n```{e}```\n"
+                    f"{E.INFO} 最後まで省略せずに貼れているか確認してください。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        pairs = slot_bridge.pairs_in_order(d.items)
+        if not pairs:
+            await interaction.followup.send(
+                embed=embeds.info(
+                    "この注文コードに、枠と中間ノードの組み合わせはありませんでした。\n\n"
+                    f"{E.INFO} 中間ノードが要るのはセットのドリンク枠などです。"
+                    "単品や、中間ノードの無いセットでは何も学べません。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        # 覚える前に、どれが新しいかを見ておく
+        before = {c: slot_bridge.bridge_for(c) for c, _ in pairs}
+        learned = slot_bridge.learn_from_order(d.items)
+
+        menu = None
+        try:
+            menu = await mcd_stores.load_menu(str(d.store_id or await self._recent_store()))
+        except Exception:
+            pass
+
+        def nm(c: str) -> str:
+            if menu is None:
+                return ""
+            p = menu.products.get(str(c))
+            return f" {p.name}" if p else ""
+
+        lines, fresh = [], []
+        for slot_code, bridge_code in pairs:
+            if before.get(slot_code) == bridge_code:
+                lines.append(f"　既に知っています　`{slot_code}` → `{bridge_code}`")
+            elif before.get(slot_code):
+                # ⚠️ 既に別の値を知っていた。上書きされている。
+                lines.append(
+                    f"{E.WARN} 書き換えました　`{slot_code}` → `{bridge_code}`"
+                    f"（前は `{before[slot_code]}`）"
+                )
+                fresh.append(slot_code)
+            else:
+                lines.append(f"{E.OK} おぼえました　`{slot_code}` → `{bridge_code}`")
+                fresh.append(slot_code)
+
+        e = discord.Embed(
+            title=f"{E.SYNC} 選択枠の構造をおぼえました"
+            if learned else f"{E.INFO} 新しく学ぶものはありませんでした",
+            description="\n".join(lines)[:4000],
+            color=embeds.GREEN if learned else embeds.BLUE,
+        )
+
+        # 何が注文できるようになったか
+        if fresh and menu is not None:
+            affected = menu.products_using_slots(fresh)
+            if affected:
+                names = [f"・{p.name}" for p in affected[:15]]
+                more = len(affected) - len(names)
+                e.add_field(
+                    name=f"これで通るようになる見込みの商品（{len(affected)} 件）",
+                    value=("\n".join(names) + (f"\n…ほか {more} 件" if more > 0 else ""))[:1024],
+                    inline=False,
+                )
+        if fresh and menu is None:
+            e.add_field(
+                name="注意",
+                value=f"{E.WARN} メニューを読めなかったため、影響する商品を出せませんでした。",
+                inline=False,
+            )
+        e.set_footer(text=f"店舗 {d.store_id or '—'}　/debug bridges で一覧を確認できます")
+        await interaction.followup.send(embed=e, ephemeral=True)
+
+    @debug_group.command(
+        name="bridges", description="選択枠の中間ノードの分かっている分と不明な分を表示します"
+    )
+    @app_commands.describe(store="店舗ID（省略すると直近の注文の店舗）")
+    @admin_only()
+    async def debug_bridges(
+        self, interaction: discord.Interaction,
+        store: app_commands.Range[str, 1, 8] | None = None,
+    ) -> None:
+        """何が分かっていて、何が分かっていないかを見せる。
+
+        ⚠️ 「不明」と「中間不要と確認済み」を混ぜない。混ぜると、
+           直す必要の無いものを追いかけることになる。
+        """
+        from services.mcd import slot_bridge, stores as mcd_stores
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        store_id = str(store or await self._recent_store() or "")
+
+        e = discord.Embed(
+            title=f"{E.RECEIPT} 選択枠の中間ノード", color=embeds.BLUE,
+            description=(
+                "セットの枠と商品の間に、もう1段入ることがあります。\n"
+                "この値は**カタログにも公式アプリにも載っていない**ため、"
+                "通った注文コードから覚えるしかありません。"
+            ),
+        )
+
+        known = slot_bridge.all_known()
+        learned_marks = [
+            f"`{k}` → `{v}`" + ("（覚えた分）" if slot_bridge.is_learned(k) else "")
+            for k, v in sorted(known.items())
+        ]
+        e.add_field(
+            name=f"{E.OK} 中間ノードあり（{len(known)} 件）",
+            value="\n".join(learned_marks)[:1024] or "—", inline=False,
+        )
+        e.add_field(
+            name=f"{E.OK} 中間ノード不要と確認済み（{len(slot_bridge.NO_BRIDGE)} 件）",
+            value="\n".join(
+                f"`{k}` → `{v}` 直結" for k, v in sorted(slot_bridge.NO_BRIDGE.items())
+            )[:1024] or "—",
+            inline=False,
+        )
+
+        menu = None
+        if store_id:
+            try:
+                menu = await mcd_stores.load_menu(store_id)
+            except Exception:
+                pass
+        if menu is None:
+            e.add_field(
+                name="まだ分からない枠",
+                value=(
+                    f"{E.WARN} 店舗 `{store_id or '—'}` のメニューを読めなかったため、"
+                    "一覧を出せませんでした。`store:` に店舗IDを指定してください。"
+                ),
+                inline=False,
+            )
+            await interaction.followup.send(embed=e, ephemeral=True)
+            return
+
+        gaps = menu.bridge_gaps()
+        total = sum(len(v) for _, v in gaps)
+        rows = []
+        for slot_code, prods in gaps[:12]:
+            例 = prods[0].name if prods else "—"
+            rows.append(f"`{slot_code}`　{len(prods)}商品　例: {例}")
+        more = len(gaps) - len(rows)
+        e.add_field(
+            name=f"{E.WARN} まだ分からない枠（{len(gaps)} 枠 / {total} 商品）",
+            value=(
+                "\n".join(rows) + (f"\n…ほか {more} 枠" if more > 0 else "")
+            )[:1024] or "すべて判明しています",
+            inline=False,
+        )
+        e.add_field(
+            name="直し方",
+            value=(
+                "通った注文コードを `/debug learn code:…` に貼ると、"
+                "その中にある分を自動でおぼえます。\n"
+                f"{E.INFO} 中間が要らない枠もここに出ます。"
+                "**全部が壊れているわけではありません。**"
+            ),
+            inline=False,
+        )
+        e.set_footer(text=f"店舗 {store_id}")
+        await interaction.followup.send(embed=e, ephemeral=True)
+
+    @debug_group.command(
+        name="forget", description="おぼえた中間ノードを1件消します"
+    )
+    @app_commands.describe(slot="枠のコード")
+    @admin_only()
+    async def debug_forget(
+        self, interaction: discord.Interaction,
+        slot: app_commands.Range[str, 1, 16],
+    ) -> None:
+        """間違っておぼえたものを消す。
+
+        ⚠️ 実物で確認済みのもの（KNOWN・NO_BRIDGE）は消せない。
+           消す手段を用意すると、事故で動かなくなる。
+        """
+        from services.mcd import slot_bridge
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        code = str(slot).strip()
+        if slot_bridge.forget(code):
+            await interaction.followup.send(
+                embed=embeds.ok(
+                    f"枠 `{code}` におぼえていた中間ノードを消しました。\n"
+                    f"{E.INFO} 次の注文からは、枠の直下に商品を置く形で送ります。"
+                ),
+                ephemeral=True,
+            )
+            return
+        if code in slot_bridge.KNOWN or code in slot_bridge.NO_BRIDGE:
+            await interaction.followup.send(
+                embed=embeds.error(
+                    f"枠 `{code}` は**実物の注文コードで確認済み**のため消せません。\n"
+                    f"{E.INFO} 間違っていると思われる場合はご連絡ください。"
+                ),
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            embed=embeds.info(f"枠 `{code}` について、おぼえている内容はありません。"),
+            ephemeral=True,
+        )
 
     # -- 保守 ---------------------------------------------------
 

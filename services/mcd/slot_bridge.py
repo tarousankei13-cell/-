@@ -41,6 +41,24 @@ KNOWN: dict[str, str] = {
     "9997925": "9997922",   # 朝マックのセットのドリンク枠（実データ・2026-10）
 }
 
+# 実物の注文コードで「中間ノードが**無い**」と確認できた枠。
+#
+# ⚠️ これを記録しないと、「分からない枠」と「不要と分かっている枠」を
+#    区別できない。区別できないと、後から誰かが（私を含めて）
+#    「この枠の中間が不明だ」と思い込んで埋めようとする。
+#    実際に一度、不要と確認済みの枠について利用者に実データを
+#    求めてしまった（2026-10-06）。
+#
+# ⚠️ ここに入れるのは **枠の直下に商品が来ている実物を見たもの限定**。
+#    「同じ種類の枠だから」で足してはいけない。一度それで
+#    9997925 に 9997914 を当てて外した（実物は 9997922）。
+NO_BRIDGE: dict[str, str] = {
+    "7251": "6048",      # ナゲットのソース枠 → バーベキューソース（実データ）
+    "9987009": "2020",   # セットのサイド枠 → ポテトM（実データ）
+    "9987010": "5010",   # セットのサイド枠 → ハッシュポテト（実データ）
+    "9987017": "3315",   # ハッピーセットのドリンク枠 → オレンジ(S)（実データ）
+}
+
 # ⚠️ 中間ノードの値に **規則は無い**。
 #      9997918 → 9997914（差4）
 #      9997925 → 9997922（差3）
@@ -117,8 +135,6 @@ def learn_from_order(items) -> int:
     「孫がいる中間ノード」＝枠の直下にあって、さらに子を持つもの、
     という形で見つける。
     """
-    found = 0
-
     # 注文の形は決まっている。
     #   深さ0  商品（セット）
     #   深さ1  選択枠
@@ -127,13 +143,10 @@ def learn_from_order(items) -> int:
     #
     # 学びたいのは「深さ1の枠」→「深さ2の中間」だけ。
     # 深さ0と深さ1の関係（商品→枠）はカタログに載っているので学ばない。
-    for top in items or []:
-        for slot in getattr(top, "components", None) or []:
-            for child in getattr(slot, "components", None) or []:
-                # child が子を持っている＝中間ノード
-                if getattr(child, "components", None):
-                    if learn(str(slot.product_code), str(child.product_code)):
-                        found += 1
+    found = 0
+    for slot_code, bridge_code in pairs_in_order(items):
+        if learn(slot_code, bridge_code):
+            found += 1
     return found
 
 
@@ -141,6 +154,73 @@ def all_known() -> dict[str, str]:
     _load()
     with _lock:
         return {**KNOWN, **_learned}
+
+
+def forget(slot_code: str) -> bool:
+    """おぼえた1件を消す。
+
+    ⚠️ KNOWN（実物で確認済みのもの）は消せない。消したいのは
+       「間違って覚えてしまったもの」だけで、確認済みのものを
+       消す手段を用意すると、事故で動かなくなる。
+    """
+    _load()
+    code = str(slot_code)
+    with _lock:
+        if code not in _learned:
+            return False
+        del _learned[code]
+        _save()
+    log.info("おぼえた中間ノードを消しました: %s", code)
+    return True
+
+
+def needs_no_bridge(slot_code: str) -> bool:
+    """「中間ノードは不要」と実物で確認できている枠か。
+
+    ⚠️ 「不明」とは違う。不明な枠も結果として直下に商品を置くので
+       送るコードは同じだが、**不明なら調べる余地があり、確認済みなら
+       調べる必要が無い**。一覧でこの2つを混ぜると、直す必要の無い
+       ものを追いかけることになる。
+    """
+    return str(slot_code) in NO_BRIDGE
+
+
+def status_of(slot_code: str) -> str:
+    """枠の状況。"bridge"（中間あり）/ "direct"（中間不要）/ "unknown"。"""
+    code = str(slot_code)
+    if bridge_for(code):
+        return "bridge"
+    if code in NO_BRIDGE:
+        return "direct"
+    return "unknown"
+
+
+def is_learned(slot_code: str) -> bool:
+    """おぼえたもの（＝消せるもの）か。KNOWN なら False。"""
+    _load()
+    with _lock:
+        return str(slot_code) in _learned
+
+
+def pairs_in_order(items) -> list[tuple[str, str]]:
+    """注文コードの中にある（枠, 中間）の対応を、学ばずに取り出す。
+
+    中身を見せるだけの場面で使う。learn_from_order() と同じ見つけ方を
+    するが、覚えない。
+
+    ⚠️ 見つけ方を2か所に書くと必ずずれる。learn_from_order() は
+       これを呼ぶ形にしてある。
+    """
+    out: list[tuple[str, str]] = []
+    for top in items or []:
+        for slot in getattr(top, "components", None) or []:
+            for child in getattr(slot, "components", None) or []:
+                # child が子を持っている＝中間ノード
+                if getattr(child, "components", None):
+                    pair = (str(slot.product_code), str(child.product_code))
+                    if pair not in out:
+                        out.append(pair)
+    return out
 
 
 def forget_all() -> None:
