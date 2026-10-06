@@ -962,7 +962,10 @@ class AdminCog(commands.Cog):
 
         from services.mcd import stores as mcd_stores
 
+        from services.mcd import errors as mcd_errors
+
         blocks = []
+        raw: list[str] = []
         for o in rows:
             created = as_utc(o.created_at)
             when = (created.astimezone(config.JST).strftime("%m/%d %H:%M")
@@ -971,20 +974,27 @@ class AdminCog(commands.Cog):
                 f"**{when}　{o.store_name or o.store_id or '—'}**",
                 f"状態 `{o.state}`　定価 {embeds.yen(o.list_price)}",
             ]
+            # ⚠️ 商品名を引く道具は try の**外**で作る。
+            #    中で作ると、送った中身が読めなかったときに未定義になり、
+            #    この下の「相手が指した原因」で落ちる。
+            #    原因が分からない注文こそ読めないことが多く、
+            #    一番必要な場面で使えなくなる。
+            menu = None
+            try:
+                menu = await mcd_stores.load_menu(str(o.store_id))
+            except Exception:
+                pass
+
+            def nm(code: str, _menu=None) -> str:
+                m = _menu if _menu is not None else menu
+                if m is None:
+                    return ""
+                p = m.products.get(str(code))
+                return f" {p.name}" if p else " （枠・中間）"
+
             # 送った中身を木の形で出す
             try:
                 dec = decode_hex(o.hex_payload)
-                menu = None
-                try:
-                    menu = await mcd_stores.load_menu(str(o.store_id))
-                except Exception:
-                    pass
-
-                def nm(code: str) -> str:
-                    if menu is None:
-                        return ""
-                    p = menu.products.get(str(code))
-                    return f" {p.name}" if p else " （枠・中間）"
 
                 def tree(it, d=0):
                     out = ["　" * d + f"`{it.product_code}`×{it.quantity}"
@@ -1000,8 +1010,6 @@ class AdminCog(commands.Cog):
 
             # ⚠️ 応答には「どれが駄目か」の経路が入っていることがある。
             #    そこを読んで、分かりやすく出す。
-            from services.mcd import errors as mcd_errors
-
             pairs = mcd_errors.rejected_pairs(o.error or "")
             if pairs:
                 told = []
@@ -1014,13 +1022,45 @@ class AdminCog(commands.Cog):
                 lines += [f"・{t}" for t in told]
 
             lines.append(f"{E.NG} **マクドナルドの応答**")
-            lines.append(f"```\n{(o.error or '（記録なし）')[:700]}\n```")
+            lines.append(
+                f"```\n{(mcd_errors.scrub(o.error) or '（記録なし）')[:700]}\n```"
+            )
             blocks.append("\n".join(lines))
 
+            # ⚠️ 画面には収まらないので、全文は別に取っておく。
+            #    切れた先に原因が書いてあることがある。
+            raw.append(
+                f"=== {when}  注文 {str(o.id)[:8]}  店舗 {o.store_id}"
+                f"（{o.store_name or '—'}）===\n"
+                f"状態: {o.state}\n"
+                f"定価: {o.list_price}\n"
+                f"--- 送った注文コード ---\n{o.hex_payload or '（記録なし）'}\n"
+                f"--- 送った中身（JSON） ---\n{o.items_json or '（記録なし）'}\n"
+                f"--- 応答（全文） ---\n"
+                f"{mcd_errors.scrub(o.error) or '（記録なし）'}\n"
+            )
+
         body = "\n\n".join(blocks)
+        # ⚠️ 1つでも切れていたら全文を付ける。原因は切れた先にあることが多い。
+        joined = "\n".join(raw)
+        too_long = len(body) > 4000 or any(
+            len(o.error or "") > 700 for o in rows
+        )
+        kw: dict = {}
+        if too_long:
+            import io
+
+            kw["file"] = discord.File(
+                io.BytesIO(joined.encode("utf-8")), filename="fails.txt"
+            )
+            body = body[:3900] + (
+                f"\n\n{E.INFO} 画面に収まらないため、"
+                f"**全文を `fails.txt` に付けました。**"
+            )
         await interaction.followup.send(
             embed=embeds.info(body[:4000], title=f"{E.WARN} 通らなかった注文"),
             ephemeral=True,
+            **kw,
         )
 
     @debug_group.command(name="hex", description="注文コードの中身を表示します")

@@ -268,3 +268,46 @@ def parse(status: int, body: bytes | str) -> McdErrorInfo:
         log.info("断られた組み合わせを相手が教えてくれました: %s", info.rejected)
     log.info("注文のエラーを解析しました: %s (HTTP %s)", info.summary(), status)
     return info
+
+
+# ------------------------------------------------------------
+# 応答を人に渡すときの伏せ字
+# ------------------------------------------------------------
+
+# ⚠️ 調査のために応答の全文を管理者へ渡すが、そのまま誰かに貼られると
+#    トークンが一緒に流れる。応答の本文に認証情報が入ることは普通ないが、
+#    「普通ない」で漏らすと取り返しがつかないので、渡す前に伏せる。
+_SECRET_KEYS = (
+    "token", "authorization", "auth", "password", "passwd", "pwd",
+    "secret", "apikey", "api_key", "accesskey", "access_token",
+    "refresh_token", "id_token", "session", "cookie", "credential",
+    "bearer",
+)
+
+# "token": "xxxx" / token=xxxx / "Authorization":"Bearer xxxx"
+_KV = re.compile(
+    r'("?(?:' + "|".join(_SECRET_KEYS) + r')"?\s*[:=]\s*"?)([^"\s,&}\]]{8,})',
+    re.IGNORECASE,
+)
+# 単体で転がっている JWT
+_JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}")
+
+
+def scrub(text: str | None) -> str:
+    """人に渡す前に、認証情報らしきものを伏せる。
+
+    ⚠️ 伏せすぎて原因が読めなくなっては意味がない。
+       商品コードや経路（9030 > 9997925 > 3120）は数字なので、
+       鍵の名前の後ろにある長い文字列だけを狙う。
+    """
+    if not text:
+        return ""
+
+    def _hide(m: re.Match) -> str:
+        head, value = m.group(1), m.group(2)
+        # 全部消すと「入っていた」ことまで分からなくなる。頭だけ残す。
+        return f"{head}{value[:4]}…（伏せました:{len(value)}文字）"
+
+    out = _KV.sub(_hide, text)
+    out = _JWT.sub("eyJ…（伏せました:JWT）", out)
+    return out

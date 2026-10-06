@@ -178,9 +178,96 @@ async def main():
               [o.description for o in drink_sel.options[:3]])
         check("選択肢は25個まで", len(drink_sel.options) <= 25)
 
+    test_debug_fails_scrub()
+    await test_debug_fails_cmd()
+
     await close_db()
     print(f"\n{'='*52}\n  成功 {ok} / 失敗 {fail}\n{'='*52}")
     return 1 if fail else 0
+
+
+
+
+# ============================================================
+# [8] 調査の窓口（/debug fails）
+# ============================================================
+
+def test_debug_fails_scrub():
+    """応答を人に渡す前に、認証情報を伏せる。"""
+    print("\n[ 応答を人に渡すときの伏せ字 ]")
+    from services.mcd.errors import rejected_pairs, scrub
+
+    body = (
+        '{"error":"9030 > 9997925 > 3120 product not found",'
+        '"token":"abcdef1234567890XYZ"}\n'
+        "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CV\n"
+        "password=hunter2hunter2\n"
+    )
+    out = scrub(body)
+
+    check("トークンが残らない", "abcdef1234567890XYZ" not in out)
+    check("JWTが残らない", "eyJhbGciOiJIUzI1NiJ9" not in out)
+    check("パスワードが残らない", "hunter2hunter2" not in out)
+    # ⚠️ 伏せすぎて原因が読めなくなっては意味がない
+    check("原因の経路は残る ★", "9030 > 9997925 > 3120" in out)
+    check("伏せた後でも経路を読める ★", rejected_pairs(out) == [("9997925", "3120")])
+    check("入っていたことは分かる", "伏せました" in out)
+
+    # 商品コードだけの応答は、何も伏せられない
+    plain = "9030 > 9997925 > 3120 product not found"
+    check("普通の応答はそのまま", scrub(plain) == plain)
+    check("空でも落ちない", scrub(None) == "" and scrub("") == "")
+
+
+async def test_debug_fails_cmd():
+    """⚠️ 実際に `/debug fails` を呼んで、落ちずに応答することを確かめる。
+
+    商品名を引く道具を try の中で作っていたため、注文コードが壊れていると
+    未定義になり NameError で落ちていた。原因不明の注文ほど中身が読めないので、
+    **一番必要な場面でだけ**窓口が使えなくなっていた。
+    文面を眺めるのではなく、呼んで確かめる。
+    """
+    print("\n[ 読めない注文でも調べられる ★ ]")
+    import cogs.admin as admin
+    from _fake_discord import FakeClient, FakeInteraction, FakeUser
+    from db.models import Order
+    from db.session import session_scope
+
+    async with session_scope() as s:
+        # ① 注文コードが壊れている（中身を木にできない）
+        s.add(Order(
+            idempotency_key="k-broken", discord_id=1, state="failed",
+            hex_payload="ZZZZ-読めない", store_id="10528", store_name="テスト店",
+            list_price=500, subsidy_rate=0, user_amount=500, subsidy_amount=0,
+            error="9030 > 9997925 > 3120 product not found",
+        ))
+        # ② 応答が長く、認証情報が混ざっている
+        s.add(Order(
+            idempotency_key="k-long", discord_id=1, state="failed",
+            hex_payload="00", store_id="10528", store_name="テスト店",
+            list_price=500, subsidy_rate=0, user_amount=500, subsidy_amount=0,
+            error=("x" * 900 + '\n{"token":"abcdef1234567890SECRET"}'
+                   + "\n9030 > 9997925 > 3120 product not found"),
+        ))
+
+    cog = admin.AdminCog(FakeClient())
+    it = FakeInteraction(FakeUser(1))
+    await admin.AdminCog.debug_fails.callback(cog, it, count=5)
+
+    check("落ちずに応答する ★", bool(it.actions))
+    body = it.text()
+    check("原因の経路が読める ★", "9997925" in body and "3120" in body)
+    check("相手が指した原因として出る ★", "断られました" in body)
+    check("読めない注文もあきらめず出す ★", "読めませんでした" in body)
+
+    f = next((kw["file"] for _, kw in it.actions if kw.get("file")), None)
+    check("切れたら全文を添付する ★", f is not None)
+    if f is not None:
+        raw = f.fp.getvalue().decode("utf-8")
+        check("添付に経路が入っている", "9030 > 9997925 > 3120" in raw)
+        check("添付にトークンが残らない ★", "abcdef1234567890SECRET" not in raw)
+        check("伏せたことが分かる", "伏せました" in raw)
+        check("両方の注文が入っている", raw.count("=== ") >= 2)
 
 
 if __name__ == "__main__":
