@@ -343,6 +343,61 @@ def decode_hex(hex_str: str) -> DecodedOrder:
 # ============================================================
 
 
+def decode_as_mcdonalds(hex_str: str) -> DecodedOrder:
+    """**相手の読み方**で注文コードを読む。検証専用。
+
+    ⚠️ decode_hex は寛容に読む（8 も 2 もどちらも繰り返し扱い）。
+       そのため、自分で作ったコードを自分で読み返しても
+       **間違いに気づけない**。実際にそれで、複数品の注文が
+       最後の1品しか届かないバグを長く見逃した。
+
+    公式の定義（docs/04）はこう：
+
+        CreateOrderInput { 8: repeated OrderItem items }   繰り返し
+        OrderItem        { 2: OrderProduct   product }     単数
+
+    単数フィールドに値が複数来たとき、protobuf は**併合**する。
+    数値や文字列は**後の値が勝つ**。ここではそれを再現する。
+    """
+    cleaned = "".join(hex_str.split()).lower()
+    data = bytes.fromhex(cleaned)
+    top = proto_parse(data)
+
+    store_id = ""
+    for v in top.get(1, []):
+        if isinstance(v, bytes):
+            store_id = _as_str(v)
+
+    items: list[OrderItem] = []
+    for f8 in top.get(8, []):
+        if not isinstance(f8, bytes):
+            continue
+        # field 2 が複数あっても **1つの商品**にしかならない。
+        # 併合の結果、最後に出てきた値が残る。
+        merged: OrderItem | None = None
+        for f2 in proto_parse(f8).get(2, []):
+            if not isinstance(f2, bytes):
+                continue
+            one = _parse_item(f2, top_level=True)
+            if merged is None:
+                merged = one
+            else:
+                # 単数の欄は後勝ち。繰り返しの欄（子）はつながる。
+                merged = replace(
+                    one, components=merged.components + one.components
+                )
+        if merged is not None:
+            items.append(merged)
+
+    return DecodedOrder(
+        store_id=store_id,
+        pickup_method=detect_pickup_method(top),
+        items=items,
+        redirect_urls=[],
+        raw_hex=cleaned,
+    )
+
+
 def build_item(item: OrderItem, *, top_level: bool = False) -> bytes:
     """
     注文の1品をバイト列にする。
@@ -427,10 +482,36 @@ def build_hex(
     if redirect_url:
         body += pb_msg(3, pb_msg(8, pb_str(1, redirect_url) + pb_str(3, redirect_url)))
     body += pb_msg(7, build_pickup_payload(pickup_method, number=pickup_number))
-    order = b"".join(
-        pb_msg(2, build_item(i, top_level=True)) for i in merge_items(items)
+
+    # ⚠️ **商品1つにつき field 8 を1つ作る。**
+    #
+    #    公式の定義（マクドナルドのアプリから取得・docs/04）はこう：
+    #
+    #        CreateOrderInput { 8: repeated OrderItem items }   繰り返し
+    #        OrderItem        { 2: OrderProduct   product }     ★単数★
+    #
+    #    以前は field 8 を1つだけ作り、その中に field 2 を商品の数だけ
+    #    並べていた。product は**単数**なので、protobuf の規則で
+    #    複数の値は**併合され、後ろの値が前を上書きする**。
+    #    つまり相手には**最後の1品しか届かない**。
+    #
+    #    実際に「三角チョコパイ¥200 ＋ 三角チョコパイ¥190 ＋ シャカチキ¥250」
+    #    を送ったら、相手の金額は ¥250（シャカチキ単体）だった。
+    #
+    #    ⚠️ このバグは**自分で読み返しても見つからない**。decode_hex は
+    #       8→2 をどちらも繰り返しとして読むので、自分が作ったコードを
+    #       自分で読むと3品に見える。相手の読み方で確かめること
+    #       （decode_as_mcdonalds）。
+    #
+    #    ⚠️ docs/09 V-2 の「同じ商品を3つ並べたら1個ぶんになる」は、
+    #       マクドナルドがまとめていたのではなく**これが原因**だった。
+    #       同じ商品なら上書きされても同じ商品なので、1個に見えていた。
+    #       merge_items はその症状に対する対処で、原因ではない。
+    #       数量をまとめること自体は正しいので残す。
+    body += b"".join(
+        pb_msg(8, pb_msg(2, build_item(i, top_level=True)))
+        for i in merge_items(items)
     )
-    body += pb_msg(8, order)
     return body.hex()
 
 

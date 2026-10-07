@@ -82,5 +82,74 @@ check("field 12 に posトークン", top[12][0].decode() == "v2.local.dummy")
 body_t = build_store_order_body(d, pos_paseto="x", pickup_method="takeOut")
 check("受取方法を上書きできる（takeOut=2）", 2 in proto_parse(proto_parse(body_t)[7][0]))
 
+print("\n[7] ★複数の商品が本当に相手へ届くか（相手の読み方で確認）")
+# ⚠️ これが無かったせいで、複数品の注文が最後の1品しか届かないバグを
+#    長く見逃した。decode_hex は寛容に読むので、自分で作ったコードを
+#    自分で読み返すと3品に見えてしまう。相手の読み方で確かめること。
+#
+#    公式の定義（マクドナルドのアプリから取得・docs/04）：
+#        CreateOrderInput { 8: repeated OrderItem items }   繰り返し
+#        OrderItem        { 2: OrderProduct   product }     ★単数★
+from dataclasses import replace as _replace
+
+from services.mcd.protocol import (
+    build_pickup_payload, decode_as_mcdonalds, merge_items, pb_int, pb_msg, pb_str,
+)
+
+three = [
+    OrderItem(product_code="2157", quantity=1, amount=200),   # 三角チョコパイ いちご
+    OrderItem(product_code="2139", quantity=1, amount=190),   # 三角チョコパイ 黒
+    OrderItem(product_code="2080", quantity=1, amount=250),   # シャカチキ
+]
+
+# いまの作り方を、相手の読み方で読む
+got = decode_as_mcdonalds(build_hex("10528", three, "takeOut"))
+check("3品すべて届く ★", len(got.items) == 3, [i.product_code for i in got.items])
+check("合計が ¥640 のまま ★", got.total_amount == 640, got.total_amount)
+check("並び順が変わらない",
+      [i.product_code for i in got.items] == ["2157", "2139", "2080"])
+
+# ⚠️ 昔の作り方（field 8 を1つにまとめる）だと、相手には最後の1品しか
+#    届かない。実際に ¥640 の注文が ¥250 になった（2026-10-07）。
+#    もう一度この形に戻してしまわないよう、症状を固定しておく。
+_body = pb_str(1, "10528") + pb_msg(7, build_pickup_payload("takeOut"))
+_body += pb_msg(8, b"".join(
+    pb_msg(2, build_item(i, top_level=True)) for i in merge_items(three)
+))
+_old = decode_as_mcdonalds(_body.hex())
+check("昔の作り方だと1品に潰れる（再現）★", len(_old.items) == 1, len(_old.items))
+check("潰れると最後の1品が残る（¥250）★", _old.total_amount == 250, _old.total_amount)
+
+# ⚠️ 自分の読み方では、昔の作り方でも3品に見えてしまう。
+#    これが「自分で確かめても気づけない」の正体。
+check("自分の読み方では昔の形も3品に見える（だから当てにならない）★",
+      len(decode_hex(_body.hex()).items) == 3)
+
+# 同じ商品を並べたときは、数量にまとめてから1件にする
+same = [OrderItem(product_code="2080", quantity=1, amount=250) for _ in range(3)]
+got_same = decode_as_mcdonalds(build_hex("10528", same, "takeOut"))
+check("同じ商品は1件×数量3にまとまる", len(got_same.items) == 1, len(got_same.items))
+check("数量が3になっている ★",
+      got_same.items[0].quantity == 3, got_same.items[0].quantity)
+
+# セット（入れ子）が混ざっても崩れない
+nested = [
+    OrderItem(product_code="9030", quantity=1, amount=500, components=[
+        OrderItem(product_code="9997925", quantity=1, has_flag=True, components=[
+            OrderItem(product_code="9997922", quantity=1, has_flag=True, components=[
+                OrderItem(product_code="3120", quantity=1)])])]),
+    OrderItem(product_code="2080", quantity=1, amount=250),
+]
+got_n = decode_as_mcdonalds(build_hex("10528", nested, "takeOut"))
+check("セットと単品を混ぜても2件のまま ★", len(got_n.items) == 2, len(got_n.items))
+check("セットの中身が残っている ★",
+      bool(got_n.items[0].components)
+      and got_n.items[0].components[0].product_code == "9997925")
+
+# 実物の公式コードも、相手の読み方で同じに読める
+check("実物の公式コードも相手の読み方で読める ★",
+      [i.product_code for i in decode_as_mcdonalds(REAL).items]
+      == [i.product_code for i in decode_hex(REAL).items])
+
 print(f"\n{'='*46}\n  成功 {ok} / 失敗 {fail}\n{'='*46}")
 sys.exit(1 if fail else 0)
