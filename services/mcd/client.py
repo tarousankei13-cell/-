@@ -554,7 +554,9 @@ class McdClient:
             info,
         )
 
-    async def authorise_order(self, group: str, order_token: str) -> OrderResponse:
+    async def authorise_order(
+        self, group: str, order_token: str, pickup_method: str = "takeOut"
+    ) -> OrderResponse:
         """
         支払いを確定する。
 
@@ -566,7 +568,7 @@ class McdClient:
         await self.ensure_auth(force=True)  # 確定直前に必ず新しいPASETOで
         r = await self._qor_post(
             f"{ORD.format(group=group)}/app/mcdord.UserOrderService/AuthoriseOrder",
-            build_authorise_body(order_token),
+            build_authorise_body(order_token, pickup_method),
             retry_on_401=False,   # ★リトライ禁止
             idempotency=retry.Idempotency.ONCE, label="支払いの確定",
         )

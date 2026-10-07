@@ -151,5 +151,71 @@ check("実物の公式コードも相手の読み方で読める ★",
       [i.product_code for i in decode_as_mcdonalds(REAL).items]
       == [i.product_code for i in decode_hex(REAL).items])
 
+print("\n[8] ★決済の成否を取り違えないか")
+# ⚠️ 公式の定義（docs/04）：
+#      CreateOrderOutput    { 1: Order }
+#      AuthoriseOrderOutput { 1: Order }
+#      GetPaidOrderOutput   { 1: isSettled bool / 2: Order / 3: PaymentError }
+#
+#    決済が成立したかは **isSettled** が答え。注文オブジェクトが返って
+#    きたかどうかでは判断できない。カードを断られた注文にも order_code は
+#    付く。そこを取り違えると、**お金が動いていないのに残高を引き落として
+#    「成功しました」と伝える**ことになる。
+from services.mcd.protocol import pb_int, parse_order_response
+
+_order = pb_str(1, "OC123") + pb_int(7, 640) + pb_str(9, "7161") + pb_str(10, "tok")
+
+r = parse_order_response(pb_msg(1, _order))
+check("StoreOrder は注文を読める", r.order_code == "OC123" and r.total_amount == 640)
+check("StoreOrder は成否を言わない（None）★", r.is_settled is None, r.is_settled)
+
+r = parse_order_response(pb_int(1, 1) + pb_msg(2, _order))
+check("GetPaidOrder・成立を読める ★", r.is_settled is True, r.is_settled)
+check("成立でも注文の中身は読める", r.display_order_number == "7161")
+
+r = parse_order_response(pb_int(1, 0) + pb_msg(2, _order))
+check("GetPaidOrder・不成立を読める ★", r.is_settled is False, r.is_settled)
+# ⚠️ ここが肝。不成立でも注文コードは付いている。
+check("不成立でも注文コードは付いている（だから当てにならない）★",
+      r.order_code == "OC123")
+
+r = parse_order_response(pb_int(1, 0) + pb_msg(2, _order) + pb_msg(3, pb_int(1, 5)))
+check("決済エラーを見つけられる ★", r.has_payment_error is True)
+
+# saga 側が、不成立を「成立」と読まないこと
+import asyncio as _asyncio
+
+from core import saga as _saga
+
+
+class _FakeHandle:
+    def __init__(self, resp):
+        self.client = type("C", (), {
+            "get_paid_order": lambda _s, g, t, _r=resp: _asyncio.sleep(0, result=_r)
+        })()
+
+
+_settled = parse_order_response(pb_int(1, 1) + pb_msg(2, _order))
+_failed = parse_order_response(pb_int(1, 0) + pb_msg(2, _order))
+_nosay = parse_order_response(pb_msg(1, _order))
+
+_got = _asyncio.run(_saga._probe_paid(_FakeHandle(_settled), "g", "t", attempts=1))
+check("成立なら成立として返す ★", _got is not None and _got.is_settled is True)
+
+_got = _asyncio.run(_saga._probe_paid(_FakeHandle(_failed), "g", "t", attempts=1))
+check("不成立を『成立』と読まない ★★", _got is None, _got)
+
+_got = _asyncio.run(_saga._probe_paid(_FakeHandle(_nosay), "g", "t", attempts=1))
+check("成否を言わない応答は、注文の有無で判断する", _got is not None)
+
+print("\n[9] 決済の受取方法が固定されていないか")
+# ⚠️ 以前は takeOut 固定だった。店内を選んでも決済だけ「お持ち帰り」で
+#    送っていた。StoreOrder と食い違う指定になる。
+from services.mcd.protocol import build_authorise_body
+
+for _m, _f in (("eatIn", 1), ("takeOut", 2), ("tableDelivery", 3), ("driveThru", 5)):
+    _inner = proto_parse(proto_parse(build_authorise_body("tok", _m))[2][0])
+    check(f"決済でも {_m} が伝わる ★", _f in _inner, list(_inner))
+
 print(f"\n{'='*46}\n  成功 {ok} / 失敗 {fail}\n{'='*46}")
 sys.exit(1 if fail else 0)

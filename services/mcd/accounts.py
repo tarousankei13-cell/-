@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import config
+from core import crypto
 from core.crypto import get_cipher
 from core import breaker
 from db.models import as_utc, McdAccount, McdToken, utcnow
@@ -58,13 +59,26 @@ class AccountHandle:
 # ============================================================
 
 async def _load_tokens(session: AsyncSession, account_id: int) -> TokenSet:
-    cipher = get_cipher()
+    """保存してあるトークンを読み出す。
+
+    ⚠️ 鍵が合わないと復号で落ちる。ここで落とすと**注文の途中**で
+       例外になり、利用者には理由の分からない失敗になる。
+       読めなかったものは空として扱い、「ログインし直しが要る
+       アカウント」として普通の経路に乗せる。
+    """
     acc = await session.get(McdAccount, account_id)
     row = await session.get(McdToken, account_id)
-    tokens = TokenSet(refresh_token=cipher.decrypt(acc.refresh_token_enc) or "" if acc else "")
+    if acc is not None and crypto.is_unreadable(acc.refresh_token_enc):
+        log.error(
+            "アカウント %s の登録内容を、いまの鍵では読み取れません。"
+            "data/encryption_key.txt を確認してください", account_id,
+        )
+    tokens = TokenSet(
+        refresh_token=(crypto.try_decrypt(acc.refresh_token_enc) or "") if acc else ""
+    )
     if row:
-        tokens.access_token = cipher.decrypt(row.access_token_enc) or ""
-        tokens.root_paseto = cipher.decrypt(row.root_paseto_enc) or ""
+        tokens.access_token = crypto.try_decrypt(row.access_token_enc) or ""
+        tokens.root_paseto = crypto.try_decrypt(row.root_paseto_enc) or ""
         tokens.access_exp = row.access_exp.timestamp() if row.access_exp else 0.0
         tokens.root_exp = row.root_exp.timestamp() if row.root_exp else 0.0
     return tokens

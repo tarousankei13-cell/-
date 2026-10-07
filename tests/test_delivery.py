@@ -40,7 +40,7 @@ class FakeMcd:
     async def store_order(self, group, body):
         from services.mcd.client import OrderResponse
         return OrderResponse(order_code="OC1", order_token="T1")
-    async def authorise_order(self, group, token):
+    async def authorise_order(self, group, token, pickup_method="takeOut"):
         from services.mcd.client import OrderResponse
         return OrderResponse(order_code="OC1", display_order_number=self.number)
     async def aclose(self): pass

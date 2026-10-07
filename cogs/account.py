@@ -22,6 +22,8 @@ from discord.ext import commands
 
 import emoji as E
 from core import audit
+from core import crypto
+from core import proxy as core_proxy
 from core.crypto import get_cipher
 from db.models import KyashAccount, McdAccount, McdToken, utcnow
 from db.session import session_scope
@@ -544,6 +546,19 @@ class AccountCog(commands.Cog):
         from services.paypay.client import PayPayClient, PayPayError
 
         await interaction.response.defer(ephemeral=True, thinking=True)
+
+        # ⚠️ プロキシの形を**使う前に**確かめる。httpx は知らない形を渡されると
+        #    ValueError を投げるので、そのままだと生のエラーで落ちる。
+        #    `/config proxy set` では確かめているのに、ここだけ素通りだった。
+        if proxy:
+            why = core_proxy.problem(proxy.strip())
+            if why:
+                await interaction.followup.send(
+                    embed=embeds.error(f"プロキシの指定が正しくありません。\n\n{why}"),
+                    ephemeral=True,
+                )
+                return
+
         cipher = get_cipher()
         client = PayPayClient(proxy=proxy or pp_accounts.config_proxy())
         try:
@@ -788,8 +803,24 @@ class AccountCog(commands.Cog):
                     embed=embeds.error("アカウントが見つかりません。"), ephemeral=True
                 )
                 return
-            email = cipher.decrypt(acc.email_enc) or ""
-            password = cipher.decrypt(acc.password_enc) or ""
+            # ⚠️ 鍵が合わないと復号で落ちる。生の例外を利用者に見せない。
+            #    バックアップを鍵なしで戻すと、全アカウントがこうなる。
+            if crypto.is_unreadable(acc.email_enc) or crypto.is_unreadable(
+                acc.password_enc
+            ):
+                await interaction.followup.send(
+                    embed=embeds.error(
+                        "このアカウントの登録内容を、いまの鍵では読み取れませんでした。\n\n"
+                        f"{E.WARN} `data/encryption_key.txt` が、登録したときと"
+                        "違うものになっています。バックアップを鍵なしで戻した場合や、"
+                        "`ENCRYPTION_KEY` を変えた場合に起きます。\n\n"
+                        "元の鍵を戻すか、登録し直してください。"
+                    ),
+                    ephemeral=True,
+                )
+                return
+            email = crypto.try_decrypt(acc.email_enc) or ""
+            password = crypto.try_decrypt(acc.password_enc) or ""
             label = acc.label
             client_uuid = acc.client_uuid or ""
             installation_uuid = acc.installation_uuid or ""

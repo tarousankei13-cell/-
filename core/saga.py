@@ -326,6 +326,9 @@ async def execute(order_id: str, progress: ProgressCallback | None = None) -> Or
             async with session_scope() as s:
                 order = await s.get(Order, order_id)
                 token, group = order.order_token or "", order.group_name or "group-f"
+                # ⚠️ 決済の段階でも受取方法を渡す。渡さないと takeOut 固定になり、
+                #    店内を選んだ注文が、決済だけ「お持ち帰り」として送られる。
+                auth_pickup = order.pickup_method or "takeOut"
 
             if state == MCD_STORED:
                 # ★呼び出す前に状態を確定させる。
@@ -333,7 +336,9 @@ async def execute(order_id: str, progress: ProgressCallback | None = None) -> Or
                 await _record(order_id, state, MCD_AUTHORISING)
                 state = MCD_AUTHORISING
                 try:
-                    auth = await handle.client.authorise_order(group, token)
+                    auth = await handle.client.authorise_order(
+                        group, token, auth_pickup
+                    )
                     receipt = auth.display_order_number
                 except (McdError, McdNetworkError, McdOrderError) as exc:
                     # ⚠️ 課金されたかどうか分からない。リトライは絶対にしない。
@@ -433,6 +438,24 @@ async def _probe_paid(handle, group: str, token: str, attempts: int = 3):
     for i in range(attempts):
         try:
             paid = await handle.client.get_paid_order(group, token)
+
+            # ⚠️⚠️ **決済の成否は isSettled が答え。**
+            #       注文オブジェクトが返ってきたかどうかでは判断できない。
+            #       カードが拒否された注文でも、注文そのものは存在して
+            #       order_code を持つ。それを「成立」と読むと、
+            #       **お金が動いていないのに利用者の残高を引き落とし、
+            #       成功したと伝えてしまう。**
+            if paid.is_settled is False or paid.has_payment_error:
+                log.error(
+                    "決済は成立していませんでした（isSettled=%s エラー=%s）。"
+                    "手動確認へ回します", paid.is_settled, paid.has_payment_error,
+                )
+                return None
+
+            if paid.is_settled is True:
+                return paid
+
+            # isSettled を言ってこない応答のときだけ、注文の有無で判断する
             if paid.order_code or paid.display_order_number:
                 return paid
         except McdError as e:

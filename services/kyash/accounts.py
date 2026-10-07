@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 
 import config
-from core.crypto import get_cipher
+from core import crypto
 from db.models import as_utc, KyashAccount
 from db.session import session_scope
 from services.kyash.client import KyashClient, KyashError, KyashSession
@@ -32,10 +32,11 @@ class KyashHandle:
 
 
 def build_client(acc: KyashAccount) -> KyashClient:
-    cipher = get_cipher()
     return KyashClient(
         KyashSession(
-            access_token=cipher.decrypt(acc.access_token_enc) or "",
+            # ⚠️ 鍵が合わなければ空にする。ここで落とすと、チャージの
+            #    途中で理由の分からない失敗になる。
+            access_token=crypto.try_decrypt(acc.access_token_enc) or "",
             client_uuid=acc.client_uuid or "",
             installation_uuid=acc.installation_uuid or "",
         ),

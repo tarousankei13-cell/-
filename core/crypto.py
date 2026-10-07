@@ -72,6 +72,40 @@ class Cipher:
             ) from e
 
 
+def try_decrypt(blob: bytes | None) -> str | None:
+    """復号を試みる。読めなければ None。
+
+    ⚠️ 鍵が合わないと **すべての登録が読めなくなる**。これは起こりうる。
+       バックアップを `data/encryption_key.txt` 無しで戻した場合、
+       ENCRYPTION_KEY を書き換えた場合、鍵を作り直した場合。
+
+    ⚠️ そのとき例外をそのまま上げると、コマンドが生のエラーで落ちる。
+       「何が起きたか」が利用者に伝わらず、原因にも辿り着けない。
+       **読めなかったことを値で返し、呼び出し側が説明する。**
+
+    ⚠️ 中身が空（None / b""）のときと、**読めなかったとき**は違う。
+       どちらも None を返すので、区別が要る場面では
+       `is_unreadable()` を使うこと。
+    """
+    if not blob:
+        return None
+    try:
+        return get_cipher().decrypt(blob)
+    except CryptoError:
+        return None
+
+
+def is_unreadable(blob: bytes | None) -> bool:
+    """中身はあるのに、いまの鍵では読めない状態か。"""
+    if not blob:
+        return False
+    try:
+        get_cipher().decrypt(blob)
+        return False
+    except CryptoError:
+        return True
+
+
 _cipher: Cipher | None = None
 
 

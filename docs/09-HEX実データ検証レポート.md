@@ -318,3 +318,59 @@ for f8 in top.get(8, []):
 | 12:30 | 128 件 | **0 件** |
 | 17:30 | 193 件 | **0 件** |
 | 22:00 | 193 件 | **0 件** |
+
+---
+
+# V-14 送信本体でも商品が1品に潰れていた（2026-10-07）
+
+V-13 で `build_hex` を直したが、**同じ誤りが `build_store_order_body` にも
+あった。そちらが本番の送信経路**である。
+
+```
+カート → build_hex → 保存 → decode_hex → build_store_order_body → 送信
+                                          ↑ ここが直っていなかった
+```
+
+`build_hex` が作る注文コードは途中の表現にすぎず、実際にマクドナルドへ
+送るのは `build_store_order_body`。**片方だけ直しても実際の注文は直らない。**
+
+⚠️ 同じ形の誤りは1か所とは限らない。1つ見つけたら、**同じことをして
+   いる場所を全部探す**こと。`pb_msg(8` を全文検索して見つけた。
+
+# V-15 決済の成否を推測していた（2026-10-07）
+
+公式の定義（docs/04）：
+
+```
+GetPaidOrderOutput { 1: isSettled  bool
+                     2: Order
+                     3: PaymentError }
+```
+
+`_probe_paid()` は「注文オブジェクトが返ってくれば成立」と判断していた。
+
+⚠️ **カードを断られた注文にも order_code は付く。**
+   不成立を成立と読むと、**お金が動いていないのに利用者の残高を
+   引き落とし、「成功しました」と伝える**ことになる。
+
+`isSettled` と `PaymentError` を読み、
+
+| isSettled | 判断 |
+|---|---|
+| `True` | 成立 |
+| `False` / 決済エラーあり | **成立としない**（手動確認へ） |
+| 欄が無い（`None`） | 言ってこない応答なので、注文の有無で判断 |
+
+⚠️ `None`（言っていない）と `False`（違うと言っている）を混同しない。
+   StoreOrder / AuthoriseOrder の応答にはこの欄が無いので `None` になる。
+
+# V-16 決済の受取方法が takeOut 固定だった（2026-10-07）
+
+```
+AuthoriseOrderInput { 1: orderToken / 2: deliveryMethod / … }
+```
+
+`build_authorise_body()` は `deliveryMethod` を **takeOut 決め打ち**で
+送っていた。店内（eatIn）や席まで（tableDelivery）を選んでも、
+決済の段階だけ「お持ち帰り」として送っていたことになる。
+StoreOrder と食い違う指定になる。注文の受取方法を渡すよう直した。

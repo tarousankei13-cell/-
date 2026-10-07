@@ -541,20 +541,46 @@ def build_store_order_body(
         b += pb_msg(3, pb_msg(1, b""))
     # field 7: createDeliveryMethod ★ここが本命
     b += pb_msg(7, build_pickup_payload(method, number=pickup_number))
-    # field 8: 商品（複数対応）
-    # ⚠️ ここでも必ずまとめる。利用者が貼った注文コードに同じ商品が
-    #    並んでいることがあり、そのまま送ると1個ぶんしか注文されない。
-    order = b"".join(
-        pb_msg(2, build_item(i, top_level=True)) for i in merge_items(decoded.items)
+    # field 8: 商品
+    #
+    # ⚠️⚠️ **商品1つにつき field 8 を1つ作る。** build_hex と同じ理由。
+    #       OrderItem.product は**単数**なので、1つの field 8 に field 2 を
+    #       並べると併合され、**最後の1品しか届かない**（docs/09 V-13）。
+    #
+    # ⚠️ ここは build_hex と違い、**実際にマクドナルドへ送る本体**。
+    #    build_hex だけ直してもここが古いままなら、実際の注文は直らない。
+    #    注文の流れは カート → build_hex → 保存 → decode_hex →
+    #    **build_store_order_body** → 送信。最後がここ。
+    #
+    # ⚠️ まとめる処理は残す。利用者が貼った注文コードに同じ商品が
+    #    並んでいることがあり、数量にまとめないと1個ぶんになる。
+    b += b"".join(
+        pb_msg(8, pb_msg(2, build_item(i, top_level=True)))
+        for i in merge_items(decoded.items)
     )
-    b += pb_msg(8, order)
     if pos_paseto:
         b += pb_str(12, pos_paseto)
     return b
 
 
-def build_authorise_body(order_token: str) -> bytes:
-    return pb_str(1, order_token) + pb_msg(2, pb_msg(2, b""))
+def build_authorise_body(order_token: str, pickup_method: str = "takeOut") -> bytes:
+    """AuthoriseOrder へ送る本体。
+
+    公式の定義（docs/04）：
+        AuthoriseOrderInput {
+          1: orderToken          string
+          2: deliveryMethod      DeliveryMethod
+          3: createPaymentMethod
+          4: createDeliveryMethod
+        }
+
+    ⚠️ **受取方法を固定で takeOut にしない。** 以前はここを決め打ちして
+       いたため、店内（eatIn）や席まで（tableDelivery）を選んでも、
+       決済の段階だけ「お持ち帰り」として送っていた。
+       StoreOrder と食い違う指定を送ることになる。
+    """
+    fn = PICKUP_FIELD.get(pickup_method, PICKUP_FIELD["takeOut"])
+    return pb_str(1, order_token) + pb_msg(2, pb_msg(fn, b""))
 
 
 def build_get_paid_body(order_token: str) -> bytes:
@@ -576,20 +602,55 @@ class OrderResponse:
     display_order_number: str = ""   # ★注文番号（例 7161）
     order_token: str = ""
     raw_hex: str = ""
+    # GetPaidOrder だけが返す「決済が成立したか」。
+    # ⚠️ None は「応答が何も言っていない」という意味。False と混同しない。
+    #    StoreOrder / AuthoriseOrder の応答にはこの欄が無いので None になる。
+    is_settled: bool | None = None
+    # 決済エラーが入っていたか（カード拒否など）
+    has_payment_error: bool = False
 
 
 def parse_order_response(data: bytes) -> OrderResponse:
+    """注文の応答を読む。
+
+    公式の定義（docs/04）：
+
+        CreateOrderOutput    { 1: Order }
+        AuthoriseOrderOutput { 1: Order }
+        GetPaidOrderOutput   { 1: isSettled bool
+                               2: Order
+                               3: PaymentError }
+
+    ⚠️ **GetPaidOrder だけが `isSettled` を返す。** 決済が成立したかは
+       この欄が答えであって、注文オブジェクトが返ってきたかどうかでは
+       判断できない。失敗した決済でも注文は存在しうる。
+    """
     top = proto_parse(data, strict=False)
+
+    # GetPaidOrderOutput の形か（field 2 に注文が入っている）
     raw = next((v for v in top.get(2, []) if isinstance(v, bytes)), None)
-    if raw is None:
+    is_settled: bool | None = None
+    has_err = False
+    if raw is not None:
+        # この形のときだけ field 1 は isSettled、field 3 は PaymentError
+        for v in top.get(1, []):
+            if isinstance(v, int):
+                is_settled = bool(v)
+                break
+        has_err = any(isinstance(v, bytes) and v for v in top.get(3, []))
+    else:
         raw = next((v for v in top.get(1, []) if isinstance(v, bytes)), None)
     if raw is None:
-        return OrderResponse(raw_hex=data.hex())
+        return OrderResponse(
+            raw_hex=data.hex(), is_settled=is_settled, has_payment_error=has_err
+        )
 
     try:
         f = proto_parse(raw, strict=False)
     except ProtocolError:
-        return OrderResponse(raw_hex=data.hex())
+        return OrderResponse(
+            raw_hex=data.hex(), is_settled=is_settled, has_payment_error=has_err
+        )
 
     def s(n: int) -> str:
         return _as_str(f[n][0]) if n in f and f[n] else ""
@@ -606,4 +667,6 @@ def parse_order_response(data: bytes) -> OrderResponse:
         display_order_number=s(9),   # docs/07 §4.3
         order_token=s(10),
         raw_hex=data.hex(),
+        is_settled=is_settled,
+        has_payment_error=has_err,
     )

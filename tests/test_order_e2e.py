@@ -36,7 +36,7 @@ class FakeClient:
         self._maybe("store")
         return OrderResponse(order_code="OC123", order_token="TOKEN123",
                              total_amount=self.total_amount)
-    async def authorise_order(self, group, token):
+    async def authorise_order(self, group, token, pickup_method="takeOut"):
         self.authorise_calls += 1
         self._maybe("authorise")
         return OrderResponse(order_code="OC123", display_order_number="7161")
@@ -150,7 +150,7 @@ async def main():
     await user_repo.get_or_create(uid4)
     async with user_scope(uid4) as s: await L.charge(s, uid4, 2000, receipt_id="r4")
     client = FakeClient(fail_at="paid")
-    client.authorise_order = lambda g, t: _raise_after_auth(client)
+    client.authorise_order = lambda g, t, pm="takeOut": _raise_after_auth(client)
     CURRENT["client"] = client
     oid4 = await new_order(uid4, make_quote())
     r = await saga.execute(oid4)
@@ -171,7 +171,7 @@ async def main():
     async with user_scope(uid5) as s: await L.charge(s, uid5, 2000, receipt_id="r5")
     # 決済も確認も通らない状況（成否が分からない）→ 要確認になるはず
     client = FakeClient(fail_at="paid")
-    client.authorise_order = lambda g, t: _raise_after_auth(client)
+    client.authorise_order = lambda g, t, pm="takeOut": _raise_after_auth(client)
     CURRENT["client"] = client
     oid5 = await new_order(uid5, make_quote())
     r5 = await saga.execute(oid5)
@@ -185,7 +185,7 @@ async def main():
     await user_repo.get_or_create(uid5b)
     async with user_scope(uid5b) as s: await L.charge(s, uid5b, 2000, receipt_id="r5b")
     client = FakeClient()                       # GetPaidOrder は成功する
-    client.authorise_order = lambda g, t: _raise_after_auth(client)
+    client.authorise_order = lambda g, t, pm="takeOut": _raise_after_auth(client)
     CURRENT["client"] = client
     oid5b = await new_order(uid5b, make_quote())
     r5b = await saga.execute(oid5b)

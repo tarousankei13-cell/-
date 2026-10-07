@@ -49,6 +49,7 @@ TESTS = [
     ("使いやすさ", "test_usability.py"),
     ("チャージ処理", "test_charge.py"),
     ("アカウント登録（OTP）", "test_account_setup.py"),
+    ("全スラッシュコマンドの総当たり", "test_all_commands.py"),
     ("管理者コマンド", "test_admin_cmds.py"),
     ("管理操作の記録", "test_audit.py"),
     ("アカウント健全性パネル", "test_admin_panel.py"),
@@ -83,6 +84,7 @@ TESTS = [
     ("サーバー管理：コマンドとイベント", "test_server_cmds.py"),
     ("利用を広げる機能（声かけ・再注文・ランキング）", "test_growth.py"),
     ("人数が増えたときの挙動", "test_scale.py"),
+    ("鍵が合わないとき", "test_key_mismatch.py"),
     ("安全性（認証情報・権限）", "test_security.py"),
 ]
 
