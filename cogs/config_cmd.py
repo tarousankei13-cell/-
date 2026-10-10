@@ -1624,8 +1624,15 @@ class ConfigCog(commands.Cog):
         else:
             body += (
                 f"{E.NG} 通りませんでした（{detail}）。\n"
-                "設定は保存しましたが、このままでは通信できません。"
-                "URLと、プロキシ側の許可設定をご確認ください。"
+                "設定は保存しましたが、このままでは通信できません。\n"
+            )
+            # ⚠️ 症状の名前だけ出しても直せない。次にやることを名指しする。
+            #    `ProxyError: 400 Bad Request` だけでは、ポート番号の
+            #    書き忘れに辿り着けなかった（実際に起きた）。
+            hint = proxy.advice(url, detail)
+            body += (
+                f"\n{E.INFO} **考えられること**\n{hint}"
+                if hint else "URLと、プロキシ側の許可設定をご確認ください。"
             )
         if service and service.value == "discord":
             body += (
@@ -1704,15 +1711,18 @@ class ConfigCog(commands.Cog):
         )
 
         lines = []
-        for (label, _), res in zip(targets, results):
+        for (label, url), res in zip(targets, results):
             if isinstance(res, BaseException):
                 lines.append(f"{E.NG} **{label}**　{type(res).__name__}")
                 continue
             ok, detail = res
-            lines.append(
-                f"{E.OK} **{label}**　{detail}" if ok
-                else f"{E.NG} **{label}**　{detail}"
-            )
+            if ok:
+                lines.append(f"{E.OK} **{label}**　{detail}")
+                continue
+            lines.append(f"{E.NG} **{label}**　{detail}")
+            # ⚠️ 症状の名前だけでは直せない。ここでも次の一手を出す。
+            if hint := proxy.advice(url, detail):
+                lines.append(hint)
 
         body = "\n".join(lines)
         body += (

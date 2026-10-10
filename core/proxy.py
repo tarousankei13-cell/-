@@ -221,6 +221,59 @@ def problem(url: str) -> str:
     return ""
 
 
+def advice(url: str, detail: str) -> str:
+    """通らなかったときの、次にやることの案内。無ければ空文字。
+
+    ⚠️ `ProxyError: 400 Bad Request` とだけ出しても、何を直せばいいか
+       分からない。実際に `http://45.146.163.31/` を設定して400になり、
+       原因（ポート番号の書き忘れ）に辿り着けなかった。
+       **出た症状から、次にやることを名指しする。**
+    """
+    tips: list[str] = []
+    low = (detail or "").lower()
+    try:
+        parts = urlsplit(url or "")
+    except Exception:
+        parts = None
+
+    # ⚠️ いちばん多い書き忘れ。ポートを書かないと 80番 につなぎに行く。
+    #    そこに普通のWebサーバーが居れば「400 Bad Request」が返る。
+    #    プロキシの待ち受けはたいてい 8080 / 3128 / 8000 などで、
+    #    80番であることはまず無い。
+    if parts is not None and parts.hostname and not parts.port:
+        tips.append(
+            f"**ポート番号が入っていません。** `{url}` は80番につなぎに行きます。"
+            "買ったプロキシの案内にある番号を付けてください"
+            "（例 `http://ホスト:8080`）。"
+        )
+    if "400" in low or "405" in low or "501" in low:
+        tips.append(
+            "その住所に居るのが**プロキシではない**かもしれません"
+            "（普通のWebサーバーは、プロキシ宛ての要求を断ります）。"
+        )
+    if "407" in low or "proxy authentication" in low or "401" in low:
+        tips.append(
+            "**ユーザー名とパスワードが要ります。**"
+            "`http://ユーザー名:パスワード@ホスト:ポート` の形で入れ直してください。"
+        )
+    if "403" in low:
+        tips.append(
+            "プロキシ側で、**このサーバーのIPが許可されていません**。"
+            "プロキシの管理画面で許可リストに追加してください。"
+        )
+    if "timeout" in low or "timedout" in low or "connecterror" in low:
+        tips.append(
+            "応答がありません。ホスト名とポート番号の打ち間違いか、"
+            "プロキシが止まっている可能性があります。"
+        )
+    if "ssl" in low or "certificate" in low:
+        tips.append(
+            "`https://` ではつながりませんでした。"
+            "プロキシへの接続は `http://` で指定するものが多いです。"
+        )
+    return "\n".join(f"・{t}" for t in tips)
+
+
 def valid(url: str) -> bool:
     """設定してよい形か。"""
     return not problem(url)

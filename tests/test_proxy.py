@@ -279,6 +279,41 @@ async def main():
 
     if saved_env is not None:
         os.environ[proxy.ENV_KEY] = saved_env
+    print("\n[通らなかったときに、次の一手を出せるか ★]")
+    # ⚠️ 実際に起きた。`http://45.146.163.31/` を設定して
+    #    「ProxyError: 400 Bad Request」とだけ出たため、原因
+    #    （ポート番号の書き忘れ）に辿り着けなかった。
+    #    症状の名前を出すだけでは、設定した人は直せない。
+    real = proxy.advice("http://45.146.163.31/", "ProxyError: 400 Bad Request")
+    check("ポート抜けを名指しする ★", "ポート番号" in real, real)
+    check("直し方の例を出す ★", "8080" in real, real)
+    check("プロキシでない可能性にも触れる", "プロキシではない" in real, real)
+
+    for url, detail, want, label in (
+        ("http://1.2.3.4:8080", "ProxyError: 407 Proxy Authentication Required",
+         "ユーザー名とパスワード", "407 は資格情報"),
+        ("http://1.2.3.4:8080", "ProxyError: 403 Forbidden",
+         "許可されていません", "403 は許可リスト"),
+        ("http://1.2.3.4:8080", "ConnectTimeout: ",
+         "応答がありません", "時間切れ"),
+        ("https://1.2.3.4:8080", "SSLError: certificate verify failed",
+         "http://", "SSLなら http を勧める"),
+    ):
+        got = proxy.advice(url, detail)
+        check(f"{label} ★", want in got, got or "（案内なし）")
+
+    # ⚠️ ポートまで正しく書いてあるのに「ポートが無い」と言わないこと。
+    #    的外れな案内は、無いより悪い。
+    got = proxy.advice("http://1.2.3.4:8080", "ProxyError: 403 Forbidden")
+    check("ポートがあるときは、ポートの話をしない ★",
+          "ポート番号が入っていません" not in got, got)
+    check("思い当たらなければ何も言わない",
+          proxy.advice("http://1.2.3.4:8080", "") == "",
+          proxy.advice("http://1.2.3.4:8080", ""))
+    check("空のURLでも落ちない", isinstance(proxy.advice("", "なにか"), str))
+    check("壊れたURLでも落ちない",
+          isinstance(proxy.advice("http://[", "400"), str))
+
     await close_db()
     print(f"\n{'='*52}\n  成功 {ok} / 失敗 {fail}\n{'='*52}")
     return 1 if fail else 0
