@@ -743,6 +743,11 @@ JavaScript（8ファイル・1.88MB）を読んだ。
 | `StoreOrder` / `AuthoriseOrder` | 1 / 7 |
 | `totalAmount` | 22 |
 
+⚠️ **この書き方は言い過ぎだった**（V-26 で訂正）。正しくは
+   「読み込んだ8ファイルの中には見当たらない」。あの site は
+   McDonald's のアプリそのもので、注文を組んでいるのは
+   McDonald's 自身のコードである。
+
 `totalAmount` が出てくるのは **protobuf の復号処理の中だけ**。
 
 ```js
@@ -834,3 +839,64 @@ CancelOrderOutput { （欄なし）}
 ⚠️ ここは**失敗したときだけ通る道**。間違えると、いちばん必要な
    場面で `UnboundLocalError` になる。`/debug fails` の `nm()` で
    踏んだのとまったく同じ型の誤り。テストが捕まえた。
+
+
+# V-26 なぜあのサイトは「何を送るか」まで正確なのか（2026-10-10）
+
+答え：**自分で組んでいないから。**
+
+`index.html` に埋め込まれているスクリプトを読むと、改造は
+**1か所しかない**。`window.fetch` を差し替えて、支払いの送信を
+横取りしているだけ。
+
+```js
+window.fetch = function (...args) {
+  let urlStr = args[0] instanceof Request ? args[0].url : String(args[0]);
+  // ★ CheckoutOrder を検出したらURLをプロキシ（同オリジン）に書き換え
+  if (urlStr.includes('mcdord.OrderService/CheckoutOrder')) {
+    ...
+    p.then(r => r.clone().json().then(d => {
+      if (d && d.status === 'intercepted_success') showModal(d.hexStream);
+    }));
+    return p;
+  }
+  return _origFetch.apply(this, args);
+};
+```
+
+ページ自体はマクドナルドの公式フロントエンドそのもの。
+
+```html
+<title>マクドナルド モバイルオーダー | McDonald's Japan</title>
+<link rel="icon" href="https://www.mcdonalds.co.jp/favicon.ico" />
+<meta name="description" content="日本マクドナルドモバイルオーダーは…" />
+```
+
+つまり **商品を選んでいるのも、枠に何が入るか決めているのも、
+金額を出しているのも、全部マクドナルド自身のコード**。
+サイトの作者は「どれが選べるか」も「上乗せ額」も解いていない。
+**解く必要が無かった。**
+
+## こちらとの違い
+
+|  | あのサイト | このBOT |
+|---|---|---|
+| 正体 | マクドナルドのアプリ＋盗聴1行 | 公開カタログからの**作り直し** |
+| 選べる商品 | マクドナルドのコードが決める | カタログに書かれていない（V-22） |
+| 上乗せ額 | マクドナルドのコードが出す | カタログに書かれていない（V-23） |
+| 注文の構造 | マクドナルドのコードが組む | 中間ノードが24枠不明 |
+
+**同じ土俵ではない。** 向こうは答えを持っている側のコードを
+そのまま動かしており、こちらは外から組み立て直している。
+賢さの差ではなく、立っている場所の差である。
+
+## だから `/debug learn` が効く
+
+あのサイトが出すHEXは、**マクドナルド自身が組んだ正解の構造**。
+それを貼ってもらえば、中間ノードがそのまま手に入る。
+ミラーを作る必要は無い。**出てきたHEXを貼るだけでよい。**
+
+⚠️ ただし「どれが選べるか」と「上乗せ額」はHEXからは学べない。
+   HEXには**選んだ1通りの結果**しか入っていないため。
+   前者は断られた記録から（V-22）、後者は StoreOrder の応答から
+   （V-23）取るしかない。
