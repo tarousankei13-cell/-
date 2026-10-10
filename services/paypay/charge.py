@@ -225,8 +225,11 @@ async def charge_from_link(
         # ⚠️ 残高に入れるのはチャージ率を掛けたあとの額。
         #    受け取った額（info.amount）は現実に動いたお金なので、
         #    PayPayReceipt にはそのまま残す。
-        rate = limits.charge_rate()
-        credited = limits.credited_for(info.amount)
+        # ⚠️ **口座の種類を必ず渡す。** 渡し忘れると共通の率が使われ、
+        #    paypay に別の率を設定していても効かない（静かに違う額を
+        #    記帳してしまう）。
+        rate = limits.charge_rate("paypay")
+        credited = limits.credited_for(info.amount, "paypay")
         memo = f"PayPay {info.sender_name}".strip()
         if credited != info.amount:
             memo = f"{memo}（チャージ率{rate}%: ¥{info.amount:,}→¥{credited:,}）"

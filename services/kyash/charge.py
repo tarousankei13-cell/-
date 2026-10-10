@@ -135,8 +135,11 @@ async def charge_from_link(discord_id: int, url: str) -> ChargeResult:
         # ⚠️ 残高に入れるのは **チャージ率を掛けたあと** の額。
         #    受け取った額（info.amount）は現実に動いたお金なので、
         #    KyashReceipt にはそのまま残す。混同しないこと。
-        rate = limits.charge_rate()
-        credited = limits.credited_for(info.amount)
+        # ⚠️ **口座の種類を必ず渡す。** 渡し忘れると共通の率が使われ、
+        #    kyash に別の率を設定していても効かない（静かに違う額を
+        #    記帳してしまう）。
+        rate = limits.charge_rate("kyash")
+        credited = limits.credited_for(info.amount, "kyash")
         memo = f"Kyash {info.sender_name}".strip()
         if credited != info.amount:
             memo = f"{memo}（チャージ率{rate}%: ¥{info.amount:,}→¥{credited:,}）"

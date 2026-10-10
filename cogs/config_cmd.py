@@ -59,17 +59,17 @@ class ConfigCog(commands.Cog):
         )
         from core import limits
 
-        rate = limits.charge_rate()
+        rates = []
+        for pv in limits.PROVIDERS:
+            r = limits.charge_rate(pv)
+            mark = "" if limits.rate_is_set(pv) else "（共通）"
+            rates.append(f"{limits.PROVIDER_LABEL[pv]} **{r}%**{mark}")
         e.add_field(
             name=f"{E.CHARGE} チャージ",
             value=(
                 f"{embeds.yen(int(v.get('charge_min', 100)))} 〜 "
                 f"{embeds.yen(int(v.get('charge_max', 50000)))}\n"
-                + (
-                    f"率 **{rate}%**（{embeds.yen(1000)}→"
-                    f"{embeds.yen(limits.credited_for(1000))}）"
-                    if rate != 100 else "率 100%（そのまま）"
-                )
+                + "\n".join(rates)
             ),
             inline=True,
         )
@@ -391,36 +391,59 @@ class ConfigCog(commands.Cog):
         name="charge_rate",
         description="チャージ率を設定します（120%なら1,000円の送金で1,200円ぶん）",
     )
-    @app_commands.describe(percent="チャージ率(%)。100でそのまま、120で2割増し")
+    @app_commands.describe(
+        percent="チャージ率(%)。100でそのまま、120で2割増し",
+        provider="どの口座に適用するか（省略すると共通）",
+    )
+    @app_commands.choices(provider=[
+        app_commands.Choice(name="共通（口座ごとの設定が無いとき）", value=""),
+        app_commands.Choice(name="Kyash だけ", value="kyash"),
+        app_commands.Choice(name="PayPay だけ", value="paypay"),
+    ])
     @admin_only()
     async def charge_rate_cmd(
         self, interaction: discord.Interaction,
         percent: app_commands.Range[int, 1, 1000],
+        provider: app_commands.Choice[str] | None = None,
     ) -> None:
         """
         ⚠️ 100 を超えたぶんは運営の持ち出し。
            上げる前に、どれだけ配るつもりかを決めること。
+
+        ⚠️ 口座ごとに決められる。**設定しなかった口座は共通の値に戻る**
+           ので、片方だけ決めても壊れない。
         """
         from core import limits
 
-        before = limits.charge_rate()
+        who = (provider.value if provider else "") or ""
+        key = f"charge_rate_{who}" if who else "charge_rate"
+        label = limits.PROVIDER_LABEL.get(who, "共通")
+
+        before = limits.charge_rate(who or None)
         await settings.set_value(
-            "charge_rate", int(percent), updated_by=interaction.user.id
+            key, int(percent), updated_by=interaction.user.id
         )
         cmax = int(settings.get("charge_max", 50_000))
-        lines = [f"チャージ率を **{before}% → {percent}%** にしました。"]
+        lines = [f"**{label}**のチャージ率を **{before}% → {percent}%** にしました。"]
+        # ⚠️ いまどの口座がいくらになるのかを必ず見せる。共通を変えたとき、
+        #    個別設定のある口座は**変わらない**ので、それが分からないと
+        #    「変えたのに効かない」と見える。
+        lines.append("")
+        for pv in limits.PROVIDERS:
+            mark = "（個別）" if limits.rate_is_set(pv) else "（共通）"
+            lines.append(
+                f"　{limits.PROVIDER_LABEL[pv]}　**{limits.charge_rate(pv)}%**{mark}"
+                f"　{embeds.yen(1000)} → {embeds.yen(limits.credited_for(1000, pv))}"
+            )
         if percent > 100:
             lines += [
                 "",
-                f"{E.YEN} {embeds.yen(1000)} の送金 → "
-                f"**{embeds.yen(limits.credited_for(1000))}** ぶんの残高",
                 f"{E.YEN} {embeds.yen(cmax)} の送金 → "
-                f"**{embeds.yen(limits.credited_for(cmax))}** ぶんの残高",
-                "",
+                f"**{embeds.yen(limits.credited_for(cmax, who or None))}** ぶんの残高",
                 f"{E.WARN} 1回のチャージで最大 "
-                f"**{embeds.yen(limits.bonus_for(cmax))}** の持ち出しになります。",
+                f"**{embeds.yen(limits.bonus_for(cmax, who or None))}** の持ち出しになります。",
                 f"{E.INFO} 端数は切り捨てです（{embeds.yen(333)} → "
-                f"{embeds.yen(limits.credited_for(333))}）。",
+                f"{embeds.yen(limits.credited_for(333, who or None))}）。",
             ]
         elif percent < 100:
             lines.append(

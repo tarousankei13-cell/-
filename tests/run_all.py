@@ -49,6 +49,7 @@ TESTS = [
     ("利用者の操作フロー", "test_ui_flows.py"),
     ("使いやすさ", "test_usability.py"),
     ("チャージ処理", "test_charge.py"),
+    ("口座ごとのチャージ率", "test_charge_rate.py"),
     ("アカウント登録（OTP）", "test_account_setup.py"),
     ("同時注文のアカウント割り当て", "test_account_pick.py"),
     ("決済カードとまとめ登録", "test_account_cards.py"),

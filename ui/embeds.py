@@ -128,20 +128,33 @@ def charge_panel() -> discord.Embed:
     cmax = int(settings.get("charge_max", 50_000))
     from core import limits
 
-    rate = limits.charge_rate()
     from ui.flows import charge_methods as _ways
 
     _names = {"kyash": "Kyash", "paypay": "PayPay"}
+    ways = _ways()
     desc = (
-        " / ".join(_names[w] for w in _ways())
+        " / ".join(_names[w] for w in ways)
         + " の送金リンクで残高をチャージできます。"
     )
-    if rate > 100:
-        example = limits.credited_for(1000)
-        desc += (
-            f"\n\n{E.PARTY} **いまなら {rate}% 増量中**\n"
-            f"　例）{yen(1000)} の送金で **{yen(example)}** ぶんの残高になります"
-        )
+    # ⚠️ 率は口座ごとに違うことがある。**まとめて1つ出さない。**
+    #    Kyash 120% / PayPay 100% のときに「120%増量中」とだけ出すと、
+    #    PayPayで送った人が「話が違う」ことになる。
+    boosted = [(w, limits.charge_rate(w)) for w in ways if limits.charge_rate(w) > 100]
+    if boosted:
+        if len(boosted) == len(ways) and len({r for _, r in boosted}) == 1:
+            rate = boosted[0][1]
+            desc += (
+                f"\n\n{E.PARTY} **いまなら {rate}% 増量中**\n"
+                f"　例）{yen(1000)} の送金で "
+                f"**{yen(limits.credited_for(1000, boosted[0][0]))}** ぶんの残高になります"
+            )
+        else:
+            desc += f"\n\n{E.PARTY} **いまなら増量中**"
+            for w, r in boosted:
+                desc += (
+                    f"\n　{_names[w]}　**{r}%**　"
+                    f"（{yen(1000)} → {yen(limits.credited_for(1000, w))}）"
+                )
     e = discord.Embed(title=f"{E.YEN} 残高チャージ", description=desc, color=BLUE)
     from ui.flows import charge_methods
 

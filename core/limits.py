@@ -34,12 +34,45 @@ class LimitError(Exception):
 #  チャージ率
 # ============================================================
 
-def charge_rate() -> int:
-    """チャージ率（％）。100 なら送金額がそのまま残高になる。"""
-    return max(1, int(settings.get("charge_rate", config.CHARGE_RATE)))
+# 口座の種類。設定のキーに使うので、**勝手に変えないこと**
+# （変えると既に保存されている設定が読めなくなる）。
+PROVIDERS = ("kyash", "paypay")
+PROVIDER_LABEL = {"kyash": "Kyash", "paypay": "PayPay"}
 
 
-def credited_for(sent: int) -> int:
+def _rate_key(provider: str) -> str:
+    return f"charge_rate_{provider}"
+
+
+def charge_rate(provider: str | None = None) -> int:
+    """チャージ率（％）。100 なら送金額がそのまま残高になる。
+
+    ⚠️ 口座の種類ごとに決められる。**設定が無ければ共通の値に戻る**
+       ので、片方だけ決めてももう片方が壊れない。
+
+    ⚠️ 0 や負の値を許さない。0にすると、いくら送っても残高が
+       1円も増えないのに受け取りだけ成立する。
+    """
+    common = max(1, int(settings.get("charge_rate", config.CHARGE_RATE)))
+    if not provider:
+        return common
+    key = _rate_key(str(provider).lower())
+    v = settings.get(key, None)
+    if v in (None, ""):
+        return common
+    try:
+        return max(1, int(v))
+    except (TypeError, ValueError):
+        log.warning("チャージ率の設定が読めません: %s=%r。共通の値を使います", key, v)
+        return common
+
+
+def rate_is_set(provider: str) -> bool:
+    """その口座に専用のチャージ率が入っているか（共通との区別）。"""
+    return settings.get(_rate_key(str(provider).lower()), None) not in (None, "")
+
+
+def credited_for(sent: int, provider: str | None = None) -> int:
     """
     その送金額で、残高にいくら入るか。
 
@@ -47,12 +80,12 @@ def credited_for(sent: int) -> int:
        運営の持ち出しが増えるため。
     """
     sent = max(0, int(sent))
-    return math.floor(sent * charge_rate() / 100)
+    return math.floor(sent * charge_rate(provider) / 100)
 
 
-def bonus_for(sent: int) -> int:
+def bonus_for(sent: int, provider: str | None = None) -> int:
     """チャージ率で上乗せされるぶん。"""
-    return credited_for(sent) - max(0, int(sent))
+    return credited_for(sent, provider) - max(0, int(sent))
 
 
 # ============================================================
