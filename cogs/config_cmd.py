@@ -568,7 +568,7 @@ class ConfigCog(commands.Cog):
             ephemeral=True,
         )
 
-    @group.command(name="refund", description="返金（実際に送金）の設定")
+    @group.command(name="refund", description="【設定】返金を使うかどうか・上限（お金は動きません）")
     @app_commands.describe(enabled="返金を使えるようにするか", maximum="1回の上限(円)")
     @admin_only()
     async def refund_cmd(

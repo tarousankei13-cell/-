@@ -248,6 +248,11 @@ async def main():
                           traceback.format_exc().strip().splitlines()[-1])
     print(f"\n[ 読み込めた Cog: {len(cogs_list)} 個 ]")
 
+    # ⚠️ 本物の Bot と同じく client から cog を引けるようにする。
+    #    `/help` は登録済みのコマンドをここから数えるため、
+    #    入れておかないと `/help` だけが落ちる。
+    client.cogs = {type(c).__name__: c for c in cogs_list}
+
     total = crashed = silent = skipped = network_slow = 0
     problems = []
     for cog in cogs_list:

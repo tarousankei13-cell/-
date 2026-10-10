@@ -171,6 +171,28 @@ async def main():
     check("複数語の判定語が効く ★",
           _parse(0, "product not found").kind == "PRODUCT_GONE")
 
+    # ⚠️ 印を付けたあとで失敗したら、印を外さなければならない。
+    #    呼び出し側は handle を受け取れないので閉じようがなく、
+    #    外し忘れるとそのアカウントは15分間選ばれない。
+    #    アカウントが1件しかない環境では、それで注文が止まる。
+    A.release_all()
+    before = set(A.in_use())
+    real = A.build_client
+    A.build_client = lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError("端末情報が壊れている"))
+    try:
+        await A.pick_account()
+        check("作れないときは例外になる ★", False, "例外が出なかった")
+    except RuntimeError:
+        check("作れないときは例外になる ★", True)
+    finally:
+        A.build_client = real
+    check("作るのに失敗しても使用中の印が残らない ★",
+          set(A.in_use()) == before, sorted(A.in_use()))
+    h = await A.pick_account()
+    check("失敗の直後でも普通に選べる ★", h is not None)
+    await h.aclose()
+
     await close_db()
     print(f"\n{'='*52}\n  成功 {ok} / 失敗 {fail}\n{'='*52}")
     return 1 if fail else 0

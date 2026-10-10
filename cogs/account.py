@@ -380,13 +380,14 @@ async def _after_mcd_added(
     if note:
         head += f"\n{E.INFO} {note}"
 
-    if len(usable) == 1:
-        card = usable[0]
-        name = (card.get("masked") or card.get("name") or "")[:64]
-        async with session_scope() as s:
-            acc = await s.get(McdAccount, account_id)
-            if acc:
-                acc.card_id = card["card_id"]
+    # ⚠️ 1枚だけのときの扱いは **services/mcd/accounts.py に一本化**。
+    #    ここで同じ判断を書き直すと、片方だけ直して食い違う。
+    #    一覧はもう持っているので、渡して通信をやり直さない。
+    picked, _n, auto_name = await mcd_accounts.auto_pick_card(
+        account_id, cards=cards,
+    )
+    if picked:
+        name = auto_name
         await interaction.followup.send(
             embed=embeds.ok(
                 f"{head}\n\n{E.CARD} 決済カードも自動で設定しました"
@@ -689,7 +690,7 @@ class AccountCog(commands.Cog):
 
         await admin_flows.show_accounts(interaction)
 
-    @mcd.command(name="card", description="決済に使うカードを選び直します")
+    @mcd.command(name="card", description="このアカウント1件の決済カードを選ぶ")
     @app_commands.describe(account_id="アカウントID")
     @admin_only()
     async def mcd_card(self, interaction: discord.Interaction, account_id: int) -> None:
@@ -725,7 +726,7 @@ class AccountCog(commands.Cog):
         """
         await interaction.response.send_modal(McdBulkModal())
 
-    @mcd.command(name="cards", description="全アカウントの決済カードの状況を表示します")
+    @mcd.command(name="cards", description="全アカウントのカードを一覧で見る・まとめて探す")
     @admin_only()
     async def mcd_cards(self, interaction: discord.Interaction) -> None:
         """どのアカウントにカードが付いているかを一目で見る。
@@ -907,7 +908,7 @@ class AccountCog(commands.Cog):
             embed=embeds.ok(f"`#{account_id}` **{label}** を削除しました。"), ephemeral=True
         )
 
-    @mcd.command(name="health", description="全アカウントの状態を確認します")
+    @mcd.command(name="health", description="登録したアカウント1件ずつの生死を確かめる")
     @admin_only()
     async def mcd_health(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)

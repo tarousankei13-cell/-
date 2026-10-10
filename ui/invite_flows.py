@@ -22,7 +22,6 @@ import discord
 
 import emoji as E
 from core import invite as inv
-from core import ledger as L
 from core import settings
 from core import users as user_repo
 from db.session import session_scope

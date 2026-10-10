@@ -20,12 +20,25 @@ SKIP_NAMES = {"tools_build_zip.py", "site_menu.html"}
 
 
 def check_secrets_empty() -> None:
-    """トークンが書き込まれたまま配らないように確かめる。"""
-    text = (ROOT / "main.py").read_text(encoding="utf-8")
-    for name in ("DISCORD_TOKEN", "ENCRYPTION_KEY"):
-        line = f'{name} = ""'
-        if line not in text:
-            sys.exit(f"✗ main.py の {name} が空ではありません。消してから作り直してください。")
+    """秘密が書き込まれたまま配らないように確かめる。
+
+    ⚠️ **PROXY_URL も秘密。** `http://利用者:合い言葉@…` の形で
+       書くので、トークンと同じ扱いにしなければならない。
+    ⚠️ 注文番号ページ側の PUSH_SECRET も同じ。ページを配るときに
+       合い言葉が付いていくと、誰でも控えを登録できてしまう。
+    """
+    targets = (
+        ("main.py", ("DISCORD_TOKEN", "ENCRYPTION_KEY", "PROXY_URL")),
+        ("receipt_site/main.py", ("PUSH_SECRET",)),
+    )
+    for rel, names in targets:
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        for name in names:
+            if f'{name} = ""' not in text:
+                sys.exit(
+                    f"✗ {rel} の {name} が空ではありません。"
+                    "消してから作り直してください。"
+                )
 
 
 def check_page_copy() -> None:

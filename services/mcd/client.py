@@ -21,7 +21,6 @@ import httpx
 
 from core import breaker, retry
 from core.http import build_async_client
-from core.telemetry import current as correlation_id
 from services.mcd import errors as mcd_errors
 from services.mcd.protocol import (
     OrderResponse, build_authorise_body, build_get_paid_body,

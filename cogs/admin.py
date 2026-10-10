@@ -216,7 +216,7 @@ class AdminCog(commands.Cog):
         e.set_footer(text=f"控えは {dns.TTL:.0f} 秒で作り直します")
         await interaction.response.send_message(embed=e, ephemeral=True)
 
-    @stats_group.command(name="health", description="マクドナルド側の様子を確認します")
+    @stats_group.command(name="health", description="マクドナルド側に繋がるかを外から見る（通信の様子）")
     @admin_only()
     async def stats_health(self, interaction: discord.Interaction) -> None:
         """いま接続できているかを、その場で確かめる。"""
@@ -324,7 +324,7 @@ class AdminCog(commands.Cog):
         )
 
     @admin.command(
-        name="refund", description="実際にお金をお返しします（送金リンクを作ります）"
+        name="refund", description="【実行】いますぐ返金する（お金が動きます）"
     )
     @app_commands.describe(
         user="お返しする相手", amount="返金額（円）", reason="理由（記録に残ります）",
@@ -398,7 +398,7 @@ class AdminCog(commands.Cog):
             ephemeral=True,
         )
 
-    @admin.command(name="ban", description="利用者の利用を停止します")
+    @admin.command(name="ban", description="【BOT】この人のBOT利用を止める（Discordには残ります）")
     @app_commands.describe(user="対象の利用者", reason="停止の理由（記録に残ります）")
     @admin_only()
     async def ban(
@@ -418,7 +418,7 @@ class AdminCog(commands.Cog):
             embed=embeds.ok(f"{user.mention} の利用を停止しました。"), ephemeral=True
         )
 
-    @admin.command(name="unban", description="利用停止を解除します")
+    @admin.command(name="unban", description="【BOT】BOT利用の停止を解除する")
     @app_commands.describe(user="解除する利用者")
     @admin_only()
     async def unban(self, interaction: discord.Interaction, user: discord.User) -> None:
@@ -719,7 +719,7 @@ class AdminCog(commands.Cog):
 
     # -- メニュー -----------------------------------------------
 
-    @menu_group.command(name="sync", description="メニューを同期します")
+    @menu_group.command(name="sync", description="マクドナルドのメニューを取り直す")
     @app_commands.describe(store_id="店舗ID。省略すると使用中の全店舗")
     @admin_only()
     async def menu_sync(
@@ -1379,7 +1379,7 @@ class AdminCog(commands.Cog):
 
     # -- 保守 ---------------------------------------------------
 
-    @app_commands.command(name="sync", description="スラッシュコマンドを手動で同期します")
+    @app_commands.command(name="sync", description="【保守】スラッシュコマンドをDiscordへ登録し直す")
     @owner_only()
     async def sync_commands(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)

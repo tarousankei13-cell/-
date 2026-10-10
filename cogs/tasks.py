@@ -708,8 +708,6 @@ class TasksCog(commands.Cog):
         ⚠️ 設置されていなければ何もしない。毎回パネルを探しに行くが、
            DBを1回引くだけなので軽い。
         """
-        from sqlalchemy import select
-
         from db.models import Panel
         from db.session import session_scope
 
@@ -857,23 +855,32 @@ class TasksCog(commands.Cog):
         except Exception:
             log.exception("注文の復旧に失敗しました")
 
-        try:
-            from services.kyash.charge import recover_pending as recover_charges
+        # ⚠️ Kyash と PayPay の**両方**を復旧する。
+        #    片方だけ書いていたため、PayPayの受け取りが途中で落ちると
+        #    RECEIVING のまま誰にも気付かれず残っていた。
+        #    「送ったのに残高に入らない」が放置される形になる。
+        import importlib
 
-            count = await recover_charges()
-            if count:
-                await self.notify_admin(
-                    discord.Embed(
-                        title=f"{E.WARN} 未完了のチャージがあります",
-                        description=(
-                            f"{count} 件を「要確認」にしました。\n"
-                            "Kyashの受取履歴と照合してください。"
-                        ),
-                        color=embeds.ORANGE,
+        for label, loader in (
+            ("Kyash", "services.kyash.charge"),
+            ("PayPay", "services.paypay.charge"),
+        ):
+            try:
+                recover_charges = importlib.import_module(loader).recover_pending
+                count = await recover_charges()
+                if count:
+                    await self.notify_admin(
+                        discord.Embed(
+                            title=f"{E.WARN} 未完了の{label}チャージがあります",
+                            description=(
+                                f"{count} 件を「要確認」にしました。\n"
+                                f"{label}の受取履歴と照合してください。"
+                            ),
+                            color=embeds.ORANGE,
+                        )
                     )
-                )
-        except Exception:
-            log.exception("チャージの復旧に失敗しました")
+            except Exception:
+                log.exception("%sチャージの復旧に失敗しました", label)
 
         # レシート画像が作れるか確認
         from services.receipt import self_check

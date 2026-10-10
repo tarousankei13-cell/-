@@ -113,6 +113,33 @@ async def main():
     r.error_info = E.parse(422, REAL_422)
     check("解析があればその案内", "選び直して" in r.user_message, r.user_message[:60])
 
+    print("\n[9] 項目名を理由と取り違えない")
+    # ⚠️ 送信内容には createPaymentMethod / messagingToken /
+    #    userPosIdToken といった**項目名**がある。相手の入力不備の
+    #    エラーはこの名前を本文に載せてくる。"payment" や "token" を
+    #    部分一致で見ると、ただの組み立てミスが「決済拒否」
+    #    「ログイン切れ」に化け、**そのアカウントが即座に隔離される**。
+    #    アカウントが1〜2件なら、それだけで注文が止まる。
+    for body, want in (
+        (b"ErrorCode_Validation\x12\x14createPaymentMethod", "UNKNOWN"),
+        (b"ErrorCode_Validation\x12\x10messagingToken", "UNKNOWN"),
+        (b"ErrorCode_Validation\x12\x0euserPosIdToken", "UNKNOWN"),
+        (b"ErrorCode_Validation\x12\x0boffersToken", "UNKNOWN"),
+    ):
+        got = E.parse(0, body)
+        name = body.split(b"\x12")[1][1:].decode()
+        check(f"{name} だけでは決めつけない ★", got.kind == "UNKNOWN", got.kind)
+        check(f"{name} でアカウントを外さない ★", not got.account_fault)
+    # 単語として出てくるものは、これまでどおり拾えること
+    for body, want in ((b"payment failed", "PAYMENT"),
+                       (b"ErrorCode_PaymentError", "PAYMENT"),
+                       (b"payment was declined", "PAYMENT"),
+                       (b"token expired", "AUTH"),
+                       (b"The access token is invalid", "AUTH"),
+                       (b'{"error":"invalid_token"}', "AUTH")):
+        got = E.parse(0, body).kind
+        check(f"「{body.decode()[:28]}」は {want}", got == want, got)
+
     await close_db()
     print(f"\n{'='*46}\n  成功 {ok} 件 / 失敗 {fail} 件\n{'='*46}")
     return 1 if fail else 0

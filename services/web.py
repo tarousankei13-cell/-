@@ -21,7 +21,6 @@ BOT と同じプロセスで動く（aiohttp は discord.py が持っている�
 
 from __future__ import annotations
 
-import html
 import logging
 import os
 import secrets

@@ -19,6 +19,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from core import ledger as L
@@ -95,6 +96,10 @@ async def charge_from_link(
 
     handle = None
     checker = None
+    # ⚠️ 保留で覚えていた行を使い回したときの印。失敗したときに
+    #    「失敗」で終わらせてしまうと、見張りから外れて自動では
+    #    受け取られなくなる。保留だったものは保留に戻す。
+    was_held = False
     receipt_id = str(uuid.uuid4())
     code = normalize_link(url)
     if not code:
@@ -137,16 +142,38 @@ async def charge_from_link(
         handle, checker = await paypay_accounts.pick_account(info.amount), None
 
         # ② 予約（同じリンクを2回使わせない）
-        try:
-            async with session_scope() as s:
+        #
+        # ⚠️ 保留で一度覚えたリンクは、**同じ link_uuid の行がすでにある**。
+        #    保留が解除されたあとに利用者が自分で貼り直すと、ここで
+        #    一意制約に当たり「すでに使用されています」と出ていた。
+        #    お金はまだ受け取っていないのに、使用済みと言われる形。
+        #    まだお金が動いていない状態（保留・失敗）なら、その行を
+        #    そのまま使い直す。受け取り済みのものは今までどおり断る。
+        link_key = info.order_id or code
+        async with session_scope() as s:
+            prev = (await s.execute(
+                select(PayPayReceipt).where(PayPayReceipt.link_uuid == link_key)
+            )).scalars().first()
+            if prev is not None and prev.status not in (HELD, FAILED):
+                raise ChargeError("このリンクはすでに使用されています")
+            if prev is not None:
+                receipt_id = prev.id          # 同じ行を使い続ける
+                was_held = prev.status == HELD
+                prev.paypay_account_id = handle.account_id
+                prev.discord_id = discord_id
+                prev.amount = info.amount
+                prev.sender_name = info.sender_name
+                prev.status = RESERVED
+                prev.raw_link = code[:255]
+                prev.error = None
+                prev.next_check_at = None
+            else:
                 s.add(PayPayReceipt(
-                    id=receipt_id, link_uuid=info.order_id or code,
+                    id=receipt_id, link_uuid=link_key,
                     paypay_account_id=handle.account_id, discord_id=discord_id,
                     amount=info.amount, sender_name=info.sender_name,
                     status=RESERVED, raw_link=code[:255],
                 ))
-        except IntegrityError:
-            raise ChargeError("このリンクはすでに使用されています") from None
 
         # ③ 受取前の残高
         before = (await handle.client.get_balance()).all_balance
@@ -235,7 +262,10 @@ async def charge_from_link(
         async with session_scope() as s:
             row = await s.get(PayPayReceipt, receipt_id)
             if row and row.status == RESERVED:
-                row.status = FAILED
+                # 保留だったものは見張りに戻す（お金はまだ動いていない）
+                row.status = HELD if was_held else FAILED
+                if was_held:
+                    row.next_check_at = None
                 row.error = str(e)[:500]
         log.warning("PayPayチャージに失敗しました: %s", e)
         raise ChargeError(f"チャージに失敗しました: {e}") from e
@@ -270,8 +300,6 @@ async def _remember_hold(
     """
     from datetime import timedelta
 
-    from sqlalchemy import select
-
     from db.models import utcnow
 
     key = info.order_id or code
@@ -303,9 +331,46 @@ async def _remember_hold(
     return receipt_id
 
 
+async def recover_pending() -> int:
+    """起動時の復旧。
+
+    ⚠️ **RECEIVING のまま残っている行を放置してはいけない。**
+       受け取りを投げた直後にBOTが落ちると、お金が動いたのかどうか
+       こちらには分からない。放っておくと、誰も見ないまま
+       「送ったのに残高に入らない」だけが残る。
+
+    ⚠️ 自動で記帳しない。残高が増えていない場合に増やしてしまうと
+       取り返せない。管理者の確認（要確認）へ回す。
+
+    ⚠️ 保留（HELD）はここで触らない。あちらは見張りのループが
+       面倒を見るので、要確認にすると自動受け取りが止まってしまう。
+    """
+    async with session_scope() as s:
+        rows = (await s.execute(
+            select(PayPayReceipt)
+            .where(PayPayReceipt.status.in_([RECEIVING, RECEIVED]))
+        )).scalars().all()
+        pending = [r.id for r in rows]
+
+    if not pending:
+        return 0
+
+    log.warning("未完了のPayPayチャージが %d 件あります。復旧します", len(pending))
+    for receipt_id in pending:
+        async with session_scope() as s:
+            row = await s.get(PayPayReceipt, receipt_id)
+            if row is None:
+                continue
+            row.status = MANUAL_REVIEW
+            row.error = (
+                "受け取り中にBOTが停止しました。"
+                "PayPayの取引履歴と照合してください"
+            )
+    return len(pending)
+
+
 async def held_links() -> list[dict]:
     """いま見張っている保留のリンク。"""
-    from sqlalchemy import select
 
     async with session_scope() as s:
         rows = (await s.execute(
@@ -346,8 +411,6 @@ async def recheck_held() -> list[tuple[str, int, str, int]]:
        崩れる。
     """
     from datetime import timedelta
-
-    from sqlalchemy import select
 
     from db.models import utcnow
     from services.paypay.client import LinkAlreadyUsed as _Used

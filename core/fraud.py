@@ -27,7 +27,7 @@ from sqlalchemy import func, select
 
 import config
 from core import saga
-from db.models import as_utc, Ledger, Order, User
+from db.models import Ledger, Order
 from db.session import session_scope
 
 log = logging.getLogger("bot.fraud")

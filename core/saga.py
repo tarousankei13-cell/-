@@ -460,7 +460,10 @@ async def _probe_paid(handle, group: str, token: str, attempts: int = 3):
                 return paid
         except McdError as e:
             log.info("決済状況の確認を再試行します (%d/%d): %s", i + 1, attempts, e)
-        await asyncio.sleep(1.5)
+        # ⚠️ 最後の回のあとに待たない。待っても誰も見ないので、
+        #    失敗の知らせがその分だけ遅れるだけになる。
+        if i + 1 < attempts:
+            await asyncio.sleep(1.5)
     return None
 
 

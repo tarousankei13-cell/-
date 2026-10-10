@@ -27,7 +27,7 @@ import asyncio
 import logging
 import random
 from enum import Enum
-from typing import Any, Awaitable, Callable, TypeVar
+from typing import Awaitable, Callable, TypeVar
 
 log = logging.getLogger("bot.retry")
 

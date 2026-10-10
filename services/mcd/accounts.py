@@ -251,56 +251,74 @@ async def pick_account(exclude: set[int] | None = None) -> AccountHandle:
 
 
 async def _pick_locked(exclude: set[int], now: datetime) -> AccountHandle:
-    async with session_scope() as s:
-        rows = (
-            await s.execute(select(McdAccount).where(McdAccount.status.in_(USABLE)))
-        ).scalars().all()
-        # ⚠️ いま使われているアカウントは避ける。`last_used_at` は
-        #    注文が終わるまで更新されないので、それだけでは防げない。
-        busy = in_use()
-        free = [a for a in rows
-                if a.id not in exclude and a.id not in busy and a.card_id]
-        if free:
-            candidates = free
-        else:
-            # ⚠️ 全部ふさがっていても止めない。待たせるより、
-            #    いちばん余裕のあるものを使い回すほうがよい。
-            #    （注文の同時数は core/queue.py 側で既に絞ってある）
-            candidates = [a for a in rows if a.id not in exclude and a.card_id]
-            if candidates:
-                log.info("空いているアカウントがありません。使用中から選び直します")
-        # 続けて失敗しているアカウントは、しばらく使わない。
-        # 壊れた相手に送り続けると全員がタイムアウトを待たされるため。
-        usable = [a for a in candidates if breaker.accounts.allows(f"mcd:{a.id}")]
-        if usable:
-            candidates = usable
-        elif candidates:
-            # 全部止まっている場合は、一番早く復帰するものを試す
-            log.warning("使えるアカウントが一時的にありません。最も回復が近いものを試します")
-            candidates.sort(key=lambda a: breaker.accounts.get(f"mcd:{a.id}").retry_after)
-            candidates = candidates[:1]
-        if not candidates:
-            no_card = [a.label for a in rows if a.id not in exclude and not a.card_id]
-            if no_card:
+    # ⚠️ 外へ返せなかった handle は、**誰も閉じられない**。
+    #    使用中の印も通信も残り続けるので、ここで後片付けする。
+    #    保存の失敗は `async with` を**抜けるとき**に起きるため、
+    #    try はその外側に置かなければ捕まえられない。
+    handle: AccountHandle | None = None
+    try:
+        async with session_scope() as s:
+            rows = (
+                await s.execute(select(McdAccount).where(McdAccount.status.in_(USABLE)))
+            ).scalars().all()
+            # ⚠️ いま使われているアカウントは避ける。`last_used_at` は
+            #    注文が終わるまで更新されないので、それだけでは防げない。
+            busy = in_use()
+            free = [a for a in rows
+                    if a.id not in exclude and a.id not in busy and a.card_id]
+            if free:
+                candidates = free
+            else:
+                # ⚠️ 全部ふさがっていても止めない。待たせるより、
+                #    いちばん余裕のあるものを使い回すほうがよい。
+                #    （注文の同時数は core/queue.py 側で既に絞ってある）
+                candidates = [a for a in rows if a.id not in exclude and a.card_id]
+                if candidates:
+                    log.info("空いているアカウントがありません。使用中から選び直します")
+            # 続けて失敗しているアカウントは、しばらく使わない。
+            # 壊れた相手に送り続けると全員がタイムアウトを待たされるため。
+            usable = [a for a in candidates if breaker.accounts.allows(f"mcd:{a.id}")]
+            if usable:
+                candidates = usable
+            elif candidates:
+                # 全部止まっている場合は、一番早く復帰するものを試す
+                log.warning("使えるアカウントが一時的にありません。最も回復が近いものを試します")
+                candidates.sort(key=lambda a: breaker.accounts.get(f"mcd:{a.id}").retry_after)
+                candidates = candidates[:1]
+            if not candidates:
+                no_card = [a.label for a in rows if a.id not in exclude and not a.card_id]
+                if no_card:
+                    raise McdError(
+                        "決済カードが設定されていないため注文できません。"
+                        f"（{', '.join(no_card[:3])}）"
+                        " /mcd card <ID> で設定してください"
+                    )
                 raise McdError(
-                    "決済カードが設定されていないため注文できません。"
-                    f"（{', '.join(no_card[:3])}）"
-                    " /mcd card <ID> で設定してください"
+                    "使用できるマクドナルドアカウントがありません。"
+                    "/mcd list で状態を確認してください"
                 )
-            raise McdError(
-                "使用できるマクドナルドアカウントがありません。"
-                "/mcd list で状態を確認してください"
-            )
-        best = max(candidates, key=lambda a: _score(a, now))
-        # ⚠️ **選んだ直後に印を付ける。** セッションを抜けてから付けると、
-        #    その隙間に別の注文が同じものを選ぶ。
-        _in_use[best.id] = time.monotonic()
-        tokens = await _load_tokens(s, best.id)
-        handle = AccountHandle(
-            account_id=best.id, label=best.label, card_id=best.card_id or "",
-            client=build_client(best, tokens),
-        )
-        best.last_used_at = now
+            best = max(candidates, key=lambda a: _score(a, now))
+            # ⚠️ **選んだ直後に印を付ける。** セッションを抜けてから付けると、
+            #    その隙間に別の注文が同じものを選ぶ。
+            _in_use[best.id] = time.monotonic()
+            # ⚠️ 印を付けたあとで失敗したら、**必ず外す**。
+            #    外さないと、呼び出し側は handle を受け取っていないので
+            #    閉じることができず、そのアカウントは15分間使えなくなる。
+            #    アカウントが1〜2件の環境では、それだけで注文が止まる。
+            try:
+                tokens = await _load_tokens(s, best.id)
+                handle = AccountHandle(
+                    account_id=best.id, label=best.label, card_id=best.card_id or "",
+                    client=build_client(best, tokens),
+                )
+            except BaseException:
+                release(best.id)
+                raise
+            best.last_used_at = now
+    except BaseException:
+        if handle is not None:
+            await handle.aclose()   # 印を外し、通信も閉じる
+        raise
     log.info("アカウントを選択しました: %s (ID %s)", handle.label, handle.account_id)
     return handle
 
@@ -554,7 +572,9 @@ async def fetch_cards(account_id: int) -> list[dict]:
             await handle.aclose()
 
 
-async def auto_pick_card(account_id: int) -> tuple[bool, int, str]:
+async def auto_pick_card(
+    account_id: int, cards: list[dict] | None = None,
+) -> tuple[bool, int, str]:
     """カードが1枚だけなら自動で選ぶ。
 
     返り値は (設定したか, 見つかった枚数, 表示名)。
@@ -564,6 +584,12 @@ async def auto_pick_card(account_id: int) -> tuple[bool, int, str]:
 
     ⚠️ すでに設定済みなら触らない。せっかく選んだものを、
        取り直しのたびに上書きしてしまう。
+
+    ⚠️ **この判断を他所で書き直さないこと。** 登録直後の案内も
+       まとめ登録も、必ずここを通す。同じ規則を2か所に書くと、
+       片方だけ直して食い違う（それで実際に `field 8` を間違えた）。
+       登録の途中で既に一覧を持っているときは `cards` で渡せば、
+       もう一度通信しない。
     """
     async with session_scope() as s:
         acc = await s.get(McdAccount, account_id)
@@ -572,11 +598,12 @@ async def auto_pick_card(account_id: int) -> tuple[bool, int, str]:
         if acc.card_id:
             return False, -1, ""      # -1 は「すでに設定済み」
 
-    try:
-        cards = await fetch_cards(account_id)
-    except Exception as e:
-        log.info("アカウント %s のカードを取れませんでした: %s", account_id, e)
-        return False, 0, ""
+    if cards is None:
+        try:
+            cards = await fetch_cards(account_id)
+        except Exception as e:
+            log.info("アカウント %s のカードを取れませんでした: %s", account_id, e)
+            return False, 0, ""
 
     usable = [c for c in cards if c.get("card_id")]
     if len(usable) != 1:

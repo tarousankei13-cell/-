@@ -88,6 +88,7 @@ TESTS = [
     ("利用を広げる機能（声かけ・再注文・ランキング）", "test_growth.py"),
     ("人数が増えたときの挙動", "test_scale.py"),
     ("鍵が合わないとき", "test_key_mismatch.py"),
+    ("コマンドの案内（/help）", "test_help.py"),
     ("安全性（認証情報・権限）", "test_security.py"),
 ]
 

@@ -112,6 +112,57 @@ async def main():
           AC._mask_mail("a@x.jp"))
     check("＠が無くても落ちない", "***" in AC._mask_mail("こわれた"))
 
+    print("\n[カードを決める規則が1か所にまとまっているか ★]")
+    # ⚠️ 登録直後の案内にも、まとめ登録にも「1枚だけなら自動」という
+    #    同じ判断が要る。2か所に書くと、片方だけ直して食い違う。
+    #    （それで実際に field 8 を間違えた。）
+    import cogs.account as AC2
+
+    calls = []
+    real_auto = A.auto_pick_card
+
+    async def spy(account_id, cards=None):
+        calls.append((account_id, cards))
+        return await real_auto(account_id, cards=cards)
+
+    AC2.mcd_accounts.auto_pick_card = spy
+
+    class _Follow:
+        def __init__(self): self.sent = []
+        async def send(self, **kw): self.sent.append(kw)
+
+    class _It:
+        def __init__(self): self.followup = _Follow(); self.user = type("U", (), {"id": 1})()
+
+    async with session_scope() as s:
+        s.add(McdAccount(
+            id=9, label="acc9", email_enc=c.encrypt("a9@x"),
+            refresh_token_enc=c.encrypt("rt"), card_id="",
+            device_uid="d", wmop_device_id="w", fb_instance_id="f",
+            home_lat=35.0, home_lng=139.0, status="ACTIVE"))
+    it = _It()
+    await AC2._after_mcd_added(
+        it, 9, "acc9", [{"card_id": "only1", "masked": "**** 9999"}])
+    check("登録直後の案内も同じ処理を通す ★", calls and calls[0][0] == 9, calls)
+    check("持っている一覧を渡して通信をやり直さない ★",
+          calls and calls[0][1] is not None)
+    async with session_scope() as s:
+        check("1枚だけなら設定される ★",
+              (await s.get(McdAccount, 9)).card_id == "only1")
+    check("自動で設定したと伝える ★",
+          any("自動で設定" in str(k.get("embed").description or "")
+              for k in it.followup.sent if k.get("embed")), it.followup.sent)
+
+    # ⚠️ すでに選んであるものを、登録し直しで上書きしない
+    it2 = _It()
+    await AC2._after_mcd_added(
+        it2, 9, "acc9", [{"card_id": "other", "masked": "**** 0000"}])
+    async with session_scope() as s:
+        check("設定済みのカードを上書きしない ★",
+              (await s.get(McdAccount, 9)).card_id == "only1",
+              (await s.get(McdAccount, 9)).card_id)
+    AC2.mcd_accounts.auto_pick_card = real_auto
+
     await close_db()
     print(f"\n{'='*52}\n  成功 {ok} / 失敗 {fail}\n{'='*52}")
     return 1 if fail else 0

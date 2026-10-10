@@ -144,6 +144,24 @@ async def main():
           len([h for h in hosts if h.startswith("ord.group-")]) == 6)
     check("控えの寿命が決めてある", 0 < dns.TTL <= 3600, dns.TTL)
 
+    print("\n[起動時の復旧が、口座の種類ごとに漏れていないか ★]")
+    # ⚠️ 受け取りの途中で落ちた行は、放っておくと誰も見ない。
+    #    「送ったのに残高に入らない」が残るだけになる。
+    #    Kyash だけ書いて PayPay を忘れていた（実際の抜け）。
+    #    口座を増やしたときに同じ抜けが起きないよう、ここで見る。
+    import inspect
+
+    import cogs.tasks as _T
+
+    src = inspect.getsource(_T.TasksCog)
+    for mod in ("services.kyash.charge", "services.paypay.charge"):
+        check(f"{mod} の復旧を呼ぶ ★", mod in src)
+    for mod in ("services.kyash.charge", "services.paypay.charge"):
+        import importlib
+        m = importlib.import_module(mod)
+        check(f"{mod}.recover_pending がある ★",
+              callable(getattr(m, "recover_pending", None)))
+
     await close_db()
     print(f"\n{'='*52}\n  成功 {ok} / 失敗 {fail}\n{'='*52}")
     return 1 if fail else 0

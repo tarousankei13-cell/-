@@ -29,7 +29,7 @@ from services.mcd import accounts as mcd_accounts
 from services.mcd import store_index
 from services.mcd import stores as mcd_stores
 from services.mcd.client import McdError
-from services.mcd import availability, slot_bridge, slot_rules
+from services.mcd import availability, slot_rules
 from services.mcd.menu import (
     ParsedMenu, Product, customization_note, minutes_of,
 )

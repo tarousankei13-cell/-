@@ -12,6 +12,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core.crypto import init_cipher
+from sqlalchemy import select as _select
+
 from db.session import init_db, session_scope, close_db
 
 ok = fail = 0
@@ -329,6 +331,107 @@ async def main():
         a.token_obtained_at = utcnow() - timedelta(days=85)
     warns = await jobs.kyash_token_warnings()
     check("PayPayの期限も出る ★", any("PayPay" in w for w in warns), warns)
+
+    print("\n── ⑮ 保留が解けたあとに自分で貼り直せるか ★ ──")
+    # ⚠️ 保留になったリンクは、その時点で1行覚える（見張りのため）。
+    #    link_uuid は一意なので、保留が解けたあとに利用者が自分で
+    #    貼り直すと、**お金はまだ受け取っていないのに**
+    #    「すでに使用されています」と断られていた。
+    #    利用者からすれば「送ったのに使えないと言われた」になる。
+    PC.paypay_accounts.pick_account = fake_pick
+    PA.pick_account = fake_pick
+    HOLD_URL = "https://pay.paypay.ne.jp/held001"
+
+    CUR["client"] = FakeClient(1500, status="ON_HOLD")   # 保留中
+    try:
+        await PC.charge_from_link(UID, HOLD_URL)
+        check("保留だと分かる ★", False, "例外が出なかった")
+    except PC.ChargeOnHold as e:
+        check("保留だと分かる ★", e.amount == 1500, e.amount)
+        held_row = e.receipt_id
+    except PC.ChargeError as e:
+        check("保留だと分かる ★", False, f"保留ではなく拒否された: {e}")
+        held_row = None
+    check("見張りに入る ★",
+          any(h["link"].endswith("held001") for h in await PC.held_links()))
+
+    # 送った側が「送る」を押して、受け取れるようになった
+    CUR["client"] = FakeClient(1500, status="PENDING")
+    before = await balance(UID)
+    try:
+        r = await PC.charge_from_link(UID, HOLD_URL)
+        check("貼り直しで受け取れる ★", r.amount == 1500, r.amount)
+    except PC.ChargeError as e:
+        check("貼り直しで受け取れる ★", False, f"断られた: {e}")
+    check("残高に入る ★", await balance(UID) == before + 1500,
+          await balance(UID) - before)
+    check("見張りから消える ★",
+          not [h for h in await PC.held_links() if h["link"].endswith("held001")])
+    # ⚠️ 受け取ったあとは、もう一度貼っても断ること（二重受け取りを防ぐ）
+    CUR["client"] = FakeClient(1500, status="PENDING")
+    try:
+        await PC.charge_from_link(UID, HOLD_URL)
+        check("受け取り後は断る ★", False, "2回受け取れてしまった")
+    except PC.ChargeError as e:
+        check("受け取り後は断る ★", "すでに使用" in str(e), e)
+
+    print("\n── ⑯ 受け取りを投げたあとに落ちたら、要確認へ回るか ★ ──")
+    # ⚠️ 受け取りを投げたあとは、**お金が動いたか分からない**。
+    #    見張りに戻して自動で再受け取りすると、二重に受け取りうる。
+    #    かといって放置すると「送ったのに残高に入らない」が
+    #    誰にも気付かれず残る。だから「要確認」へ回す。
+    #    Kyash にはこの復旧があったのに、PayPay には無かった。
+    HOLD2 = "https://pay.paypay.ne.jp/held002"
+    CUR["client"] = FakeClient(1600, status="ON_HOLD")
+    try:
+        await PC.charge_from_link(UID, HOLD2)
+    except (PC.ChargeOnHold, PC.ChargeError):
+        pass
+
+    class FailAfterReceive(FakeClient):
+        async def link_receive(self, url, info=None, passcode=None):
+            raise C.PayPayError("受け取りの途中で切れました")
+    CUR["client"] = FailAfterReceive(1600, status="PENDING")
+    before = await balance(UID)
+    try:
+        await PC.charge_from_link(UID, HOLD2)
+    except PC.ChargeError:
+        pass
+    check("自動で記帳しない ★", await balance(UID) == before)
+    check("自動で再受け取りしない ★",
+          not [h for h in await PC.held_links() if h["link"].endswith("held002")])
+    moved = await PC.recover_pending()
+    check("起動時の復旧が拾う ★", moved >= 1, moved)
+    async with session_scope() as s:
+        from db.models import PayPayReceipt as _PR
+        rows = (await s.execute(
+            _select(_PR).where(_PR.raw_link.like("%held002%"))
+        )).scalars().all()
+    check("要確認になる ★", rows and rows[0].status == "MANUAL_REVIEW",
+          rows[0].status if rows else "行が無い")
+    check("理由が残る ★", rows and "照合" in (rows[0].error or ""),
+          rows[0].error if rows else "")
+
+    print("\n── ⑰ 受け取る前に落ちたら見張りに戻るか ★ ──")
+    # ⚠️ まだお金は動いていない。ここは見張りに戻すのが正しい。
+    HOLD3 = "https://pay.paypay.ne.jp/held003"
+    CUR["client"] = FakeClient(1700, status="ON_HOLD")
+    try:
+        await PC.charge_from_link(UID, HOLD3)
+    except (PC.ChargeOnHold, PC.ChargeError):
+        pass
+
+    class FailBeforeReceive(FakeClient):
+        async def get_balance(self):
+            raise C.PayPayError("残高が読めません")
+    CUR["client"] = FailBeforeReceive(1700, status="PENDING")
+    try:
+        await PC.charge_from_link(UID, HOLD3)
+    except PC.ChargeError:
+        pass
+    check("受け取る前の失敗なら見張りに残る ★",
+          any(h["link"].endswith("held003") for h in await PC.held_links()),
+          [h["link"] for h in await PC.held_links()])
 
     await close_db()
     print(f"\n{'='*52}\n  成功 {ok} / 失敗 {fail}\n{'='*52}")

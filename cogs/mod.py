@@ -327,7 +327,7 @@ class ModCog(commands.Cog):
             member=member, by=interaction.user, reason=reason,
         )
 
-    @group.command(name="ban", description="BANします")
+    @group.command(name="ban", description="【Discord】サーバーからBANする（追放・再参加も不可）")
     @app_commands.describe(
         member="対象の方", reason="理由",
         delete_days="直近何日分のメッセージも消すか（0〜7）",
@@ -368,7 +368,7 @@ class ModCog(commands.Cog):
             extra=[("消したメッセージ", f"直近 {delete_days} 日分")] if delete_days else [],
         )
 
-    @group.command(name="unban", description="BANを解除します")
+    @group.command(name="unban", description="【Discord】サーバーのBANを解除する")
     @app_commands.describe(user_id="解除する方のユーザーID")
     @admin_only()
     async def unban_cmd(

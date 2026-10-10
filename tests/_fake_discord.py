@@ -89,6 +89,10 @@ class FakeClient:
         self.admin_role_ids = set()
         self.sent: dict[int, list] = {}
         self.users: dict[int, "FakeUser"] = {}
+        # ⚠️ 本物の Bot が必ず持つ。`/help` のように「いま登録されて
+        #    いるコマンド」を自分で数えるコマンドがここを読む。
+        #    無いと AttributeError で落ちるので、空でも必ず持たせる。
+        self.cogs: dict[str, object] = {}
 
     def get_channel(self, cid):
         return FakeChannel(cid, self)

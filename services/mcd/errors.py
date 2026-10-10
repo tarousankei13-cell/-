@@ -49,7 +49,7 @@ _RULES: list[tuple[str, tuple[str, ...]]] = [
     )),
     (PAYMENT, (
         "残高", "残高不足", "限度額", "ご利用いただけません", "決済", "支払い",
-        "カードが拒否", "承認されませんでした", "payment", "declin",
+        "カードが拒否", "承認されませんでした", "declin",
         "insufficient", "ErrorCode_Payment", "ErrorCode_Authorisation",
         "ErrorCode_Settlement", "PaymentError", "CreditCardError",
         # ⚠️ 裸の "authoriz" を入れてはいけない。**"unauthorized" に
@@ -72,7 +72,7 @@ _RULES: list[tuple[str, tuple[str, ...]]] = [
         "ErrorCode_ProductValidation", "ProductsError", "ErrorCode_Product",
     )),
     (AUTH, (
-        "unauthenticated", "unauthorized", "token", "ErrorCode_Auth",
+        "unauthenticated", "unauthorized", "ErrorCode_Auth",
         "認証",
         # ⚠️ ログインできなくなる形。OAuth が返す定型の文言で、
         #    「アカウントが止められた」ときに最初に出るのがここ。
@@ -128,6 +128,23 @@ _GUIDE: dict[str, tuple[str, str]] = {
         "残高は元に戻っています。",
         "原因を特定できませんでした。下の詳細を確認してください。",
     ),
+}
+
+# ⚠️ **単語として**一致させる語。部分一致にしてはいけないもの。
+#
+#    注文の送信内容には `createPaymentMethod` `messagingToken`
+#    `userPosIdToken` `offersToken` `crewToken` という**項目名**がある。
+#    相手の入力不備のエラーはこの項目名を本文に載せてくるため、
+#    "payment" や "token" を部分一致で見てしまうと、
+#    ただの組み立てミスが「決済拒否」「ログイン切れ」に化ける。
+#    この2つは _ACCOUNT_FAULT なので、**そのアカウントが即座に
+#    隔離される**。アカウントが1〜2件なら、それで注文が止まる。
+#
+#    「単語として」なら `createpaymentmethod` には当たらず、
+#    "payment failed" や "token expired" には当たる。
+_WORD_RULES: dict[str, tuple[str, ...]] = {
+    PAYMENT: ("payment",),
+    AUTH: ("token",),
 }
 
 # アカウント側の問題＝そのアカウントを使い続けても直らないもの
@@ -211,6 +228,12 @@ class McdErrorInfo:
         return " / ".join(parts)
 
 
+def _word_in(word: str, haystack: str) -> bool:
+    """`word` が**単語として**出てくるか（項目名の一部では当たらない）。"""
+    return re.search(rf"(?<![a-z0-9_]){re.escape(word)}(?![a-z0-9_])",
+                     haystack) is not None
+
+
 def _clean(text: str) -> str:
     """
     抜き出した日本語から、protobufの区切りが紛れ込んだ末尾を落とす。
@@ -261,6 +284,9 @@ def parse(status: int, body: bytes | str) -> McdErrorInfo:
     kind = UNKNOWN
     for candidate, needles in _RULES:
         if any(n.lower() in haystack for n in needles):
+            kind = candidate
+            break
+        if any(_word_in(w, haystack) for w in _WORD_RULES.get(candidate, ())):
             kind = candidate
             break
 
