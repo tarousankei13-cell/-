@@ -184,6 +184,36 @@ async def main():
     e = C.ChargeOnHold(900, "太郎", "ON_HOLD", "r21")
     check("例外が受取IDを持つ ★", e.receipt_id == "r21")
 
+    print("\n[12] 見張りの間隔が、見に行く間隔より細かいか ★")
+    # ⚠️ **見張りの細かさは、見に行く間隔より細かくできない。**
+    #    charge.py は「2分後→5分後→…」と予定を立てるが、それを読む
+    #    ループが1時間に1回しか回らなければ、2分の予定は意味を持たない。
+    #    最初はそう作ってしまい、保留が解けても最長1時間待たせていた。
+    import config as _cfg
+    from discord.ext import tasks as _tasks
+
+    import cogs.tasks as _T
+
+    loops = {n: v for n, v in vars(_T.TasksCog).items()
+             if isinstance(v, _tasks.Loop)}
+    check("専用の見張りループがある ★", "paypay_hold_watch" in loops, list(loops))
+    watch = loops.get("paypay_hold_watch")
+    if watch is not None:
+        every = (watch.minutes or 0) + (watch.hours or 0) * 60 + (watch.seconds or 0) / 60
+        shortest = min(C.HOLD_RETRY_MINUTES)
+        check("いちばん短い予定より細かく回る ★", every <= shortest,
+              f"ループ{every}分 / 予定の最短{shortest}分")
+        check("設定から読んでいる",
+              (watch.minutes or 0) == _cfg.PAYPAY_HOLD_POLL_MINUTES,
+              watch.minutes)
+    # ⚠️ 毎時のループに相乗りさせない（それが元の誤り）
+    hourly = loops.get("hourly_checks")
+    if hourly is not None:
+        import inspect
+        src = inspect.getsource(hourly.coro)
+        check("毎時のループからは呼ばない ★",
+              "_recheck_paypay_holds" not in src)
+
     C.charge_from_link = real_charge
     await close_db()
     print(f"\n{'='*52}\n  成功 {ok} / 失敗 {fail}\n{'='*52}")

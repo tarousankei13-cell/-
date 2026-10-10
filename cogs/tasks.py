@@ -516,24 +516,6 @@ class TasksCog(commands.Cog):
                 )
             )
 
-        # PayPay が保留している受け取りリンクを見に行く
-        #
-        # ⚠️ 保留は送った側の操作で解ける。いつ解けるかは分からないので
-        #    こちらで見張る。利用者に貼り直させない。
-        try:
-            moved = await self._recheck_paypay_holds()
-        except Exception:
-            log.exception("保留リンクの再確認に失敗しました")
-            moved = []
-        if moved:
-            await self.notify_admin(
-                discord.Embed(
-                    title=f"{E.WALLET} 保留だったチャージが動きました",
-                    description="\n".join(moved)[:4000],
-                    color=embeds.GREEN,
-                )
-            )
-
         # 日次リセット（バックアップとは別のフラグで管理する）
         if now.hour == 0 and self._last_daily_reset_day != now.day:
             self._last_daily_reset_day = now.day
@@ -570,6 +552,41 @@ class TasksCog(commands.Cog):
         ):
             self._last_backup_day = now.day
             await self._send_backup()
+
+    @tasks.loop(minutes=config.PAYPAY_HOLD_POLL_MINUTES)
+    async def paypay_hold_watch(self) -> None:
+        """PayPay が保留した受け取りリンクを見に行く。
+
+        ⚠️ **毎時のループに相乗りさせない。** charge.py は
+           「2分後→5分後→…」と細かく予定を立てるが、1時間に1回しか
+           回らないループから呼ぶと、その予定は意味を持たない。
+           最初はそう作ってしまい、保留が解けても最長1時間待たせる
+           ことになっていた。保留はお金を待たせている状態なので、
+           見に行く側を細かくする。
+
+        ⚠️ 実際に通信するのは `next_check_at` を過ぎたものだけ。
+           2分ごとに回っても、1件あたりの問い合わせは
+           2分→5分→10分→…と間が空いていく。
+        """
+        if not self._started:
+            return
+        try:
+            moved = await self._recheck_paypay_holds()
+        except Exception:
+            log.exception("保留リンクの再確認に失敗しました")
+            return
+        if moved:
+            await self.notify_admin(
+                discord.Embed(
+                    title=f"{E.WALLET} 保留だったチャージが動きました",
+                    description="\n".join(moved)[:4000],
+                    color=embeds.GREEN,
+                )
+            )
+
+    @paypay_hold_watch.before_loop
+    async def before_paypay_hold_watch(self) -> None:
+        await self.bot.wait_until_ready()
 
     async def _recheck_paypay_holds(self) -> list[str]:
         """保留されていた受け取りリンクを見に行く。
