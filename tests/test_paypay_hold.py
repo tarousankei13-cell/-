@@ -161,6 +161,29 @@ async def main():
         row = await s.get(PayPayReceipt, "r11")
         check("理由が残る", "時間" in (row.error or ""), row.error)
 
+    print("\n[10] 保留を本人に知らせる ★")
+    # ⚠️ 画面に出す案内は本人にしか見えず、閉じると消える。保留が解ける
+    #    のは送った側の操作次第で、何時間も先かもしれない。その間、
+    #    手元に「待っている」記録が何も残らないのは不親切なのでDMも送る。
+    await C._remember_hold("r20", 1234, "LINK9", _info("ON_HOLD", 800))
+    check("1回目は送る ★", (await C.mark_notified("r20")) is True)
+    # ⚠️ 焦って何度も貼る人がいる。DMは1回だけ。
+    check("2回目は送らない ★", (await C.mark_notified("r20")) is False)
+    check("3回目も送らない", (await C.mark_notified("r20")) is False)
+    check("知らせた印が残る",
+          [h for h in await C.held_links() if h["id"] == "r20"][0]["notified"])
+    check("知らない受取IDでも落ちない", (await C.mark_notified("ないID")) is False)
+
+    print("\n[11] 保留の例外が受取IDを持ち歩く ★")
+    # これが無いと、どの保留について知らせたのか印を付けられない。
+    held_id = await C._remember_hold("r21", 1234, "LINK10", _info("ON_HOLD", 900))
+    check("覚えた行のIDを返す ★", held_id == "r21", held_id)
+    # 同じリンクを貼り直したら、**最初の行のID**が返る（二重に作らない）
+    again = await C._remember_hold("r22", 1234, "LINK10", _info("ON_HOLD", 900))
+    check("貼り直しても同じIDを返す ★", again == "r21", again)
+    e = C.ChargeOnHold(900, "太郎", "ON_HOLD", "r21")
+    check("例外が受取IDを持つ ★", e.receipt_id == "r21")
+
     C.charge_from_link = real_charge
     await close_db()
     print(f"\n{'='*52}\n  成功 {ok} / 失敗 {fail}\n{'='*52}")

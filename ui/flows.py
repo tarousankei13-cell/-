@@ -347,6 +347,37 @@ class ChargeModal(discord.ui.Modal, title="残高チャージ"):
                 ),
                 ephemeral=True,
             )
+            # ⚠️ **DMにも送る。** 上の案内は本人にしか見えないうえ、
+            #    画面を閉じると消える。保留が解けるのは送った側の操作
+            #    次第で、何時間も先かもしれない。その間、利用者の手元に
+            #    「待っている」という記録が何も残らないのは不親切。
+            #
+            # ⚠️ 同じリンクを何度貼ってもDMは1回だけ。焦って何度も
+            #    貼る人がいるので、印で止める。
+            if method == "paypay" and getattr(hold, "receipt_id", ""):
+                from services.paypay import charge as pp_charge
+
+                try:
+                    if await pp_charge.mark_notified(hold.receipt_id):
+                        await interaction.user.send(
+                            embed=discord.Embed(
+                                title=f"{E.LOADING} チャージの受け取りを待っています",
+                                description=(
+                                    f"**{embeds.yen(hold.amount)}** の PayPay リンクが"
+                                    "保留になっています。\n\n"
+                                    f"{E.INFO} **送った方**が PayPay アプリで"
+                                    "「送る」を押すと受け取れます。\n"
+                                    f"{E.OK} 貼り直しは要りません。"
+                                    "解除されしだい、ここでお知らせします。\n"
+                                    f"{E.WARN} 24時間たっても解除されない場合は"
+                                    "取り消します（お金は動きません）。"
+                                ),
+                                color=embeds.YELLOW,
+                            )
+                        )
+                except discord.HTTPException:
+                    # DMを閉じている人もいる。届かなくても処理は止めない。
+                    log.debug("保留の知らせをDMできませんでした", exc_info=True)
             return
         except ChargeError as e:
             await interaction.followup.send(embed=embeds.error(str(e)), ephemeral=True)

@@ -59,11 +59,14 @@ class ChargeOnHold(Exception):
     """
 
     def __init__(self, amount: int, sender_name: str = "",
-                 link_status: str = "") -> None:
+                 link_status: str = "", receipt_id: str = "") -> None:
         super().__init__("受け取り待ちです")
         self.amount = amount
         self.sender_name = sender_name
         self.link_status = link_status
+        # ⚠️ 知らせを二重に送らないための印に使う。利用者は焦って
+        #    同じリンクを何度も貼るので、その都度DMを送ってはいけない。
+        self.receipt_id = receipt_id
 
 
 class ChargeError(Exception):
@@ -113,10 +116,12 @@ async def charge_from_link(
                 raise ChargeError(
                     "このリンクはすでに受け取り・辞退・取り消しのいずれかが済んでいます。"
                 )
-            await _remember_hold(
+            held_id = await _remember_hold(
                 receipt_id, discord_id, code, info, handle_id=None,
             )
-            raise ChargeOnHold(info.amount, info.sender_name, info.status)
+            raise ChargeOnHold(
+                info.amount, info.sender_name, info.status, held_id,
+            )
         if info.amount < charge_min:
             raise ChargeError(f"チャージは ¥{charge_min:,} 以上から受け付けています")
         if info.amount > charge_max:
@@ -164,7 +169,9 @@ async def charge_from_link(
                     row.link_status = (e.status or "")[:32]
                     row.next_check_at = None   # 次の巡回で見る
             log.info("受け取りの直前に保留になりました: %s", code[:16])
-            raise ChargeOnHold(info.amount, info.sender_name, e.status) from e
+            raise ChargeOnHold(
+                info.amount, info.sender_name, e.status, receipt_id,
+            ) from e
 
         # ⑤ 残高の検証
         after = (await handle.client.get_balance()).all_balance
@@ -255,8 +262,8 @@ async def charge_from_link(
 
 async def _remember_hold(
     receipt_id: str, discord_id: int, code: str, info, *, handle_id=None,
-) -> None:
-    """保留のリンクを覚えて、見張りに入れる。
+) -> str:
+    """保留のリンクを覚えて、見張りに入れる。実際に使った行のIDを返す。
 
     ⚠️ すでに覚えているリンクなら、二重に作らない。利用者が焦って
        何度も貼ることがある。
@@ -276,11 +283,11 @@ async def _remember_hold(
         if row is not None:
             # ⚠️ すでに受け取り済みのものを保留に戻さない。
             if row.status in (RECEIVED, CREDITED):
-                return
+                return row.id
             row.status = HELD
             row.link_status = (info.status or "")[:32]
             row.next_check_at = now + timedelta(minutes=HOLD_RETRY_MINUTES[0])
-            return
+            return row.id
         s.add(PayPayReceipt(
             id=receipt_id, link_uuid=key,
             paypay_account_id=handle_id, discord_id=discord_id,
@@ -293,6 +300,7 @@ async def _remember_hold(
         "保留のリンクを見張りに入れました: %s ¥%s 状態=%s",
         key[:16], info.amount, info.status,
     )
+    return receipt_id
 
 
 async def held_links() -> list[dict]:
@@ -317,7 +325,7 @@ async def held_links() -> list[dict]:
         ]
 
 
-async def _mark_notified(receipt_id: str) -> bool:
+async def mark_notified(receipt_id: str) -> bool:
     """保留を知らせた印。すでに付いていれば False。"""
     async with session_scope() as s:
         row = await s.get(PayPayReceipt, receipt_id)
