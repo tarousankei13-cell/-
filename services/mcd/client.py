@@ -23,6 +23,7 @@ from core import breaker, retry
 from core.http import build_async_client
 from services.mcd import errors as mcd_errors
 from services.mcd.protocol import (
+    build_cancel_body,
     OrderResponse, build_authorise_body, build_get_paid_body,
     parse_order_response, pb_str, proto_parse, varint_encode,
 )
@@ -591,6 +592,30 @@ class McdClient:
         if r.status_code != 200 or not r.content:
             raise McdOrderError(f"注文を確認できませんでした (HTTP {r.status_code})")
         return parse_order_response(r.content)
+
+    async def cancel_order(self, group: str, order_token: str) -> bool:
+        """決済前の注文を取り消す。
+
+        ⚠️ **決済の前にだけ使うこと。** 支払い済みの注文をここで
+           取り消そうとしてはいけない（返金は別の話になる）。
+
+        ⚠️ 失敗しても注文の流れを壊さない。あくまで後片付けで、
+           できなくても利用者には影響が無い。残しても害は無いが、
+           使う気のない注文が溜まるので、できるなら片付ける。
+        """
+        try:
+            r = await self._qor_post(
+                f"{ORD.format(group=group)}/app/mcdord.UserOrderService/CancelOrder",
+                build_cancel_body(order_token),
+                idempotency=retry.Idempotency.SAFE, label="注文の取り消し",
+            )
+        except Exception as e:
+            log.info("注文の取り消しに失敗しました（害はありません）: %s", e)
+            return False
+        if r.status_code != 200:
+            log.info("注文を取り消せませんでした (HTTP %s)", r.status_code)
+            return False
+        return True
 
     async def get_buzzer_number(self, group: str, order_token: str) -> int | None:
         """呼び出し番号。出来上がり通知に使う。"""

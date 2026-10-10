@@ -770,3 +770,67 @@ V-23（上乗せ額が分からない）は**1つも解決しない**。
 そして「値段をマクドナルドに聞く」という部分は、
 **V-23 でこちらに入れた仕組みとまったく同じ**。
 すでに同じ土俵に立っている。
+
+# V-25 公式が持つRPCの全一覧と、使えるもの（2026-10-10）
+
+「値段をマクドナルドに聞けばいいのでは」という問いから、
+公式フロントエンドのRPC定義を全部取り出した。28個ある。
+
+```
+AuthoriseOrder         CancelOrder            CheckIfThreeDSRequired
+CheckoutOrder          CreateAddress          DeleteAddress
+DetermineComponentFrameRoot                   FulfilOrder
+GetAddresses           GetApplePaySession     GetAuthorisedOrder
+GetDeliveryCancelledOrder                     GetDeliveryOrder
+GetDeliveryUpdate      GetOrder               GetOrderBuzzerNotification
+GetOrderStatus         GetOrderStatusByOrderCode
+GetPaidOrder           GetWaitingForAuthOrder
+PushAuthorisationNotification                 SendReceiptEmail
+StoreOrder             UpdateAddress          UpdateOrderMessagingToken
+ValidateOfferCart      ValidateOrder          ValidateOrderAndSendOrderToFOE
+```
+
+## ValidateOrder は値段を教えてくれない
+
+名前から期待したが、**出力に欄が1つも無い**。
+
+```js
+ValidateOrderInput  { 1: storeId / 2: totalAmount / 3: repeated products }
+ValidateOrderOutput { （decode は全部 skipType。欄なし）}
+```
+
+`totalAmount` は**入力**にある。つまり「この中身でこの金額で合って
+いますか」を聞く呼び出しであって、**金額を教える呼び出しではない**。
+
+⚠️ 最初 `errors` という欄があると読んだが、**間違い**。
+   隣の型（`ValidateOrderAndSendOrderToFOE`）の定義を拾っていた。
+   `ValidateOrderOutput` に欄は無い。
+
+結局、金額を知る方法は **StoreOrder の応答の `totalAmount`** だけ。
+V-23 でそうしたのは正しかった。
+
+## CancelOrder は使える
+
+```
+CancelOrderInput  { 1: orderToken string }
+CancelOrderOutput { （欄なし）}
+```
+
+金額を見せて断られたとき、**登録しただけの注文がマクドナルド側に
+残り続けていた**。決済前なので取り消してよい。後片付けとして呼ぶ。
+
+⚠️ 失敗しても注文の流れを壊さないこと。あくまで片付けで、
+   できなくても利用者には影響が無い。
+
+⚠️ **決済の前にだけ使う。** 支払い済みの注文をここで取り消そうと
+   しないこと（返金は別の話）。
+
+## 実装で踏んだ穴
+
+取り消しを入れた最初の版で `group` を使ったが、その変数は
+**まだ代入されていなかった**（④の決済のところで入る）。
+正しくは `info.group`。
+
+⚠️ ここは**失敗したときだけ通る道**。間違えると、いちばん必要な
+   場面で `UnboundLocalError` になる。`/debug fails` の `nm()` で
+   踏んだのとまったく同じ型の誤り。テストが捕まえた。

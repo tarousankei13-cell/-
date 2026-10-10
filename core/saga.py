@@ -335,9 +335,22 @@ async def execute(
                 ok = False
                 if confirm_price is not None:
                     ok = await confirm_price(list_price, stored.total_amount)
+                if ok:
+                    ok = await _accept_new_price(order_id, stored.total_amount)
                 if not ok:
-                    raise PriceChanged(list_price, stored.total_amount)
-                if not await _accept_new_price(order_id, stored.total_amount):
+                    # ⚠️ 登録しただけの注文を置き去りにしない。
+                    #    放っておくと、使う気のない注文がマクドナルド側に
+                    #    溜まっていく。決済前なので取り消してよい
+                    #    （CancelOrder / docs/09 V-25）。
+                    #    失敗しても気にしない。あくまで後片付け。
+                    # ⚠️ `group` はこの時点ではまだ代入されていない
+                    #    （下の④で入る）。`info.group` を使うこと。
+                    #    ここは失敗したときだけ通る道なので、間違えると
+                    #    **いちばん必要な場面で落ちる**。
+                    if stored.order_token:
+                        await handle.client.cancel_order(
+                            info.group, stored.order_token
+                        )
                     raise PriceChanged(list_price, stored.total_amount)
                 list_price = stored.total_amount
                 async with session_scope() as s:

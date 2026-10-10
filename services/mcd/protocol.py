@@ -587,6 +587,20 @@ def build_get_paid_body(order_token: str) -> bytes:
     return pb_str(1, order_token)
 
 
+def build_cancel_body(order_token: str) -> bytes:
+    """CancelOrder へ送る本体。
+
+    公式フロントエンドの定義（docs/09 V-25）：
+        CancelOrderInput  { 1: orderToken string }
+        CancelOrderOutput { （欄なし）}
+
+    ⚠️ **決済前の注文を片付けるためのもの。** 金額を見せて断られたとき、
+       登録しただけの注文がマクドナルド側に残り続ける。
+       放っておくと、使う気のない注文が溜まっていく。
+    """
+    return pb_str(1, order_token)
+
+
 # ============================================================
 #  注文レスポンス（docs/07 §4.3 / mcdord.Order）
 # ============================================================

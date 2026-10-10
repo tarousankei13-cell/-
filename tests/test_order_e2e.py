@@ -27,6 +27,7 @@ class FakeClient:
         self.fail_at = fail_at
         self.error = error
         self.authorise_calls = 0
+        self.cancel_calls = 0
         # マクドナルドが言う金額。0 なら「言ってこなかった」扱い
         self.total_amount = total_amount
 
@@ -40,6 +41,9 @@ class FakeClient:
         self.authorise_calls += 1
         self._maybe("authorise")
         return OrderResponse(order_code="OC123", display_order_number="7161")
+    async def cancel_order(self, group, token):
+        self.cancel_calls += 1
+        return True
     async def get_paid_order(self, group, token):
         self._maybe("paid")
         return OrderResponse(order_code="OC123", display_order_number="7161")
@@ -323,6 +327,8 @@ async def main():
         check("本当の金額どおり引かれている ★", now9b == bal9b - want_user,
               (bal9b, now9b, want_user))
         check("ホールドが残っていない ★", await L.held_balance(s, uid9b) == 0)
+    check("進めたときは取り消さない ★",
+          CURRENT["client"].cancel_calls == 0, CURRENT["client"].cancel_calls)
 
     print("\n[9d-3] 断れば、1円も動かない ★")
     uid9c = 1093
@@ -341,6 +347,10 @@ async def main():
     check("決済を呼んでいない ★", CURRENT["client"].authorise_calls == 0)
     async with session_scope() as s:
         check("残高が元どおり ★", await L.user_balance(s, uid9c) == bal9c)
+    # ⚠️ 登録しただけの注文を置き去りにしない（docs/09 V-25）。
+    #    放っておくと、使う気のない注文がマクドナルド側に溜まる。
+    check("登録した注文を取り消している ★",
+          CURRENT["client"].cancel_calls == 1, CURRENT["client"].cancel_calls)
 
     print("\n[9d-4] 残高が足りなければ進めない ★")
     # ⚠️ 本人が「はい」と言っても、払えないものは通せない。
