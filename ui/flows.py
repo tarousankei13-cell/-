@@ -306,9 +306,15 @@ class ChargeModal(discord.ui.Modal, title="残高チャージ"):
             return
 
         if method == "paypay":
-            from services.paypay.charge import ChargeError, charge_from_link
+            from services.paypay.charge import (
+                ChargeError, ChargeOnHold, charge_from_link,
+            )
         else:
             from services.kyash.charge import ChargeError, charge_from_link
+
+            # Kyash に保留の仕組みは無い。捕まえない例外を揃えるための器。
+            class ChargeOnHold(Exception):
+                pass
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         await user_repo.get_or_create(interaction.user.id)
@@ -319,6 +325,29 @@ class ChargeModal(discord.ui.Modal, title="残高チャージ"):
                 )
             else:
                 result = await charge_from_link(interaction.user.id, url)
+        except ChargeOnHold as hold:
+            # ⚠️ **失敗ではない。** PayPay が送金を保留しているだけで、
+            #    お金はまだ送り主の手元にある。送った側が PayPay アプリで
+            #    「送る」を押せば受け取れる。
+            #    以前はここを「もう使えません」と伝えており、届くはずの
+            #    お金を諦めさせていた。
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title=f"{E.LOADING} 送った方の操作を待っています",
+                    description=(
+                        f"**{embeds.yen(hold.amount)}** のリンクを確認しましたが、"
+                        "PayPay 側で**保留**になっています。\n\n"
+                        f"{E.INFO} **送った方の PayPay アプリに確認が出ています。**\n"
+                        "「送る」を押していただくと受け取れます。\n\n"
+                        f"{E.OK} **貼り直しは要りません。** 解除されしだい"
+                        "こちらで受け取り、完了をお知らせします。\n"
+                        f"{E.WARN} 24時間たっても解除されない場合は取り消します。"
+                    ),
+                    color=embeds.YELLOW,
+                ),
+                ephemeral=True,
+            )
+            return
         except ChargeError as e:
             await interaction.followup.send(embed=embeds.error(str(e)), ephemeral=True)
             return

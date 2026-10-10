@@ -51,6 +51,34 @@ APP_VERSION = "5.57.0"
 # 受け取れる状態
 PENDING = "PENDING"
 
+# ⚠️ **もう動かない（受け取りようがない）状態。**
+#    ここに**無い**ものは「まだ終わっていない」として扱う。
+#
+#    理由：PayPay は2024-02-28 から、受け取りリンクを**保留**にする
+#    ことがある（送った側に警告を出し、「送る」か「キャンセル」を
+#    選ばせる）。保留中のリンクはまだ生きているが、こちらからは
+#    受け取れない。
+#    https://paypay.ne.jp/notice/20240228/f-p2p-money-link/
+#
+#    以前は「PENDING でなければ受け取り・辞退・取り消し済み」と
+#    決めつけていたため、**保留中の人に「このリンクはもう使えません」
+#    と伝えていた**。お金はまだ送り主の手元にあるのに。
+#
+# ⚠️ 迷ったら「終わっていない」側に倒す。
+#    ・終わったものを保留と誤れば → 無駄に数回見に行って期限切れ。害は小さい
+#    ・保留を終わったと誤れば     → 届くはずのお金を「使えません」と断る。害が大きい
+#
+# ⚠️ この一覧は**実際に見た値で育てる**。保留の状態値が何かは
+#    分かっていないので、推測で足さないこと（PayPayReceipt.link_status に
+#    実際の値が残るので、それを見て判断する）。
+TERMINAL_STATUSES = frozenset({
+    # このBOTが以前から終了として扱っていた値（tests/test_paypay.py 由来）
+    "SUCCESS", "FAILED", "REJECTED",
+    # 同じ意味で来うる言い回し
+    "COMPLETED", "COMPLETE", "RECEIVED", "ACCEPTED",
+    "DECLINED", "CANCELED", "CANCELLED", "EXPIRED",
+})
+
 
 class PayPayError(Exception):
     """利用者にそのまま見せてよい、PayPay 側の失敗。"""
@@ -62,6 +90,21 @@ class PayPayLoginError(PayPayError):
 
 class LinkAlreadyUsed(PayPayError):
     """すでに受け取り・辞退・取り消し済みのリンク。"""
+
+
+class LinkOnHold(PayPayError):
+    """まだ受け取れないが、**終わってもいない**リンク。
+
+    PayPay が送金を保留している場合など。送った側が PayPay アプリで
+    「送る」を押すと受け取れるようになる。
+
+    ⚠️ LinkAlreadyUsed と**必ず区別する**。混ぜると、まだ生きている
+       お金を「使えません」と断ってしまう。
+    """
+
+    def __init__(self, message: str, status: str = "") -> None:
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass
@@ -86,6 +129,19 @@ class LinkInfo:
     @property
     def receivable(self) -> bool:
         return self.status == PENDING
+
+    @property
+    def terminal(self) -> bool:
+        """もう受け取りようがないか。
+
+        ⚠️ **分からない状態は終わっていない扱い。** 保留かもしれない。
+        """
+        return (self.status or "").upper() in TERMINAL_STATUSES
+
+    @property
+    def on_hold(self) -> bool:
+        """まだ受け取れないが、終わってもいない（保留など）。"""
+        return not self.receivable and not self.terminal
 
 
 @dataclass
@@ -519,8 +575,14 @@ class PayPayClient:
         code = normalize_link(url)
         info = info or await self.link_check(code)
         if info.status and info.status != PENDING:
-            raise LinkAlreadyUsed(
-                "このリンクはすでに受け取り・辞退・取り消しのいずれかが済んでいます。"
+            # ⚠️ 終わったものと保留を分ける。保留を「使えません」と
+            #    断ると、届くはずのお金を取りこぼす。
+            if info.terminal:
+                raise LinkAlreadyUsed(
+                    "このリンクはすでに受け取り・辞退・取り消しのいずれかが済んでいます。"
+                )
+            raise LinkOnHold(
+                "このリンクはまだ受け取れる状態になっていません。", info.status
             )
         if info.has_password and not passcode:
             raise PayPayError("このリンクにはパスコードが設定されています。")

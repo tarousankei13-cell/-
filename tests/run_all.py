@@ -81,6 +81,7 @@ TESTS = [
     ("定期更新の総点検", "test_periodic.py"),
     ("通信を使う新しい機能", "test_new_features.py"),
     ("PayPayでのチャージ", "test_paypay.py"),
+    ("PayPayの保留", "test_paypay_hold.py"),
     ("プロキシ（通信の出口）", "test_proxy.py"),
     ("サーバー管理（チケット・認証・監視・処分）", "test_server.py"),
     ("サーバー管理：コマンドとイベント", "test_server_cmds.py"),

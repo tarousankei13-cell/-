@@ -516,6 +516,24 @@ class TasksCog(commands.Cog):
                 )
             )
 
+        # PayPay が保留している受け取りリンクを見に行く
+        #
+        # ⚠️ 保留は送った側の操作で解ける。いつ解けるかは分からないので
+        #    こちらで見張る。利用者に貼り直させない。
+        try:
+            moved = await self._recheck_paypay_holds()
+        except Exception:
+            log.exception("保留リンクの再確認に失敗しました")
+            moved = []
+        if moved:
+            await self.notify_admin(
+                discord.Embed(
+                    title=f"{E.WALLET} 保留だったチャージが動きました",
+                    description="\n".join(moved)[:4000],
+                    color=embeds.GREEN,
+                )
+            )
+
         # 日次リセット（バックアップとは別のフラグで管理する）
         if now.hour == 0 and self._last_daily_reset_day != now.day:
             self._last_daily_reset_day = now.day
@@ -552,6 +570,52 @@ class TasksCog(commands.Cog):
         ):
             self._last_backup_day = now.day
             await self._send_backup()
+
+    async def _recheck_paypay_holds(self) -> list[str]:
+        """保留されていた受け取りリンクを見に行く。
+
+        ⚠️ 解けたら**本人に必ず知らせる**。黙って残高に入れると、
+           利用者は「結局どうなったのか」が分からないまま。
+        """
+        from services.paypay import charge as pp_charge
+
+        moved: list[str] = []
+        for outcome, discord_id, receipt_id, credited in (
+            await pp_charge.recheck_held()
+        ):
+            if outcome == "still":
+                continue
+            user = self.bot.get_user(discord_id)
+            if outcome == "credited":
+                moved.append(f"{E.OK} <@{discord_id}>　{embeds.yen(credited)} を反映")
+                body = discord.Embed(
+                    title=f"{E.OK} チャージが完了しました",
+                    description=(
+                        "保留されていた PayPay の受け取りが解除されたので、"
+                        f"**{embeds.yen(credited)}** を残高に入れました。\n\n"
+                        f"{E.INFO} お待たせしました。そのままご注文いただけます。"
+                    ),
+                    color=embeds.GREEN,
+                )
+            else:
+                moved.append(f"{E.NG} <@{discord_id}>　受け取れませんでした")
+                body = discord.Embed(
+                    title=f"{E.NG} 受け取れませんでした",
+                    description=(
+                        "保留されていた PayPay のリンクが、"
+                        "取り消されたか期限切れになりました。\n\n"
+                        f"{E.INFO} **お金は動いていません。**"
+                        "送った方の PayPay に残っているはずです。\n"
+                        "もう一度送っていただければ、改めて受け付けます。"
+                    ),
+                    color=embeds.RED,
+                )
+            if user is not None:
+                try:
+                    await user.send(embed=body)
+                except discord.HTTPException:
+                    log.debug("保留の結果をDMできませんでした", exc_info=True)
+        return moved
 
     @hourly_checks.before_loop
     async def before_hourly(self) -> None:

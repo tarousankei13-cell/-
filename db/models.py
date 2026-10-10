@@ -558,6 +558,17 @@ class PayPayReceipt(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     raw_link: Mapped[str | None] = mapped_column(String(255))
     error: Mapped[str | None] = mapped_column(Text)
+
+    # ⚠️ PayPay が返した生の状態（orderStatus）。
+    #    保留のときに何という値が来るのかは**分かっていない**ので、
+    #    推測で決めず、実際に来た値をここに残して後から判断する。
+    link_status: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    # 保留のリンクを見に行った回数と、次に見る時刻
+    checks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # 保留を知らせたか（同じ知らせを何度も送らない）
+    notified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
