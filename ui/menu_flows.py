@@ -35,7 +35,6 @@ from services.mcd.menu import (
 )
 from services.mcd.protocol import PICKUP_LABEL, OrderItem, build_hex
 from ui import embeds, flows
-from ui.gate import GuardedView
 
 log = logging.getLogger("bot.menu_flows")
 
@@ -221,7 +220,7 @@ async def show_search_results(
     await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
 
 
-class SearchResultView(GuardedView):
+class SearchResultView(discord.ui.View):
     def __init__(self, owner_id: int, purpose: str, hits: list, query: str) -> None:
         super().__init__(timeout=config.VIEW_TIMEOUT)
         self.owner_id = owner_id
@@ -254,7 +253,7 @@ class SearchResultView(GuardedView):
             color=embeds.GREEN,
         )
 
-    async def allow(self, interaction: discord.Interaction) -> bool:
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
                 embed=embeds.error("この操作は開いた本人のみ行えます。"), ephemeral=True
@@ -270,7 +269,7 @@ class SearchResultView(GuardedView):
         await open_menu(interaction, self._sel.values[0], self.purpose)
 
 
-class StoreSelectView(GuardedView):
+class StoreSelectView(discord.ui.View):
     """
     お店の選び方。
 
@@ -320,7 +319,7 @@ class StoreSelectView(GuardedView):
         by_id.callback = self._on_input
         self.add_item(by_id)
 
-    async def allow(self, interaction: discord.Interaction) -> bool:
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
                 embed=embeds.error("この操作は開いた本人のみ行えます。"), ephemeral=True
@@ -339,7 +338,7 @@ class StoreSelectView(GuardedView):
     async def _on_input(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(StoreIdModal(self.purpose))
 
-class ResumeCartView(GuardedView):
+class ResumeCartView(discord.ui.View):
     """
     途中まで作ったカートを拾い直すか聞く。
 
@@ -388,7 +387,7 @@ class ResumeCartView(GuardedView):
         fresh.callback = self._on_fresh
         self.add_item(fresh)
 
-    async def allow(self, interaction: discord.Interaction) -> bool:
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
                 embed=embeds.error("この操作は開いた本人のみ行えます。"), ephemeral=True
@@ -609,7 +608,7 @@ async def open_menu(
 #  カート
 # ============================================================
 
-class CartView(GuardedView):
+class CartView(discord.ui.View):
     def __init__(
         self, owner_id: int, purpose: str, store_id: str, store_name: str,
         supported: dict[str, bool], menu: ParsedMenu,
@@ -782,7 +781,7 @@ class CartView(GuardedView):
         cancel.callback = self._on_cancel
         self.add_item(cancel)
 
-    async def allow(self, interaction: discord.Interaction) -> bool:
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
                 embed=embeds.error("この操作は開いた本人のみ行えます。"), ephemeral=True
@@ -1106,7 +1105,7 @@ class CartView(GuardedView):
 #  カテゴリ → 商品 → オプション
 # ============================================================
 
-class PickupView(GuardedView):
+class PickupView(discord.ui.View):
     """
     お受け取り方法を選ぶ。注文の最後の一歩。
 
@@ -1173,7 +1172,7 @@ class PickupView(GuardedView):
         back.callback = self._on_back
         self.add_item(back)
 
-    async def allow(self, interaction: discord.Interaction) -> bool:
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.cart.owner_id
 
     def _make_pick(self, method: str):
@@ -1257,7 +1256,7 @@ class ProductSearchModal(discord.ui.Modal, title="商品名でさがす"):
         )
 
 
-class ProductSearchView(GuardedView):
+class ProductSearchView(discord.ui.View):
     """商品名の検索結果。選ぶと商品の詳細へ進む。"""
 
     def __init__(self, cart: "CartView", query: str, hits: list[Product]) -> None:
@@ -1305,7 +1304,7 @@ class ProductSearchView(GuardedView):
         back.callback = self._on_back
         self.add_item(back)
 
-    async def allow(self, interaction: discord.Interaction) -> bool:
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.cart.owner_id
 
     async def _on_pick(self, interaction: discord.Interaction) -> None:
@@ -1324,7 +1323,7 @@ class ProductSearchView(GuardedView):
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
 
-class CategoryView(GuardedView):
+class CategoryView(discord.ui.View):
     def __init__(self, cart: CartView) -> None:
         super().__init__(timeout=config.VIEW_TIMEOUT)
         self.cart = cart
@@ -1424,7 +1423,7 @@ class CategoryView(GuardedView):
             color=embeds.GREEN,
         )
 
-    async def allow(self, interaction: discord.Interaction) -> bool:
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.cart.owner_id
 
     async def _on_back(self, interaction: discord.Interaction) -> None:
@@ -1440,7 +1439,7 @@ class CategoryView(GuardedView):
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
 
-class ProductView(GuardedView):
+class ProductView(discord.ui.View):
     """商品一覧。Discordのセレクトは25件までなのでページ送りする。"""
 
     def __init__(self, cart: CartView, collection_id: str, page: int) -> None:
@@ -1507,7 +1506,7 @@ class ProductView(GuardedView):
         back.callback = self._on_back
         self.add_item(back)
 
-    async def allow(self, interaction: discord.Interaction) -> bool:
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.cart.owner_id
 
     async def _on_prev(self, interaction: discord.Interaction) -> None:
@@ -1544,7 +1543,7 @@ class ProductView(GuardedView):
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
 
-class ProductDetailView(GuardedView):
+class ProductDetailView(discord.ui.View):
     """
     商品の詳細。商品を選ぶと必ずここに来る。
 
@@ -1741,7 +1740,7 @@ class ProductDetailView(GuardedView):
 
     # -- 操作 --
 
-    async def allow(self, interaction: discord.Interaction) -> bool:
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.cart.owner_id
 
     def _make_add(self, quantity: int):
@@ -1800,7 +1799,7 @@ class ProductDetailView(GuardedView):
         await self.cart.show(interaction)
 
 
-class OptionView(GuardedView):
+class OptionView(discord.ui.View):
     """セットのサイド・ドリンクなどを選ぶ。"""
 
     def __init__(
@@ -2034,7 +2033,7 @@ class OptionView(GuardedView):
             await interaction.response.edit_message(embed=self.build_embed(), view=self)
         return cb
 
-    async def allow(self, interaction: discord.Interaction) -> bool:
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.cart.owner_id
 
     async def _on_back(self, interaction: discord.Interaction) -> None:
@@ -2073,7 +2072,7 @@ class OptionView(GuardedView):
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
 
-class CustomizeView(GuardedView):
+class CustomizeView(discord.ui.View):
     """
     具材の増減を選ぶ（ピクルス抜き・氷抜きなど）。
 
@@ -2190,7 +2189,7 @@ class CustomizeView(GuardedView):
 
     # -- 操作 --
 
-    async def allow(self, interaction: discord.Interaction) -> bool:
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.cart.owner_id:
             await interaction.response.send_message(
                 embed=embeds.error("この操作は開いた本人のみ行えます。"), ephemeral=True

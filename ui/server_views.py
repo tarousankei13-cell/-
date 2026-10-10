@@ -15,7 +15,6 @@ import discord
 
 import emoji as E
 from ui import embeds
-from ui.gate import GuardedView
 
 log = logging.getLogger("bot.ui.server")
 
@@ -145,7 +144,7 @@ class TicketKindSelect(discord.ui.Select):
         )
 
 
-class TicketPanel(GuardedView):
+class TicketPanel(discord.ui.View):
     """チャンネルに貼る問い合わせパネル。"""
 
     def __init__(self) -> None:
@@ -200,7 +199,7 @@ class TicketCloseModal(discord.ui.Modal, title="この問い合わせを閉じ�
             pass
 
 
-class TicketControls(GuardedView):
+class TicketControls(discord.ui.View):
     """チケットの中に出すボタン。"""
 
     def __init__(self) -> None:
@@ -306,7 +305,7 @@ class CaptchaModal(discord.ui.Modal, title="画像の文字を入力してくだ
         await _finish_verify(interaction, method="captcha")
 
 
-class CaptchaAnswerView(GuardedView):
+class CaptchaAnswerView(discord.ui.View):
     """画像と一緒に出す「入力する」ボタン（本人にだけ見える）。"""
 
     def __init__(self) -> None:
@@ -376,7 +375,7 @@ async def _finish_verify(interaction: discord.Interaction, *, method: str) -> No
         log.warning("認証の記録を送れませんでした")
 
 
-class VerifyPanel(GuardedView):
+class VerifyPanel(discord.ui.View):
     """チャンネルに貼る認証パネル。"""
 
     def __init__(self) -> None:

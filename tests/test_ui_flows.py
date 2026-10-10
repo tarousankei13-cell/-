@@ -30,14 +30,6 @@ async def main():
     await init_db(f"sqlite+aiosqlite:///{tmp}/ui.db")
     await settings.load_all()
 
-    # ⚠️ 画面の操作はすべて貸し出しの関所を通る（ui/gate.py）。
-    #    ライセンスが無いサーバーでは、画面ごとの決まりを見る前に
-    #    止められる。ここで見たいのは「本人だけが押せる」などの
-    #    画面側の決まりなので、先にホームとして登録しておく。
-    #    （偽の FakeGuild は id=1）
-    from core import license as lic
-    await lic.ensure_home(1)
-
     from ui import flows, panels, embeds, menu_flows
 
     UID = 7001

@@ -17,12 +17,11 @@ import discord
 import config
 import emoji as E
 from ui import embeds
-from ui.gate import GuardedView
 
 log = logging.getLogger("bot.ui.nudge")
 
 
-class NudgeView(GuardedView):
+class NudgeView(discord.ui.View):
     """声かけのDMに付けるボタン。"""
 
     def __init__(self) -> None:

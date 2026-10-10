@@ -35,7 +35,6 @@ from services.mcd.protocol import (
     PICKUP_LABEL, DecodedOrder, OrderItem, ProtocolError, decode_hex,
 )
 from ui import embeds
-from ui.gate import GuardedView
 
 log = logging.getLogger("bot.flows")
 
@@ -155,13 +154,13 @@ class ReorderSelect(discord.ui.Select):
         await reorder(interaction, self.values[0])
 
 
-class ReorderView(GuardedView):
+class ReorderView(discord.ui.View):
     def __init__(self, owner_id: int, orders: list[Order]) -> None:
         super().__init__(timeout=config.VIEW_TIMEOUT)
         self.owner_id = owner_id
         self.add_item(ReorderSelect(orders))
 
-    async def allow(self, interaction: discord.Interaction) -> bool:
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
                 embed=embeds.error("この操作は開いた本人のみ行えます。"),
@@ -367,14 +366,14 @@ async def open_charge_modal(interaction: discord.Interaction) -> None:
 #  注文 — 入口
 # ============================================================
 
-class MethodView(GuardedView):
+class MethodView(discord.ui.View):
     """注文コードを貼るか、メニューから選ぶか。"""
 
     def __init__(self, owner_id: int) -> None:
         super().__init__(timeout=config.VIEW_TIMEOUT)
         self.owner_id = owner_id
 
-    async def allow(self, interaction: discord.Interaction) -> bool:
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
                 embed=embeds.error("この操作は開いた本人のみ行えます。"), ephemeral=True
@@ -622,7 +621,7 @@ async def open_preview(interaction: discord.Interaction, hex_text: str) -> None:
     await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
 
 
-class ConfirmView(GuardedView):
+class ConfirmView(discord.ui.View):
     """受取方法を選んでから確定する。"""
 
     def __init__(
@@ -704,7 +703,7 @@ class ConfirmView(GuardedView):
             warning=warning,
         )
 
-    async def allow(self, interaction: discord.Interaction) -> bool:
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
                 embed=embeds.error("この操作は開いた本人のみ行えます。"), ephemeral=True

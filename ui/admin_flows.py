@@ -17,7 +17,6 @@ from db.models import (
 )
 from db.session import session_scope
 from ui import embeds
-from ui.gate import GuardedView
 
 log = logging.getLogger("bot.admin_flows")
 
@@ -276,7 +275,7 @@ async def preview_broadcast(
     )
 
 
-class BroadcastConfirm(GuardedView):
+class BroadcastConfirm(discord.ui.View):
     def __init__(self, heading: str, body: str, target: str, count: int) -> None:
         super().__init__(timeout=300)
         self.heading, self.body, self.target, self.count = heading, body, target, count
@@ -522,7 +521,7 @@ async def show_user(interaction: discord.Interaction, user: discord.User) -> Non
     )
 
 
-class UserCardView(GuardedView):
+class UserCardView(discord.ui.View):
     """利用者カードから、そのまま手当てできるようにする。"""
 
     def __init__(self, discord_id: int, banned: bool) -> None:
@@ -607,7 +606,7 @@ class UserCardView(GuardedView):
 #  アカウントの健全性（管理1）
 # ============================================================
 
-class AccountHealthView(GuardedView):
+class AccountHealthView(discord.ui.View):
     """
     アカウントの状態を見て、その場で手当てできるようにする。
 
@@ -801,7 +800,7 @@ def _account_todo(status: str, has_card: bool, error: str) -> str:
     return ""
 
 
-class ReviewView(GuardedView):
+class ReviewView(discord.ui.View):
     """要確認の注文を1件ずつ処理する。"""
 
     def __init__(self, orders: list[tuple[str, str, int, str]]) -> None:
