@@ -21,6 +21,7 @@ from core import users as user_repo
 from db.session import session_scope, user_scope
 from cogs._checks import admin_only, handle_check_failure, owner_only
 from ui import admin_flows, balance_panel, embeds
+from ui.gate import GuardedView
 
 log = logging.getLogger("bot.cogs.admin")
 
@@ -1413,7 +1414,7 @@ class AdminCog(commands.Cog):
             log.exception("admin コマンドでエラー", exc_info=error)
 
 
-class RestoreConfirm(discord.ui.View):
+class RestoreConfirm(GuardedView):
     """復元の最終確認。押し間違いが起きないよう、文言と色を強くする。"""
 
     def __init__(self, data: bytes, filename: str) -> None:

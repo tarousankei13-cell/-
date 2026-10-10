@@ -192,6 +192,10 @@ class FakeInteraction:
         self.actions: list[tuple[str, dict]] = []
         self.channel = channel if channel is not None else FakeChannel()
         self.guild = guild if guild is not None else FakeGuild()
+        # ⚠️ 本物の Interaction は必ず持っている（サーバー外なら None）。
+        #    偽物に無いと、サーバーを見る処理が AttributeError で落ちる。
+        self.guild_id = getattr(self.guild, "id", None)
+        self.channel_id = getattr(self.channel, "id", None)
         self.message = None
 
     @property

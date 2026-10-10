@@ -21,6 +21,7 @@ import emoji as E
 from core import settings
 from core import users as user_repo
 from ui import embeds
+from ui.gate import GuardedView
 
 log = logging.getLogger("bot.panels")
 
@@ -61,7 +62,7 @@ async def guard_user(interaction: discord.Interaction) -> bool:
 #  注文パネル
 # ============================================================
 
-class OrderPanel(discord.ui.View):
+class OrderPanel(GuardedView):
     """
     注文パネル。
 
@@ -125,7 +126,7 @@ class OrderPanel(discord.ui.View):
 #  チャージパネル
 # ============================================================
 
-class ChargePanel(discord.ui.View):
+class ChargePanel(GuardedView):
     def __init__(self) -> None:
         super().__init__(timeout=None)
 
@@ -154,11 +155,11 @@ class ChargePanel(discord.ui.View):
 #  管理者パネル
 # ============================================================
 
-class AdminPanel(discord.ui.View):
+class AdminPanel(GuardedView):
     def __init__(self) -> None:
         super().__init__(timeout=None)
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+    async def allow(self, interaction: discord.Interaction) -> bool:
         if is_admin(interaction):
             return True
         await interaction.response.send_message(
@@ -244,7 +245,7 @@ class AdminPanel(discord.ui.View):
         await admin_flows.refresh_admin_panel(interaction)
 
 
-class InvitePanel(discord.ui.View):
+class InvitePanel(GuardedView):
     """
     紹介プログラムの常設パネル。
 

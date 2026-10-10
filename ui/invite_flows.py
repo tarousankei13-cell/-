@@ -27,6 +27,7 @@ from core import settings
 from core import users as user_repo
 from db.session import session_scope
 from ui import embeds
+from ui.gate import GuardedView
 
 log = logging.getLogger("bot.invite_flows")
 
@@ -296,7 +297,7 @@ async def finish_link(
 #  ③ DM の受取ボタン
 # ============================================================
 
-class ClaimView(discord.ui.View):
+class ClaimView(GuardedView):
     """
     招待された方が押す受取ボタン。
 

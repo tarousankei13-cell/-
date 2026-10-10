@@ -351,6 +351,11 @@ class McdBot(commands.Bot):
             log.info("Discord への接続にプロキシを使います: %s",
                      proxy.mask(d_proxy))
 
+        # ⚠️ 貸していないサーバーでは**すべてのコマンドを止める**ための器。
+        #    コマンドごとに判定を書くと、足すたびに書き忘れて穴が開く。
+        #    入口を1つにしてある（ui/gate.py）。
+        from ui.gate import LicensedTree
+
         super().__init__(
             # ⚠️ command_prefix に "/" を使わない。
             #    スラッシュコマンドと衝突し、コマンドが二重に見える原因になる。
@@ -358,6 +363,7 @@ class McdBot(commands.Bot):
             intents=intents,
             owner_ids=set(OWNER_IDS),
             help_command=None,
+            tree_cls=LicensedTree,
             **extra,
         )
         self._synced = False
@@ -454,6 +460,8 @@ class McdBot(commands.Bot):
         log.info("ログインしました: %s (ID: %s)", self.user, self.user.id)
         log.info("discord.py %s / サーバー数 %d", discord.__version__, len(self.guilds))
 
+        await self._ensure_home_guild()
+
         if not self._synced:
             try:
                 result = await self.sync_commands()
@@ -464,6 +472,88 @@ class McdBot(commands.Bot):
 
         await self._refresh_panels()
         await self._refresh_invite_cache()
+        await self._report_licenses()
+
+    # -- BOTの貸し出し ------------------------------------------
+
+    async def _ensure_home_guild(self) -> None:
+        """持ち主自身のサーバーを「ホーム」にしておく。
+
+        ⚠️ これが無いと詰む。貸していないサーバーでは全コマンドが
+           止まるので、ホームが未設定だと `/lend` すら打てず、
+           自分で自分を締め出すことになる。
+
+        ⚠️ 入っているサーバーが**1つのときだけ**自動で決める。
+           複数あるときに勝手に選ぶと、よその貸し先をホームにして
+           しまい、無期限で使われ続ける。
+        """
+        from core import license as lic
+
+        try:
+            if await lic.home_guild_id() is not None:
+                return
+            if len(self.guilds) == 1:
+                g = self.guilds[0]
+                await lic.set_home(g.id)
+                log.info("ホームサーバーを自動設定しました: %s (%s)", g.name, g.id)
+                return
+            log.warning(
+                "ホームサーバーが未設定です。サーバーが %d 個あるため自動では決めません。"
+                "オーナーが `/lend home` を実行してください", len(self.guilds),
+            )
+        except Exception:
+            log.exception("ホームサーバーの確認に失敗しました")
+
+    async def _report_licenses(self) -> None:
+        """起動時に、貸し出しの状況をログへ出す。"""
+        from core import license as lic
+
+        try:
+            rows = await lic.all_licenses()
+        except Exception:
+            log.exception("貸し出しの一覧を読めませんでした")
+            return
+        known = {r.guild_id for r in rows}
+        for g in self.guilds:
+            st = await lic.status(g.id)
+            mark = "ホーム" if st.is_home else (
+                f"残り{st.days_left}日" if st.allowed else f"停止({st.reason})"
+            )
+            log.info("  サーバー %s (%s): %s", g.name, g.id, mark)
+            if g.id not in known:
+                log.warning(
+                    "    ⚠️ 貸し出していないサーバーに入っています。"
+                    "`/lend grant` で貸すか、退出させてください"
+                )
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        """招かれたサーバー。貸していなければ、その旨だけ伝える。
+
+        ⚠️ 勝手に使えるようにしない。マクドナルドのアカウントと
+           カードはこちら持ちなので、無断で使われると損害になる。
+        """
+        from core import license as lic
+
+        try:
+            st = await lic.status(guild.id)
+        except Exception:
+            log.exception("招待先の確認に失敗しました: %s", guild.id)
+            return
+        log.info("サーバーに招かれました: %s (%s) 使える=%s", guild.name, guild.id,
+                 st.allowed)
+        if st.allowed:
+            return
+        ch = guild.system_channel
+        if ch is None:
+            ch = next((c for c in guild.text_channels
+                       if c.permissions_for(guild.me).send_messages), None)
+        if ch is None:
+            return
+        try:
+            from ui.gate import blocked_embed
+            await ch.send(embed=blocked_embed(st))
+        except discord.HTTPException:
+            log.debug("招待先への案内を送れませんでした", exc_info=True)
 
     # -- 招待の自動追跡 -----------------------------------------
     #

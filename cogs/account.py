@@ -32,6 +32,7 @@ from services.kyash.client import KyashClient, KyashError
 from services.mcd import accounts as mcd_accounts
 from services.mcd.client import Fingerprint, McdClient, McdError
 from ui import embeds
+from ui.gate import GuardedView
 
 log = logging.getLogger("bot.cogs.account")
 
@@ -128,7 +129,7 @@ class McdCredModal(discord.ui.Modal, title="マクドナルドアカウントを
         )
 
 
-class McdOtpView(discord.ui.View):
+class McdOtpView(GuardedView):
     def __init__(self, owner_id, client, fp, mfa_token, email, label) -> None:
         super().__init__(timeout=300)
         self.owner_id = owner_id
@@ -139,7 +140,7 @@ class McdOtpView(discord.ui.View):
         self.label = label
         self.attempts = 0
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+    async def allow(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.owner_id
 
     async def on_timeout(self) -> None:
@@ -211,7 +212,7 @@ class McdOtpModal(discord.ui.Modal, title="認証コードの入力"):
         )
 
 
-class CardSelectView(discord.ui.View):
+class CardSelectView(GuardedView):
     def __init__(self, owner_id: int, account_id: int, cards: list[dict]) -> None:
         super().__init__(timeout=300)
         self.owner_id = owner_id
@@ -229,7 +230,7 @@ class CardSelectView(discord.ui.View):
         self.add_item(sel)
         self._sel = sel
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+    async def allow(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.owner_id
 
     async def _on_pick(self, interaction: discord.Interaction) -> None:
@@ -291,7 +292,7 @@ class KyashCredModal(discord.ui.Modal, title="Kyashアカウントを追加"):
         )
 
 
-class KyashOtpView(discord.ui.View):
+class KyashOtpView(GuardedView):
     def __init__(self, owner_id, client, email, password, label) -> None:
         super().__init__(timeout=300)
         self.owner_id = owner_id
@@ -301,7 +302,7 @@ class KyashOtpView(discord.ui.View):
         self.label = label
         self.attempts = 0
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+    async def allow(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.owner_id
 
     async def on_timeout(self) -> None:

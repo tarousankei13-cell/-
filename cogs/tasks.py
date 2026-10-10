@@ -516,6 +516,29 @@ class TasksCog(commands.Cog):
                 )
             )
 
+        # BOTの貸し出し — 期限の予告と、切れたときの知らせ
+        #
+        # ⚠️ 毎時まわす。日に1回にすると、期限が切れてから最大24時間
+        #    「止まっているのに理由が出ない」状態が続く。
+        #    同じ予告を繰り返さない仕組みは jobs 側にある。
+        try:
+            notices = await jobs.license_notices(self.bot)
+        except Exception:
+            log.exception("貸し出しの予告に失敗しました")
+            notices = []
+        if notices:
+            await self.notify_admin(
+                discord.Embed(
+                    title=f"{E.BELL} 貸し出しの期限をお知らせしました",
+                    description="\n".join(
+                        f"・`{gid}`　{'期限切れ' if tag == '0' else f'あと{tag}日'}"
+                        f"（{to}）"
+                        for gid, tag, to in notices
+                    )[:4000],
+                    color=embeds.YELLOW,
+                )
+            )
+
         # 日次リセット（バックアップとは別のフラグで管理する）
         if now.hour == 0 and self._last_daily_reset_day != now.day:
             self._last_daily_reset_day = now.day
