@@ -287,6 +287,103 @@ async def main():
     check("支払いが無いことを伝える ★", "発生していません" in msg, msg[:200])
     check("「時間外」とは言わない ★", "お時間" not in msg, msg[:200])
 
+    print("\n[9d-2] 本人が承知すれば、その金額で通る ★")
+    # ⚠️⚠️ **セットの上乗せ額は計算で出せない**（docs/09 V-23）。
+    #    カフェラテは参照より安いのに +¥50、野菜生活100 は高いのに
+    #    +¥0 で、カタログのどこにも書かれていない。
+    #    当てにいって中止していると、既定の組み合わせしか注文できない。
+    #    マクドナルドが言う本当の金額を見せて、本人に決めてもらう。
+    uid9b = 1092
+    await user_repo.get_or_create(uid9b)
+    async with user_scope(uid9b) as s:
+        await L.charge(s, uid9b, 5000, receipt_id="r9b")
+    async with session_scope() as s:
+        bal9b = await L.user_balance(s, uid9b)
+
+    asked = []
+    async def say_yes(expected, actual):
+        asked.append((expected, actual))
+        return True
+
+    CURRENT["client"] = FakeClient(total_amount=1210)   # 見積り800 → 実際1210
+    oid9b = await new_order(uid9b, make_quote())        # 補助率40%
+    r9b = await saga.execute(oid9b, None, say_yes)
+    check("本人に確かめている ★", asked == [(800, 1210)], asked)
+    check("注文が成立する ★", r9b.succeeded, (r9b.state, r9b.error))
+    async with session_scope() as s:
+        o = await s.get(Order, oid9b)
+        check("定価を直している ★", o.list_price == 1210, o.list_price)
+        # 補助率40% → 利用者60%。1210 の 60% = 726
+        want_user, want_sub = calculate(1210, 40.0)
+        check(f"利用者の負担を計算し直している ★（¥{want_user}）",
+              o.user_amount == want_user, o.user_amount)
+        check(f"管理者の負担も計算し直している ★（¥{want_sub}）",
+              o.subsidy_amount == want_sub, o.subsidy_amount)
+        now9b = await L.user_balance(s, uid9b)
+        check("本当の金額どおり引かれている ★", now9b == bal9b - want_user,
+              (bal9b, now9b, want_user))
+        check("ホールドが残っていない ★", await L.held_balance(s, uid9b) == 0)
+
+    print("\n[9d-3] 断れば、1円も動かない ★")
+    uid9c = 1093
+    await user_repo.get_or_create(uid9c)
+    async with user_scope(uid9c) as s:
+        await L.charge(s, uid9c, 5000, receipt_id="r9c")
+    async with session_scope() as s:
+        bal9c = await L.user_balance(s, uid9c)
+
+    async def say_no(expected, actual):
+        return False
+
+    CURRENT["client"] = FakeClient(total_amount=1210)
+    r9c = await saga.execute(await new_order(uid9c, make_quote()), None, say_no)
+    check("注文は成立しない ★", not r9c.succeeded, r9c.state)
+    check("決済を呼んでいない ★", CURRENT["client"].authorise_calls == 0)
+    async with session_scope() as s:
+        check("残高が元どおり ★", await L.user_balance(s, uid9c) == bal9c)
+
+    print("\n[9d-4] 残高が足りなければ進めない ★")
+    # ⚠️ 本人が「はい」と言っても、払えないものは通せない。
+    uid9d = 1094
+    await user_repo.get_or_create(uid9d)
+    async with user_scope(uid9d) as s:
+        await L.charge(s, uid9d, 500, receipt_id="r9d")   # 800の60%=480 は足りる
+    CURRENT["client"] = FakeClient(total_amount=5000)     # 5000の60%=3000 は足りない
+    r9d = await saga.execute(await new_order(uid9d, make_quote()), None, say_yes)
+    check("注文は成立しない ★", not r9d.succeeded, r9d.state)
+    check("決済を呼んでいない ★", CURRENT["client"].authorise_calls == 0)
+    async with session_scope() as s:
+        check("残高が元どおり ★", await L.user_balance(s, uid9d) == 500,
+              await L.user_balance(s, uid9d))
+
+    print("\n[9d-5] 安くなったぶんは戻る ★")
+    uid9e = 1095
+    await user_repo.get_or_create(uid9e)
+    async with user_scope(uid9e) as s:
+        await L.charge(s, uid9e, 5000, receipt_id="r9e")
+    async with session_scope() as s:
+        bal9e = await L.user_balance(s, uid9e)
+    CURRENT["client"] = FakeClient(total_amount=600)      # 見積り800 → 実際600
+    r9e = await saga.execute(await new_order(uid9e, make_quote()), None, say_yes)
+    check("注文が成立する ★", r9e.succeeded, (r9e.state, r9e.error))
+    want_user, _ = calculate(600, 40.0)
+    async with session_scope() as s:
+        check(f"安いほうで引かれている ★（¥{want_user}）",
+              await L.user_balance(s, uid9e) == bal9e - want_user,
+              await L.user_balance(s, uid9e))
+        check("ホールドが残っていない ★", await L.held_balance(s, uid9e) == 0)
+
+    print("\n[9d-6] 確かめる手段が無ければ、今までどおり中止 ★")
+    # ⚠️ 復旧処理など、本人に聞けない場面で勝手に高い金額を通さない。
+    uid9f = 1096
+    await user_repo.get_or_create(uid9f)
+    async with user_scope(uid9f) as s:
+        await L.charge(s, uid9f, 5000, receipt_id="r9f")
+    CURRENT["client"] = FakeClient(total_amount=1210)
+    r9f = await saga.execute(await new_order(uid9f, make_quote()))   # 第3引数なし
+    check("中止する ★", not r9f.succeeded, r9f.state)
+    check("決済を呼んでいない ★", CURRENT["client"].authorise_calls == 0)
+
     print("\n[9e] 金額が一致していれば、そのまま通る ★")
     uid10 = 1010
     await user_repo.get_or_create(uid10)

@@ -28,6 +28,7 @@ from typing import Awaitable, Callable
 from sqlalchemy import select
 
 from core import ledger as L
+from core import subsidy
 from core.subsidy import Quote
 from db.models import Order, OrderEvent, User, utcnow
 from db.session import session_scope, user_scope
@@ -78,6 +79,19 @@ PAID_OR_LATER = {
 }
 
 ProgressCallback = Callable[[str, str], Awaitable[None]]  # (段階, 表示文言)
+
+# 金額がこちらの見積りと違ったときに、本人へ確かめるための呼び出し。
+#   (こちらの見積り, マクドナルドが言う金額) → 進めてよいか
+#
+# ⚠️ **セットの上乗せ額は計算で出せない。** 実機で確かめたところ、
+#    カフェラテ（単品¥240・参照のコーラMより安い）は +¥50、
+#    野菜生活100（単品¥330・参照より高い）は +¥0 だった。
+#    単品価格の差では説明がつかず、カタログのどこにも書かれていない。
+#
+#    だから**当てにいかない**。マクドナルドは注文を登録した時点で
+#    本当の金額を返してくるので、**その数字を見せて確かめる**。
+#    登録は決済の前なので、ここで止めれば1円も動かない。
+PriceConfirm = Callable[[int, int], Awaitable[bool]]
 
 
 class SagaError(Exception):
@@ -213,7 +227,11 @@ def _decoded_from_order(order: Order) -> DecodedOrder:
 #  実行
 # ============================================================
 
-async def execute(order_id: str, progress: ProgressCallback | None = None) -> OrderResult:
+async def execute(
+    order_id: str,
+    progress: ProgressCallback | None = None,
+    confirm_price: PriceConfirm | None = None,
+) -> OrderResult:
     """注文を最後まで実行する。"""
 
     async def notify(step: str, text: str) -> None:
@@ -309,7 +327,25 @@ async def execute(order_id: str, progress: ProgressCallback | None = None) -> Or
                     "見積りと実際の金額が違います: 注文=%s 見積り=%d 実際=%d",
                     order_id, list_price, stored.total_amount,
                 )
-                raise PriceChanged(list_price, stored.total_amount)
+                # ⚠️ ここで黙って中止しない。セットの上乗せ額は計算で
+                #    出せないので、**違うのが当たり前**。中止すると
+                #    既定の組み合わせしか注文できなくなる。
+                #    本当の金額を見せて、本人に決めてもらう。
+                #    確かめる手段が無いとき（復旧処理など）は今までどおり中止。
+                ok = False
+                if confirm_price is not None:
+                    ok = await confirm_price(list_price, stored.total_amount)
+                if not ok:
+                    raise PriceChanged(list_price, stored.total_amount)
+                if not await _accept_new_price(order_id, stored.total_amount):
+                    raise PriceChanged(list_price, stored.total_amount)
+                list_price = stored.total_amount
+                async with session_scope() as s:
+                    order = await s.get(Order, order_id)
+                    user_amount = order.user_amount
+                await notify(
+                    "price", f"金額を ¥{stored.total_amount:,} に直しました"
+                )
 
             async with session_scope() as s:
                 order = await s.get(Order, order_id)
@@ -426,6 +462,48 @@ async def _reopen_account(order_id: str):
     if not account_id:
         raise SagaError("この注文に紐づくアカウントが分かりません")
     return await mcd_accounts.open_account(account_id)
+
+
+async def _accept_new_price(order_id: str, new_price: int) -> bool:
+    """マクドナルドが言う金額で、残高を確保し直す。足りなければ False。
+
+    ⚠️ 補助率はそのまま。定価が変われば利用者の負担も管理者の負担も
+       変わるので、**両方とも計算し直す**。片方だけ直すと帳尻が合わない。
+
+    ⚠️ 安くなった場合は差額を戻す。確保したままにすると、その注文が
+       終わるまで使えない残高が残る。
+    """
+    async with session_scope() as s:
+        order = await s.get(Order, order_id)
+        if order is None:
+            return False
+        discord_id = order.discord_id
+        rate = order.subsidy_rate
+        before = order.user_amount
+
+    user_amount, subsidy_amount = subsidy.calculate(new_price, rate)
+    diff = user_amount - before
+    try:
+        async with user_scope(discord_id) as s:
+            if diff > 0:
+                await L.hold(s, discord_id, diff, order_id=order_id)
+            elif diff < 0:
+                await L.release(
+                    s, discord_id, -diff, order_id=order_id,
+                    memo="金額が下がったぶんを戻しました",
+                )
+            order = await s.get(Order, order_id)
+            order.list_price = new_price
+            order.user_amount = user_amount
+            order.subsidy_amount = subsidy_amount
+    except L.InsufficientBalance as e:
+        log.info("金額が上がったが残高が足りません: 注文=%s %s", order_id[:8], e)
+        return False
+    log.info(
+        "金額を直しました: 注文=%s 定価 ¥%d / 利用者 ¥%d（差 %+d）",
+        order_id[:8], new_price, user_amount, diff,
+    )
+    return True
 
 
 async def _probe_paid(handle, group: str, token: str, attempts: int = 3):

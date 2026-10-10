@@ -865,6 +865,39 @@ async def wait_for_recovery(interaction: discord.Interaction) -> bool:
 
 
 @traced("注文")
+class PriceChangeView(discord.ui.View):
+    """金額が違ったときの確認。
+
+    ⚠️ **既定は「進めない」。** 返事が無いまま進めてはいけない。
+       時間切れでも、押し間違いでも、お金が動かない側に倒す。
+
+    ⚠️ 待っている間はマクドナルドのアカウントと順番待ちの枠を
+       掴んだままになる。長く待たせない（1分）。
+    """
+
+    def __init__(self, owner_id: int, expected: int, actual: int) -> None:
+        super().__init__(timeout=60)
+        self.owner_id = owner_id
+        self.expected = expected
+        self.actual = actual
+        self.accepted = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_id
+
+    @discord.ui.button(label="この金額で注文する", style=discord.ButtonStyle.success)
+    async def ok(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
+        self.accepted = True
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="やめる", style=discord.ButtonStyle.secondary)
+    async def no(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
+        self.accepted = False
+        await interaction.response.defer()
+        self.stop()
+
+
 async def run_order(
     interaction: discord.Interaction,
     decoded: DecodedOrder,
@@ -938,9 +971,47 @@ async def run_order(
         except discord.HTTPException:
             pass
 
+    async def confirm_price(expected: int, actual: int) -> bool:
+        """マクドナルドが言う金額が見積りと違ったとき、本人に確かめる。
+
+        ⚠️ **セットの上乗せ額は計算で出せない。** カフェラテは
+           参照より安いのに +¥50、野菜生活100 は高いのに +¥0 で、
+           カタログのどこにも書かれていない（docs/09 V-23）。
+           当てにいかず、相手が言う金額をそのまま見せる。
+
+        ⚠️ ここはまだ決済前。押さなければ1円も動かない。
+        """
+        view = PriceChangeView(interaction.user.id, expected, actual)
+        up = actual - expected
+        try:
+            await interaction.edit_original_response(
+                embed=embeds.warn(
+                    f"{E.YEN} **お会計は {embeds.yen(actual)} です。**\n"
+                    f"（画面のご案内は {embeds.yen(expected)} でした"
+                    f"／{'＋' if up > 0 else '−'}{embeds.yen(abs(up))}）\n\n"
+                    "セットの中身によって、お値段が変わることがあります。\n"
+                    "このまま進めてよろしいですか？\n\n"
+                    f"{E.INFO} **まだお支払いは発生していません。**\n"
+                    "⏰ 1分以内にお選びください。",
+                    title=f"{E.YEN} お値段のご確認",
+                ),
+                view=view,
+            )
+        except discord.HTTPException:
+            return False
+        await view.wait()
+        try:
+            await interaction.edit_original_response(
+                embed=embeds.progress(done, current=None, detail=detail),
+                view=None,
+            )
+        except discord.HTTPException:
+            pass
+        return view.accepted
+
     try:
         async with order_gate.gate.enter(interaction.user.id):
-            result = await saga.execute(order_id, progress)
+            result = await saga.execute(order_id, progress, confirm_price)
     except (order_gate.QueueFull, order_gate.QueueTimeout) as e:
         log.info("混雑のため注文を受け付けられませんでした: %s", e)
         await saga.cancel_waiting(order_id, str(e))

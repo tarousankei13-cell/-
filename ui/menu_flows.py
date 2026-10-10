@@ -1853,55 +1853,27 @@ class OptionView(discord.ui.View):
             name = self._slot_label(c)
             if c.multi:
                 name += f"（{c.need}個）"
-            # ⚠️ `c.extra_price`（枠の prePrice）を「+○円」として出して
-            #    いた。これは**セット価格に含まれている額**であって
-            #    上乗せ額ではない。コカ・コーラMを選んだだけで
-            #    「+90円」と出ており、意味が逆だった。
-            #    出すべきは「参照より高いものを選んだぶんの差額」。
-            up = self._slot_extra(c, codes)
             e.add_field(
                 name=name,
-                value=(
-                    ("\n".join(shown) if shown else f"{E.WARN} 未選択")
-                    + (f"（+{embeds.yen(up)}）" if up else "")
-                ),
+                value=("\n".join(shown) if shown else f"{E.WARN} 未選択"),
                 inline=True,
             )
         pickup = self.cart.pickup or "takeOut"
         base = self.product.price_for(pickup)
-        total = base + sum(
-            self._slot_extra(c, picked_codes(self.picks.get(self._key_of(c))))
-            for c in self.choices
-        )
-        # ⚠️ 差額を足した額を出す。足さずに出していたため、
-        #    画面では¥810と案内しておきながら実際は¥1,220で、
-        #    金額の照合に引っかかって注文が中止されていた。
+        # ⚠️ 選ぶものによってはお値段が上がる。**いくら上がるかは
+        #    こちらには分からない**（docs/09 V-23）。分かったふりを
+        #    せず「変わることがある」とだけ伝え、確定した金額は
+        #    注文の直前にマクドナルドの数字で見せる。
         e.add_field(
             name=f"{E.YEN} 価格",
             value=(
-                f"**{embeds.yen(total)}**"
-                + (f"（セット {embeds.yen(base)} ＋ 差額 {embeds.yen(total - base)}）"
-                   if total != base else "")
+                f"**{embeds.yen(base)}**"
+                + ("\n（お選びいただく内容によって変わることがあります）"
+                   if self.choices else "")
             ),
             inline=False,
         )
         return e
-
-    def _slot_extra(self, slot, codes) -> int:
-        """その枠で選んだものの差額（参照より高いぶん）。"""
-        pickup = self.cart.pickup or "takeOut"
-        ref_code = str(slot.reference_product or slot.default_product or "")
-        ref = self.cart.menu.products.get(ref_code)
-        if ref is None:
-            return 0
-        base = _unit_price(ref, pickup)
-        extra = 0
-        for code, n in spread_quantity(codes, slot.need):
-            chosen = self.cart.menu.products.get(code)
-            if chosen is None:
-                continue
-            extra += max(0, _unit_price(chosen, pickup) - base) * max(1, n)
-        return extra
 
     def _slot_label(self, slot, candidates: list[Product] | None = None) -> str:
         """
@@ -1966,25 +1938,17 @@ class OptionView(discord.ui.View):
 
             grouped = drinks.is_drink_slot(candidates)
             options = []
-            # ⚠️ 差額は**選ぶ前**に見せる。あとで合計だけ変わると、
-            #    なぜ高くなったのか分からない。
-            ref_code = str(c.reference_product or c.default_product or "")
-            ref = self.cart.menu.products.get(ref_code)
-            pickup_now = self.cart.pickup or "takeOut"
-            ref_price = _unit_price(ref, pickup_now)
+            # ⚠️ ここに「+¥50」のような上乗せ額を出さない。
+            #    こちらには正しい額が分からない（docs/09 V-23）。
+            #    間違った額を自信ありげに出すくらいなら、出さないほうがよい。
             for p in candidates[:25]:
                 opt = discord.SelectOption(
                     label=p.name[:100], value=p.code, default=(p.code in now),
                 )
-                up = max(0, _unit_price(p, pickup_now) - ref_price)
                 if grouped:
                     order, emoji, group_name = drinks.group_of(p.name)
                     opt.emoji = emoji
-                    opt.description = (
-                        f"{group_name}　+{embeds.yen(up)}" if up else group_name
-                    )
-                elif up:
-                    opt.description = f"+{embeds.yen(up)}"
+                    opt.description = group_name
                 options.append(opt)
             # ⚠️ ナゲット15ピースのソースのように3個必須の枠は、
             #    実際のアプリと同じく **種類を分けて選べる** ようにする。
@@ -2292,7 +2256,17 @@ def price_of(menu: ParsedMenu, item: OrderItem, pickup: str) -> int:
     p = menu.products.get(str(item.product_code))
     if p is None:
         return int(item.amount or 0)
-    return p.price_for(pickup) + choice_upcharge(menu, p, item, pickup)
+    # ⚠️ **選んだ中身による上乗せ額を、ここで当てにいかない。**
+    #    実機で確かめたところ、カフェラテ（単品¥240・参照のコーラM
+    #    ¥310 より安い）は +¥50、野菜生活100（¥330・参照より高い）は
+    #    +¥0 だった。単品価格の差では説明がつかず、カタログの
+    #    どこにも書かれていない（docs/09 V-23）。
+    #    一度「差額＝単品価格の差」で計算したが、8件中5件外れた。
+    #
+    #    **当て推量の金額を出すくらいなら、定価だけを出す。**
+    #    本当の金額はマクドナルドが注文の登録時に返してくるので、
+    #    決済の前にそれを見せて確かめる（core/saga.py）。
+    return p.price_for(pickup)
 
 
 def _unit_price(product, pickup: str) -> int:
@@ -2312,68 +2286,6 @@ def _unit_price(product, pickup: str) -> int:
         return int(getter(pickup) or 0)
     except Exception:
         return 0
-
-
-def choice_upcharge(
-    menu: ParsedMenu, product: Product, item, pickup: str
-) -> int:
-    """選択枠で、参照より高いものを選んだときの差額。
-
-    ⚠️⚠️ **セットの値段は「参照商品を選んだときの値段」。**
-       実データで検算できる（13934 / 9241 ビッグマック® セット）。
-
-           セット prePrice 810
-             = 350（バーガー分 priceList TAKEOUT）
-             + 370（サイド枠 9987009 の prePrice ＝ ポテトM の単品価格）
-             +  90（ドリンク枠 9997918 の prePrice）
-
-       つまり ¥810 は「ポテトM＋コーラM を選んだ場合」の値段であって、
-       別のものを選べば差額が乗る。
-
-    ⚠️ **これを見積りに入れていなかった。** そのため既定以外のドリンクや
-       サイドを選んだセットは、マクドナルドの言う金額とこちらの見積りが
-       必ず食い違い、決済の直前で中止されていた。
-       利用者に出るのは「お値段が変わっていたため中止しました」だけで、
-       **セットが頼めない**ように見える。サイドをナゲット15ピース
-       （単品¥780 / 参照のポテトMは¥370）にすれば ¥410 もずれる。
-
-    ⚠️ 差額の出し方は「選んだ商品の単品価格 − 参照商品の単品価格」。
-       これはカタログの計算と**つじつまが合う唯一の式**で、
-       参照を選べば差額0・合計はセット価格ちょうどになる。
-       （枠の prePrice そのものを引く式では、参照を選んだだけで
-         差額が出てしまい、実データの810円に合わない。）
-
-    ⚠️ ただし**実機で確かめたのは参照の組み合わせだけ**。別のものを
-       選んだ注文の記録がまだ無い。もし実際の上乗せ額が違っても、
-       金額の照合は決済より前なのでお金は動かない（今までどおり
-       中止されるだけ）。確かめたら docs/09 に残すこと。
-    """
-    refs = {
-        str(sl.code): str(sl.reference_product or sl.default_product or "")
-        for sl in product.slots_of("choices")
-    }
-    # 入れ子の枠（ポテナゲの中のナゲットのソースなど）も見る
-    for _comp, sl in menu.nested_choices(product):
-        refs.setdefault(
-            str(sl.code),
-            str(sl.reference_product or sl.default_product or ""),
-        )
-    if not refs:
-        return 0
-
-    extra = 0
-    for slot_code, chosen_code in slot_rules.choices_of(item):
-        ref_code = refs.get(str(slot_code))
-        if not ref_code:
-            continue
-        ref = menu.products.get(ref_code)
-        chosen = menu.products.get(str(chosen_code))
-        if ref is None or chosen is None:
-            continue
-        # ⚠️ 安いものを選んでも**引かない**。カタログの refundThreshold は
-        #    0 で、返金の仕組みが無い。引くと取りはぐれになる。
-        extra += max(0, _unit_price(chosen, pickup) - _unit_price(ref, pickup))
-    return extra
 
 
 def reprice(menu: ParsedMenu, items: list[OrderItem], pickup: str) -> None:

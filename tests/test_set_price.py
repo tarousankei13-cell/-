@@ -22,7 +22,7 @@
    ② 高いものを選んだら差額が乗る
    ③ 安いものを選んでも**引かない**（refundThreshold=0 ＝ 返金の仕組みが無い）
 """
-import asyncio, json, os, sys
+import asyncio, json, os, pathlib, sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -67,27 +67,29 @@ def main() -> int:
     got = MF.price_of(mn, item, "takeOut")
     check("ポテトM＋コーラM は ¥810 のまま ★", got == 810, got)
 
-    print("\n[3] 高いものを選んだら差額が乗る ★")
-    for picks, want, label in (
-        ({"9997918": "3479"}, 810 + 50,  "黒烏龍茶（単品¥360 / 参照¥310）"),
-        ({"9997918": "3918"}, 810 + 20,  "野菜生活100 M（¥330）"),
-        ({"9997918": "3120", "9987009": "1670"}, 810 + 410,
-         "サイドをナゲット15ピース（¥780 / 参照のポテトM¥370）"),
-        ({"9997918": "3479", "9987009": "9099"}, 810 + 50 + 610,
-         "ポテナゲ特大（¥980）＋黒烏龍茶"),
+    print("\n[3] 上乗せ額を当てにいかない ★")
+    # ⚠️⚠️ **実機で確かめた結果、計算では出せないと分かった。**
+    #    参照は コカ・コーラ M（¥310）。
+    #       カフェラテ    単品¥240（参照より安い） → 実機 **+¥50**
+    #       野菜生活100   単品¥330（参照より高い） → 実機 **+¥0**
+    #    一度「差額＝単品価格の差」で計算したが、8件中5件外れた。
+    #    カタログのどこにも上乗せ額は書かれていない（全項目確認済み）。
+    #
+    #    だから**定価だけを出す**。当て推量の金額を自信ありげに
+    #    出すほうが、出さないより悪い。本当の金額はマクドナルドが
+    #    注文の登録時に返すので、決済の前にそれを見せて確かめる。
+    for picks, label in (
+        ({"9997918": "3479"}, "黒烏龍茶（単品¥360）"),
+        ({"9997918": "3918"}, "野菜生活100（¥330・実機は+¥0）"),
+        ({"9997918": "3120", "9987009": "1610"}, "サイドをナゲット5ピース"),
     ):
         item = MF.build_order_item(cart, p, picks)
         got = MF.price_of(mn, item, "takeOut")
-        check(f"{label} → ¥{want}", got == want, got)
+        check(f"{label} でも定価 ¥810 のまま ★", got == 810, got)
+    check("差額を計算する処理を持たない ★",
+          not hasattr(MF, "choice_upcharge"), "choice_upcharge が残っている")
 
-    print("\n[4] 安いものを選んでも引かない ★")
-    # ⚠️ カタログの refundThreshold は 0。返金の仕組みが無いので、
-    #    引くと取りはぐれ（運営の持ち出し）になる。
-    item = MF.build_order_item(cart, p, {"9997918": "3501"})   # コーヒーS ¥140
-    got = MF.price_of(mn, item, "takeOut")
-    check("コーヒーS（¥140）でも ¥810 のまま ★", got == 810, got)
-
-    print("\n[5] 受取方法で差額も変わるか")
+    print("\n[5] 受取方法ごとの定価")
     for method in ("eatIn", "takeOut", "addressDelivery"):
         item = MF.build_order_item(cart, p, {"9997918": "3120"})
         got = MF.price_of(mn, item, method)
@@ -95,32 +97,14 @@ def main() -> int:
         check(f"{method}: 参照の組み合わせは定価 ¥{want} と一致",
               got == want, got)
 
-    print("\n[6] 画面の表示が差額になっているか ★")
-    # ⚠️ 以前は枠の prePrice（含まれている額）を「+90円」と出していた。
-    #    コカ・コーラMを選んだだけで「+90円」と出ており、意味が逆。
-    view_cls = None
-    for nm in dir(MF):
-        o = getattr(MF, nm)
-        if isinstance(o, type) and hasattr(o, "_slot_extra"):
-            view_cls = o
-            break
-    check("差額を出す処理がある ★", view_cls is not None, "見つからない")
-    if view_cls is not None:
-        v = view_cls.__new__(view_cls)
-        v.cart = cart
-        v.product = p
-        v.choices = list(p.slots_of("choices"))
-        v.picks = {}
-        drink = [s for s in v.choices if s.code == "9997918"][0]
-        side = [s for s in v.choices if s.code == "9987009"][0]
-        check("コーラMは「+0円」（含まれている90円を出さない）★",
-              v._slot_extra(drink, ["3120"]) == 0, v._slot_extra(drink, ["3120"]))
-        check("黒烏龍茶は「+50円」★",
-              v._slot_extra(drink, ["3479"]) == 50, v._slot_extra(drink, ["3479"]))
-        check("ナゲット15ピースは「+410円」★",
-              v._slot_extra(side, ["1670"]) == 410, v._slot_extra(side, ["1670"]))
-        check("未選択なら0（落ちない）", v._slot_extra(drink, []) == 0)
-        check("知らないコードでも落ちない", v._slot_extra(drink, ["ないコード"]) == 0)
+    print("\n[6] 画面に当て推量の金額を出さないか ★")
+    # ⚠️ 以前は枠の prePrice（含まれている額）を「+90円」として
+    #    出していた。意味が逆なうえ、正しい上乗せ額でもない。
+    src = (pathlib.Path(__file__).parent.parent / "ui" / "menu_flows.py").read_text()
+    check("選択肢に「+¥」を出さない ★", "+{embeds.yen(up)}" not in src)
+    check("extra_price を上乗せ額として出さない ★",
+          "c.extra_price" not in src, "まだ出している")
+    check("お値段が変わりうることは伝える ★", "変わることがあります" in src)
 
     print("\n[7] 入れ子の枠でも落ちないか")
     # ポテナゲ（中のナゲットにソース枠がある）
