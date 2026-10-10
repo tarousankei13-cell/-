@@ -361,6 +361,19 @@ async def restore(data: bytes, categories: list[str], *,
         except OSError as e:
             log.warning("ファイル %s を戻せませんでした: %s", fn, e)
 
+    # ⚠️ 学習ファイルを戻したら、プロセス内のキャッシュも読み直す。
+    #    呼ばないと、再起動するまで古い内容のまま使われる。
+    if any(fn in ("slot_bridge.json", "slot_rules.json") for fn in written):
+        try:
+            from services.mcd import slot_bridge, slot_rules
+            if "slot_bridge.json" in written:
+                slot_bridge.reload()
+            if "slot_rules.json" in written:
+                slot_rules.reload()
+        except Exception:
+            log.warning("学習内容の読み直しに失敗しました（再起動で反映されます）",
+                        exc_info=True)
+
     restored_key = False
     if key_bytes is not None:
         try:

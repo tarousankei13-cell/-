@@ -180,6 +180,22 @@ async def main() -> int:
     check("orders の件数が変わっていない ★（ロールバック）", before == after,
           (before, after))
 
+    print("\n[7c] 学習ファイルを戻したら、その場で反映される ★")
+    # ⚠️ ファイルを戻すだけでは、プロセス内のキャッシュは古いまま。
+    #    再起動まで反映されないと「復元したのに効かない」になる。
+    from services.mcd import slot_bridge as SB
+    SB.STORE_PATH = FB._DATA / "slot_bridge.json"
+    SB.reload()
+    SB.forget_all()
+    SB.learn("8800001", "8800009")        # KNOWNに無いコードを1件おぼえる
+    rb = await FB.make_backup()           # ← この状態をバックアップ
+    SB.forget_all()                       # 全部忘れる
+    check("いったん忘れた", SB.bridge_for("8800001") == "")
+    rr = await FB.restore(rb.data, ["menu"])
+    check("menu 復元は成功", rr.ok, rr.message)
+    check("復元で学習が戻る（再起動不要）★",
+          SB.bridge_for("8800001") == "8800009", SB.bridge_for("8800001"))
+
     print("\n[8] 区分漏れがあるとバックアップを作らせない ★")
     # わざと1区分からテーブルを抜く
     saved = FB.CATEGORY_TABLES["users"]

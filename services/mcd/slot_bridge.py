@@ -228,3 +228,17 @@ def forget_all() -> None:
     with _lock:
         _learned.clear()
     _save()
+
+
+def reload() -> None:
+    """ファイルから読み直す。復元の直後に呼ぶ。
+
+    ⚠️ バックアップから slot_bridge.json を戻しても、プロセス内の
+       キャッシュは古いまま。これを呼ばないと、再起動するまで
+       反映されない。
+    """
+    global _loaded
+    with _lock:
+        _learned.clear()
+        _loaded = False
+    _load()

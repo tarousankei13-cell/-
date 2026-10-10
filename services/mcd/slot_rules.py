@@ -73,6 +73,18 @@ def _key(store_id: str, slot_code: str, product_code: str) -> str:
     return f"{store_id}/{slot_code}/{product_code}"
 
 
+def reload() -> None:
+    """ファイルから読み直す（復元の直後に呼ぶ）。
+
+    ⚠️ 復元で slot_rules.json を戻しても、プロセス内のキャッシュは
+       古いまま。これを呼ばないと再起動するまで反映されない。
+    """
+    global _loaded
+    with _lock:
+        _loaded = False
+    load()
+
+
 def load() -> None:
     """保存してある学習結果を読む。壊れていても起動を止めない。"""
     global _loaded
