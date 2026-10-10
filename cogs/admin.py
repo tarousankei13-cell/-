@@ -434,19 +434,22 @@ class AdminCog(commands.Cog):
             embed=embeds.ok(f"{user.mention} の利用停止を解除しました。"), ephemeral=True
         )
 
-    @admin.command(name="restore", description="バックアップから復元します（要注意）")
-    @app_commands.describe(file="復元するバックアップファイル（.db）")
+    @admin.command(
+        name="restore",
+        description="バックアップから復元します（戻す項目を選べます・要注意）",
+    )
+    @app_commands.describe(file="`/admin backup` で取り出したファイル")
     @owner_only()
     async def admin_restore(
         self, interaction: discord.Interaction, file: discord.Attachment
     ) -> None:
         """
-        バックアップから戻す。
+        バックアップから戻す。戻す項目を選べる（全部も可）。
 
-        ⚠️ いまの内容は失われる。中身を確かめ、確認を取ってから実行する。
-           戻す直前のものは別名で残すので、間違えても戻せる。
+        ⚠️ 選んだ項目のいまの内容は、ファイルの内容で置き換わる。
+           中身を確かめ、確認を取ってから実行する。
         """
-        from services import backup as backup_svc
+        from services import full_backup as FB
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         if file.size > 200 * 1024 * 1024:
@@ -464,28 +467,61 @@ class AdminCog(commands.Cog):
             )
             return
 
-        good, message = await asyncio.to_thread(backup_svc.verify, data)
-        if not good:
+        man = await asyncio.to_thread(FB.read_manifest, data)
+        if not man.ok:
+            # ⚠️ 昔の自動バックアップは .db ファイル（まるごと1個）。
+            #    まるごと復元として受け付ける（項目選択はできない）。
+            from services import backup as backup_svc
+
+            good, msg = await asyncio.to_thread(backup_svc.verify, data)
+            if good:
+                e = discord.Embed(
+                    title=f"{E.WARN} 本当に復元しますか（まるごと）",
+                    description=(
+                        f"`{file.filename}`（{file.size / 1024:.0f} KB）\n{msg}\n\n"
+                        "これは古い形式のバックアップです。**項目は選べず、"
+                        "いまの残高・注文履歴がまるごと置き換わります。**\n"
+                        "復元前の内容は別名で残します。\n\n"
+                        f"{E.INFO} 復元後は**再起動**をおすすめします。"
+                    ),
+                    color=embeds.RED,
+                )
+                await interaction.followup.send(
+                    embed=e, view=LegacyRestoreConfirm(data, file.filename),
+                    ephemeral=True,
+                )
+                return
             await interaction.followup.send(
                 embed=embeds.error(
-                    f"このファイルからは復元できません。\n{message}"
+                    f"このファイルからは復元できません。\n{man.error}"
                 ),
                 ephemeral=True,
             )
             return
 
+        lines = ["**戻したい項目を選んでください**（複数選べます）。\n"]
+        for cat, label, rows in man.category_choices():
+            lines.append(f"・{label}　（{rows:,}件）")
+        lines.append(
+            f"\n{E.WARN} 選んだ項目のいまの内容は、ファイルの内容で"
+            f"**置き換わります**。"
+        )
+        if man.includes_key:
+            lines.append(
+                f"{E.INFO} このファイルには暗号化キーも入っています"
+                f"（戻すかどうかは下で選べます）。"
+            )
+        lines.append(f"{E.INFO} 復元後は**BOTの再起動**をおすすめします。")
+
         e = discord.Embed(
-            title=f"{E.WARN} 本当に復元しますか",
-            description=(
-                f"`{file.filename}`（{file.size / 1024:.0f} KB）\n{message}\n\n"
-                "**いまの残高・注文履歴は、このファイルの内容で置き換わります。**\n"
-                "復元する直前の内容は別名で残すので、間違えても戻せます。\n\n"
-                f"{E.INFO} 復元後は**BOTの再起動が必要**です。"
-            ),
+            title=f"{E.WARN} 復元する項目を選ぶ",
+            description="\n".join(lines),
             color=embeds.RED,
         )
         await interaction.followup.send(
-            embed=e, view=RestoreConfirm(data, file.filename), ephemeral=True
+            embed=e,
+            view=RestoreConfirm(data, file.filename, man),
+            ephemeral=True,
         )
 
     @admin.command(name="broadcast", description="利用者へお知らせを送ります")
@@ -695,25 +731,54 @@ class AdminCog(commands.Cog):
             ephemeral=True,
         )
 
-    @admin.command(name="backup", description="データベースのバックアップを取り出します")
+    @admin.command(
+        name="backup",
+        description="すべての設定・データ・学習内容をまとめて取り出します",
+    )
+    @app_commands.describe(
+        include_key="暗号化キーも含める（アカウント認証情報の復元に必要・取扱注意）",
+    )
     @owner_only()
-    async def backup(self, interaction: discord.Interaction) -> None:
+    async def backup(
+        self, interaction: discord.Interaction,
+        include_key: bool = False,
+    ) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
-        from services.tasks import make_backup
+        from services import full_backup as FB
 
         try:
-            name, data = await make_backup()
+            r = await FB.make_backup(include_key=include_key)
         except Exception as e:
             await interaction.followup.send(embed=embeds.error(str(e)), ephemeral=True)
             return
+
+        lines = [
+            f"{E.OK} まるごとバックアップ（{r.size / 1024:.0f} KB）",
+            f"　設定・利用者・残高・注文・アカウント・学習内容まで全部入りです。",
+            f"　復元は `/admin restore` で、戻す項目を選べます。",
+        ]
+        if r.included_key:
+            # ⚠️ 鍵を同梱したときは、必ず強く警告する。漏れたら全部読める。
+            lines += [
+                "",
+                f"{E.WARN} **暗号化キーを含めました。**",
+                f"　このファイルが漏れると、登録アカウントの認証情報が"
+                f"すべて読めてしまいます。保管に十分注意してください。",
+            ]
+        else:
+            lines.append(
+                f"{E.INFO} 登録アカウントも戻すには、別途 "
+                f"`data/encryption_key.txt` が必要です"
+                f"（`include_key:True` で同梱できます）。"
+            )
+        await audit.record(
+            actor_id=interaction.user.id, actor_name=str(interaction.user),
+            action="backup.make", target=r.name,
+            after=f"{r.rows}行 / 鍵{'あり' if r.included_key else 'なし'}",
+        )
         await interaction.followup.send(
-            content=(
-                f"{E.OK} バックアップ（{len(data) / 1024:.0f} KB）\n"
-                f"{E.INFO} 残高・注文履歴はこのファイルだけで復元できます。\n"
-                f"　　登録済みアカウントも戻すには、サーバーの "
-                f"`data/encryption_key.txt` も必要です"
-            ),
-            file=discord.File(io.BytesIO(data), filename=name),
+            content="\n".join(lines),
+            file=discord.File(io.BytesIO(r.data), filename=r.name),
             ephemeral=True,
         )
 
@@ -1414,7 +1479,118 @@ class AdminCog(commands.Cog):
 
 
 class RestoreConfirm(discord.ui.View):
-    """復元の最終確認。押し間違いが起きないよう、文言と色を強くする。"""
+    """復元の確認。戻す項目を選んでから実行する。
+
+    ⚠️ 押し間違いが起きないよう、色と文言を強くする。既定は何も
+       選ばない（選ばず押しても「選んでください」で止まる）。
+    """
+
+    def __init__(self, data: bytes, filename: str, manifest) -> None:
+        super().__init__(timeout=180)
+        self.data = data
+        self.filename = filename
+        self.manifest = manifest
+        self.chosen: list[str] = []
+        self.restore_key = False
+
+        from services import full_backup as FB
+
+        options = [
+            discord.SelectOption(label=label[:100], value=cat,
+                                 description=f"{rows:,}件")
+            for cat, label, rows in manifest.category_choices()
+        ]
+        # ⚠️ 鍵は区分とは別物なので、同じ選択肢に混ぜる（値で見分ける）。
+        if manifest.includes_key:
+            options.append(discord.SelectOption(
+                label="暗号化キーも戻す", value="__key__",
+                emoji="🔑", description="アカウント認証情報の復元に必要・取扱注意",
+            ))
+        sel = discord.ui.Select(
+            placeholder="戻す項目を選ぶ（複数可）",
+            options=options, min_values=1,
+            max_values=len(options), row=0,
+        )
+        sel.callback = self._pick
+        self.add_item(sel)
+        self._sel = sel
+        self._FB = FB
+
+    async def _pick(self, interaction: discord.Interaction) -> None:
+        vals = list(self._sel.values)
+        self.restore_key = "__key__" in vals
+        self.chosen = [v for v in vals if v != "__key__"]
+        picked = "・".join(
+            self._FB.CATEGORY_LABEL.get(c, c) for c in self.chosen
+        ) or "（区分は選ばれていません）"
+        if self.restore_key:
+            picked += "　＋🔑キー"
+        await interaction.response.edit_message(
+            embed=embeds.warn(
+                f"**次の項目を復元します**\n{picked}\n\n"
+                "下の「復元する」で実行します。",
+                title=f"{E.WARN} 復元する項目を選ぶ",
+            ),
+            view=self,
+        )
+
+    @discord.ui.button(
+        label="復元する（置き換わります）", emoji="⚠️",
+        style=discord.ButtonStyle.danger, row=1,
+    )
+    async def do_restore(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        if not self.chosen and not self.restore_key:
+            await interaction.response.send_message(
+                embed=embeds.warn("戻す項目が選ばれていません。上の一覧から選んでください。"),
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            rr = await self._FB.restore(
+                self.data, self.chosen, restore_key=self.restore_key
+            )
+        except Exception as e:
+            log.exception("復元に失敗しました")
+            rr = self._FB.RestoreResult(False, f"復元に失敗しました: {e}")
+
+        await audit.record(
+            actor_id=interaction.user.id, actor_name=str(interaction.user),
+            action="backup.restore", target=self.filename,
+            after="成功" if rr.ok else "失敗",
+            detail=f"{'・'.join(rr.restored)} / {rr.rows}行"
+                   f"{' / 🔑' if rr.restored_key else ''}" if rr.ok else rr.message,
+        )
+        if rr.ok:
+            msg = (
+                f"{rr.message}\n"
+                f"{E.INFO} {rr.tables}テーブル / {rr.rows:,}件を戻しました。\n"
+                f"{E.WARN} 反映のため、`/restart` での再起動をおすすめします。"
+            )
+            await interaction.followup.send(embed=embeds.ok(msg), ephemeral=True)
+        else:
+            await interaction.followup.send(
+                embed=embeds.error(rr.message), ephemeral=True)
+        self.stop()
+
+    @discord.ui.button(label="やめる", style=discord.ButtonStyle.secondary, row=1)
+    async def cancel(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await interaction.response.edit_message(
+            embed=embeds.info("復元をやめました。"), view=None
+        )
+        self.stop()
+
+
+class LegacyRestoreConfirm(discord.ui.View):
+    """古い .db バックアップのまるごと復元（項目は選べない）。
+
+    ⚠️ 旧形式を今までどおり戻せるように残してある。新しい
+       `/admin backup` の書庫は RestoreConfirm のほうを使う。
+    """
 
     def __init__(self, data: bytes, filename: str) -> None:
         super().__init__(timeout=120)
@@ -1422,7 +1598,8 @@ class RestoreConfirm(discord.ui.View):
         self.filename = filename
 
     @discord.ui.button(
-        label="復元する（元に戻せません）", emoji="⚠️", style=discord.ButtonStyle.danger
+        label="まるごと復元する（元に戻せません）", emoji="⚠️",
+        style=discord.ButtonStyle.danger,
     )
     async def do_restore(
         self, interaction: discord.Interaction, _: discord.ui.Button
@@ -1437,7 +1614,7 @@ class RestoreConfirm(discord.ui.View):
         await audit.record(
             actor_id=interaction.user.id, actor_name=str(interaction.user),
             action="backup.restore", target=self.filename,
-            after="成功" if good else "失敗", detail=message,
+            after="成功（旧形式）" if good else "失敗", detail=message,
         )
         await interaction.followup.send(
             embed=(embeds.ok if good else embeds.error)(message), ephemeral=True

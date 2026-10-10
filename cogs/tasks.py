@@ -896,6 +896,29 @@ class TasksCog(commands.Cog):
                 )
             )
 
+        # ⚠️ バックアップの区分にテーブルの入れ忘れが無いか起動時に見る。
+        #    新しいテーブルを足したのに区分へ入れ忘れると、全体バックアップ
+        #    から漏れ、全体復元で静かに消える。起動時に気づけるようにする。
+        try:
+            from services import full_backup
+
+            miss = full_backup.check_coverage()
+            if miss:
+                log.error("バックアップの区分に未割り当てのテーブル: %s", miss)
+                await self.notify_admin(
+                    discord.Embed(
+                        title=f"{E.WARN} バックアップの設定に漏れがあります",
+                        description=(
+                            "次のテーブルがバックアップの区分に入っていません。"
+                            "このままでは全体復元で消えます。\n`"
+                            + "`, `".join(miss) + "`"
+                        ),
+                        color=embeds.RED,
+                    )
+                )
+        except Exception:
+            log.exception("バックアップ区分の確認に失敗しました")
+
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(TasksCog(bot))

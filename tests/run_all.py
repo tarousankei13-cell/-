@@ -64,6 +64,7 @@ TESTS = [
     ("紹介プログラム", "test_invite.py"),
     ("紹介プログラムの画面", "test_invite_ui.py"),
     ("バックアップと復元", "test_backup.py"),
+    ("まるごとバックアップと項目復元", "test_full_backup.py"),
     ("再送の方針（冪等性）", "test_retry.py"),
     ("サーキットブレーカー", "test_breaker.py"),
     ("名前解決の控え", "test_dns.py"),
