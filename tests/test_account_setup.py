@@ -106,8 +106,56 @@ async def main():
     await modal15.on_submit(itx15)
     check("認証コードを聞かない ★", "認証コードを送信" not in itx15.text(), itx15.text()[:120])
     check("そのまま登録が終わる ★", "登録しました" in itx15.text(), itx15.text()[:120])
-    check("入力ボタンを出さない ★", itx15.last_view() is None, itx15.last_view())
-    check("次の手順を案内する", "/mcd card" in itx15.text(), itx15.text()[:200])
+    # ⚠️ ここで見たいのは「**認証コードの入力画面を出さない**」こと。
+    #    画面が何も出ないことではない。カードが2枚あるので、
+    #    続けてカードを選ぶ画面が出るのが正しい。
+    v15 = itx15.last_view()
+    check("認証コードの入力画面は出さない ★",
+          not isinstance(v15, acc.McdOtpView), type(v15).__name__)
+    # ⚠️ 登録しただけで放すと、カード未設定のアカウントが残り、
+    #    そのアカウントは注文に選ばれない。カードまで面倒を見る。
+    check("カードの手当てまで案内する ★",
+          isinstance(v15, acc.CardSelectView) or "/mcd card" in itx15.text(),
+          f"{type(v15).__name__} / {itx15.text()[:120]}")
+
+    print("\n[1.6] カードが1枚だけなら自動で設定する ★")
+    # ⚠️ 毎回選ばせると手間なうえ、設定し忘れたアカウントは注文に
+    #    使われないまま放置される。1枚しか無いなら迷う余地が無い。
+    one = FakeMcd(need_otp=False,
+                  cards=[{"card_id": "only-1", "masked": "**** 9999"}])
+    acc.McdClient = lambda fp, *a, **kw: one
+    m16 = acc.McdCredModal()
+    m16.label, m16.email, m16.password = (
+        FakeValue("1枚だけ"), FakeValue("one@y.z"), FakeValue("pw"))
+    itx16 = FakeInteraction(owner, client)
+    await m16.on_submit(itx16)
+    check("自動で設定したと伝える ★", "自動で設定" in itx16.text(), itx16.text()[:140])
+    check("選ばせる画面は出さない ★",
+          not isinstance(itx16.last_view(), acc.CardSelectView))
+    async with session_scope() as s:
+        from sqlalchemy import select as _s2
+        rows16 = (await s.execute(_s2(McdAccount))).scalars().all()
+    got16 = [r for r in rows16 if r.label == "1枚だけ"]
+    check("本当に保存されている ★",
+          bool(got16) and got16[0].card_id == "only-1",
+          got16[0].card_id if got16 else "無し")
+
+    print("\n[1.7] カードが無いときは、付け方を案内する ★")
+    # ⚠️ カード未設定のアカウントは注文に選ばれない。黙って登録を
+    #    終えると、使えるアカウントが静かに減っていく。
+    zero = FakeMcd(need_otp=False, cards=[])
+    acc.McdClient = lambda fp, *a, **kw: zero
+    m17 = acc.McdCredModal()
+    m17.label, m17.email, m17.password = (
+        FakeValue("カード無し"), FakeValue("zero@y.z"), FakeValue("pw"))
+    itx17 = FakeInteraction(owner, client)
+    await m17.on_submit(itx17)
+    check("注文に使われないことを伝える ★",
+          "注文に使われません" in itx17.text(), itx17.text()[:160])
+    check("探し直すボタンを出す ★",
+          isinstance(itx17.last_view(), acc.CardScanView),
+          type(itx17.last_view()).__name__)
+    acc.McdClient = lambda fp, *a, **kw: mcd_no_otp
     check("接続を閉じる", mcd_no_otp.closed)
     async with session_scope() as s:
         from sqlalchemy import select as _sel

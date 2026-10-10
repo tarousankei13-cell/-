@@ -530,3 +530,83 @@ async def reset_daily_counters() -> None:
     async with session_scope() as s:
         for acc in (await s.execute(select(McdAccount))).scalars().all():
             acc.orders_today = 0
+
+
+# ============================================================
+#  決済カードの世話
+# ============================================================
+
+async def fetch_cards(account_id: int) -> list[dict]:
+    """そのアカウントに登録されているカードを取り直す。
+
+    ⚠️ カード番号そのものは扱わない。マクドナルド側が持っている
+       カードの**識別子**を受け取るだけ。登録は公式アプリで行う。
+       （公式のAPIにカードを登録する呼び出しは存在しない。
+         3-Dセキュアを通す別の画面で行う作りになっている）
+    """
+    handle = None
+    try:
+        handle = await open_account(account_id)
+        await handle.client.ensure_auth()
+        return await handle.client.get_cards()
+    finally:
+        if handle:
+            await handle.aclose()
+
+
+async def auto_pick_card(account_id: int) -> tuple[bool, int, str]:
+    """カードが1枚だけなら自動で選ぶ。
+
+    返り値は (設定したか, 見つかった枚数, 表示名)。
+
+    ⚠️ **2枚以上あるときは選ばない。** どれで決済するかはお金の話で、
+       勝手に決めてよいものではない。人に選んでもらう。
+
+    ⚠️ すでに設定済みなら触らない。せっかく選んだものを、
+       取り直しのたびに上書きしてしまう。
+    """
+    async with session_scope() as s:
+        acc = await s.get(McdAccount, account_id)
+        if acc is None:
+            return False, 0, ""
+        if acc.card_id:
+            return False, -1, ""      # -1 は「すでに設定済み」
+
+    try:
+        cards = await fetch_cards(account_id)
+    except Exception as e:
+        log.info("アカウント %s のカードを取れませんでした: %s", account_id, e)
+        return False, 0, ""
+
+    usable = [c for c in cards if c.get("card_id")]
+    if len(usable) != 1:
+        return False, len(usable), ""
+
+    card = usable[0]
+    name = (card.get("masked") or card.get("name") or card.get("card_id") or "")[:64]
+    async with session_scope() as s:
+        acc = await s.get(McdAccount, account_id)
+        if acc is None or acc.card_id:
+            return False, len(usable), ""
+        acc.card_id = card["card_id"]
+    log.info("アカウント %s のカードを自動で設定しました: %s", account_id, name)
+    return True, 1, name
+
+
+async def card_overview() -> list[dict]:
+    """全アカウントのカードの状況。一覧と一括設定のため。
+
+    ⚠️ カードが無いアカウントは**注文に選ばれない**（pick_account が
+       外す）。気づかないと、使えるアカウントが静かに減っていく。
+    """
+    async with session_scope() as s:
+        rows = (await s.execute(
+            select(McdAccount).order_by(McdAccount.id)
+        )).scalars().all()
+        return [
+            {
+                "id": a.id, "label": a.label, "status": a.status,
+                "card_id": a.card_id or "", "has_card": bool(a.card_id),
+            }
+            for a in rows
+        ]

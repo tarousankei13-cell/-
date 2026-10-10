@@ -108,14 +108,20 @@ class McdCredModal(discord.ui.Modal, title="マクドナルドアカウントを
                     embed=embeds.error("アカウントの保存に失敗しました。")
                 )
                 return
+            # ⚠️ ここでもカードを見る。以前は「`/mcd card` を実行して
+            #    ください」と案内するだけで、やり忘れるとそのアカウントは
+            #    注文に選ばれないまま放置されていた。
+            cards = []
+            try:
+                cards = await client.get_cards()
+            except McdError as e:
+                log.info("カード一覧を取得できませんでした: %s", e)
             await client.aclose()
             await interaction.edit_original_response(
-                embed=embeds.ok(
-                    f"マクドナルドアカウント `#{account_id}` **{label}** を登録しました。\n"
-                    f"{E.INFO} 認証コードは求められませんでした。\n"
-                    f"続けて `/mcd card {account_id}` で決済カードを選んでください。"
-                ),
-                view=None,
+                embed=embeds.info(f"{E.OK} 登録しました。"), view=None)
+            await _after_mcd_added(
+                interaction, account_id, label, cards,
+                note="認証コードは求められませんでした。",
             )
             return
 
@@ -191,25 +197,293 @@ class McdOtpModal(discord.ui.Modal, title="認証コードの入力"):
         await p.client.aclose()
         p.stop()
 
-        if not cards:
-            await interaction.followup.send(
-                embed=embeds.warn(
-                    f"アカウント `#{account_id}` **{p.label}** を登録しました。\n\n"
-                    f"{E.WARN} 決済カードが見つかりませんでした。\n"
-                    "マクドナルド公式アプリでカードを登録してから "
-                    f"`/mcd card {account_id}` を実行してください。"
+        await _after_mcd_added(interaction, account_id, p.label, cards)
+
+
+
+class McdBulkModal(discord.ui.Modal, title="アカウントをまとめて登録"):
+    """自分で作ったアカウントを、順に取り込む。
+
+    ⚠️ **新しくアカウントを作るものではない。** すでにマクドナルドに
+       登録してあるアカウントを、このBOTへ取り込むだけ。
+
+    ⚠️ 認証コードを求められたものは、ここでは進められない。
+       コードは本人が受け取るものなので、まとめ処理の中で待てない。
+       その分は `/mcd add` で1件ずつ入れてもらう。
+    """
+
+    lines = discord.ui.TextInput(
+        label="メールアドレスとパスワード（1行に1件）",
+        style=discord.TextStyle.paragraph,
+        required=True, max_length=2000,
+        placeholder=("a@example.com,ぱすわーど\n"
+                     "b@example.com,ぱすわーど\n"
+                     "（カンマ・コロン・スペース・タブ区切り）"),
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        raw = str(self.lines.value)
+        entries = _parse_bulk(raw)
+        if not entries:
+            await interaction.response.send_message(
+                embed=embeds.error(
+                    "読み取れる行がありませんでした。\n"
+                    "`メールアドレス,パスワード` の形で1行に1件、"
+                    "入れてください。"
+                ),
+                ephemeral=True,
+            )
+            return
+        if len(entries) > 20:
+            await interaction.response.send_message(
+                embed=embeds.error(
+                    f"一度に登録できるのは20件までです（{len(entries)}件ありました）。"
                 ),
                 ephemeral=True,
             )
             return
 
+        await interaction.response.send_message(
+            embed=embeds.info(
+                f"{E.LOADING} {len(entries)} 件を順に登録しています…\n"
+                f"{E.INFO} 1件ずつログインするので少し時間がかかります。"
+            ),
+            ephemeral=True,
+        )
+
+        added, otp_needed, failed = [], [], []
+        for email, password, label in entries:
+            fp = Fingerprint.generate(*mcd_accounts.random_home_location())
+            client = McdClient(fp)
+            try:
+                result = await client.login(email, password)
+                if result.needs_otp:
+                    # ⚠️ ここでは進めない。コードは本人が受け取るもので、
+                    #    まとめ処理の中で待つことはできない。
+                    otp_needed.append(email)
+                    await client.aclose()
+                    continue
+                account_id = await _save_mcd(client, fp, email, label)
+                cards = []
+                try:
+                    cards = await client.get_cards()
+                except McdError:
+                    pass
+                await client.aclose()
+                # カードが1枚だけなら、ここで設定してしまう
+                usable = [c for c in cards if c.get("card_id")]
+                card_name = ""
+                if len(usable) == 1:
+                    async with session_scope() as s:
+                        acc = await s.get(McdAccount, account_id)
+                        if acc:
+                            acc.card_id = usable[0]["card_id"]
+                    card_name = (usable[0].get("masked") or "")[:32]
+                added.append((account_id, label, card_name, len(usable)))
+            except McdError as e:
+                failed.append((email, str(e)[:80]))
+                await client.aclose()
+            except Exception as e:
+                log.exception("まとめ登録に失敗しました: %s", email)
+                failed.append((email, f"{type(e).__name__}: {e}"[:80]))
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
+
+        parts = []
+        if added:
+            rows = []
+            for aid, label, card, n in added:
+                mark = (f"カード {card or '設定済み'}" if n == 1
+                        else (f"{E.WARN} カード{n}枚 → `/mcd card {aid}`" if n > 1
+                              else f"{E.NG} カード無し"))
+                rows.append(f"・`#{aid}` **{label}**　{mark}")
+            parts.append(f"{E.OK} **登録できました（{len(added)}件）**\n"
+                         + "\n".join(rows))
+        if otp_needed:
+            parts.append(
+                f"{E.KEY} **認証コードが必要です（{len(otp_needed)}件）**\n"
+                + "\n".join(f"・{_mask_mail(m)}" for m in otp_needed)
+                + "\n→ `/mcd add` で1件ずつ登録してください。"
+            )
+        if failed:
+            parts.append(
+                f"{E.NG} **登録できませんでした（{len(failed)}件）**\n"
+                + "\n".join(f"・{_mask_mail(m)}　{why}" for m, why in failed)
+            )
+
+        no_card = [a for a in added if a[3] == 0]
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title=f"{E.PEOPLE} まとめ登録の結果",
+                description="\n\n".join(parts)[:4000],
+                color=embeds.GREEN if added else embeds.RED,
+            ),
+            view=(CardScanView(interaction.user.id, [a[0] for a in no_card])
+                  if no_card else None),
+            ephemeral=True,
+        )
+
+
+def _mask_mail(email: str) -> str:
+    """記録や画面にメールをそのまま出さない。"""
+    name, _, domain = email.partition("@")
+    head = name[:2] if len(name) > 2 else name[:1]
+    return f"{head}***@{domain}" if domain else f"{head}***"
+
+
+def _parse_bulk(raw: str) -> list[tuple[str, str, str]]:
+    """貼られた文字列から (メール, パスワード, 表示名) を取り出す。
+
+    ⚠️ 区切り文字を決め打ちしない。カンマで貼る人もコロンで貼る人も
+       タブで貼る人もいる。パスワードに区切り文字が入ることもあるので、
+       **最初の1つだけ**で切る。
+    """
+    out: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        email = password = ""
+        for sep in (",", ":", "\t", " "):
+            if sep in line:
+                email, _, password = line.partition(sep)
+                break
+        email, password = email.strip(), password.strip()
+        if not email or not password or "@" not in email:
+            continue
+        key = email.lower()
+        if key in seen:      # 同じものを2回登録しない
+            continue
+        seen.add(key)
+        out.append((email, password, email.split("@")[0][:32]))
+    return out
+
+
+async def _after_mcd_added(
+    interaction: discord.Interaction, account_id: int, label: str,
+    cards: list[dict], *, note: str = "",
+) -> None:
+    """アカウントを登録したあとの案内。
+
+    ⚠️ カードが**1枚だけなら自動で設定する**。毎回 `/mcd card` を
+       打たせると手間なうえ、設定し忘れたアカウントは注文に選ばれず、
+       使えるアカウントが静かに減っていく。
+
+    ⚠️ **2枚以上なら自動で決めない。** どれで決済するかはお金の話で、
+       勝手に選んでよいものではない。
+    """
+    usable = [c for c in cards if c.get("card_id")]
+    head = f"アカウント `#{account_id}` **{label}** を登録しました。"
+    if note:
+        head += f"\n{E.INFO} {note}"
+
+    if len(usable) == 1:
+        card = usable[0]
+        name = (card.get("masked") or card.get("name") or "")[:64]
+        async with session_scope() as s:
+            acc = await s.get(McdAccount, account_id)
+            if acc:
+                acc.card_id = card["card_id"]
         await interaction.followup.send(
             embed=embeds.ok(
-                f"アカウント `#{account_id}` **{p.label}** を登録しました。\n"
-                "決済に使うカードを選んでください。"
+                f"{head}\n\n{E.CARD} 決済カードも自動で設定しました"
+                f"{f'（{name}）' if name else ''}。\n"
+                f"{E.INFO} 変えたいときは `/mcd card {account_id}`。"
             ),
-            view=CardSelectView(interaction.user.id, account_id, cards),
             ephemeral=True,
+        )
+        return
+
+    if not usable:
+        await interaction.followup.send(
+            embed=embeds.warn(
+                f"{head}\n\n"
+                f"{E.WARN} **決済カードがありません。このままでは注文に使われません。**\n\n"
+                "① 公式アプリ／サイトでこのアカウントにログイン\n"
+                "② カードを登録（3Dセキュアの確認があります）\n"
+                "③ 下の「カードを探す」を押す"
+            ),
+            view=CardScanView(interaction.user.id, [account_id]),
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(
+        embed=embeds.ok(f"{head}\n決済に使うカードを選んでください。"),
+        view=CardSelectView(interaction.user.id, account_id, usable),
+        ephemeral=True,
+    )
+
+
+class CardScanView(discord.ui.View):
+    """カード未設定のアカウントを、まとめて探し直す画面。
+
+    ⚠️ 公式アプリで登録した直後に押してもらう想定。こちらから
+       カードを登録する手段は無い（公式のAPIにその呼び出しが無く、
+       3-Dセキュアの本人確認を通す必要があるため）。
+    """
+
+    def __init__(self, owner_id: int, account_ids: list[int]) -> None:
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.account_ids = list(account_ids)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_id
+
+    @discord.ui.button(label="カードを探す", emoji=E.SYNC,
+                       style=discord.ButtonStyle.primary)
+    async def scan(self, interaction: discord.Interaction,
+                   btn: discord.ui.Button) -> None:
+        # ⚠️ 1件ずつ通信するので時間がかかる。先に応答しておかないと
+        #    「BOTは時間内に応答しませんでした」になる。
+        btn.disabled = True
+        await interaction.response.edit_message(
+            embed=embeds.info(f"{E.LOADING} カードを探しています…"), view=self)
+
+        done, several, none_, failed = [], [], [], []
+        for aid in self.account_ids:
+            try:
+                ok_, count, name = await mcd_accounts.auto_pick_card(aid)
+            except Exception:
+                log.exception("カードの確認に失敗しました: %s", aid)
+                failed.append(aid)
+                continue
+            if ok_:
+                done.append((aid, name))
+            elif count > 1:
+                several.append((aid, count))
+            elif count == 0:
+                none_.append(aid)
+
+        parts = []
+        if done:
+            parts.append(f"{E.OK} **設定しました**\n" + "\n".join(
+                f"・`#{a}`　{n}" for a, n in done))
+        if several:
+            # ⚠️ 2枚以上あるときは選ばない。どれで決済するかはお金の話で、
+            #    勝手に決めてよいものではない。
+            parts.append(f"{E.WARN} **複数あるので選んでください**\n" + "\n".join(
+                f"・`#{a}`　{c}枚 → `/mcd card {a}`" for a, c in several))
+        if none_:
+            parts.append(f"{E.NG} **まだカードがありません**\n" + "\n".join(
+                f"・`#{a}`" for a in none_)
+                + "\n公式アプリで登録してから、もう一度お試しください。")
+        if failed:
+            parts.append(f"{E.NG} **確認できませんでした**（ログインできない等）\n"
+                         + "\n".join(f"・`#{a}`　→ `/mcd history {a}`" for a in failed))
+
+        self.stop()
+        await interaction.edit_original_response(
+            embed=discord.Embed(
+                title=f"{E.CARD} カードを探しました",
+                description="\n\n".join(parts)[:4000] or "変化はありませんでした。",
+                color=embeds.GREEN if done else embeds.YELLOW,
+            ),
+            view=None,
         )
 
 
@@ -440,6 +714,67 @@ class AccountCog(commands.Cog):
         await interaction.followup.send(
             embed=embeds.info("決済に使うカードを選んでください。"),
             view=CardSelectView(interaction.user.id, account_id, cards),
+            ephemeral=True,
+        )
+
+    @mcd.command(name="bulk", description="自分のアカウントをまとめて登録します")
+    @admin_only()
+    async def mcd_bulk(self, interaction: discord.Interaction) -> None:
+        """⚠️ すでに持っているアカウントを取り込むもの。
+           新しくアカウントを作る機能ではない。
+        """
+        await interaction.response.send_modal(McdBulkModal())
+
+    @mcd.command(name="cards", description="全アカウントの決済カードの状況を表示します")
+    @admin_only()
+    async def mcd_cards(self, interaction: discord.Interaction) -> None:
+        """どのアカウントにカードが付いているかを一目で見る。
+
+        ⚠️ カードが無いアカウントは**注文に選ばれない**。気づかないと
+           使えるアカウントが静かに減り、同時注文がさばけなくなる。
+        """
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        rows = await mcd_accounts.card_overview()
+        if not rows:
+            await interaction.followup.send(
+                embed=embeds.info("登録されているアカウントがありません。"),
+                ephemeral=True)
+            return
+
+        lines, missing = [], []
+        for r in rows:
+            if r["has_card"]:
+                lines.append(f"{E.OK} `#{r['id']}` **{r['label']}**　カードあり")
+            else:
+                lines.append(f"{E.NG} `#{r['id']}` **{r['label']}**　"
+                             f"**カード未設定（注文に使われません）**")
+                missing.append(r["id"])
+
+        e = discord.Embed(
+            title=f"{E.CARD} 決済カードの状況",
+            description="\n".join(lines)[:4000],
+            color=embeds.YELLOW if missing else embeds.GREEN,
+        )
+        e.add_field(
+            name="使える数",
+            value=f"**{len(rows) - len(missing)}** / {len(rows)} アカウント",
+            inline=True,
+        )
+        if missing:
+            e.add_field(
+                name=f"{E.WARN} カードの付け方",
+                value=(
+                    "① 公式アプリ／サイトでそのアカウントにログイン\n"
+                    "② カードを登録（3Dセキュアの確認があります）\n"
+                    "③ 下の「カードを探す」を押す\n\n"
+                    f"{E.INFO} 1枚だけなら自動で設定します。"
+                    "複数ある場合は選んでいただきます。"
+                ),
+                inline=False,
+            )
+        await interaction.followup.send(
+            embed=e,
+            view=(CardScanView(interaction.user.id, missing) if missing else None),
             ephemeral=True,
         )
 
