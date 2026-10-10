@@ -173,6 +173,20 @@ def main():
     empty = Slot(kind="choices", code="9999998")
     check("基準商品が無ければ空", m.choice_candidates(empty, 410) == [])
 
+    print("\n[時間帯区分の相性 ★]")
+    # 時間帯区分の相性（分からないものは外さない）
+    from services.mcd.menu import _dayparts_fit
+    for a, b, want, label in (
+        ("DAY_MENU", "DAY_MENU", True, "昼と昼"),
+        ("DAY_MENU", "BREAKFAST_MENU", False, "昼のセットに朝の商品"),
+        ("BREAKFAST_MENU", "DAY_MENU", False, "朝のセットに昼の商品"),
+        ("DAY_MENU", "BREAKFAST_DAY_MENU", True, "朝も昼もの商品"),
+        ("DAY_MENU", "", True, "区分が空（ナゲット）"),
+        ("", "BREAKFAST_MENU", True, "親の区分が空"),
+    ):
+        check(f"時間帯の相性: {label}", _dayparts_fit(a, b) is want,
+              _dayparts_fit(a, b))
+
     print(f"\n{'='*46}\n  成功 {ok} 件 / 失敗 {fail} 件\n{'='*46}")
     return 1 if fail else 0
 

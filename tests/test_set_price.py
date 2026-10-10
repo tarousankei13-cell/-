@@ -150,6 +150,55 @@ def main() -> int:
             bad.append(f"{q.code} {type(e).__name__}: {e}")
     check("選択枠を持つ全商品で落ちない・定価を下回らない ★", not bad, bad[:3])
 
+    print("\n[9] 実機の選択肢とどれだけ合っているか ★")
+    # ⚠️ 実機（公式アプリ / チーズチーズ倍月見 セット）で確かめた。
+    #    サイド枠に出るのは **4つだけ**。
+    #      マックフライポテト / サイドサラダ /
+    #      チキンマックナゲット5ピース / えだまめコーン
+    #    こちらは14件出しており、**セットそのもの**（ポテナゲ特大 ¥980、
+    #    食べくらべポテナゲ特大 ¥990）まで並べていた。
+    #    選べないものを選ばせれば、注文は必ず断られる。
+    #    カタログには「どれが選べるか」が書かれていない（全項目確認済み）
+    #    ので完全には絞れないが、**確実に違うものは外す**。
+    REAL = {"2020", "2323", "1610", "2605"}
+    p9195 = mn.products["9195"]
+    side = [x for x in p9195.slots_of("choices") if x.code == "9987009"][0]
+    cands = mn.choice_candidates(side, 14 * 60, parent=p9195)
+    got = {c.code for c in cands}
+    check("実機の4つが全部残っている ★", REAL <= got, sorted(REAL - got))
+    meals = [c.code for c in cands if c.product_class == "VALUE_MEAL"]
+    check("セット（VALUE_MEAL）を候補にしない ★", not meals, meals)
+    check("朝だけの商品（ハッシュポテト5010）を出さない ★",
+          "5010" not in got, sorted(got))
+    check("ナゲット15ピース（¥780）を出さない ★",
+          "1670" not in got or len(got) <= 8, sorted(got))
+    check(f"候補が広がりすぎない（8件以下 / いま{len(got)}件）★",
+          len(got) <= 8, sorted(got))
+    check("候補が空にならない ★", bool(got))
+
+    # ⚠️ 候補を狭めすぎて空にしないこと。空になると、その商品が
+    #    一切注文できなくなる（直す前より悪い）。
+    #
+    # ⚠️ **参照商品が無い枠は数えない。** マカロンのボックスセットなど、
+    #    カタログに referenceProduct も defaultProduct も入っていない枠が
+    #    あり、これは元から候補を出しようがない（別の既知の穴で、
+    #    services/mcd/slot_hints.py の担当）。ここで一緒に数えると、
+    #    絞り込みのせいで空になったのか元からかが分からなくなる。
+    empty, no_ref = [], []
+    for q in mn.products.values():
+        for sl in q.slots_of("choices"):
+            if sl.min_quantity < 1:
+                continue
+            if not mn.slot_reference(sl):
+                no_ref.append(f"{q.code} / 枠{sl.code}")
+                continue
+            if not mn.choice_candidates(sl, 14 * 60, parent=q):
+                empty.append(f"{q.code} {q.name} / 枠{sl.code}")
+    check(f"参照のある必須枠が空にならない ★（{len(mn.products)}商品）",
+          not empty, empty[:3])
+    print(f"      （参照そのものが無い枠 {len(no_ref)} 件は別の穴。"
+          f"例 {no_ref[:2]}）")
+
     print(f"\n{'='*52}\n  成功 {ok} / 失敗 {fail}\n{'='*52}")
     return 1 if fail else 0
 

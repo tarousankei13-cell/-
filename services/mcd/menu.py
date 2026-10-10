@@ -228,6 +228,30 @@ SET_TYPE_LABEL = {
 }
 
 
+def _dayparts_fit(parent: str, child: str) -> bool:
+    """セットの時間帯区分と、中身の時間帯区分が噛み合うか。
+
+    ⚠️ `BREAKFAST_DAY_MENU` は朝にも昼にも出せる。空欄も同じ扱い
+       （ナゲット5ピースは空欄だが、昼のセットで選べる）。
+       **分からないものを外さない**こと。外すと候補が空になり、
+       その商品が一切注文できなくなる。
+    """
+    a, b = (parent or "").upper(), (child or "").upper()
+    if not a or not b:
+        return True
+    if a == b:
+        return True
+    # どちらかが「朝も昼も」なら通す
+    if "BREAKFAST" in a and "DAY" in a:
+        return True
+    if "BREAKFAST" in b and "DAY" in b:
+        return True
+    # 朝だけ ↔ 昼だけ は噛み合わない
+    return not (
+        ("BREAKFAST" in a and "DAY" in b) or ("DAY" in a and "BREAKFAST" in b)
+    )
+
+
 @dataclass
 class Slot:
     """セットの構成要素（固定構成 / 選択枠 / 追加トッピング）。"""
@@ -726,6 +750,20 @@ class ParsedMenu:
             if p is None:
                 continue
             if minutes is not None and not p.is_orderable_at(minutes):
+                continue
+            # ⚠️ **セットをセットの中身にできない。**
+            #    母集団は「参照商品と同じカテゴリ全部」なので、
+            #    サイドメニューの枠に ポテナゲ大（VALUE_MEAL・¥600）や
+            #    食べくらべポテナゲ特大（¥990）まで並んでいた。
+            #    実機（チーズチーズ倍月見 セット）で確かめたところ、
+            #    選べるのは **ポテト / サイドサラダ / ナゲット5ピース /
+            #    えだまめコーン の4つだけ**で、セットは1つも出ない。
+            if p.product_class == "VALUE_MEAL":
+                continue
+            # ⚠️ 朝の商品を昼のセットに入れられない（逆も同じ）。
+            #    ハッシュポテト（BREAKFAST_MENU・¥190）が
+            #    昼のセットの候補に出ていたが、実機では出ない。
+            if parent is not None and not _dayparts_fit(parent.day_part, p.day_part):
                 continue
             # 一度マクドナルドに断られた組み合わせは、もう出さない
             if not slot_rules.allowed(self.store_id, slot.code, p.code):
