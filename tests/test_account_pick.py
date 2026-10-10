@@ -122,6 +122,55 @@ async def main():
                     missing.append(f"{path}:{fn.name} finally の外")
     check("すべての呼び出し元が finally で手放す ★", not missing, missing[:4])
 
+    print("\n[6] 止まった理由の記録 ★")
+    # ⚠️ last_error は最後の1件しか残らない。止まった理由は後から
+    #    調べるものなので、そのときには上書きされている。
+    await A.report_failure(1, '{"error":"invalid_grant","token":"SECRET123456"}')
+    await A.report_failure(1, "HTTP 401 Unauthorized")
+    await A.report_failure(1, "HTTP 401 Unauthorized")
+    evs = await A.account_events(1)
+    check("経緯が複数残る ★", len(evs) >= 3, len(evs))
+    check("ログイン切れを AUTH と分かる ★",
+          all(e.kind == "AUTH" for e in evs[:3]), [e.kind for e in evs[:3]])
+    check("連続失敗の回数も残る", evs[0].failures >= 3, evs[0].failures)
+    check("状態の変化が残る", any(e.action in ("degrade", "quarantine") for e in evs))
+    # ⚠️ 生の応答には認証情報が混ざりうる。必ず伏せる。
+    check("生の記録に秘密が残らない ★",
+          all("SECRET123456" not in (e.raw or "") for e in evs))
+    check("伏せたことは分かる", any("伏せました" in (e.raw or "") for e in evs))
+    await A.report_success_healthcheck(1)
+    check("復帰も残る ★", (await A.account_events(1))[0].action == "recover")
+
+    print("\n[7] エラーの分類 ★")
+    from services.mcd.errors import parse as _parse
+    cases = [
+        (401, "{}", "AUTH"),
+        (0, "HTTP 401 Unauthorized", "AUTH"),
+        (0, '{"error":"invalid_grant"}', "AUTH"),
+        (0, "ログインに失敗しました", "AUTH"),
+        (402, "{}", "PAYMENT"),
+        (0, "残高が不足しています", "PAYMENT"),
+        (0, "ErrorCode_Authorisation", "PAYMENT"),
+        (0, '{"message":"9030 > 9997925 > 3120 product not found"}', "PRODUCT_GONE"),
+        (0, "card not found", "CARD"),
+        (0, "store closed", "STORE"),
+        (0, "ただいまのお時間はお取り扱いがありません", "PRODUCT_TIME"),
+        (0, "よく分からない何か", "UNKNOWN"),
+    ]
+    wrong = [(b, _parse(st, b).kind, w) for st, b, w in cases
+             if _parse(st, b).kind != w]
+    check("12通りすべて正しく分かれる ★", not wrong, wrong[:3])
+
+    # ⚠️ "authoriz" は "unauthorized" に含まれる。PAYMENT を先に判定するので、
+    #    401 が全部「決済の問題」になっていた。管理者はカードを疑い、
+    #    本当の原因（ログイン）に辿り着けない。
+    check("401 を決済の問題と取り違えない ★",
+          _parse(0, "HTTP 401 Unauthorized").kind == "AUTH")
+    # ⚠️ extract_strings は文章を単語に分解するので、複数語の判定語が
+    #    一度も一致しない。"product not found" が "found product" になる。
+    check("複数語の判定語が効く ★",
+          _parse(0, "product not found").kind == "PRODUCT_GONE")
+
     await close_db()
     print(f"\n{'='*52}\n  成功 {ok} / 失敗 {fail}\n{'='*52}")
     return 1 if fail else 0

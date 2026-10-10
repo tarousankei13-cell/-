@@ -396,8 +396,10 @@ async def report_failure(account_id: int, error: str, *, fatal: bool = False) ->
         acc = await s.get(McdAccount, account_id)
         if acc is None:
             return STATUS_BANNED
+        before = acc.status
         acc.consecutive_failures += 1
         acc.last_error = error[:500]
+        action = "failure"
         if fatal:
             acc.status = STATUS_QUARANTINED
             log.error("アカウント %s を隔離しました（回復が見込めない失敗）", acc.label)
@@ -409,7 +411,74 @@ async def report_failure(account_id: int, error: str, *, fatal: bool = False) ->
             acc.status = STATUS_DEGRADED
             log.warning("アカウント %s の状態を下げました（%d回連続失敗）",
                         acc.label, acc.consecutive_failures)
+        if acc.status != before:
+            action = ("quarantine" if acc.status == STATUS_QUARANTINED
+                      else "degrade")
+
+        # ⚠️ last_error は最後の1件しか残らない。止まった理由は後から
+        #    調べるものなので、そのときには上書きされている。経緯を残す。
+        _add_event(
+            s, account_id, action, error,
+            status_after=acc.status, failures=acc.consecutive_failures,
+        )
         return acc.status
+
+
+def _add_event(
+    s, account_id: int, action: str, error: str = "", *,
+    status_after: str = "", failures: int = 0, info=None,
+) -> None:
+    """アカウントに起きたことを1件残す。
+
+    ⚠️ **記録のために処理を止めない。** ここで落ちると注文そのものが
+       失敗する。分類できなくても、生の文面だけは必ず残す。
+
+    ⚠️ 生の応答には認証情報が混ざりうる。必ず伏せてから入れる。
+    """
+    from db.models import McdAccountEvent
+
+    try:
+        from services.mcd import errors as mcd_errors
+
+        if info is None and error:
+            try:
+                # ⚠️ parse(status, body) の順。取り違えると例外になり、
+                #    ここは握りつぶすので**無言で分類なし**になる。
+                #    HTTPの状態が分からない場面なので 0 を渡す。
+                info = mcd_errors.parse(0, error)
+            except Exception:
+                log.debug("エラーの分類に失敗しました", exc_info=True)
+                info = None
+        s.add(McdAccountEvent(
+            mcd_account_id=int(account_id),
+            action=action[:24],
+            kind=(getattr(info, "kind", "") or "")[:24],
+            http_status=int(getattr(info, "status", 0) or 0),
+            message=(getattr(info, "message", "") or error or "")[:500],
+            raw=mcd_errors.scrub(error)[:4000],
+            status_after=(status_after or "")[:16],
+            failures=int(failures or 0),
+        ))
+    except Exception:
+        log.debug("アカウントの記録に失敗しました（処理は続けます）", exc_info=True)
+
+
+async def account_events(account_id: int, limit: int = 20) -> list:
+    """そのアカウントに起きたことを新しい順に。"""
+    from db.models import McdAccountEvent
+
+    async with session_scope() as s:
+        rows = (await s.execute(
+            select(McdAccountEvent)
+            .where(McdAccountEvent.mcd_account_id == int(account_id))
+            .order_by(McdAccountEvent.created_at.desc())
+            .limit(limit)
+        )).scalars().all()
+        for r in rows:
+            _ = (r.action, r.kind, r.message, r.raw, r.http_status,
+                 r.status_after, r.failures, r.created_at)
+        s.expunge_all()
+        return list(rows)
 
 
 async def healthcheck_all() -> list[tuple[int, str, bool]]:
@@ -451,6 +520,10 @@ async def report_success_healthcheck(account_id: int) -> None:
         if acc.status in (STATUS_DEGRADED, STATUS_QUARANTINED):
             acc.status = STATUS_ACTIVE
             log.info("アカウント %s が復帰しました", acc.label)
+            # ⚠️ 復帰も残す。止まった記録だけでは「何回止まって何回
+            #    戻ったか」が分からず、たまたま一度止まったのか、
+            #    止まり続けているのかを見分けられない。
+            _add_event(s, account_id, "recover", status_after=acc.status)
 
 
 async def reset_daily_counters() -> None:

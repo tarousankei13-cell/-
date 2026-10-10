@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 
 import discord
+
+from config import JST
 from discord import app_commands
 from discord.ext import commands
 
@@ -440,6 +442,76 @@ class AccountCog(commands.Cog):
             view=CardSelectView(interaction.user.id, account_id, cards),
             ephemeral=True,
         )
+
+    @mcd.command(name="history", description="アカウントに起きたことの履歴を表示します")
+    @app_commands.describe(account_id="アカウントID", count="表示する件数")
+    @admin_only()
+    async def mcd_history(
+        self, interaction: discord.Interaction, account_id: int,
+        count: app_commands.Range[int, 1, 30] = 10,
+    ) -> None:
+        """なぜ止まったのかを後から調べるための窓口。
+
+        ⚠️ `last_error` は最後の1件しか残らない。止まった理由は
+           止まった**後**に調べるものなので、そのときには上書き
+           されている。だから経緯を別に残してある。
+        """
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        from db.models import McdAccount
+
+        async with session_scope() as s:
+            acc = await s.get(McdAccount, account_id)
+            label = acc.label if acc else ""
+            status = acc.status if acc else ""
+        if not label:
+            await interaction.followup.send(
+                embed=embeds.error("そのアカウントが見つかりません。"), ephemeral=True)
+            return
+
+        events = await mcd_accounts.account_events(account_id, limit=count)
+        if not events:
+            await interaction.followup.send(
+                embed=embeds.info(
+                    f"**{label}** には、まだ記録がありません。\n"
+                    f"{E.INFO} 失敗・隔離・復帰が起きると、ここに残ります。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        MARK = {
+            "failure": E.WARN, "degrade": E.YELLOW,
+            "quarantine": E.NG, "recover": E.OK,
+        }
+        lines = []
+        for e in events:
+            when = e.created_at.astimezone(JST)
+            kind = f"`{e.kind}`" if e.kind else ""
+            head = f"{MARK.get(e.action, E.INFO)} **{when:%m/%d %H:%M}**　{kind}"
+            body = (e.message or "").strip().replace("\n", " ")[:90]
+            lines.append(head + (f"\n　{body}" if body else ""))
+
+        # ⚠️ 何が多いかを数えて先に見せる。1件ずつ読ませると、
+        #    「たまたま1回」と「ずっと同じ理由」の区別が付かない。
+        from collections import Counter
+        kinds = Counter(e.kind or "不明" for e in events if e.action != "recover")
+
+        e_ = discord.Embed(
+            title=f"{E.HISTORY} {label} の履歴",
+            description="\n".join(lines)[:4000],
+            color=embeds.BLUE,
+        )
+        e_.add_field(name="いまの状態", value=f"`{status}`", inline=True)
+        if kinds:
+            e_.add_field(
+                name="理由の内訳",
+                value="　".join(f"{k} **{n}**" for k, n in kinds.most_common(5)),
+                inline=True,
+            )
+        e_.set_footer(
+            text="原因が分からないときは、生の応答が残っています（管理者にご相談ください）"
+        )
+        await interaction.followup.send(embed=e_, ephemeral=True)
 
     @mcd.command(name="enable", description="アカウントを再び使えるようにします")
     @app_commands.describe(account_id="対象のアカウントID（/mcd list で確認）")

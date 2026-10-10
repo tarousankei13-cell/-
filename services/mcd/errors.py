@@ -49,9 +49,15 @@ _RULES: list[tuple[str, tuple[str, ...]]] = [
     )),
     (PAYMENT, (
         "残高", "残高不足", "限度額", "ご利用いただけません", "決済", "支払い",
-        "カードが拒否", "承認されませんでした", "authoriz", "payment", "declin",
+        "カードが拒否", "承認されませんでした", "payment", "declin",
         "insufficient", "ErrorCode_Payment", "ErrorCode_Authorisation",
         "ErrorCode_Settlement", "PaymentError", "CreditCardError",
+        # ⚠️ 裸の "authoriz" を入れてはいけない。**"unauthorized" に
+        #    含まれてしまう**。PAYMENT は AUTH より先に判定されるので、
+        #    401（ログインが切れた）が全部「決済の問題」になっていた。
+        #    管理者はカードを疑い、本当の原因（ログイン）に辿り着けない。
+        #    決済の承認は下の2語で拾う。
+        "payment authoriz", "authorisation fail",
     )),
     (CARD, (
         "カードが登録", "カード情報", "有効期限", "card not found", "ErrorCode_Card",
@@ -68,6 +74,12 @@ _RULES: list[tuple[str, tuple[str, ...]]] = [
     (AUTH, (
         "unauthenticated", "unauthorized", "token", "ErrorCode_Auth",
         "認証",
+        # ⚠️ ログインできなくなる形。OAuth が返す定型の文言で、
+        #    「アカウントが止められた」ときに最初に出るのがここ。
+        #    これを拾えないと、一番起きそうな止まり方が UNKNOWN になる。
+        "invalid_grant", "invalid_token", "invalid_client",
+        "expired_token", "login_required", "ログイン",
+        "パスワード", "サインイン",
     )),
 ]
 
@@ -237,7 +249,14 @@ def parse(status: int, body: bytes | str) -> McdErrorInfo:
     """
     idents, messages = extract_strings(body)
     raw = body.decode("utf-8", "replace") if isinstance(body, bytes) else body
-    haystack = (" ".join(idents) + " " + " ".join(messages)).lower()
+    # ⚠️ **生の本文も混ぜる。** extract_strings は文章を単語に分解するので、
+    #    "product not found" のような**複数語の判定語が一度も一致しない**。
+    #    "product not found" は "found product" になってしまう。
+    #    そのせいでセットの注文失敗がすべて UNKNOWN になり、
+    #    利用者には「原因を特定できませんでした」としか出ていなかった。
+    haystack = (
+        " ".join(idents) + " " + " ".join(messages) + " " + (raw or "")
+    ).lower()
 
     kind = UNKNOWN
     for candidate, needles in _RULES:

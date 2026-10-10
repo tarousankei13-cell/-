@@ -788,3 +788,38 @@ class Nudge(Base):
         #    判定だけに任せると、処理が重なったときに二重で送ってしまう。
         UniqueConstraint("discord_id", "kind", "key", name="uq_nudge_once"),
     )
+
+
+class McdAccountEvent(Base):
+    """アカウントに起きたことの記録。
+
+    ⚠️ `McdAccount.last_error` は**最後の1件しか残らない**。
+       「なぜ止まったのか」は、止まった後に調べるものなので、
+       そのときには既に上書きされている。経緯を別に残す。
+
+    ⚠️ **分類を信じすぎない。** どんな止まり方をするかは実際に
+       起きるまで分からない。kind は目安であって、判断の根拠は
+       `raw`（相手の生の応答）に置く。分類できなければ UNKNOWN の
+       まま残し、捨てない。
+    """
+    __tablename__ = "mcd_account_events"
+
+    id: Mapped[int] = mapped_column(AutoBigInt, primary_key=True, autoincrement=True)
+    mcd_account_id: Mapped[int] = mapped_column(
+        ForeignKey("mcd_accounts.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    # failure / quarantine / degrade / recover / login_failed など
+    action: Mapped[str] = mapped_column(String(24), nullable=False)
+    # services/mcd/errors.py の分類（AUTH / PAYMENT / CARD / UNKNOWN …）
+    kind: Mapped[str] = mapped_column(String(24), default="", nullable=False)
+    http_status: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    message: Mapped[str] = mapped_column(String(500), default="", nullable=False)
+    # ⚠️ 相手の生の応答。分類が外れていても、ここを見れば分かる。
+    #    秘密情報は errors.scrub() を通してから入れること。
+    raw: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    # そのときの状態と連続失敗回数（後から経緯を追うため）
+    status_after: Mapped[str] = mapped_column(String(16), default="", nullable=False)
+    failures: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False, index=True,
+    )
