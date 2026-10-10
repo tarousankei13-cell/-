@@ -40,6 +40,35 @@ _lock = threading.Lock()
 _loaded = False
 
 
+# 実機（公式アプリ）で見て、その枠には**出てこない**と分かった商品。
+#   枠コード → 出てこない商品コード
+#
+# ⚠️ カタログには「どれが選べるか」が書かれていない（docs/09 V-22）。
+#    こちらの候補は「参照商品と同じカテゴリ全部」から出すので、
+#    実機では選べないものが混ざる。選ばせれば必ず断られる。
+#
+# ⚠️ **実機の画面で見たものだけ入れること。** 推測で足さない。
+#    下はチーズチーズ倍月見 セットのサイド枠を実機で見た結果
+#    （2026-10・1店舗）。出ていたのは4つだけだった。
+#        マックフライポテト / サイドサラダ /
+#        チキンマックナゲット5ピース / えだまめコーン
+#    エビプリオと月見パイは「ご一緒にいかがですか？」の**追加商品**
+#    として別枠に出ており、セットの中身ではない。
+#
+# ⚠️ **1店舗で見ただけ**なので、店舗や時期で違う可能性がある。
+#    だから `_confirmed`（実際に通った記録）のほうを優先する。
+#    もしどこかで本当に選べたなら、その店では自動的に復活する。
+KNOWN_BAD: dict[str, set[str]] = {
+    # セットのサイド枠（通常セット）
+    "9987009": {
+        "2080",   # シャカチキ
+        "1670",   # チキンマックナゲット® 15ピース
+        "2081",   # プリプリエビプリオ 5ピース（追加商品として別枠に出る）
+        "2255",   # 北海道産バターとあんことおもちの月見パイ（同上）
+    },
+}
+
+
 def _key(store_id: str, slot_code: str, product_code: str) -> str:
     return f"{store_id}/{slot_code}/{product_code}"
 
@@ -83,9 +112,14 @@ def allowed(store_id: str, slot_code: str, product_code: str) -> bool:
         load()
     k = _key(str(store_id), str(slot_code), str(product_code))
     with _lock:
+        # ⚠️ 実際に通った記録がいちばん強い。実機で見えなかった物でも、
+        #    その店で本当に通ったなら出してよい（店舗差・時期差がある）。
         if k in _confirmed:
             return True
-        return k not in _rejected
+        if k in _rejected:
+            return False
+    # 実機で「その枠には出てこない」と分かっているもの
+    return str(product_code) not in KNOWN_BAD.get(str(slot_code), ())
 
 
 def reject(store_id: str, slot_code: str, product_code: str) -> bool:

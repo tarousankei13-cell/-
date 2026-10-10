@@ -162,11 +162,14 @@ def main() -> int:
     #    この4件は実機では選べないが、カタログ上は正しい4つと
     #    見分けがつかない（productClass も dayPart も時間帯も価格も
     #    同じ / docs/09 V-22）。断られた時点で自動的に消える。
+    # ⚠️ 前の版は `"1670" not in got or len(got) <= 8` と書いており、
+    #    後ろが常に真なので**実際には出しているのに合格**していた。
+    #    通るだけのテストは無いより悪い。
+    #    いまは実機で見た4件を既定で外している（slot_rules.KNOWN_BAD）。
     extra = sorted(got - REAL)
-    check("実機に無い候補が4件のまま（増えていない）★",
-          extra == ["1670", "2080", "2081", "2255"], extra)
-    check(f"候補が広がりすぎない（8件以下 / いま{len(got)}件）★",
-          len(got) <= 8, sorted(got))
+    check("実機に無い候補が1つも残っていない ★", not extra, extra)
+    check(f"実機とぴったり同じ4件 ★（いま{len(got)}件）",
+          got == REAL, sorted(got))
     check("候補が空にならない ★", bool(got))
 
     # ⚠️ 候補を狭めすぎて空にしないこと。空になると、その商品が
