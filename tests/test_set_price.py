@@ -154,8 +154,17 @@ def main() -> int:
     check("セット（VALUE_MEAL）を候補にしない ★", not meals, meals)
     check("朝だけの商品（ハッシュポテト5010）を出さない ★",
           "5010" not in got, sorted(got))
-    check("ナゲット15ピース（¥780）を出さない ★",
-          "1670" not in got or len(got) <= 8, sorted(got))
+    # ⚠️ **残っている4件を「出さない」と書いてはいけない。**
+    #    前の版は `"1670" not in got or len(got) <= 8` と書いており、
+    #    後ろが常に真なので、**実際には出しているのに合格**していた。
+    #    通るだけのテストは無いより悪い。いまの状態を正直に固定する。
+    #
+    #    この4件は実機では選べないが、カタログ上は正しい4つと
+    #    見分けがつかない（productClass も dayPart も時間帯も価格も
+    #    同じ / docs/09 V-22）。断られた時点で自動的に消える。
+    extra = sorted(got - REAL)
+    check("実機に無い候補が4件のまま（増えていない）★",
+          extra == ["1670", "2080", "2081", "2255"], extra)
     check(f"候補が広がりすぎない（8件以下 / いま{len(got)}件）★",
           len(got) <= 8, sorted(got))
     check("候補が空にならない ★", bool(got))
