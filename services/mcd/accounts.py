@@ -8,8 +8,11 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import logging
 import random
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -51,7 +54,64 @@ class AccountHandle:
     client: McdClient
 
     async def aclose(self) -> None:
+        # ⚠️ 必ず予約を外す。外し忘れると、そのアカウントは
+        #    再起動するまで二度と選ばれなくなる。
+        release(self.account_id)
         await self.client.aclose()
+
+
+# ============================================================
+#  使用中のアカウント（同時注文の取り合いを防ぐ）
+# ============================================================
+#
+# ⚠️ `last_used_at` だけでは**同時に呼ばれたときに防げない**。
+#    3件が同時に来ると、3件とも書き込み前の値を読むため、
+#    同じアカウントを選んでしまう。実際に
+#    「同時に3件 → [1, 2, 1]」（1番に集中、3番は未使用）になっていた。
+#
+#    これは2つの害がある。
+#      ・同時注文が実質1〜2アカウントしか使わず、並列にならない
+#      ・1つのアカウントに注文が集中し、機械的な使い方に見える
+#
+# ⚠️ プロセス内の印なので、BOTを複数立ち上げる場合は効かない。
+#    そのときはDB側で押さえる必要がある（いまは1プロセス前提）。
+
+# ⚠️ **閉じ忘れると、そのアカウントは二度と選ばれなくなる。**
+#    これは直そうとしたバグより悪い。呼び出し側は全部 finally で
+#    閉じているが、人の手に頼る作りにはしない。印に時刻を持たせ、
+#    長すぎるものは自動で手放す。
+_HOLD_LIMIT_SECONDS = 15 * 60
+
+_in_use: dict[int, float] = {}
+_pick_lock = asyncio.Lock()
+
+
+def _sweep() -> None:
+    """長く持ちすぎている印を外す。"""
+    now = time.monotonic()
+    stale = [k for k, t in _in_use.items() if now - t > _HOLD_LIMIT_SECONDS]
+    for k in stale:
+        del _in_use[k]
+        log.warning(
+            "アカウント %s の使用中の印が %d 分を超えたため外しました。"
+            "どこかで閉じ忘れている可能性があります", k, _HOLD_LIMIT_SECONDS // 60,
+        )
+
+
+def in_use() -> set[int]:
+    """いま注文に使われているアカウント。"""
+    _sweep()
+    return set(_in_use)
+
+
+def release(account_id: int) -> None:
+    """使い終わったので手放す。二重に呼んでも害は無い。"""
+    _in_use.pop(int(account_id), None)
+
+
+def release_all() -> None:
+    """検証用。全部手放す。"""
+    _in_use.clear()
 
 
 # ============================================================
@@ -181,13 +241,34 @@ async def pick_account(exclude: set[int] | None = None) -> AccountHandle:
     決済カードが設定されていないアカウントは注文を完了できないため、
     候補から外す（/mcd card で設定できる）。
     """
-    exclude = exclude or set()
+    exclude = set(exclude or set())
     now = datetime.now(timezone.utc)
+
+    # ⚠️ 選ぶところは**1件ずつ**通す。同時に通すと、同じアカウントを
+    #    2件が同時に選んでしまう（読んでから印を付けるまでの隙間）。
+    async with _pick_lock:
+        return await _pick_locked(exclude, now)
+
+
+async def _pick_locked(exclude: set[int], now: datetime) -> AccountHandle:
     async with session_scope() as s:
         rows = (
             await s.execute(select(McdAccount).where(McdAccount.status.in_(USABLE)))
         ).scalars().all()
-        candidates = [a for a in rows if a.id not in exclude and a.card_id]
+        # ⚠️ いま使われているアカウントは避ける。`last_used_at` は
+        #    注文が終わるまで更新されないので、それだけでは防げない。
+        busy = in_use()
+        free = [a for a in rows
+                if a.id not in exclude and a.id not in busy and a.card_id]
+        if free:
+            candidates = free
+        else:
+            # ⚠️ 全部ふさがっていても止めない。待たせるより、
+            #    いちばん余裕のあるものを使い回すほうがよい。
+            #    （注文の同時数は core/queue.py 側で既に絞ってある）
+            candidates = [a for a in rows if a.id not in exclude and a.card_id]
+            if candidates:
+                log.info("空いているアカウントがありません。使用中から選び直します")
         # 続けて失敗しているアカウントは、しばらく使わない。
         # 壊れた相手に送り続けると全員がタイムアウトを待たされるため。
         usable = [a for a in candidates if breaker.accounts.allows(f"mcd:{a.id}")]
@@ -211,6 +292,9 @@ async def pick_account(exclude: set[int] | None = None) -> AccountHandle:
                 "/mcd list で状態を確認してください"
             )
         best = max(candidates, key=lambda a: _score(a, now))
+        # ⚠️ **選んだ直後に印を付ける。** セッションを抜けてから付けると、
+        #    その隙間に別の注文が同じものを選ぶ。
+        _in_use[best.id] = time.monotonic()
         tokens = await _load_tokens(s, best.id)
         handle = AccountHandle(
             account_id=best.id, label=best.label, card_id=best.card_id or "",

@@ -49,6 +49,7 @@ TESTS = [
     ("使いやすさ", "test_usability.py"),
     ("チャージ処理", "test_charge.py"),
     ("アカウント登録（OTP）", "test_account_setup.py"),
+    ("同時注文のアカウント割り当て", "test_account_pick.py"),
     ("全スラッシュコマンドの総当たり", "test_all_commands.py"),
     ("管理者コマンド", "test_admin_cmds.py"),
     ("管理操作の記録", "test_audit.py"),
