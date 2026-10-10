@@ -42,6 +42,7 @@ TESTS = [
     ("具材の調整（抜き・増量）", "test_customize.py"),
     ("商品詳細と受取方法", "test_product_detail.py"),
     ("セット注文の組み立て", "test_set_order.py"),
+    ("セットの金額（選んだ中身の差額）", "test_set_price.py"),
     ("店名検索", "test_store_search.py"),
     ("店舗の注文可否", "test_availability.py"),
     ("店舗一覧の定期同期", "test_store_sync.py"),
