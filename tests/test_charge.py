@@ -132,17 +132,33 @@ async def main():
         )).scalars().all()
         check("要確認として記録される", len(rows) == 1, len(rows))
 
-    print("\n[7] 受け取りが失敗した場合")
+    print("\n[7] ★受け取りを投げたあとに失敗（お金が動いたか不明）→ 要確認へ")
+    # ⚠️ link_receive が投げたあとは、サーバ側で受け取り済みかもしれない。
+    #    「失敗」と言って再試行させると二重受け取りの恐れ、放置すると
+    #    「送ったのに入らない」が残る。だから記帳も失敗確定もせず、
+    #    **その場で**要確認へ回す（RECEIVING のまま固めない）。
+    from sqlalchemy import select as _sel
     async with session_scope() as s:
         before = await L.user_balance(s, UID)
+        mr_before = len((await s.execute(
+            _sel(KyashReceipt).where(KyashReceipt.status == "MANUAL_REVIEW")
+        )).scalars().all())
     CUR["client"] = FakeKyash(amount=1000, receive_error=KyashError("受け取りに失敗"))
     try:
         await kyash_charge.charge_from_link(UID, "https://kyash.me/payments/ggg777")
-        check("失敗として扱う", False)
+        check("受け取り失敗を検出して中断", False, "通ってしまった")
     except ChargeError as e:
-        check("失敗として扱う", "失敗" in str(e), str(e))
+        check("受け取り失敗を検出して中断", "確認中" in str(e), str(e))
     async with session_scope() as s:
-        check("残高は変わらない", await L.user_balance(s, UID) == before)
+        check("残高は変わらない（記帳しない）★", await L.user_balance(s, UID) == before)
+        mr_after = len((await s.execute(
+            _sel(KyashReceipt).where(KyashReceipt.status == "MANUAL_REVIEW")
+        )).scalars().all())
+        rec_stuck = len((await s.execute(
+            _sel(KyashReceipt).where(KyashReceipt.status == "RECEIVING")
+        )).scalars().all())
+    check("要確認が1件増える ★", mr_after == mr_before + 1, (mr_before, mr_after))
+    check("RECEIVING のまま固まらない ★", rec_stuck == 0, rec_stuck)
 
     print("\n[8] 同時に同じリンクを使おうとした場合")
     CUR["client"] = FakeKyash(amount=1000)

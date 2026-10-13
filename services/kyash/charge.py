@@ -108,10 +108,47 @@ async def charge_from_link(discord_id: int, url: str) -> ChargeResult:
             row.status = RECEIVING   # ★落ちても復旧できるよう、実行前に確定させる
 
         # ④ 受け取り（ここでお金が動く）
-        await handle.client.link_receive(info.uuid)
+        try:
+            await handle.client.link_receive(info.uuid)
+        except KyashError as e:
+            # ⚠️ 受け取りを投げたあとの失敗は、**お金が動いたか分からない**。
+            #    ・自動で再受け取りすると二重受け取りの恐れ
+            #    ・残高はこの直後は反映が遅れて当てにならない
+            #    ・RECEIVING のまま放置すると「送ったのに入らない」が残る
+            #    だから、**その場で**「要確認」へ回す（再起動を待たない）。
+            #    これが無く、下の except が RESERVED しか戻さないため、
+            #    RECEIVING のまま固まるのが「入金が上手くできない」の正体。
+            async with session_scope() as s:
+                row = await s.get(KyashReceipt, receipt_id)
+                if row:
+                    row.status = MANUAL_REVIEW
+                    row.error = (
+                        f"受け取りの途中で切れました。"
+                        f"Kyashの取引履歴と照合してください: {e}"
+                    )[:500]
+            log.error("Kyash受け取りが途中で失敗しました: link=%s err=%s", info.uuid, e)
+            raise ChargeError(
+                "受け取りの確認中です。管理者が対応しますので少々お待ちください"
+            ) from e
 
         # ⑤ 残高の検証
-        after = (await handle.client.get_wallet()).all_balance
+        try:
+            after = (await handle.client.get_wallet()).all_balance
+        except KyashError as e:
+            # ⚠️ 受け取りは投げ終えている＝お金が動いた可能性が高いが、
+            #    確認できない。勝手に記帳も失敗確定もできないので要確認へ。
+            async with session_scope() as s:
+                row = await s.get(KyashReceipt, receipt_id)
+                if row:
+                    row.status = MANUAL_REVIEW
+                    row.error = (
+                        f"受け取り後に残高を確認できませんでした。"
+                        f"Kyashの取引履歴と照合してください: {e}"
+                    )[:500]
+            log.error("Kyash残高の確認に失敗しました: link=%s err=%s", info.uuid, e)
+            raise ChargeError(
+                "受け取りの確認中です。管理者が対応しますので少々お待ちください"
+            ) from e
         async with session_scope() as s:
             row = await s.get(KyashReceipt, receipt_id)
             row.wallet_after = after

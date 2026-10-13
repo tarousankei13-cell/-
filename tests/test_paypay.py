@@ -400,17 +400,46 @@ async def main():
     check("自動で記帳しない ★", await balance(UID) == before)
     check("自動で再受け取りしない ★",
           not [h for h in await PC.held_links() if h["link"].endswith("held002")])
-    moved = await PC.recover_pending()
-    check("起動時の復旧が拾う ★", moved >= 1, moved)
+    # ★以前は再起動（recover_pending）まで RECEIVING で固まっていた。
+    #   いまは **その場で** 要確認へ回す（＝入金詰まりの再発防止）。
     async with session_scope() as s:
         from db.models import PayPayReceipt as _PR
         rows = (await s.execute(
             _select(_PR).where(_PR.raw_link.like("%held002%"))
         )).scalars().all()
-    check("要確認になる ★", rows and rows[0].status == "MANUAL_REVIEW",
+    check("その場で要確認になる ★（再起動を待たない）",
+          rows and rows[0].status == "MANUAL_REVIEW",
+          rows[0].status if rows else "行が無い")
+    check("RECEIVING のまま固まらない ★",
+          rows and rows[0].status != "RECEIVING",
           rows[0].status if rows else "行が無い")
     check("理由が残る ★", rows and "照合" in (rows[0].error or ""),
           rows[0].error if rows else "")
+    # もう一度 recover_pending を呼んでも、片付いた行は動かさない
+    moved_again = await PC.recover_pending()
+    check("片付いた行は起動復旧の対象にしない ★", moved_again == 0, moved_again)
+
+    print("\n── ⑯b 本当に落ちて RECEIVING が残ったら、起動時に拾う安全網 ★ ──")
+    # ⚠️ 受け取りの直前〜直後でプロセスが落ちると、在プロセスの後始末は
+    #    動けない。その取りこぼしを起動時 recover_pending が拾う。
+    import uuid as _uuid
+    async with session_scope() as s:
+        from db.models import PayPayReceipt as _PR
+        s.add(_PR(
+            id=str(_uuid.uuid4()), link_uuid="crash-" + _uuid.uuid4().hex,
+            paypay_account_id=None, discord_id=UID, amount=100,
+            sender_name="crash", status="RECEIVING",
+            raw_link="https://pay.paypay.ne.jp/crash001",
+        ))
+    moved = await PC.recover_pending()
+    check("落ちた RECEIVING を起動時に拾う ★", moved >= 1, moved)
+    async with session_scope() as s:
+        from db.models import PayPayReceipt as _PR
+        crow = (await s.execute(
+            _select(_PR).where(_PR.raw_link.like("%crash001%"))
+        )).scalars().first()
+    check("要確認に回す ★", crow and crow.status == "MANUAL_REVIEW",
+          crow.status if crow else "行が無い")
 
     print("\n── ⑰ 受け取る前に落ちたら見張りに戻るか ★ ──")
     # ⚠️ まだお金は動いていない。ここは見張りに戻すのが正しい。
