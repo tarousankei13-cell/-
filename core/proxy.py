@@ -332,9 +332,40 @@ def describe() -> list[tuple[str, str]]:
     return out
 
 
-async def check(url: str | None = None, *, timeout: float = 15.0) -> tuple[bool, str]:
+# 出口の「国」まで分かる確認先。国が分かるものを先に試す。
+#   ⚠️ PayPay とマクドナルドは**日本の外からの通信を弾く**。
+#      IPだけ見ても「買ったプロキシが海外だった」ことに気づけない。
+COUNTRY_URLS = (
+    "https://ipinfo.io/json",
+    "https://api.my-ip.io/v2/ip.json",
+    "https://api.ipify.org?format=json",
+)
+
+
+def _read_country(data) -> str:
+    """応答から国コードを取り出す。分からなければ空文字。
+
+    ⚠️ 確認先ごとに形が違う。ipinfo は `"country": "JP"`、
+       my-ip.io は `"country": {"code": "JP"}`。**両方の形を読む。**
+       片方しか読まないと、国が分からないまま「不明」になる。
     """
-    実際に通って、外から見える出口のIPを確かめる。
+    if not isinstance(data, dict):
+        return ""
+    got = data.get("country")
+    if isinstance(got, str):
+        return got.strip().upper()[:2]
+    if isinstance(got, dict):
+        return str(got.get("code") or got.get("Code") or "").strip().upper()[:2]
+    return ""
+
+
+async def check_exit(
+    url: str | None = None, *, timeout: float = 15.0
+) -> tuple[bool, str, str]:
+    """実際に通って、出口のIPと国コードを確かめる。
+
+    戻り値は (通ったか, IPまたは理由, 国コード)。
+    国コードは分かったときだけ入る（確認先が返さないことがある）。
 
     ⚠️ 設定しただけでは効いているか分からない。
        「日本から出ているつもりで海外から出ていた」を防ぐために、
@@ -344,29 +375,41 @@ async def check(url: str | None = None, *, timeout: float = 15.0) -> tuple[bool,
 
     target = url if url is not None else global_proxy()
     if target and (why := problem(target)):
-        return False, why.replace("\n", " ")
+        return False, why.replace("\n", " "), ""
 
     client = None
     last = "確認先につながりませんでした"
     try:
         client = build_async_client(timeout=timeout, proxy=target or None)
-        for endpoint in CHECK_URLS:
+        for endpoint in COUNTRY_URLS:
             try:
                 r = await client.get(endpoint)
             except Exception as e:
                 last = f"{type(e).__name__}: {str(e)[:120]}"
                 continue
-            ip = ""
+            ip, country = "", ""
             try:
-                ip = str((r.json() or {}).get("ip") or "")
+                data = r.json() or {}
+                ip = str(data.get("ip") or "")
+                country = _read_country(data)
             except Exception:
                 ip = (r.text or "").strip()[:40]
             if ip:
-                return True, ip
+                return True, ip, country
             last = f"応答を読めませんでした（HTTP {r.status_code}）"
-        return False, last
+        return False, last, ""
     except Exception as e:
-        return False, f"{type(e).__name__}: {str(e)[:120]}"
+        return False, f"{type(e).__name__}: {str(e)[:120]}", ""
     finally:
         if client:
             await client.aclose()
+
+
+async def check(url: str | None = None, *, timeout: float = 15.0) -> tuple[bool, str]:
+    """実際に通って、外から見える出口のIPを確かめる。
+
+    ⚠️ 国まで見たいときは check_exit を使う。こちらは
+       今までどおり (通ったか, IPまたは理由) だけを返す。
+    """
+    ok, detail, _ = await check_exit(url, timeout=timeout)
+    return ok, detail

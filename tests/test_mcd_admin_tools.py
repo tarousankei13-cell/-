@@ -148,6 +148,98 @@ async def main() -> int:
           isinstance(itx7.last_modal(), acc.McdRelabelModal),
           type(itx7.last_modal()).__name__)
 
+    # ============================================================
+    print("\n[6] プロキシの設定 ★")
+    # ⚠️ McdAccount.proxy_url は読まれているのに、設定する手段が
+    #    無かった。全アカウントが同じ出口から出てしまっていた。
+    import core.proxy as CP
+
+    RESULT = [(True, "203.0.113.9", "JP")]
+    asked: list[str] = []
+
+    async def fake_check(url=None, *, timeout=15.0):
+        asked.append(url)
+        return RESULT[0]
+
+    real_check = CP.check_exit
+    CP.check_exit = fake_check
+
+    async def proxy_of(i: int):
+        async with session_scope() as s:
+            a = await s.get(McdAccount, i)
+            return a.proxy_url if a else None
+
+    # socks は断る（追加の部品が要るうえ Discord で使えない）
+    itx8 = FakeInteraction(owner, dclient)
+    await cog.mcd_proxy.callback(cog, itx8, url="socks5://u:p@1.2.3.4:1080")
+    check("socks は断る ★", "socks" in itx8.text(), itx8.text()[:160])
+    check("socks のときは確かめに行かない ★", not asked, asked)
+    check("socks では設定されない ★", await proxy_of(1) is None)
+
+    # 通らないプロキシは設定しない
+    RESULT[0] = (False, "ProxyError: 400 Bad Request", "")
+    itx9 = FakeInteraction(owner, dclient)
+    await cog.mcd_proxy.callback(cog, itx9, url="http://1.2.3.4")
+    check("通らなければ設定しない ★", await proxy_of(1) is None)
+    check("通らない理由を見せる ★", "通りませんでした" in itx9.text(),
+          itx9.text()[:200])
+    check("次にやることを案内する ★", "ポート番号" in itx9.text(),
+          itx9.text()[:400])
+
+    # 海外の出口は断る
+    RESULT[0] = (True, "198.51.100.7", "US")
+    itx10 = FakeInteraction(owner, dclient)
+    await cog.mcd_proxy.callback(cog, itx10, url="http://1.2.3.4:8080")
+    check("海外の出口は断る ★", await proxy_of(1) is None)
+    check("日本の外だと伝える ★", "日本の外" in itx10.text(), itx10.text()[:200])
+    check("通らなくなると伝える ★", "通りません" in itx10.text(),
+          itx10.text()[:300])
+
+    # force なら海外でも入れる
+    itx11 = FakeInteraction(owner, dclient)
+    await cog.mcd_proxy.callback(
+        cog, itx11, url="http://1.2.3.4:8080", account_id=1, force=True)
+    check("force なら設定できる ★",
+          await proxy_of(1) == "http://1.2.3.4:8080", await proxy_of(1))
+    check("force では確かめに行かない ★", len(asked) == 2, len(asked))
+
+    # 日本なら、そのまま全件に設定
+    RESULT[0] = (True, "203.0.113.9", "JP")
+    itx12 = FakeInteraction(owner, dclient)
+    await cog.mcd_proxy.callback(
+        cog, itx12, url="http://user:secret@5.6.7.8:3128")
+    got_all = [await proxy_of(i) for i in (1, 2, 3)]
+    check("全件に設定できる ★",
+          all(g == "http://user:secret@5.6.7.8:3128" for g in got_all), got_all)
+    check("出口のIPを見せる ★", "203.0.113.9" in itx12.text(), itx12.text()[:300])
+    check("日本だと伝える ★", "日本" in itx12.text(), itx12.text()[:300])
+    # ⚠️ ここが漏れると、画面共有や配信でプロキシの資格情報が流出する
+    check("パスワードを画面に出さない ★", "secret" not in itx12.text(),
+          itx12.text()[:300])
+
+    # 1件だけ解除
+    itx13 = FakeInteraction(owner, dclient)
+    await cog.mcd_proxy.callback(cog, itx13, url="clear", account_id=2)
+    check("1件だけ解除できる ★", await proxy_of(2) is None, await proxy_of(2))
+    check("他は残る ★", await proxy_of(3) is not None, await proxy_of(3))
+    check("解除では確かめに行かない ★", len(asked) == 3, len(asked))
+
+    # 全件解除
+    itx14 = FakeInteraction(owner, dclient)
+    await cog.mcd_proxy.callback(cog, itx14, url="解除")
+    got_clear = [await proxy_of(i) for i in (1, 2, 3)]
+    check("全件解除できる ★", all(g is None for g in got_clear), got_clear)
+    check("解除したと伝える", "解除" in itx14.text(), itx14.text()[:160])
+
+    # 見つからないID
+    itx15 = FakeInteraction(owner, dclient)
+    await cog.mcd_proxy.callback(
+        cog, itx15, url="http://5.6.7.8:3128", account_id=999)
+    check("見つからないIDは断る ★", "見つかりません" in itx15.text(),
+          itx15.text()[:160])
+
+    CP.check_exit = real_check
+
     await close_db()
     print(f"\n{'='*52}\n  成功 {ok} / 失敗 {fail}\n{'='*52}")
     return 1 if fail else 0

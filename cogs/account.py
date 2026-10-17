@@ -1674,6 +1674,111 @@ class AccountCog(commands.Cog):
             ephemeral=True,
         )
 
+    @mcd.command(name="proxy", description="アカウントの通信の出口（プロキシ）を設定します")
+    @app_commands.describe(
+        url="http://ユーザー:パスワード@ホスト:ポート（`clear` と書くと解除）",
+        account_id="1件だけに設定する場合のID（省略すると全件）",
+        force="つながるか確かめずに、そのまま設定します",
+    )
+    @admin_only()
+    async def mcd_proxy(
+        self, interaction: discord.Interaction, url: str,
+        account_id: int | None = None, force: bool = False,
+    ) -> None:
+        """アカウントごとの通信の出口を決める。
+
+        ⚠️ McdAccount.proxy_url は読まれているのに、これまで**設定する
+           手段が無かった**。そのため全アカウントが同じ出口から出ていた。
+
+        ⚠️ パスワードを画面にも記録にも残さない。**必ず mask を通す。**
+
+        ⚠️ 設定する前に、通るか・日本から出ているかを確かめる。
+           海外の出口を入れると、注文も入金も黙って通らなくなる。
+        """
+        from sqlalchemy import select
+
+        raw = url.strip()
+        clearing = raw.lower() in ("clear", "none", "off", "解除", "なし", "")
+        target = "" if clearing else raw
+
+        if not clearing and (why := core_proxy.problem(target)):
+            await interaction.response.send_message(
+                embed=embeds.error(why), ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        note = ""
+        if not clearing and not force:
+            okay, detail, country = await core_proxy.check_exit(target)
+            if not okay:
+                tip = core_proxy.advice(target, detail)
+                await interaction.followup.send(
+                    embed=embeds.error(
+                        f"このプロキシは通りませんでした。\n`{detail}`"
+                        + (f"\n\n{tip}" if tip else "")
+                        + "\n\n確かめずに設定する場合は `force:True` を付けてください。"
+                    ),
+                    ephemeral=True,
+                )
+                return
+            if country and country != "JP":
+                await interaction.followup.send(
+                    embed=embeds.error(
+                        f"このプロキシは **日本の外（{country}）** から出ています"
+                        f"（出口のIP `{detail}`）。\n"
+                        "PayPay とマクドナルドは日本の外からの通信を弾くので、"
+                        "このままだと注文も入金も通りません。\n\n"
+                        "それでも設定する場合は `force:True` を付けてください。"
+                    ),
+                    ephemeral=True,
+                )
+                return
+            where = "日本" if country == "JP" else "国は分かりませんでした"
+            note = f"\n{E.OK} 出口のIP `{detail}`・{where}"
+
+        changed: list[str] = []
+        async with session_scope() as s:
+            q = select(McdAccount).order_by(McdAccount.id)
+            if account_id is not None:
+                q = q.where(McdAccount.id == account_id)
+            rows = (await s.execute(q)).scalars().all()
+            for a in rows:
+                a.proxy_url = target or None
+                changed.append(f"・`#{a.id}` **{a.label}**")
+
+        if not changed:
+            await interaction.followup.send(
+                embed=embeds.error(
+                    f"`#{account_id}` が見つかりませんでした。"
+                    if account_id is not None
+                    else "登録されているアカウントがありません。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        shown = core_proxy.mask(target) if target else "（解除）"
+        await audit.record(
+            actor_id=interaction.user.id, actor_name=str(interaction.user),
+            action="account.proxy",
+            target=(f"mcd:{account_id}" if account_id is not None else "mcd:all"),
+            after=shown,
+        )
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title=(f"{E.OK} プロキシを解除しました（{len(changed)}件）"
+                       if clearing
+                       else f"{E.OK} プロキシを設定しました（{len(changed)}件）"),
+                description=(
+                    f"出口: `{shown}`" + note + "\n\n" + _few(changed, 20)
+                )[:4000],
+                color=embeds.GREEN,
+            ),
+            ephemeral=True,
+        )
+
     @mcd.command(name="cards", description="全アカウントのカードを一覧で見る・まとめて探す")
     @admin_only()
     async def mcd_cards(self, interaction: discord.Interaction) -> None:
