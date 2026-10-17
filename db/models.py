@@ -189,6 +189,11 @@ class McdAccount(Base):
     #    毎回問い合わせると通信が増えるので、カードを設定した時点の値を
     #    控えておき、切れる前の知らせに使う。
     card_expiry: Mapped[str | None] = mapped_column(String(8))
+    # ゴミ箱に入れた日時。入っていなければ None。
+    #
+    # ⚠️ 削除をすぐ本削除にすると、IDを打ち間違えただけで取り返せない。
+    #    一定期間はここに日時を入れて残し、あとから戻せるようにする。
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     # 端末フィンガープリント（アカウント作成時に一度だけ生成して固定）
     device_uid: Mapped[str] = mapped_column(String(36), nullable=False)

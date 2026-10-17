@@ -211,6 +211,15 @@ async def check_ledger() -> tuple[bool, str]:
 async def daily_reset() -> None:
     await mcd_accounts.reset_daily_counters()
     log.info("アカウントの当日カウンタをリセットしました")
+    # ⚠️ ゴミ箱の期限切れを本削除する。残し続けると、消したはずの
+    #    資格情報がDBに残り続ける。注文の履歴は消さない。
+    try:
+        gone = await mcd_accounts.purge_expired()
+    except Exception as e:
+        log.warning("ゴミ箱の片付けに失敗しました: %s", e)
+    else:
+        if gone:
+            log.info("ゴミ箱のアカウントを本削除しました: %d件", gone)
 
 
 async def monthly_reset_if_needed(last_month: int | None) -> int:

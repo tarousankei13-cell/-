@@ -55,6 +55,7 @@ TESTS = [
     ("ファイルでのまとめ登録・下見", "test_mcd_bulk_file.py"),
     ("アカウント管理の道具（CSV・付け替え）", "test_mcd_admin_tools.py"),
     ("アカウント在庫・カード期限の知らせ", "test_mcd_stock.py"),
+    ("アカウントのゴミ箱と取り消し", "test_mcd_trash.py"),
     ("同時注文のアカウント割り当て", "test_account_pick.py"),
     ("決済カードとまとめ登録", "test_account_cards.py"),
     ("全スラッシュコマンドの総当たり", "test_all_commands.py"),

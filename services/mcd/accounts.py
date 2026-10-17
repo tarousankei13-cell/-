@@ -16,7 +16,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,6 +36,11 @@ STATUS_ACTIVE = "ACTIVE"
 STATUS_DEGRADED = "DEGRADED"
 STATUS_QUARANTINED = "QUARANTINED"
 STATUS_BANNED = "BANNED"
+# ゴミ箱。消したが、まだ戻せる状態。
+#
+# ⚠️ これを USABLE に入れてはいけない。注文に使うアカウントの選び方は
+#    USABLE だけを見るので、入れなければ**自動的に注文から外れる**。
+STATUS_DELETED = "DELETED"
 USABLE = (STATUS_ACTIVE, STATUS_DEGRADED)
 
 # 使えるアカウントがこれを下回ったら知らせる
@@ -49,6 +54,117 @@ def _low_threshold() -> int:
         return max(1, int(settings.get("mcd_low_accounts", LOW_ACCOUNTS_DEFAULT)))
     except (TypeError, ValueError):
         return LOW_ACCOUNTS_DEFAULT
+
+
+# ゴミ箱に入れてから、本当に消すまでの日数
+TRASH_DAYS_DEFAULT = 30
+
+
+def trash_days() -> int:
+    try:
+        return max(1, int(settings.get("mcd_trash_days", TRASH_DAYS_DEFAULT)))
+    except (TypeError, ValueError):
+        return TRASH_DAYS_DEFAULT
+
+
+def live():
+    """ゴミ箱に入っていないアカウントだけを選ぶ問い合わせ。
+
+    ⚠️ 一覧・点検・書き出し・一括操作は**必ずこれを通す**。素の
+       `select(McdAccount)` のままだと、消したはずのアカウントが一覧に
+       出たり、一括復帰でゴミ箱から蘇ったりする。
+
+    ⚠️ 注文に使うアカウントを選ぶところ（_pick_locked）は、もともと
+       USABLE だけを見ているので DELETED は入らない。
+    """
+    return select(McdAccount).where(McdAccount.status != STATUS_DELETED)
+
+
+async def soft_delete(account_id: int) -> str | None:
+    """ゴミ箱に入れる。戻り値は表示名（できなければ None）。
+
+    ⚠️ すぐに本削除しない。IDを打ち間違えただけで取り返せなくなる。
+    """
+    async with session_scope() as s:
+        acc = await s.get(McdAccount, account_id)
+        if acc is None or acc.status == STATUS_DELETED:
+            return None
+        acc.status = STATUS_DELETED
+        acc.deleted_at = utcnow()
+        return acc.label
+
+
+async def undelete(account_id: int) -> str | None:
+    """ゴミ箱から戻す。戻り値は表示名（ゴミ箱に無ければ None）。"""
+    async with session_scope() as s:
+        acc = await s.get(McdAccount, account_id)
+        if acc is None or acc.status != STATUS_DELETED:
+            return None
+        acc.status = STATUS_ACTIVE
+        acc.consecutive_failures = 0
+        acc.deleted_at = None
+        return acc.label
+
+
+async def trashed() -> list[tuple[int, str, int]]:
+    """ゴミ箱の中身。(ID, 表示名, 本削除まであと何日) を返す。"""
+    keep = trash_days()
+    now = utcnow()
+    out: list[tuple[int, str, int]] = []
+    async with session_scope() as s:
+        rows = (await s.execute(
+            select(McdAccount)
+            .where(McdAccount.status == STATUS_DELETED)
+            .order_by(McdAccount.id)
+        )).scalars().all()
+        for a in rows:
+            when = as_utc(a.deleted_at)
+            used = (now - when).days if when else 0
+            out.append((a.id, a.label, max(0, keep - used)))
+    return out
+
+
+async def purge_expired() -> int:
+    """ゴミ箱の期限切れを本当に消す。消した件数を返す。
+
+    ⚠️ 注文の履歴は残す。orders.mcd_account_id を**自分で NULL にして
+       から**消す。SQLite は既定で外部キーを効かせないので、
+       ondelete="SET NULL" に任せると、居ないアカウントを指したまま
+       残ってしまう。
+
+    ⚠️ トークンと履歴も一緒に消す。残すと、消したはずの資格情報が
+       DBに残り続ける。
+    """
+    from sqlalchemy import delete, update
+
+    from db.models import McdAccountEvent, Order
+
+    limit = utcnow() - timedelta(days=trash_days())
+    gone = 0
+    async with session_scope() as s:
+        rows = (await s.execute(
+            select(McdAccount).where(McdAccount.status == STATUS_DELETED)
+        )).scalars().all()
+        for a in rows:
+            when = as_utc(a.deleted_at)
+            if when is None or when > limit:
+                continue
+            await s.execute(
+                update(Order).where(Order.mcd_account_id == a.id)
+                .values(mcd_account_id=None)
+            )
+            await s.execute(
+                delete(McdAccountEvent)
+                .where(McdAccountEvent.mcd_account_id == a.id)
+            )
+            await s.execute(
+                delete(McdToken).where(McdToken.mcd_account_id == a.id)
+            )
+            await s.delete(a)
+            gone += 1
+    if gone:
+        log.info("ゴミ箱のアカウントを本削除しました: %d件", gone)
+    return gone
 
 
 def _expiry_threshold() -> int:
@@ -139,7 +255,7 @@ async def stock_report(*, today: date | None = None) -> StockReport:
     days_ahead = _expiry_threshold()
     async with session_scope() as s:
         rows = (await s.execute(
-            select(McdAccount).order_by(McdAccount.id)
+            live().order_by(McdAccount.id)
         )).scalars().all()
         for a in rows:
             rep.total += 1
@@ -629,7 +745,7 @@ async def healthcheck_all() -> list[tuple[int, str, bool]]:
     async with session_scope() as s:
         rows = (
             await s.execute(
-                select(McdAccount).where(McdAccount.status != STATUS_BANNED)
+                live().where(McdAccount.status != STATUS_BANNED)
             )
         ).scalars().all()
         targets = [(a.id, a.label) for a in rows]
@@ -671,7 +787,7 @@ async def report_success_healthcheck(account_id: int) -> None:
 
 async def reset_daily_counters() -> None:
     async with session_scope() as s:
-        for acc in (await s.execute(select(McdAccount))).scalars().all():
+        for acc in (await s.execute(live())).scalars().all():
             acc.orders_today = 0
 
 
@@ -754,7 +870,7 @@ async def card_overview() -> list[dict]:
     """
     async with session_scope() as s:
         rows = (await s.execute(
-            select(McdAccount).order_by(McdAccount.id)
+            live().order_by(McdAccount.id)
         )).scalars().all()
         return [
             {

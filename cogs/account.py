@@ -29,7 +29,7 @@ from core import audit
 from core import crypto
 from core import proxy as core_proxy
 from core.crypto import get_cipher
-from db.models import KyashAccount, McdAccount, McdToken, as_utc, utcnow
+from db.models import KyashAccount, McdAccount, as_utc, utcnow
 from db.session import session_scope
 from cogs._checks import admin_only, handle_check_failure
 from services.kyash.client import KyashClient, KyashError
@@ -961,7 +961,7 @@ async def _export_csv() -> tuple[bytes, int]:
     n = 0
     async with session_scope() as s:
         rows = (await s.execute(
-            select(McdAccount).order_by(McdAccount.id)
+            mcd_accounts.live().order_by(McdAccount.id)
         )).scalars().all()
         for a in rows:
             w.writerow([
@@ -1028,7 +1028,7 @@ class McdRelabelModal(discord.ui.Modal, title="表示名をまとめて付け替
         missing: list[int] = []
         async with session_scope() as s:
             rows = (await s.execute(
-                select(McdAccount).where(McdAccount.id.in_(list(want)))
+                mcd_accounts.live().where(McdAccount.id.in_(list(want)))
             )).scalars().all()
             found = {a.id for a in rows}
             missing = [i for i in want if i not in found]
@@ -1654,7 +1654,7 @@ class AccountCog(commands.Cog):
         rows_text = []
         async with session_scope() as s:
             rows = (await s.execute(
-                select(McdAccount).order_by(McdAccount.id)
+                mcd_accounts.live().order_by(McdAccount.id)
             )).scalars().all()
             for i, a in enumerate(rows, start=1):
                 before = a.label
@@ -1748,7 +1748,7 @@ class AccountCog(commands.Cog):
 
         changed: list[str] = []
         async with session_scope() as s:
-            q = select(McdAccount).order_by(McdAccount.id)
+            q = mcd_accounts.live().order_by(McdAccount.id)
             if account_id is not None:
                 q = q.where(McdAccount.id == account_id)
             rows = (await s.execute(q)).scalars().all()
@@ -1921,6 +1921,17 @@ class AccountCog(commands.Cog):
                     embed=embeds.error("アカウントが見つかりません。"), ephemeral=True
                 )
                 return
+            # ⚠️ ゴミ箱のものを、ここから戻させない。消したつもりの
+            #    アカウントが黙って注文に戻るのを防ぐ（戻すなら /mcd undo）。
+            if acc.status == mcd_accounts.STATUS_DELETED:
+                await interaction.response.send_message(
+                    embed=embeds.error(
+                        f"`#{account_id}` は**ゴミ箱に入っています**。\n"
+                        f"戻す場合は `/mcd undo {account_id}` をお使いください。"
+                    ),
+                    ephemeral=True,
+                )
+                return
             acc.status = "ACTIVE"
             acc.consecutive_failures = 0
             label = acc.label
@@ -1945,28 +1956,94 @@ class AccountCog(commands.Cog):
             embed=embeds.ok(f"`#{account_id}` **{label}** を無効にしました。"), ephemeral=True
         )
 
-    @mcd.command(name="remove", description="アカウントを削除します")
+    @mcd.command(name="remove", description="アカウントをゴミ箱に入れます（あとで戻せます）")
     @app_commands.describe(account_id="削除するアカウントID（/mcd list で確認）")
     @admin_only()
     async def mcd_remove(self, interaction: discord.Interaction, account_id: int) -> None:
-        async with session_scope() as s:
-            acc = await s.get(McdAccount, account_id)
-            if acc is None:
-                await interaction.response.send_message(
-                    embed=embeds.error("アカウントが見つかりません。"), ephemeral=True
-                )
-                return
-            label = acc.label
-            token = await s.get(McdToken, account_id)
-            if token:
-                await s.delete(token)
-            await s.delete(acc)
+        """⚠️ すぐには本削除しない。
+
+        以前はその場で消していたため、IDを1文字打ち間違えるだけで
+        取り返しがつかなかった。一定期間ゴミ箱に置き、戻せるようにする。
+        注文には使われなくなる（状態が DELETED になり、注文に使う
+        アカウントの選び方は USABLE だけを見るため）。
+        """
+        label = await mcd_accounts.soft_delete(account_id)
+        if label is None:
+            await interaction.response.send_message(
+                embed=embeds.error(
+                    "アカウントが見つかりません。\n"
+                    "（すでにゴミ箱に入っている場合は `/mcd undo` で確認できます）"
+                ),
+                ephemeral=True,
+            )
+            return
+        days = mcd_accounts.trash_days()
         await audit.record(
             actor_id=interaction.user.id, actor_name=str(interaction.user),
             action="account.remove", target=f"mcd:{account_id}", before=label,
+            detail="ゴミ箱へ",
         )
         await interaction.response.send_message(
-            embed=embeds.ok(f"`#{account_id}` **{label}** を削除しました。"), ephemeral=True
+            embed=embeds.ok(
+                f"`#{account_id}` **{label}** をゴミ箱に入れました。\n"
+                f"{E.INFO} 注文には使われなくなります。\n"
+                f"{E.INFO} **{days}日以内**なら `/mcd undo {account_id}` で戻せます。"
+            ),
+            ephemeral=True,
+        )
+
+    @mcd.command(name="undo", description="ゴミ箱のアカウントを元に戻します")
+    @app_commands.describe(
+        account_id="戻すアカウントID（省略するとゴミ箱の中身を表示します）",
+    )
+    @admin_only()
+    async def mcd_undo(
+        self, interaction: discord.Interaction, account_id: int | None = None,
+    ) -> None:
+        """ゴミ箱の確認と、取り消し。"""
+        if account_id is None:
+            rows = await mcd_accounts.trashed()
+            if not rows:
+                await interaction.response.send_message(
+                    embed=embeds.info("ゴミ箱は空です。"), ephemeral=True
+                )
+                return
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title=f"{E.INFO} ゴミ箱の中身（{len(rows)}件）",
+                    description=(
+                        _few(
+                            f"・`#{i}` **{l}**　あと {d} 日で本削除"
+                            for i, l, d in rows
+                        )
+                        + "\n\n戻すには `/mcd undo <ID>` を実行してください。"
+                    )[:4000],
+                    color=embeds.ORANGE,
+                ),
+                ephemeral=True,
+            )
+            return
+
+        label = await mcd_accounts.undelete(account_id)
+        if label is None:
+            await interaction.response.send_message(
+                embed=embeds.error(
+                    f"`#{account_id}` はゴミ箱に入っていません。\n"
+                    "（本削除された場合は戻せません。もう一度登録してください）"
+                ),
+                ephemeral=True,
+            )
+            return
+        await audit.record(
+            actor_id=interaction.user.id, actor_name=str(interaction.user),
+            action="account.undo", target=f"mcd:{account_id}", after=label,
+        )
+        await interaction.response.send_message(
+            embed=embeds.ok(
+                f"`#{account_id}` **{label}** を元に戻しました。\n"
+                f"{E.INFO} 有効（ACTIVE）になっているので、注文に使われます。"
+            ),
+            ephemeral=True,
         )
 
     @mcd.command(name="health", description="登録したアカウント1件ずつの生死を確かめる")

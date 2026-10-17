@@ -153,10 +153,12 @@ async def show_subsidy(interaction: discord.Interaction) -> None:
 
 async def show_accounts(interaction: discord.Interaction) -> None:
     from services.kyash.accounts import token_days_left
+    from services.mcd import accounts as mcd_accounts
 
     await interaction.response.defer(ephemeral=True, thinking=True)
     async with session_scope() as s:
-        mcds = (await s.execute(select(McdAccount).order_by(McdAccount.id))).scalars().all()
+        mcds = (await s.execute(
+            mcd_accounts.live().order_by(McdAccount.id))).scalars().all()
         kyashes = (await s.execute(select(KyashAccount).order_by(KyashAccount.id))).scalars().all()
         mcd_rows = [
             (a.id, a.label, a.status, a.consecutive_failures, a.orders_today, bool(a.card_id))
@@ -659,11 +661,12 @@ class AccountHealthView(discord.ui.View):
         from core import breaker
         from db.models import as_utc
         from services.kyash.accounts import token_days_left
+        from services.mcd import accounts as mcd_accounts
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         async with session_scope() as s:
             mcds = (
-                await s.execute(select(McdAccount).order_by(McdAccount.id))
+                await s.execute(mcd_accounts.live().order_by(McdAccount.id))
             ).scalars().all()
             rows = [
                 (a.id, a.label, a.status, a.consecutive_failures, a.orders_today,
@@ -731,13 +734,16 @@ class AccountHealthView(discord.ui.View):
     async def _on_unlock(self, interaction: discord.Interaction) -> None:
         """隔離したアカウントを使える状態に戻す。"""
         from core import audit, breaker
+        from services.mcd import accounts as mcd_accounts
         from services.mcd.accounts import STATUS_ACTIVE
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         restored = []
         async with session_scope() as s:
-            rows = (await s.execute(select(McdAccount))).scalars().all()
+            rows = (await s.execute(mcd_accounts.live())).scalars().all()
             for a in rows:
+                # ⚠️ ゴミ箱(DELETED)は live() で除いてある。ここで
+                #    蘇らせると、消したアカウントが注文に戻ってしまう。
                 if a.status not in ("ACTIVE", "DEGRADED", "BANNED"):
                     a.status = STATUS_ACTIVE
                     a.consecutive_failures = 0

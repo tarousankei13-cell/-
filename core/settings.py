@@ -42,6 +42,7 @@ DEFAULTS: dict[str, Any] = {
     "order_daily_limit": defaults.ORDER_DAILY_LIMIT,
     "mcd_low_accounts": defaults.MCD_LOW_ACCOUNTS,
     "mcd_card_expiry_days": defaults.MCD_CARD_EXPIRY_DAYS,
+    "mcd_trash_days": defaults.MCD_TRASH_DAYS,
     "menu_sync_interval_minutes": defaults.MENU_SYNC_INTERVAL_MINUTES,
     "store_refresh_minutes": defaults.STORE_REFRESH_MINUTES,
     "menu_notify_diff": defaults.MENU_NOTIFY_DIFF,
