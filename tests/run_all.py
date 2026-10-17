@@ -51,6 +51,8 @@ TESTS = [
     ("チャージ処理", "test_charge.py"),
     ("口座ごとのチャージ率", "test_charge_rate.py"),
     ("アカウント登録（OTP）", "test_account_setup.py"),
+    ("認証コードのまとめ入力", "test_mcd_otp_batch.py"),
+    ("ファイルでのまとめ登録・下見", "test_mcd_bulk_file.py"),
     ("同時注文のアカウント割り当て", "test_account_pick.py"),
     ("決済カードとまとめ登録", "test_account_cards.py"),
     ("全スラッシュコマンドの総当たり", "test_all_commands.py"),

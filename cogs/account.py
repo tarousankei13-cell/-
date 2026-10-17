@@ -15,6 +15,7 @@ Discord のモーダルは「送信から3秒以内に応答」が必要で、�
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 
 import discord
 
@@ -67,6 +68,43 @@ async def _save_mcd(client, fp, email: str, label: str) -> int:
         s.add(acc)
         await s.flush()
         return acc.id
+
+
+# 認証コードの入力を待つ時間（秒）。
+#
+# ⚠️ まとめ登録では**何件分ものコードを集めてから**入れる。メールを
+#    順に開いて書き写す時間が要るので、1件ぶんの感覚で短くすると
+#    「書き写している間に画面が死ぬ」→ 最初からやり直しになる。
+OTP_WAIT_SECONDS = 15 * 60
+
+
+async def _save_and_autocard(
+    client, fp, email: str, label: str,
+) -> tuple[int, str, int]:
+    """保存して、カードが1枚だけならそれを設定する。
+
+    ⚠️ 認証コードが要らなかった分と、あとからコードを入れた分の
+       **両方**がここを通る。別々に書くと、片方だけカードが設定されず
+       「登録したのに注文に選ばれない」食い違いが起きる。
+
+    戻り値は (アカウントID, カードの表示名, 使えるカードの枚数)。
+    クライアントは閉じない（呼び出し側で閉じる）。
+    """
+    account_id = await _save_mcd(client, fp, email, label)
+    cards: list[dict] = []
+    try:
+        cards = await client.get_cards()
+    except McdError:
+        pass
+    usable = [c for c in cards if c.get("card_id")]
+    card_name = ""
+    if len(usable) == 1:
+        async with session_scope() as s:
+            acc = await s.get(McdAccount, account_id)
+            if acc:
+                acc.card_id = usable[0]["card_id"]
+        card_name = (usable[0].get("masked") or "")[:32]
+    return account_id, card_name, len(usable)
 
 
 class McdCredModal(discord.ui.Modal, title="マクドナルドアカウントを追加"):
@@ -138,7 +176,7 @@ class McdCredModal(discord.ui.Modal, title="マクドナルドアカウントを
 
 class McdOtpView(discord.ui.View):
     def __init__(self, owner_id, client, fp, mfa_token, email, label) -> None:
-        super().__init__(timeout=300)
+        super().__init__(timeout=OTP_WAIT_SECONDS)
         self.owner_id = owner_id
         self.client = client
         self.fp = fp
@@ -200,6 +238,294 @@ class McdOtpModal(discord.ui.Modal, title="認証コードの入力"):
         await _after_mcd_added(interaction, account_id, p.label, cards)
 
 
+# ============================================================
+#  認証コードを、あとからまとめて入れる
+# ============================================================
+#
+# まとめ登録では、認証コードを求められた分を**捨てずに預かる**。
+# メールとパスワードは預かった側が持っているので、利用者があとから
+# 入れるのは **コードだけ** で済む。
+#
+# ⚠️ 以前はコードを求められた時点で諦めていた（クライアントを閉じて
+#    「`/mcd add` で1件ずつ」と案内していた）。10件あれば10回、
+#    メールとパスワードを打ち直すことになっていた。
+
+
+@dataclass
+class _PendingOtp:
+    """認証コードを待っているアカウント1件。
+
+    ⚠️ client と mfa_token は**ログインの続き**に必要なので捨てない。
+       持ち続ける以上、**必ず閉じる**こと。完了・やめる・時間切れの
+       すべての道で閉じる（閉じ忘れると通信が開いたまま残る）。
+    """
+
+    email: str
+    label: str
+    fp: object
+    client: object
+    mfa_token: str
+    attempts: int = 0
+    done: bool = False
+    note: str = ""
+
+
+_OTP_SEPS = (",", ":", "=", "\t", " ")
+
+
+def _parse_otp_batch(
+    raw: str, open_idx: list[int],
+) -> tuple[dict[int, str], list[str]]:
+    """貼られた文字列から {番号: コード} を取り出す。
+
+    ⚠️ 入れ方を1つに強制しない。届いたメールを開く順番は人によって
+       違うので、
+
+         ・`1,123456` と番号を添える（並び順が違っても安全）
+         ・`123456` だけを並べる（表示した順に当てる）
+
+       の両方を受ける。番号付きを先に確定させ、番号なしのコードは
+       **空いている番号へ上から詰める**。
+
+    ⚠️ 番号は画面の表示と同じ 1 始まり。内部は 0 始まりなので変換する。
+
+    戻り値は (割り当て, 読めなかった行)。
+    """
+    numbered: dict[int, str] = {}
+    bare: list[str] = []
+    bad: list[str] = []
+    allowed = set(open_idx)
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        idx: int | None = None
+        code = line
+        for sep in _OTP_SEPS:
+            if sep in line:
+                head, _, tail = line.partition(sep)
+                head, tail = head.strip(), tail.strip()
+                if head.isdigit() and tail.isdigit():
+                    idx, code = int(head) - 1, tail
+                break
+        if not code.isdigit() or not (4 <= len(code) <= 8):
+            bad.append(line[:40])
+            continue
+        if idx is None:
+            bare.append(code)
+        elif idx in allowed:
+            numbered[idx] = code
+        else:
+            # まだ待っていない番号。取り違えて別の口座に入れないよう断る。
+            bad.append(line[:40])
+
+    # 番号なしのコードを、空いている番号へ上から詰める
+    free = [i for i in open_idx if i not in numbered]
+    for code in bare:
+        if not free:
+            bad.append(code)
+            continue
+        numbered[free.pop(0)] = code
+    return numbered, bad
+
+
+class OtpBatchView(discord.ui.View):
+    """預かった分の認証コードを、まとめて片付ける画面。
+
+    ⚠️ 持っているクライアントは必ず閉じる。完了・やめる・時間切れの
+       すべての道で閉じること。
+    """
+
+    def __init__(self, owner_id: int, pending: list[_PendingOtp]) -> None:
+        super().__init__(timeout=OTP_WAIT_SECONDS)
+        self.owner_id = owner_id
+        self.pending = pending
+        # 登録できた分（アカウントID, 表示名, カード名, 使えるカード枚数）
+        self.added: list[tuple[int, str, str, int]] = []
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_id
+
+    def open_idx(self) -> list[int]:
+        """まだコードを待っている番号（0始まり）。"""
+        return [i for i, x in enumerate(self.pending) if not x.done]
+
+    def listing(self) -> str:
+        rows = []
+        for i, x in enumerate(self.pending):
+            no = i + 1
+            if x.done:
+                rows.append(f"{E.OK} `{no}` {_mask_mail(x.email)}　{x.note}")
+            else:
+                tail = f"　{x.note}" if x.note else ""
+                rows.append(f"{E.KEY} `{no}` {_mask_mail(x.email)}{tail}")
+        return "\n".join(rows)
+
+    async def close_open(self) -> None:
+        """まだ終わっていない分のクライアントを閉じる。"""
+        for x in self.pending:
+            if not x.done:
+                try:
+                    await x.client.aclose()
+                except Exception:
+                    pass
+
+    async def on_timeout(self) -> None:
+        # ⚠️ 時間切れでも必ず閉じる。
+        await self.close_open()
+
+    @discord.ui.button(
+        label="認証コードをまとめて入力", emoji=E.KEY,
+        style=discord.ButtonStyle.primary,
+    )
+    async def enter(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not self.open_idx():
+            await interaction.response.send_message(
+                embed=embeds.info("待っている分はもうありません。"), ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(OtpBatchModal(self))
+
+    @discord.ui.button(label="やめる", emoji=E.NG, style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        left = len(self.open_idx())
+        await self.close_open()
+        for x in self.pending:
+            x.done = True
+        self.stop()
+        await interaction.response.edit_message(
+            embed=embeds.info(
+                f"{E.INFO} 残り {left} 件の登録をやめました。\n"
+                "あとで入れたい場合は、`/mcd bulk` からもう一度お試しください。"
+            ),
+            view=None,
+        )
+
+
+class OtpBatchModal(discord.ui.Modal, title="認証コードの入力（まとめて）"):
+    codes = discord.ui.TextInput(
+        label="番号とコード（1行に1件）",
+        style=discord.TextStyle.paragraph,
+        required=True, max_length=1000,
+        placeholder=("1,123456\n2,654321\n"
+                     "（番号を省いてコードだけ並べても大丈夫です）"),
+    )
+
+    def __init__(self, parent: OtpBatchView) -> None:
+        super().__init__()
+        self.parent = parent
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        p = self.parent
+        assign, bad = _parse_otp_batch(str(self.codes.value), p.open_idx())
+
+        if not assign:
+            await interaction.followup.send(
+                embed=embeds.error(
+                    "コードを読み取れませんでした。\n"
+                    "`番号,コード` の形で1行に1件入れてください。"
+                    + (f"\n読めなかった行: {len(bad)}" if bad else "")
+                ),
+                ephemeral=True,
+            )
+            return
+
+        ok, ng = 0, 0
+        for idx, code in sorted(assign.items()):
+            x = p.pending[idx]
+            if x.done:
+                continue
+            try:
+                await x.client.login_with_mfa(x.mfa_token, code)
+            except McdError as e:
+                x.attempts += 1
+                ng += 1
+                if x.attempts >= 3:
+                    # ⚠️ 3回間違えたら、この分は閉じて終わりにする。
+                    #    開いたまま残すと通信が残る。
+                    try:
+                        await x.client.aclose()
+                    except Exception:
+                        pass
+                    x.done = True
+                    x.note = f"{E.NG} 3回失敗したのでやめました"
+                else:
+                    x.note = f"{E.NG} {str(e)[:40]}（残り {3 - x.attempts} 回）"
+                continue
+            except Exception as e:
+                log.exception("認証コードの確認に失敗しました: %s", x.email)
+                ng += 1
+                x.note = f"{E.NG} {type(e).__name__}"
+                continue
+
+            try:
+                account_id, card_name, n_usable = await _save_and_autocard(
+                    x.client, x.fp, x.email, x.label
+                )
+            except Exception as e:
+                log.exception("アカウントの保存に失敗しました: %s", x.email)
+                ng += 1
+                x.note = f"{E.NG} 保存に失敗 {type(e).__name__}"
+                continue
+            finally:
+                try:
+                    await x.client.aclose()
+                except Exception:
+                    pass
+
+            x.done = True
+            ok += 1
+            p.added.append((account_id, x.label, card_name, n_usable))
+            mark = (f"カード {card_name or '設定済み'}" if n_usable == 1
+                    else (f"{E.WARN} カード{n_usable}枚 → `/mcd card {account_id}`"
+                          if n_usable > 1 else f"{E.NG} カード無し"))
+            x.note = f"`#{account_id}` **{x.label}**　{mark}"
+
+            await audit.record(
+                actor_id=interaction.user.id, actor_name=str(interaction.user),
+                action="account.add", target=f"mcd:{account_id}",
+                detail="まとめ登録（認証コード）",
+            )
+
+        left = p.open_idx()
+        parts = [
+            f"{E.OK} **{ok} 件を登録しました**" if ok else "",
+            f"{E.NG} **{ng} 件は進めませんでした**" if ng else "",
+            f"{E.WARN} 読めなかった行: {len(bad)} 件" if bad else "",
+            p.listing(),
+        ]
+        desc = "\n\n".join([x for x in parts if x])[:4000]
+
+        if left:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title=f"{E.KEY} 認証コードの入力（残り {len(left)} 件）",
+                    description=desc + (
+                        "\n\n残っている分は、もう一度 **認証コードをまとめて入力** "
+                        "から入れてください。"
+                    ),
+                    color=embeds.GREEN if ok else embeds.RED,
+                ),
+                view=p,
+                ephemeral=True,
+            )
+            return
+
+        p.stop()
+        no_card = [a for a in p.added if a[3] == 0]
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title=f"{E.PEOPLE} 認証コードの入力が終わりました",
+                description=desc,
+                color=embeds.GREEN if ok else embeds.RED,
+            ),
+            view=(CardScanView(interaction.user.id, [a[0] for a in no_card])
+                  if no_card else None),
+            ephemeral=True,
+        )
+
 
 class McdBulkModal(discord.ui.Modal, title="アカウントをまとめて登録"):
     """自分で作ったアカウントを、順に取り込む。
@@ -222,22 +548,29 @@ class McdBulkModal(discord.ui.Modal, title="アカウントをまとめて登録
     )
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        # ⚠️ ここは**3秒以内に応答**しなければならない。読み取りは
+        #    文字列を見るだけにして、DBや通信は応答後（_run_bulk）に回す。
+        #    既に登録済みかどうかの照合も、あちらで行う。
         raw = str(self.lines.value)
-        entries = _parse_bulk(raw)
-        if not entries:
+        r = _parse_bulk_report(raw)
+        if not r.entries:
             await interaction.response.send_message(
                 embed=embeds.error(
                     "読み取れる行がありませんでした。\n"
                     "`メールアドレス,パスワード` の形で1行に1件、"
-                    "入れてください。"
+                    "入れてください。\n\n" + _skip_report(r, [])
                 ),
                 ephemeral=True,
             )
             return
-        if len(entries) > 20:
+        if len(r.entries) > BULK_MAX_PASTE:
             await interaction.response.send_message(
                 embed=embeds.error(
-                    f"一度に登録できるのは20件までです（{len(entries)}件ありました）。"
+                    f"一度に登録できるのは{BULK_MAX_PASTE}件までです"
+                    f"（{len(r.entries)}件ありました）。\n"
+                    f"{E.INFO} ファイルを添付すれば、"
+                    f"{BULK_MAX_FILE}件までまとめて入れられます"
+                    "（`/mcd bulk file:〜`）。"
                 ),
                 ephemeral=True,
             )
@@ -245,83 +578,130 @@ class McdBulkModal(discord.ui.Modal, title="アカウントをまとめて登録
 
         await interaction.response.send_message(
             embed=embeds.info(
-                f"{E.LOADING} {len(entries)} 件を順に登録しています…\n"
+                f"{E.LOADING} {len(r.entries)} 件を順に登録しています…\n"
                 f"{E.INFO} 1件ずつログインするので少し時間がかかります。"
+                + _skip_summary(r)
             ),
             ephemeral=True,
         )
+        await _run_bulk(interaction, r.entries, parse=r)
 
-        added, otp_needed, failed = [], [], []
-        for email, password, label in entries:
-            fp = Fingerprint.generate(*mcd_accounts.random_home_location())
-            client = McdClient(fp)
+
+async def _run_bulk(
+    interaction: discord.Interaction, entries: list[tuple[str, str, str]],
+    *, parse: "BulkParse | None" = None,
+) -> None:
+    """読み取り済みの行を順に登録して、結果を出す。
+
+    ⚠️ 貼り付けから来た分とファイルから来た分の**両方**がここを通る。
+       別々に書くと、片方だけ認証コードを預からない等の食い違いが起きる。
+
+    ⚠️ すでに応答済み（defer か send_message 済み）で呼ぶこと。
+       ここからは followup で返す。
+
+    ⚠️ すでに登録済みのメールは**ログインを試さずに外す**。ここは
+       応答済みなので、復号の時間がかかってもモーダルの3秒制限に
+       かからない。二重に登録すると、どちらが使われるか分からなくなる。
+    """
+    have = await _existing_emails()
+    already = [e for e, _, _ in entries if e.lower() in have]
+    entries = [x for x in entries if x[0].lower() not in have]
+    # ⚠️ 呼び出し側がすでに外している分（ファイル経路）も合わせて報告する。
+    #    ここで数え直すだけだと、外してある分は空になり、
+    #    「登録済みだから飛ばした」ことが画面から消えてしまう。
+    if parse is not None and parse.already:
+        already = list(dict.fromkeys(list(parse.already) + already))
+
+    added, failed = [], []
+    # ⚠️ 認証コードが必要な分は**捨てずに預かる**。クライアントと
+    #    mfa_token を持ち続けるので、利用者はあとから**コードだけ**
+    #    入れれば済む（メールとパスワードを打ち直さない）。
+    #    預かったものは OtpBatchView が必ず閉じる。
+    pending_otp: list[_PendingOtp] = []
+    for email, password, label in entries:
+        fp = Fingerprint.generate(*mcd_accounts.random_home_location())
+        client = McdClient(fp)
+        try:
+            result = await client.login(email, password)
+            if result.needs_otp:
+                pending_otp.append(_PendingOtp(
+                    email=email, label=label, fp=fp,
+                    client=client, mfa_token=result.mfa_token,
+                ))
+                continue          # ★閉じない。続きがある
+            account_id, card_name, n_usable = await _save_and_autocard(
+                client, fp, email, label
+            )
+            await client.aclose()
+            added.append((account_id, label, card_name, n_usable))
+        except McdError as e:
+            failed.append((email, str(e)[:80]))
+            await client.aclose()
+        except Exception as e:
+            log.exception("まとめ登録に失敗しました: %s", email)
+            failed.append((email, f"{type(e).__name__}: {e}"[:80]))
             try:
-                result = await client.login(email, password)
-                if result.needs_otp:
-                    # ⚠️ ここでは進めない。コードは本人が受け取るもので、
-                    #    まとめ処理の中で待つことはできない。
-                    otp_needed.append(email)
-                    await client.aclose()
-                    continue
-                account_id = await _save_mcd(client, fp, email, label)
-                cards = []
-                try:
-                    cards = await client.get_cards()
-                except McdError:
-                    pass
                 await client.aclose()
-                # カードが1枚だけなら、ここで設定してしまう
-                usable = [c for c in cards if c.get("card_id")]
-                card_name = ""
-                if len(usable) == 1:
-                    async with session_scope() as s:
-                        acc = await s.get(McdAccount, account_id)
-                        if acc:
-                            acc.card_id = usable[0]["card_id"]
-                    card_name = (usable[0].get("masked") or "")[:32]
-                added.append((account_id, label, card_name, len(usable)))
-            except McdError as e:
-                failed.append((email, str(e)[:80]))
-                await client.aclose()
-            except Exception as e:
-                log.exception("まとめ登録に失敗しました: %s", email)
-                failed.append((email, f"{type(e).__name__}: {e}"[:80]))
-                try:
-                    await client.aclose()
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
-        parts = []
-        if added:
-            rows = []
-            for aid, label, card, n in added:
-                mark = (f"カード {card or '設定済み'}" if n == 1
-                        else (f"{E.WARN} カード{n}枚 → `/mcd card {aid}`" if n > 1
-                              else f"{E.NG} カード無し"))
-                rows.append(f"・`#{aid}` **{label}**　{mark}")
-            parts.append(f"{E.OK} **登録できました（{len(added)}件）**\n"
-                         + "\n".join(rows))
-        if otp_needed:
-            parts.append(
-                f"{E.KEY} **認証コードが必要です（{len(otp_needed)}件）**\n"
-                + "\n".join(f"・{_mask_mail(m)}" for m in otp_needed)
-                + "\n→ `/mcd add` で1件ずつ登録してください。"
-            )
-        if failed:
-            parts.append(
-                f"{E.NG} **登録できませんでした（{len(failed)}件）**\n"
-                + "\n".join(f"・{_mask_mail(m)}　{why}" for m, why in failed)
-            )
+    parts = []
+    # ⚠️ 飛ばした分を黙って消さない。打ち間違えた1行が
+    #    「登録されていない」ことに気づけなくなる。
+    skip = _skip_report(parse, already)
+    if skip:
+        parts.append(skip)
+    if added:
+        rows = []
+        for aid, label, card, n in added:
+            mark = (f"カード {card or '設定済み'}" if n == 1
+                    else (f"{E.WARN} カード{n}枚 → `/mcd card {aid}`" if n > 1
+                          else f"{E.NG} カード無し"))
+            rows.append(f"・`#{aid}` **{label}**　{mark}")
+        parts.append(f"{E.OK} **登録できました（{len(added)}件）**\n"
+                     + "\n".join(rows))
+    if pending_otp:
+        parts.append(
+            f"{E.KEY} **認証コードが必要です（{len(pending_otp)}件）**\n"
+            "→ このあとの画面で、**コードだけ**まとめて入れれば登録できます。\n"
+            "（メールとパスワードを打ち直す必要はありません）"
+        )
+    if failed:
+        parts.append(
+            f"{E.NG} **登録できませんでした（{len(failed)}件）**\n"
+            + "\n".join(f"・{_mask_mail(m)}　{why}" for m, why in failed)
+        )
 
-        no_card = [a for a in added if a[3] == 0]
+    no_card = [a for a in added if a[3] == 0]
+    await interaction.followup.send(
+        embed=discord.Embed(
+            title=f"{E.PEOPLE} まとめ登録の結果",
+            description="\n\n".join(parts)[:4000],
+            color=embeds.GREEN if added else embeds.RED,
+        ),
+        view=(CardScanView(interaction.user.id, [a[0] for a in no_card])
+              if no_card else None),
+        ephemeral=True,
+    )
+
+    # 認証コードを待っている分は、別のメッセージで預かり画面を出す。
+    #
+    # ⚠️ 1つのメッセージに付けられる画面は1つだけなので、カードの
+    #    画面とは分ける。こちらは時間切れがあるので後に出す。
+    if pending_otp:
+        view = OtpBatchView(interaction.user.id, pending_otp)
         await interaction.followup.send(
             embed=discord.Embed(
-                title=f"{E.PEOPLE} まとめ登録の結果",
-                description="\n\n".join(parts)[:4000],
-                color=embeds.GREEN if added else embeds.RED,
+                title=f"{E.KEY} 認証コードの入力（{len(pending_otp)}件）",
+                description=(
+                    "届いた **6桁** を、下のボタンから**まとめて**入れて"
+                    f"ください（{OTP_WAIT_SECONDS // 60}分以内）。\n"
+                    "番号を添えても、コードだけ順に並べても読み取れます。\n\n"
+                    + view.listing()
+                )[:4000],
+                color=embeds.BLUE,
             ),
-            view=(CardScanView(interaction.user.id, [a[0] for a in no_card])
-                  if no_card else None),
+            view=view,
             ephemeral=True,
         )
 
@@ -333,16 +713,46 @@ def _mask_mail(email: str) -> str:
     return f"{head}***@{domain}" if domain else f"{head}***"
 
 
-def _parse_bulk(raw: str) -> list[tuple[str, str, str]]:
+# 一度に登録できる件数。
+#
+# ⚠️ 1件ずつログインするので、多すぎると Discord の応答期限
+#    （操作を受け付けてから15分）を超えて結果を返せなくなる。
+#    貼り付けは入力窓が2000文字までなので、そもそも多くは入らない。
+BULK_MAX_PASTE = 20
+BULK_MAX_FILE = 100
+
+
+@dataclass
+class BulkParse:
+    """読み取りの結果。**何を採って何を捨てたか**を全部持つ。
+
+    ⚠️ 黙って捨てないこと。以前は読めない行をそのまま飛ばしていたので、
+       打ち間違えた1行が「登録されていない」ことに気づけなかった。
+    """
+
+    entries: list[tuple[str, str, str]] = field(default_factory=list)
+    bad: list[tuple[int, str]] = field(default_factory=list)      # 読めない行
+    dup: list[tuple[int, str]] = field(default_factory=list)      # 同じファイル内の重複
+    already: list[str] = field(default_factory=list)              # すでに登録済み
+
+    @property
+    def total_skipped(self) -> int:
+        return len(self.bad) + len(self.dup) + len(self.already)
+
+
+def _parse_bulk_report(raw: str) -> BulkParse:
     """貼られた文字列から (メール, パスワード, 表示名) を取り出す。
 
     ⚠️ 区切り文字を決め打ちしない。カンマで貼る人もコロンで貼る人も
        タブで貼る人もいる。パスワードに区切り文字が入ることもあるので、
        **最初の1つだけ**で切る。
+
+    ⚠️ 捨てた行は**行番号つきで**返す。どこを直せばよいか分からないと、
+       打ち間違いを見つけられない。
     """
-    out: list[tuple[str, str, str]] = []
-    seen: set[str] = set()
-    for line in raw.splitlines():
+    r = BulkParse()
+    seen: dict[str, int] = {}
+    for no, line in enumerate(raw.splitlines(), start=1):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -353,13 +763,122 @@ def _parse_bulk(raw: str) -> list[tuple[str, str, str]]:
                 break
         email, password = email.strip(), password.strip()
         if not email or not password or "@" not in email:
+            r.bad.append((no, line[:60]))
             continue
         key = email.lower()
         if key in seen:      # 同じものを2回登録しない
+            r.dup.append((no, email))
             continue
-        seen.add(key)
-        out.append((email, password, email.split("@")[0][:32]))
+        seen[key] = no
+        r.entries.append((email, password, email.split("@")[0][:32]))
+    return r
+
+
+def _parse_bulk(raw: str) -> list[tuple[str, str, str]]:
+    """読み取れた分だけを返す（従来どおりの入口）。"""
+    return _parse_bulk_report(raw).entries
+
+
+async def _existing_emails() -> set[str]:
+    """すでに登録されているメールアドレス（小文字）。
+
+    ⚠️ メールは暗号化して持っているので、**復号して**照合する。
+       鍵が合わず読めないものは照合できないので黙って飛ばす
+       （「登録済み」と誤って断るほうが困る）。
+    """
+    from sqlalchemy import select
+
+    out: set[str] = set()
+    async with session_scope() as s:
+        rows = (await s.execute(select(McdAccount))).scalars().all()
+        for acc in rows:
+            mail = crypto.try_decrypt(acc.email_enc)
+            if mail:
+                out.add(mail.strip().lower())
     return out
+
+
+def _few(lines, limit: int = 10) -> str:
+    """多すぎる一覧は頭だけ出す（埋め込みの字数に収めるため）。"""
+    got = list(lines)
+    tail = f"\n…ほか {len(got) - limit} 件" if len(got) > limit else ""
+    return "\n".join(got[:limit]) + tail
+
+
+def _skip_report(parse: "BulkParse | None", already: list[str]) -> str:
+    """飛ばした行の報告（登録済み・重複・読めない行）。
+
+    ⚠️ 行番号を添える。どこを直せばよいか分からないと、打ち間違いを
+       見つけられない。
+    """
+    blocks = []
+    if already:
+        blocks.append(
+            f"{E.INFO} **すでに登録済み（飛ばしました）: {len(already)}件**\n"
+            + _few(f"・{_mask_mail(m)}" for m in already)
+        )
+    if parse and parse.dup:
+        blocks.append(
+            f"{E.WARN} **同じメールの重複: {len(parse.dup)}件**\n"
+            + _few(f"・{no}行目 {_mask_mail(m)}" for no, m in parse.dup)
+        )
+    if parse and parse.bad:
+        blocks.append(
+            f"{E.NG} **読めなかった行: {len(parse.bad)}件**\n"
+            + _few(f"・{no}行目 `{t}`" for no, t in parse.bad)
+        )
+    return "\n\n".join(blocks)
+
+
+def _skip_summary(r: "BulkParse") -> str:
+    """読み込み直後に出す一行だけの要約。"""
+    bits = []
+    if r.dup:
+        bits.append(f"重複 {len(r.dup)}件")
+    if r.bad:
+        bits.append(f"読めない行 {len(r.bad)}件")
+    return f"\n{E.WARN} " + "・".join(bits) + " は飛ばします。" if bits else ""
+
+
+def _bulk_preview(r: "BulkParse", limit: int) -> str:
+    """下見（ドライラン）の結果。"""
+    parts = [f"{E.OK} **登録できる行: {len(r.entries)}件**"]
+    skip = _skip_report(r, r.already)
+    if skip:
+        parts.append(skip)
+    if len(r.entries) > limit:
+        parts.append(
+            f"{E.NG} 一度に登録できるのは **{limit}件** までです"
+            f"（{len(r.entries)}件ありました）。分けて実行してください。"
+        )
+    return "\n\n".join(parts)
+
+
+async def _read_bulk_file(file: discord.Attachment) -> str | None:
+    """添付ファイルを文字列にする。読めなければ None。
+
+    ⚠️ 大きすぎるものは読まない。間違ったファイルを添付したときに、
+       いきなり何百件もログインを試させないため。
+
+    ⚠️ 文字コードを決め打ちしない。Excel から出すと cp932 になることが
+       あり、UTF-8 だけだと「読めません」で止まってしまう。
+    """
+    if (file.size or 0) > 1_000_000:
+        return None
+    name = (file.filename or "").lower()
+    if not name.endswith((".txt", ".csv")):
+        return None
+    try:
+        data = await file.read()
+    except Exception:
+        log.exception("添付ファイルを取得できませんでした")
+        return None
+    for enc in ("utf-8-sig", "utf-8", "cp932"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return None
 
 
 async def _after_mcd_added(
@@ -719,12 +1238,96 @@ class AccountCog(commands.Cog):
         )
 
     @mcd.command(name="bulk", description="自分のアカウントをまとめて登録します")
+    @app_commands.describe(
+        file="メールとパスワードを並べたファイル（.txt / .csv・1行に1件）",
+        dry_run="登録せずに、読み取れるかどうかだけ確かめます",
+    )
     @admin_only()
-    async def mcd_bulk(self, interaction: discord.Interaction) -> None:
+    async def mcd_bulk(
+        self, interaction: discord.Interaction,
+        file: discord.Attachment | None = None,
+        dry_run: bool = False,
+    ) -> None:
         """⚠️ すでに持っているアカウントを取り込むもの。
            新しくアカウントを作る機能ではない。
+
+        ⚠️ 貼り付けの入力窓は2000文字・{BULK_MAX_PASTE}件までしか入らない。
+           件数が多いときはファイルを添付する。
         """
-        await interaction.response.send_modal(McdBulkModal())
+        # ファイルが無く、下見でもなければ、今までどおり貼り付け窓を出す
+        if file is None and not dry_run:
+            await interaction.response.send_modal(McdBulkModal())
+            return
+        if file is None:
+            await interaction.response.send_message(
+                embed=embeds.error(
+                    "下見をするときは、ファイルを添付してください。\n"
+                    "貼り付けで入れる場合は、何も付けずに実行してください。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        raw = await _read_bulk_file(file)
+        if raw is None:
+            await interaction.followup.send(
+                embed=embeds.error(
+                    "ファイルを読めませんでした。\n"
+                    "`.txt` か `.csv`（1MBまで）にしてください。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        r = _parse_bulk_report(raw)
+        # 下見でも「すでに登録済み」まで見せる。実行前に分かるほうがよい。
+        have = await _existing_emails()
+        r.already = [e for e, _, _ in r.entries if e.lower() in have]
+        r.entries = [x for x in r.entries if x[0].lower() not in have]
+
+        if dry_run:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title=f"{E.INFO} 下見の結果（登録はしていません）",
+                    description=_bulk_preview(r, BULK_MAX_FILE)[:4000],
+                    color=embeds.BLUE,
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if not r.entries:
+            await interaction.followup.send(
+                embed=embeds.error(
+                    "登録できる行がありませんでした。\n\n"
+                    + _bulk_preview(r, BULK_MAX_FILE)[:3500]
+                ),
+                ephemeral=True,
+            )
+            return
+        if len(r.entries) > BULK_MAX_FILE:
+            await interaction.followup.send(
+                embed=embeds.error(
+                    f"一度に登録できるのは{BULK_MAX_FILE}件までです"
+                    f"（{len(r.entries)}件ありました）。\n"
+                    "ファイルを分けて実行してください。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            embed=embeds.info(
+                f"{E.LOADING} {len(r.entries)} 件を順に登録しています…\n"
+                f"{E.INFO} 1件ずつログインするので時間がかかります。"
+                + _skip_summary(r)
+            ),
+            ephemeral=True,
+        )
+        # ⚠️ already はここで渡す。_run_bulk 側でもう一度照合すると、
+        #    すでに外してあるので二重に数えてしまう。
+        await _run_bulk(interaction, r.entries, parse=r)
 
     @mcd.command(name="cards", description="全アカウントのカードを一覧で見る・まとめて探す")
     @admin_only()
