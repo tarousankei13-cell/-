@@ -17,6 +17,7 @@ from core import settings
 from core.crypto import get_cipher, init_cipher
 from db.models import McdAccount
 from db.session import close_db, init_db, session_scope
+from services.mcd import accounts as A2
 
 ok = fail = 0
 def check(name, cond, extra=""):
@@ -239,6 +240,53 @@ async def main() -> int:
           itx15.text()[:160])
 
     CP.check_exit = real_check
+
+    # ============================================================
+    print("\n[7] しきい値の設定 ★")
+    # ⚠️ /config 側はサブコマンドの上限(25)に達しているので、
+    #    アカウントの設定は /mcd settings に置いてある。
+    itx16 = FakeInteraction(owner, dclient)
+    await cog.mcd_settings.callback(cog, itx16)
+    check("何も指定しなければ今の値を見せる ★", "いまの設定" in itx16.text(),
+          itx16.text()[:200])
+    check("書き換えない ★", int(settings.get("mcd_low_accounts")) == 2,
+          settings.get("mcd_low_accounts"))
+
+    itx17 = FakeInteraction(owner, dclient)
+    await cog.mcd_settings.callback(cog, itx17, low=4, expiry_days=10, trash_days=7)
+    check("3つとも設定できる ★",
+          (int(settings.get("mcd_low_accounts")) == 4
+           and int(settings.get("mcd_card_expiry_days")) == 10
+           and int(settings.get("mcd_trash_days")) == 7),
+          [settings.get(k) for k in
+           ("mcd_low_accounts", "mcd_card_expiry_days", "mcd_trash_days")])
+    check("設定したと伝える", "設定しました" in itx17.text(), itx17.text()[:200])
+
+    # 1つだけ変えても他は残る
+    itx18 = FakeInteraction(owner, dclient)
+    await cog.mcd_settings.callback(cog, itx18, low=3)
+    check("1つだけ変えられる ★",
+          int(settings.get("mcd_low_accounts")) == 3
+          and int(settings.get("mcd_trash_days")) == 7,
+          [settings.get("mcd_low_accounts"), settings.get("mcd_trash_days")])
+
+    # あり得ない値は断る
+    for kw, why in (({"low": 0}, "1以上"), ({"expiry_days": 400}, "0〜365"),
+                    ({"trash_days": 0}, "1〜365")):
+        itxX = FakeInteraction(owner, dclient)
+        await cog.mcd_settings.callback(cog, itxX, **kw)
+        check(f"あり得ない値を断る（{list(kw)[0]}）★", why in itxX.text(),
+              itxX.text()[:160])
+    check("断ったときは書き換えない ★",
+          int(settings.get("mcd_low_accounts")) == 3,
+          settings.get("mcd_low_accounts"))
+
+    # 設定が実際に効く
+    await settings.set_value("mcd_trash_days", 7)
+    check("ゴミ箱の日数が効く ★", A2.trash_days() == 7, A2.trash_days())
+    await settings.set_value("mcd_low_accounts", 2)
+    await settings.set_value("mcd_card_expiry_days", 45)
+    await settings.set_value("mcd_trash_days", 30)
 
     await close_db()
     print(f"\n{'='*52}\n  成功 {ok} / 失敗 {fail}\n{'='*52}")

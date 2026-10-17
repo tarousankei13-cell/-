@@ -28,6 +28,7 @@ import emoji as E
 from core import audit
 from core import crypto
 from core import proxy as core_proxy
+from core import settings
 from core.crypto import get_cipher
 from db.models import KyashAccount, McdAccount, as_utc, utcnow
 from db.session import session_scope
@@ -1630,7 +1631,8 @@ class AccountCog(commands.Cog):
     )
     @admin_only()
     async def mcd_relabel(
-        self, interaction: discord.Interaction, prefix: str | None = None,
+        self, interaction: discord.Interaction,
+        prefix: app_commands.Range[str, 1, 24] | None = None,
     ) -> None:
         """表示名を付け替える。
 
@@ -1690,7 +1692,8 @@ class AccountCog(commands.Cog):
     )
     @admin_only()
     async def mcd_proxy(
-        self, interaction: discord.Interaction, url: str,
+        self, interaction: discord.Interaction,
+        url: app_commands.Range[str, 1, 300],
         account_id: int | None = None, force: bool = False,
     ) -> None:
         """アカウントごとの通信の出口を決める。
@@ -1783,6 +1786,89 @@ class AccountCog(commands.Cog):
                     f"出口: `{shown}`" + note + "\n\n" + _few(changed, 20)
                 )[:4000],
                 color=embeds.GREEN,
+            ),
+            ephemeral=True,
+        )
+
+    @mcd.command(name="settings", description="アカウントの知らせ・ゴミ箱の設定")
+    @app_commands.describe(
+        low="使えるアカウントがこの数を下回ったら知らせる（既定2件）",
+        expiry_days="カードの期限がこの日数以内に迫ったら知らせる（既定45日）",
+        trash_days="削除したアカウントをゴミ箱に置く日数（既定30日）",
+    )
+    @admin_only()
+    async def mcd_settings(
+        self, interaction: discord.Interaction,
+        low: int | None = None,
+        expiry_days: int | None = None,
+        trash_days: int | None = None,
+    ) -> None:
+        """アカウントの手当てに関わる3つのしきい値。
+
+        ⚠️ `/config` 側はサブコマンドの上限（25個）に達しているため、
+           アカウントの設定はこちらに置いている。
+
+        ⚠️ 何も指定しなければ、いまの値を見せるだけにする。確認したい
+           だけの人に、うっかり書き換えさせない。
+        """
+        changed: list[str] = []
+        if low is not None:
+            if low < 1:
+                await interaction.response.send_message(
+                    embed=embeds.error("知らせる件数は1以上にしてください。"),
+                    ephemeral=True,
+                )
+                return
+            await settings.set_value(
+                "mcd_low_accounts", low, updated_by=interaction.user.id)
+            changed.append(f"使えるアカウントの目安: **{low}件**")
+        if expiry_days is not None:
+            if not 0 <= expiry_days <= 365:
+                await interaction.response.send_message(
+                    embed=embeds.error("カードの期限は0〜365日で指定してください。"),
+                    ephemeral=True,
+                )
+                return
+            await settings.set_value(
+                "mcd_card_expiry_days", expiry_days,
+                updated_by=interaction.user.id)
+            changed.append(f"カードの期限を知らせる: **{expiry_days}日前から**")
+        if trash_days is not None:
+            if not 1 <= trash_days <= 365:
+                await interaction.response.send_message(
+                    embed=embeds.error("ゴミ箱の日数は1〜365日で指定してください。"),
+                    ephemeral=True,
+                )
+                return
+            await settings.set_value(
+                "mcd_trash_days", trash_days, updated_by=interaction.user.id)
+            changed.append(f"ゴミ箱に置く日数: **{trash_days}日**")
+
+        if changed:
+            await audit.record(
+                actor_id=interaction.user.id, actor_name=str(interaction.user),
+                action="config.accounts", target="mcd",
+                after=" / ".join(changed),
+            )
+            await interaction.response.send_message(
+                embed=embeds.ok(
+                    "設定しました。\n" + "\n".join(f"・{c}" for c in changed)
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            embed=embeds.info(
+                "**アカウントの知らせ・ゴミ箱のいまの設定**\n"
+                f"・使えるアカウントの目安: "
+                f"**{settings.get('mcd_low_accounts')}件**"
+                "（下回ると管理者に知らせます）\n"
+                f"・カードの期限を知らせる: "
+                f"**{settings.get('mcd_card_expiry_days')}日前から**\n"
+                f"・ゴミ箱に置く日数: "
+                f"**{settings.get('mcd_trash_days')}日**"
+                "（過ぎると本削除します）"
             ),
             ephemeral=True,
         )
