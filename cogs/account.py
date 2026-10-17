@@ -14,6 +14,7 @@ Discord のモーダルは「送信から3秒以内に応答」が必要で、�
 
 from __future__ import annotations
 
+import io
 import logging
 from dataclasses import dataclass, field
 
@@ -28,7 +29,7 @@ from core import audit
 from core import crypto
 from core import proxy as core_proxy
 from core.crypto import get_cipher
-from db.models import KyashAccount, McdAccount, McdToken, utcnow
+from db.models import KyashAccount, McdAccount, McdToken, as_utc, utcnow
 from db.session import session_scope
 from cogs._checks import admin_only, handle_check_failure
 from services.kyash.client import KyashClient, KyashError
@@ -613,6 +614,9 @@ async def _run_bulk(
         already = list(dict.fromkeys(list(parse.already) + already))
 
     added, failed = [], []
+    # ⚠️ 失敗した行は**そのまま控える**。やり直しにはパスワードが要るので、
+    #    理由だけでなく行そのものを持つ（打ち直させない）。
+    failed_entries: list[tuple[str, str, str]] = []
     # ⚠️ 認証コードが必要な分は**捨てずに預かる**。クライアントと
     #    mfa_token を持ち続けるので、利用者はあとから**コードだけ**
     #    入れれば済む（メールとパスワードを打ち直さない）。
@@ -636,10 +640,12 @@ async def _run_bulk(
             added.append((account_id, label, card_name, n_usable))
         except McdError as e:
             failed.append((email, str(e)[:80]))
+            failed_entries.append((email, password, label))
             await client.aclose()
         except Exception as e:
             log.exception("まとめ登録に失敗しました: %s", email)
             failed.append((email, f"{type(e).__name__}: {e}"[:80]))
+            failed_entries.append((email, password, label))
             try:
                 await client.aclose()
             except Exception:
@@ -659,7 +665,7 @@ async def _run_bulk(
                           else f"{E.NG} カード無し"))
             rows.append(f"・`#{aid}` **{label}**　{mark}")
         parts.append(f"{E.OK} **登録できました（{len(added)}件）**\n"
-                     + "\n".join(rows))
+                     + _few(rows))
     if pending_otp:
         parts.append(
             f"{E.KEY} **認証コードが必要です（{len(pending_otp)}件）**\n"
@@ -669,20 +675,59 @@ async def _run_bulk(
     if failed:
         parts.append(
             f"{E.NG} **登録できませんでした（{len(failed)}件）**\n"
-            + "\n".join(f"・{_mask_mail(m)}　{why}" for m, why in failed)
+            + _few(f"・{_mask_mail(m)}　{why}" for m, why in failed)
         )
 
     no_card = [a for a in added if a[3] == 0]
+    desc = "\n\n".join(parts)
+    # ⚠️ 画面の一覧は _few で頭だけしか出していない。省略が起きたときや
+    #    埋め込みの字数に収まらないときは、**全文をファイルで渡す**。
+    #    でないと「どれが入ってどれが入らなかったか」が画面から
+    #    永久に失われる。
+    rows_total = (
+        len(added) + len(failed) + len(already)
+        + ((len(parse.dup) + len(parse.bad)) if parse else 0)
+    )
+    report = None
+    if rows_total > 10 or len(desc) > 3800:
+        report = discord.File(
+            io.BytesIO(_bulk_report_text(
+                added, failed, already, parse).encode("utf-8")),
+            filename="まとめ登録の結果.txt",
+        )
+        desc = desc[:3800] + "\n\n…全文は添付のファイルをご覧ください。"
     await interaction.followup.send(
         embed=discord.Embed(
             title=f"{E.PEOPLE} まとめ登録の結果",
-            description="\n\n".join(parts)[:4000],
+            description=desc,
             color=embeds.GREEN if added else embeds.RED,
         ),
         view=(CardScanView(interaction.user.id, [a[0] for a in no_card])
               if no_card else None),
+        file=report,
         ephemeral=True,
     )
+
+    # 登録できなかった分は、やり直しの画面を別のメッセージで出す。
+    #
+    # ⚠️ 1つのメッセージに付けられる画面は1つだけなので、カードや
+    #    認証コードの画面とは分ける。
+    if failed_entries:
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title=f"{E.NG} 登録できなかった分（{len(failed_entries)}件）",
+                description=(
+                    "原因が一時的なもの（通信など）なら、やり直すだけで"
+                    "入ることがあります。\n"
+                    "**メールとパスワードは控えてあるので、打ち直す必要は"
+                    "ありません。**\n"
+                    f"（{OTP_WAIT_SECONDS // 60}分以内）"
+                ),
+                color=embeds.ORANGE,
+            ),
+            view=BulkRetryView(interaction.user.id, failed_entries),
+            ephemeral=True,
+        )
 
     # 認証コードを待っている分は、別のメッセージで預かり画面を出す。
     #
@@ -879,6 +924,219 @@ async def _read_bulk_file(file: discord.Attachment) -> str | None:
         except UnicodeDecodeError:
             continue
     return None
+
+
+def _jst_text(dt) -> str:
+    """日時を日本時間の文字列にする。
+
+    ⚠️ **必ず as_utc を通す。** SQLite はタイムゾーンを保存しないので、
+       読み戻した値は naive になる。そのまま astimezone すると
+       「実行した機械の時間帯」として扱われ、何時間かずれる。
+    """
+    got = as_utc(dt)
+    return f"{got.astimezone(JST):%Y-%m-%d %H:%M}" if got else ""
+
+
+async def _export_csv() -> tuple[bytes, int]:
+    """登録済みアカウントをCSVにする。(中身, 件数) を返す。
+
+    ⚠️ **パスワードは保存していないので出せない。** これは控え・移行用で、
+       このファイルから登録をやり直すことはできない（やり直すときは
+       手元のメールとパスワードの一覧を使う）。
+
+    ⚠️ メールはそのまま書く。伏せると控えの意味が無くなる。
+       本人にだけ届く形で渡すこと。
+    """
+    import csv
+    from sqlalchemy import select
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([
+        "id", "表示名", "メール", "状態", "カードID", "プロキシ",
+        "今日の注文数", "連続失敗", "最後に使った日時", "登録日時",
+        "最後のエラー",
+    ])
+    n = 0
+    async with session_scope() as s:
+        rows = (await s.execute(
+            select(McdAccount).order_by(McdAccount.id)
+        )).scalars().all()
+        for a in rows:
+            w.writerow([
+                a.id, a.label,
+                crypto.try_decrypt(a.email_enc) or "(鍵が合わず読めません)",
+                a.status, a.card_id or "", "あり" if a.proxy_url else "",
+                a.orders_today, a.consecutive_failures,
+                _jst_text(a.last_used_at), _jst_text(a.created_at),
+                (a.last_error or "").replace("\n", " ")[:200],
+            ])
+            n += 1
+    # ⚠️ BOM を付ける。付けないと Excel で開いたときに日本語が化ける。
+    return buf.getvalue().encode("utf-8-sig"), n
+
+
+def _parse_relabel(raw: str) -> tuple[dict[int, str], list[tuple[int, str]]]:
+    """`ID,新しい名前` の行から {ID: 名前} を取り出す。
+
+    ⚠️ 読めなかった行は行番号つきで返す（黙って飛ばさない）。
+    """
+    out: dict[int, str] = {}
+    bad: list[tuple[int, str]] = []
+    for no, line in enumerate(raw.splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        head = tail = ""
+        for sep in (",", ":", "\t", " ", "="):
+            if sep in line:
+                head, _, tail = line.partition(sep)
+                break
+        head, tail = head.strip(), tail.strip()
+        if not head.isdigit() or not tail:
+            bad.append((no, line[:60]))
+            continue
+        out[int(head)] = tail[:32]
+    return out, bad
+
+
+class McdRelabelModal(discord.ui.Modal, title="表示名をまとめて付け替え"):
+    lines = discord.ui.TextInput(
+        label="IDと新しい名前（1行に1件）",
+        style=discord.TextStyle.paragraph,
+        required=True, max_length=1500,
+        placeholder="1,メイン\n2,予備\n（`/mcd list` でIDが分かります）",
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        from sqlalchemy import select
+
+        want, bad = _parse_relabel(str(self.lines.value))
+        if not want:
+            await interaction.response.send_message(
+                embed=embeds.error(
+                    "読み取れる行がありませんでした。\n"
+                    "`ID,新しい名前` の形で1行に1件、入れてください。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        done: list[str] = []
+        missing: list[int] = []
+        async with session_scope() as s:
+            rows = (await s.execute(
+                select(McdAccount).where(McdAccount.id.in_(list(want)))
+            )).scalars().all()
+            found = {a.id for a in rows}
+            missing = [i for i in want if i not in found]
+            for a in rows:
+                before = a.label
+                a.label = want[a.id]
+                done.append(f"・`#{a.id}` {before} → **{a.label}**")
+
+        for i in sorted(found):
+            await audit.record(
+                actor_id=interaction.user.id, actor_name=str(interaction.user),
+                action="account.relabel", target=f"mcd:{i}", after=want[i],
+            )
+
+        parts = []
+        if done:
+            parts.append(f"{E.OK} **付け替えました（{len(done)}件）**\n" + _few(done))
+        if missing:
+            parts.append(
+                f"{E.WARN} **見つからないID: {len(missing)}件**\n"
+                + _few(f"・`#{i}`" for i in missing)
+            )
+        if bad:
+            parts.append(
+                f"{E.NG} **読めなかった行: {len(bad)}件**\n"
+                + _few(f"・{no}行目 `{t}`" for no, t in bad)
+            )
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title=f"{E.PEOPLE} 表示名の付け替え",
+                description="\n\n".join(parts)[:4000],
+                color=embeds.GREEN if done else embeds.RED,
+            ),
+            ephemeral=True,
+        )
+
+
+def _bulk_report_text(added, failed, already, parse) -> str:
+    """結果の全文。埋め込みに収まらないときファイルで渡す。
+
+    ⚠️ ここには**メールをそのまま**書く。どの行を直すのか特定できないと
+       直せない。画面には伏せ字で出し、控えのファイルにだけ残す。
+    """
+    L = ["まとめ登録の結果", "=" * 40, ""]
+    L.append(f"■ 登録できた: {len(added)}件")
+    for aid, label, card, n in added:
+        L.append(f"   #{aid}\t{label}\tカード{n}枚\t{card}")
+    L.append("")
+    L.append(f"■ 登録できなかった: {len(failed)}件")
+    for m, why in failed:
+        L.append(f"   {m}\t{why}")
+    L.append("")
+    if already:
+        L.append(f"■ すでに登録済みで飛ばした: {len(already)}件")
+        L += [f"   {m}" for m in already]
+        L.append("")
+    if parse and parse.dup:
+        L.append(f"■ 重複で飛ばした: {len(parse.dup)}件")
+        L += [f"   {no}行目\t{m}" for no, m in parse.dup]
+        L.append("")
+    if parse and parse.bad:
+        L.append(f"■ 読めなかった行: {len(parse.bad)}件")
+        L += [f"   {no}行目\t{t}" for no, t in parse.bad]
+    return "\n".join(L)
+
+
+class BulkRetryView(discord.ui.View):
+    """登録できなかった分だけ、やり直す。
+
+    ⚠️ やり直しにはパスワードが要るので預かる。**時間切れで必ず捨てる**
+       （要らなくなったものを持ち続けない）。
+    """
+
+    def __init__(self, owner_id: int, entries: list[tuple[str, str, str]]) -> None:
+        super().__init__(timeout=OTP_WAIT_SECONDS)
+        self.owner_id = owner_id
+        self.entries = entries
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_id
+
+    async def on_timeout(self) -> None:
+        # ⚠️ パスワードを抱えたままにしない
+        self.entries = []
+
+    @discord.ui.button(
+        label="失敗した分だけやり直す", emoji=E.LOADING,
+        style=discord.ButtonStyle.primary,
+    )
+    async def retry(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        # ⚠️ 取り出したら手元からは消す。二度押しで二重に登録しない。
+        entries, self.entries = self.entries, []
+        if not entries:
+            await interaction.response.send_message(
+                embed=embeds.info(
+                    "やり直す分がありません。"
+                    "（時間が経ったか、すでにやり直し済みです）"
+                ),
+                ephemeral=True,
+            )
+            return
+        self.stop()
+        await interaction.response.edit_message(
+            embed=embeds.info(
+                f"{E.LOADING} {len(entries)} 件をやり直しています…"
+            ),
+            view=None,
+        )
+        await _run_bulk(interaction, entries)
 
 
 async def _after_mcd_added(
@@ -1328,6 +1586,93 @@ class AccountCog(commands.Cog):
         # ⚠️ already はここで渡す。_run_bulk 側でもう一度照合すると、
         #    すでに外してあるので二重に数えてしまう。
         await _run_bulk(interaction, r.entries, parse=r)
+
+    @mcd.command(name="export", description="登録済みアカウントの一覧をCSVで出します")
+    @admin_only()
+    async def mcd_export(self, interaction: discord.Interaction) -> None:
+        """⚠️ パスワードは保存していないので出せない。控え・移行用。"""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        data, n = await _export_csv()
+        if not n:
+            await interaction.followup.send(
+                embed=embeds.info("登録されているアカウントがありません。"),
+                ephemeral=True,
+            )
+            return
+        await audit.record(
+            actor_id=interaction.user.id, actor_name=str(interaction.user),
+            action="account.export", target="mcd", detail=f"{n}件",
+        )
+        await interaction.followup.send(
+            embed=embeds.info(
+                f"{E.OK} {n} 件を書き出しました。\n"
+                f"{E.WARN} **パスワードは保存していないため入っていません。**\n"
+                "このファイルから登録をやり直すことはできません（控え・確認用）。\n"
+                f"{E.INFO} メールアドレスがそのまま入っています。扱いにご注意ください。"
+            ),
+            file=discord.File(
+                io.BytesIO(data), filename="マクドナルドアカウント一覧.csv"
+            ),
+            ephemeral=True,
+        )
+
+    @mcd.command(name="relabel", description="表示名をまとめて付け替えます")
+    @app_commands.describe(
+        prefix="この名前＋連番に、全件まとめて付け替えます（例: メイン → メイン1, メイン2…）",
+    )
+    @admin_only()
+    async def mcd_relabel(
+        self, interaction: discord.Interaction, prefix: str | None = None,
+    ) -> None:
+        """表示名を付け替える。
+
+        prefix を付けると全件を「名前＋連番」にそろえる。
+        付けなければ `ID,新しい名前` を貼る窓を出す。
+        """
+        if not prefix:
+            await interaction.response.send_modal(McdRelabelModal())
+            return
+
+        from sqlalchemy import select
+
+        head = prefix.strip()[:24]
+        if not head:
+            await interaction.response.send_message(
+                embed=embeds.error("名前を入れてください。"), ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        rows_text = []
+        async with session_scope() as s:
+            rows = (await s.execute(
+                select(McdAccount).order_by(McdAccount.id)
+            )).scalars().all()
+            for i, a in enumerate(rows, start=1):
+                before = a.label
+                a.label = f"{head}{i}"[:32]
+                rows_text.append(f"・`#{a.id}` {before} → **{a.label}**")
+
+        if not rows_text:
+            await interaction.followup.send(
+                embed=embeds.info("登録されているアカウントがありません。"),
+                ephemeral=True,
+            )
+            return
+
+        await audit.record(
+            actor_id=interaction.user.id, actor_name=str(interaction.user),
+            action="account.relabel", target="mcd:all",
+            detail=f"{head}＋連番 / {len(rows_text)}件",
+        )
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title=f"{E.OK} 表示名をそろえました（{len(rows_text)}件）",
+                description=_few(rows_text, 20)[:4000],
+                color=embeds.GREEN,
+            ),
+            ephemeral=True,
+        )
 
     @mcd.command(name="cards", description="全アカウントのカードを一覧で見る・まとめて探す")
     @admin_only()

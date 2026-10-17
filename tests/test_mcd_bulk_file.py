@@ -201,6 +201,97 @@ async def main() -> int:
           isinstance(itx8.last_modal(), acc.McdBulkModal),
           type(itx8.last_modal()).__name__)
 
+    # ============================================================
+    print("\n[7] 失敗した分だけやり直す ★")
+    from services.mcd.client import McdError
+
+    BAD = {"r2@example.com"}
+
+    class MaybeFail(FakeMcd):
+        def __init__(self, email_box):
+            super().__init__()
+            self.email_box = email_box
+        async def login(self, email, password):
+            self.email_box.append(email)
+            if email in BAD:
+                raise McdError("一時的な通信エラー")
+            return await FakeMcd.login(self, email, password)
+
+    tried: list[str] = []
+    made2: list[MaybeFail] = []
+
+    def f2(fp, *a, **kw):
+        c = MaybeFail(tried)
+        made2.append(c)
+        return c
+
+    acc.McdClient = f2
+    n7 = await count_accounts()
+    itx9 = FakeInteraction(owner, dclient)
+    await cog.mcd_bulk.callback(
+        cog, itx9,
+        file=FakeAttachment(b"r1@example.com,pw\nr2@example.com,pw\n"))
+    check("成功した分だけ入る ★", await count_accounts() == n7 + 1,
+          await count_accounts())
+    retry = None
+    for _, kw in reversed(itx9.actions):
+        if isinstance(kw.get("view"), acc.BulkRetryView):
+            retry = kw["view"]; break
+    check("やり直しの画面が出る ★", retry is not None)
+    check("失敗した1件を控えている ★",
+          retry is not None and [e[0] for e in retry.entries] == ["r2@example.com"],
+          [e[0] for e in retry.entries] if retry else "無し")
+    # ⚠️ パスワードも控えてあること（打ち直させない）
+    check("パスワードも控えている ★",
+          retry is not None and retry.entries[0][1] == "pw",
+          retry.entries[0] if retry else "無し")
+
+    # 今度は通る状態にして、やり直す
+    BAD.clear()
+    tried.clear()
+    n8 = await count_accounts()
+    itx10 = FakeInteraction(owner, dclient)
+    await retry.retry.callback(itx10)
+    check("やり直しで入る ★", await count_accounts() == n8 + 1,
+          await count_accounts())
+    check("やり直したのは失敗した分だけ ★", tried == ["r2@example.com"], tried)
+
+    # ⚠️ 二度押しで二重に登録しない
+    tried.clear()
+    n9 = await count_accounts()
+    itx11 = FakeInteraction(owner, dclient)
+    await retry.retry.callback(itx11)
+    check("二度押ししても増えない ★", await count_accounts() == n9,
+          await count_accounts())
+    check("二度押しではログインを試さない ★", not tried, tried)
+    check("やり直す分が無いと伝える", "ありません" in itx11.text(),
+          itx11.text()[:120])
+
+    # ⚠️ 時間切れでパスワードを捨てる
+    v = acc.BulkRetryView(owner.id, [("z@example.com", "pw", "z")])
+    await v.on_timeout()
+    check("時間切れでパスワードを捨てる ★", v.entries == [], v.entries)
+
+    # ============================================================
+    print("\n[8] 省略が起きたら全文をファイルで渡す ★")
+    # ⚠️ 画面の一覧は10件で切るので、それ以上はファイルが無いと
+    #    「どれが入らなかったか」が分からなくなる。
+    acc.McdClient = lambda fp, *a, **kw: FakeMcd()
+    many2 = "\n".join(f"big{i}@example.com,pw" for i in range(12))
+    itx12 = FakeInteraction(owner, dclient)
+    await cog.mcd_bulk.callback(
+        cog, itx12, file=FakeAttachment(many2.encode("utf-8")))
+    files = [kw.get("file") for _, kw in itx12.actions if kw.get("file")]
+    check("全文のファイルが付く ★", bool(files), len(files))
+    check("全文だと分かる案内が出る ★", "添付のファイル" in itx12.text(),
+          itx12.text()[-200:])
+    body = acc._bulk_report_text(
+        [(1, "a", "**** 1", 1)], [("bad@example.com", "だめ")],
+        ["dup@example.com"], acc._parse_bulk_report("こわれ\n"))
+    check("全文に失敗の理由が入る ★", "bad@example.com" in body and "だめ" in body)
+    check("全文に登録済みが入る ★", "dup@example.com" in body)
+    check("全文に読めない行が入る ★", "こわれ" in body, body[-120:])
+
     await close_db()
     print(f"\n{'='*52}\n  成功 {ok} / 失敗 {fail}\n{'='*52}")
     return 1 if fail else 0
