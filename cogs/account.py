@@ -832,6 +832,11 @@ async def _existing_emails() -> set[str]:
     ⚠️ メールは暗号化して持っているので、**復号して**照合する。
        鍵が合わず読めないものは照合できないので黙って飛ばす
        （「登録済み」と誤って断るほうが困る）。
+
+    ⚠️ **ゴミ箱(DELETED)も含める。** ここで除くと、ゴミ箱にあるものを
+       もう一度登録できてしまい、同じメールの行が2つになる。あとで
+       `/mcd undo` したときにどちらが使われるか分からなくなる。
+       戻したいときは登録し直すのではなく `/mcd undo` を使う。
     """
     from sqlalchemy import select
 
@@ -860,9 +865,13 @@ def _skip_report(parse: "BulkParse | None", already: list[str]) -> str:
     """
     blocks = []
     if already:
+        # ⚠️ ゴミ箱(DELETED)のアカウントも「登録済み」として弾いている。
+        #    二重登録を防ぐためだが、理由を書かないと「消したのに
+        #    登録できない」と見えてしまう。
         blocks.append(
             f"{E.INFO} **すでに登録済み（飛ばしました）: {len(already)}件**\n"
             + _few(f"・{_mask_mail(m)}" for m in already)
+            + "\n（ゴミ箱にある分も含みます。戻すなら `/mcd undo`）"
         )
     if parse and parse.dup:
         blocks.append(
