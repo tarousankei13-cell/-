@@ -40,6 +40,8 @@ DEFAULTS: dict[str, Any] = {
     "charge_methods": "both",   # kyash / paypay / both
     "order_max_amount": defaults.ORDER_MAX_AMOUNT,
     "order_daily_limit": defaults.ORDER_DAILY_LIMIT,
+    "mcd_low_accounts": defaults.MCD_LOW_ACCOUNTS,
+    "mcd_card_expiry_days": defaults.MCD_CARD_EXPIRY_DAYS,
     "menu_sync_interval_minutes": defaults.MENU_SYNC_INTERVAL_MINUTES,
     "store_refresh_minutes": defaults.STORE_REFRESH_MINUTES,
     "menu_notify_diff": defaults.MENU_NOTIFY_DIFF,

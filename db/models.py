@@ -183,6 +183,12 @@ class McdAccount(Base):
     # ⚠️ 更新のたびにローテーションする。取得したら即保存すること。
     refresh_token_enc: Mapped[bytes | None] = mapped_column()
     card_id: Mapped[str | None] = mapped_column(String(64))
+    # カードの有効期限（"MM/YY" のまま持つ）。
+    #
+    # ⚠️ 期限はカタログではなく**マクドナルドの応答**にしか無い。
+    #    毎回問い合わせると通信が増えるので、カードを設定した時点の値を
+    #    控えておき、切れる前の知らせに使う。
+    card_expiry: Mapped[str | None] = mapped_column(String(8))
 
     # 端末フィンガープリント（アカウント作成時に一度だけ生成して固定）
     device_uid: Mapped[str] = mapped_column(String(36), nullable=False)

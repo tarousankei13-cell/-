@@ -167,6 +167,13 @@ MENU_FORCE_REFRESH_HOUR = 0
 MCD_FAILURES_TO_DEGRADE = 3      # 連続失敗でDEGRADEDにする回数
 MCD_FAILURES_TO_QUARANTINE = 5   # 連続失敗で隔離する回数
 MCD_HEALTHCHECK_INTERVAL_HOURS = 1
+# 使えるアカウントがこの数を下回ったら管理者へ知らせる
+#   ⚠️ 尽きると注文が全部止まる。尽きてからでは遅いので、
+#      余裕のあるうちに知らせる。
+MCD_LOW_ACCOUNTS = 2
+# カードの有効期限がこの日数以内に迫ったら知らせる
+#   ⚠️ カードが切れると、そのアカウントの注文は全部落ちる。
+MCD_CARD_EXPIRY_DAYS = 45
 # 外形監視（マクドナルド側が落ちていないか）の間隔（分）
 MONITOR_INTERVAL_MINUTES = 5
 

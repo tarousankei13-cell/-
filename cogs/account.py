@@ -104,6 +104,7 @@ async def _save_and_autocard(
             acc = await s.get(McdAccount, account_id)
             if acc:
                 acc.card_id = usable[0]["card_id"]
+                acc.card_expiry = (usable[0].get("expiry") or "")[:8] or None
         card_name = (usable[0].get("masked") or "")[:32]
     return account_id, card_name, len(usable)
 
@@ -1282,6 +1283,12 @@ class CardSelectView(discord.ui.View):
         sel.callback = self._on_pick
         self.add_item(sel)
         self._sel = sel
+        # ⚠️ 期限も覚えておく。選んだあとで取り直すと通信が増えるし、
+        #    控えが無いと「切れる前の知らせ」が出せない。
+        self._expiry = {
+            c["card_id"]: (c.get("expiry") or "")[:8]
+            for c in cards if c.get("card_id")
+        }
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.owner_id
@@ -1292,6 +1299,7 @@ class CardSelectView(discord.ui.View):
             acc = await s.get(McdAccount, self.account_id)
             if acc:
                 acc.card_id = card_id
+                acc.card_expiry = self._expiry.get(card_id) or None
         self.stop()
         await interaction.response.edit_message(
             embed=embeds.ok(

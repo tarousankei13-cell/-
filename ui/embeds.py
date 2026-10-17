@@ -28,6 +28,51 @@ def yen(v: int) -> str:
     return f"¥{v:,}"
 
 
+def mcd_stock_alert(rep) -> discord.Embed:
+    """アカウントの在庫・カードの心配ごとを知らせる。
+
+    ⚠️ 「今すぐ注文が止まる話」から先に書く。カードの期限のような
+       先の話を上に置くと、本当に急ぐ用件が埋もれる。
+    """
+    parts: list[str] = []
+    if rep.low:
+        parts.append(
+            f"{E.RED} **使えるアカウントが {rep.usable} 件しかありません**"
+            f"（目安 {rep.threshold} 件）\n"
+            "尽きると、注文が全部止まります。"
+        )
+    if rep.expired:
+        parts.append(
+            f"{E.NG} **カードの期限が切れています（{len(rep.expired)}件）**\n"
+            + "\n".join(f"・`#{i}` **{l}**　{e}" for i, l, e in rep.expired[:10])
+            + "\n→ このアカウントの注文は落ちます。`/mcd card` で入れ替えてください。"
+        )
+    if rep.no_card:
+        parts.append(
+            f"{E.CARD} **カードが未設定です（{len(rep.no_card)}件）**\n"
+            + "\n".join(f"・`#{i}` **{l}**" for i, l in rep.no_card[:10])
+            + "\n→ 注文に選ばれません。`/mcd cards` でまとめて設定できます。"
+        )
+    if rep.expiring:
+        parts.append(
+            f"{E.WARN} **カードの期限が近づいています（{len(rep.expiring)}件）**\n"
+            + "\n".join(
+                f"・`#{i}` **{l}**　{e}（あと{d}日）"
+                for i, l, e, d in rep.expiring[:10]
+            )
+        )
+    tail = (
+        f"\n\n使える {rep.usable} / 登録 {rep.total} 件"
+        + ("（" + "・".join(f"{k} {v}" for k, v in sorted(rep.by_status.items())) + "）"
+           if rep.by_status else "")
+    )
+    return discord.Embed(
+        title=f"{E.WARN} アカウントの手当てが必要です",
+        description=("\n\n".join(parts) + tail)[:4000],
+        color=RED if (rep.low or rep.expired) else ORANGE,
+    )
+
+
 # ============================================================
 #  常設パネル
 # ============================================================

@@ -10,17 +10,20 @@ from __future__ import annotations
 
 import asyncio
 
+import calendar
 import logging
 import random
+import re
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import config
 from core import crypto
+from core import settings
 from core.crypto import get_cipher
 from core import breaker
 from db.models import as_utc, McdAccount, McdToken, utcnow
@@ -34,6 +37,128 @@ STATUS_DEGRADED = "DEGRADED"
 STATUS_QUARANTINED = "QUARANTINED"
 STATUS_BANNED = "BANNED"
 USABLE = (STATUS_ACTIVE, STATUS_DEGRADED)
+
+# 使えるアカウントがこれを下回ったら知らせる
+LOW_ACCOUNTS_DEFAULT = 2
+# カードの期限がこの日数以内に迫ったら知らせる
+CARD_EXPIRY_DAYS_DEFAULT = 45
+
+
+def _low_threshold() -> int:
+    try:
+        return max(1, int(settings.get("mcd_low_accounts", LOW_ACCOUNTS_DEFAULT)))
+    except (TypeError, ValueError):
+        return LOW_ACCOUNTS_DEFAULT
+
+
+def _expiry_threshold() -> int:
+    try:
+        return max(
+            0, int(settings.get("mcd_card_expiry_days", CARD_EXPIRY_DAYS_DEFAULT))
+        )
+    except (TypeError, ValueError):
+        return CARD_EXPIRY_DAYS_DEFAULT
+
+
+def card_expiry_days(expiry: str, today: date | None = None) -> int | None:
+    """カードの有効期限まであと何日かを返す。読めなければ None。
+
+    ⚠️ 期限は "MM/YY"（"12/28"）で来る。"MM/YYYY" や "YYYY-MM" も
+       ありうるので、**4桁のほうを年とみなす**。どちらも2桁なら
+       「月/年」の順として読む。
+
+    ⚠️ カードは**その月の末日まで**使える。月初を期限として数えると、
+       まだ使えるカードを「切れた」と知らせてしまう。
+
+    ⚠️ 今日の日付は config.now_jst() から取る。テストで時計を固定
+       できるようにするため、datetime.now() を直に使わない。
+    """
+    nums = re.findall(r"\d+", str(expiry or ""))
+    if len(nums) < 2:
+        return None
+    a, b = nums[0], nums[1]
+    if len(a) == 4:
+        year, month = int(a), int(b)
+    elif len(b) == 4:
+        month, year = int(a), int(b)
+    else:
+        month, year = int(a), 2000 + int(b)
+    if not 1 <= month <= 12 or not 2000 <= year <= 2100:
+        return None
+    end = date(year, month, calendar.monthrange(year, month)[1])
+    base = today or config.now_jst().date()
+    return (end - base).days
+
+
+@dataclass
+class StockReport:
+    """アカウントの在庫と、カードの心配ごと。"""
+
+    total: int = 0
+    usable: int = 0
+    threshold: int = LOW_ACCOUNTS_DEFAULT
+    by_status: dict[str, int] = field(default_factory=dict)
+    no_card: list[tuple[int, str]] = field(default_factory=list)
+    expiring: list[tuple[int, str, str, int]] = field(default_factory=list)
+    expired: list[tuple[int, str, str]] = field(default_factory=list)
+
+    @property
+    def low(self) -> bool:
+        return self.usable < self.threshold
+
+    @property
+    def has_warning(self) -> bool:
+        return bool(self.low or self.no_card or self.expiring or self.expired)
+
+    def signature(self) -> str:
+        """同じ知らせを繰り返さないための印。
+
+        ⚠️ 1時間ごとの点検で毎回知らせると、本当に変わったときに
+           埋もれてしまう。**内容が変わったときだけ**知らせる。
+        """
+        return "|".join([
+            f"u{self.usable}/{self.threshold}",
+            "n" + ",".join(str(i) for i, _ in self.no_card),
+            "x" + ",".join(str(i) for i, _, _, _ in self.expiring),
+            "e" + ",".join(str(i) for i, _, _ in self.expired),
+        ])
+
+
+async def stock_report(*, today: date | None = None) -> StockReport:
+    """使えるアカウントの数と、カードの心配ごとをまとめて調べる。
+
+    ⚠️ 使えるアカウントが尽きると注文が**全部**止まる。尽きてから
+       気づくのでは遅いので、しきい値を下回った時点で知らせる。
+       これまでは「使えるアカウントが一時的にありません」を
+       log.warning に出すだけで、**誰にも届いていなかった**。
+
+    ⚠️ カードが未設定のアカウントは注文で必ず落ちる。数には入るのに
+       使えないので、別に挙げる。
+    """
+    rep = StockReport(threshold=_low_threshold())
+    days_ahead = _expiry_threshold()
+    async with session_scope() as s:
+        rows = (await s.execute(
+            select(McdAccount).order_by(McdAccount.id)
+        )).scalars().all()
+        for a in rows:
+            rep.total += 1
+            rep.by_status[a.status] = rep.by_status.get(a.status, 0) + 1
+            if a.status in USABLE:
+                rep.usable += 1
+            if not a.card_id:
+                rep.no_card.append((a.id, a.label))
+                continue
+            left = card_expiry_days(a.card_expiry or "", today)
+            if left is None:
+                continue
+            if left < 0:
+                rep.expired.append((a.id, a.label, a.card_expiry or ""))
+            elif left <= days_ahead:
+                rep.expiring.append(
+                    (a.id, a.label, a.card_expiry or "", left)
+                )
+    return rep
 
 # 日本国内のおおよその範囲（端末位置のゆらぎ生成に使う）
 _JP_BOUNDS = (31.0, 45.5, 130.0, 145.5)
@@ -616,6 +741,7 @@ async def auto_pick_card(
         if acc is None or acc.card_id:
             return False, len(usable), ""
         acc.card_id = card["card_id"]
+        acc.card_expiry = (card.get("expiry") or "")[:8] or None
     log.info("アカウント %s のカードを自動で設定しました: %s", account_id, name)
     return True, 1, name
 

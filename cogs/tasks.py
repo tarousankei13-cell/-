@@ -109,6 +109,8 @@ class TasksCog(commands.Cog):
         self._last_menu_force_date = None
         self._last_backup_day: int | None = None
         self._started = False
+        # 直前に知らせた在庫の状態（同じ知らせを繰り返さないための印）
+        self._stock_sig = ""
         # 紹介ランキングを何回に1回貼り直すかを数える
         self._ranking_tick = 0
 
@@ -369,6 +371,27 @@ class TasksCog(commands.Cog):
                     color=embeds.RED,
                 )
             )
+
+        # -- 在庫とカードの心配ごと --------------------------------
+        #
+        # ⚠️ 使えるアカウントが尽きると注文が全部止まる。これまでは
+        #    log.warning に出すだけで、誰にも届いていなかった。
+        #
+        # ⚠️ 1時間ごとに同じ知らせを出すと、本当に変わったときに
+        #    埋もれる。**内容が変わったときだけ**知らせ、
+        #    片付いたら印を消して次の悪化をまた知らせられるようにする。
+        try:
+            rep = await jobs.mcd_accounts.stock_report()
+        except Exception as e:
+            log.warning("アカウントの在庫を調べられませんでした: %s", e)
+        else:
+            if not rep.has_warning:
+                self._stock_sig = ""
+            else:
+                sig = rep.signature()
+                if sig != self._stock_sig:
+                    self._stock_sig = sig
+                    await self.notify_admin(embeds.mcd_stock_alert(rep))
 
     @health_check.before_loop
     async def before_health_check(self) -> None:
